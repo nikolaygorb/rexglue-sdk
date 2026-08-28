@@ -58,6 +58,24 @@ if(NOT fidelityfx_POPULATED)
     FetchContent_Populate(fidelityfx)
 endif()
 
+set(_rexglue_ffx_api_rc "${fidelityfx_SOURCE_DIR}/ffx-api/src/resource/ffx_api_dll.rc")
+if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND EXISTS "${_rexglue_ffx_api_rc}")
+    file(READ "${_rexglue_ffx_api_rc}" _rexglue_ffx_api_rc_hex HEX)
+    if(_rexglue_ffx_api_rc_hex MATCHES "^fffe")
+        execute_process(
+            COMMAND powershell -NoProfile -NonInteractive -Command
+                "$c = Get-Content -Raw -Encoding Unicode -Path '${_rexglue_ffx_api_rc}'; [System.IO.File]::WriteAllText('${_rexglue_ffx_api_rc}', $c, (New-Object System.Text.UTF8Encoding($false)))"
+            RESULT_VARIABLE _rexglue_ffx_api_rc_result
+        )
+        if(NOT _rexglue_ffx_api_rc_result EQUAL 0)
+            message(WARNING "Failed to re-encode ${_rexglue_ffx_api_rc} to UTF-8 (llvm-rc will likely fail on it)")
+        endif()
+        unset(_rexglue_ffx_api_rc_result)
+    endif()
+    unset(_rexglue_ffx_api_rc_hex)
+endif()
+unset(_rexglue_ffx_api_rc)
+
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
     "Root of the fetched FidelityFX SDK source tree")
 

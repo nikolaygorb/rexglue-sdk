@@ -145,6 +145,22 @@ if(TARGET amd_fidelityfx_dx12)
     )
 endif()
 
+foreach(_rexglue_ffx_target amd_fidelityfx_vk amd_fidelityfx_dx12)
+    if(TARGET ${_rexglue_ffx_target})
+        set_target_properties(${_rexglue_ffx_target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${REXGLUE_ROOT}/out/${REX_PLATFORM}"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${REXGLUE_ROOT}/out/${REX_PLATFORM}"
+            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${REXGLUE_ROOT}/out/${REX_PLATFORM}"
+            LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}"
+            LIBRARY_OUTPUT_DIRECTORY_DEBUG "${REXGLUE_ROOT}/out/${REX_PLATFORM}"
+            LIBRARY_OUTPUT_DIRECTORY_RELEASE "${REXGLUE_ROOT}/out/${REX_PLATFORM}"
+            LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${REXGLUE_ROOT}/out/${REX_PLATFORM}"
+        )
+    endif()
+endforeach()
+unset(_rexglue_ffx_target)
+
 # FidelityFX's toolchain.cmake force-sets CMAKE_GENERATOR_PLATFORM (for VS generators).
 # With Ninja this variable is invalid and poisons every subsequent try_compile() call.
 # Clear it from the cache.

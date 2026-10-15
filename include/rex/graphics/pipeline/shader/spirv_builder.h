@@ -45,6 +45,10 @@ class SpirvBuilder : public spv::Builder {
   spv::Id createTriBuiltinCall(spv::Id result_type, spv::Id builtins, int entry_point,
                                spv::Id operand1, spv::Id operand2, spv::Id operand3);
 
+  // Makes a constant of a float scalar or vector value_type with all
+  // components set to value.
+  spv::Id smearFloatConstant(float value, spv::Id value_type);
+
   // Helper to use for building nested control flow with if-then-else with
   // additions over SpvBuilder::If.
   class IfBuilder {

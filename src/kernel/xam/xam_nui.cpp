@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+// Disable warnings about unused parameters for kernel functions
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/runtime.h>
@@ -64,12 +67,26 @@ u32 XamShowNuiTroubleshooterUI_entry(u32 unk1, u32 unk2, u32 unk3) {
   return 0;
 }
 
+//=============================================================================
+// Ported from xenia-canary for the ReXGlue fork
+//=============================================================================
+
+u32 XamIsNatalPlaybackEnabled_entry(u32 unk1, u32 unk2) {
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamIsNuiAutomationEnabled_entry(u32 unk1, u32 unk2) {
+  return X_ERROR_SUCCESS;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
 
 REX_EXPORT(__imp__XamNuiGetDeviceStatus, rex::kernel::xam::XamNuiGetDeviceStatus_entry)
 REX_EXPORT(__imp__XamShowNuiTroubleshooterUI, rex::kernel::xam::XamShowNuiTroubleshooterUI_entry)
+REX_EXPORT(__imp__XamIsNatalPlaybackEnabled, rex::kernel::xam::XamIsNatalPlaybackEnabled_entry)
+REX_EXPORT(__imp__XamIsNuiAutomationEnabled, rex::kernel::xam::XamIsNuiAutomationEnabled_entry)
 
 REX_EXPORT_STUB(__imp__XamEnableNatalPlayback);
 REX_EXPORT_STUB(__imp__XamEnableNuiAutomation);

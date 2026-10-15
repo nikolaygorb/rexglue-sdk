@@ -125,7 +125,15 @@ u32 ExGetXConfigSetting_entry(u16 category, u16 setting, mapped_void buffer_ptr,
   return result;
 }
 
+u32 ExSetXConfigSetting_entry(u32 category, u32 setting, mapped_void buffer_ptr, u32 buffer_size) {
+  // XConfig is read-only here (ExGetXConfigSetting serves fixed values), so the
+  // change is accepted and not stored.
+  REXKRNL_DEBUG("ExSetXConfigSetting: category {:04X} setting {:04X} not stored",
+                uint32_t(category) & 0xFFFF, uint32_t(setting) & 0xFFFF);
+  return X_STATUS_SUCCESS;
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__ExGetXConfigSetting, rex::kernel::xboxkrnl::ExGetXConfigSetting_entry)
-REX_EXPORT_STUB(__imp__ExSetXConfigSetting);
+REX_EXPORT(__imp__ExSetXConfigSetting, rex::kernel::xboxkrnl::ExSetXConfigSetting_entry)

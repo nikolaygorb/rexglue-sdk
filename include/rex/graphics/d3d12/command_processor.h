@@ -28,6 +28,7 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/primitive_processor.h>
+#include <rex/graphics/d3d12/query_pool.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
@@ -38,6 +39,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
+#include <rex/ui/d3d12/d3d12_gpu_completion_timeline.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
@@ -54,7 +56,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   void InvalidateGpuMemory() override;
 
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
-                               bool blocking) override;
+                               bool blocking,
+                               std::function<void()> completion_callback = nullptr) override;
 
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
@@ -67,12 +70,16 @@ class D3D12CommandProcessor : public CommandProcessor {
     return deferred_command_list_;
   }
 
-  uint64_t GetCurrentSubmission() const { return submission_current_; }
-  uint64_t GetCompletedSubmission() const { return submission_completed_; }
+  void PollCompletedSubmission() override;
+
+  uint64_t GetCurrentSubmission() const { return completion_timeline_->GetUpcomingSubmission(); }
+  uint64_t GetCompletedSubmission() const override {
+    return completion_timeline_->GetCompletedSubmissionFromLastUpdate();
+  }
 
   // Must be called when a subsystem does something like UpdateTileMappings so
-  // it can be awaited in CheckSubmissionFence(submission_current_) if it was
-  // done after the latest ExecuteCommandLists + Signal.
+  // it can be awaited in CheckSubmissionCompletion(GetCurrentSubmission()) if
+  // it was done after the latest ExecuteCommandLists + Signal.
   void NotifyQueueOperationsDoneDirectly() {
     queue_operations_done_since_submission_signal_ = true;
   }
@@ -129,13 +136,6 @@ class D3D12CommandProcessor : public CommandProcessor {
     kNullRawSRV = kNullRawSRVAndSharedMemoryRawUAVStart,
     kSharedMemoryRawUAV,
 
-    kSharedMemoryR32UintSRV,
-    kSharedMemoryR32G32UintSRV,
-    kSharedMemoryR32G32B32A32UintSRV,
-    kSharedMemoryR32UintUAV,
-    kSharedMemoryR32G32UintUAV,
-    kSharedMemoryR32G32B32A32UintUAV,
-
     kEdramRawSRV,
     kEdramR32UintSRV,
     kEdramR32G32UintSRV,
@@ -144,6 +144,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     kEdramR32UintUAV,
     kEdramR32G32UintUAV,
     kEdramR32G32B32A32UintUAV,
+    kZpdCounterRawUAV,
 
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
@@ -160,10 +161,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   };
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSystemBindlessViewHandlePair(
       SystemBindlessView view) const;
-  ui::d3d12::util::DescriptorCpuGpuHandlePair GetSharedMemoryUintPow2BindlessSRVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
-  ui::d3d12::util::DescriptorCpuGpuHandlePair GetSharedMemoryUintPow2BindlessUAVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetEdramUintPow2BindlessSRVHandlePair(
       uint32_t element_size_bytes_pow2) const;
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetEdramUintPow2BindlessUAVHandlePair(
@@ -192,6 +189,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   void SetStencilReference(uint32_t stencil_ref);
   void SetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology);
 
+  // Sets Xenos MSAA sample positions based on ForcedSampleCount for ROV, or
+  // target sample count, or the default pattern at 1x. Submits pending
+  // barriers under the old pattern first.
+  void UpdateSamplePositions(xenos::MsaaSamples msaa_samples);
+  bool xenos_sample_positions_used() const { return xenos_sample_positions_used_; }
+
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
 
@@ -201,8 +204,6 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
-  bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count) override;
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -308,9 +309,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // decay.
 
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
-  // the submission to await to simply check status, or pass submission_current_
-  // to wait for all queue operations to be completed.
-  void CheckSubmissionFence(uint64_t await_submission);
+  // the submission to await to simply check status, or pass
+  // GetCurrentSubmission() to wait for all queue operations to be completed.
+  void CheckSubmissionCompletion(uint64_t await_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -326,8 +327,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFence(submission_current_);
-    return submission_completed_ + 1 >= submission_current_;
+    CheckSubmissionCompletion(GetCurrentSubmission());
+    return GetCompletedSubmission() + 1u >= GetCurrentSubmission();
   }
   void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
 
@@ -356,13 +357,16 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void UpdateFixedFunctionState(const draw_util::ViewportInfo& viewport_info,
                                 const draw_util::Scissor& scissor, bool primitive_polygonal,
-                                reg::RB_DEPTHCONTROL normalized_depth_control);
-  void UpdateSystemConstantValues(bool shared_memory_is_uav, bool primitive_polygonal,
-                                  uint32_t line_loop_closing_index, xenos::Endian index_endian,
-                                  const draw_util::ViewportInfo& viewport_info,
-                                  uint32_t used_texture_mask,
-                                  reg::RB_DEPTHCONTROL normalized_depth_control,
-                                  uint32_t normalized_color_mask);
+                                reg::RB_DEPTHCONTROL normalized_depth_control,
+                                uint32_t normalized_color_mask,
+                                uint32_t bound_depth_and_color_render_target_bits);
+  void UpdateSystemConstantValues(
+      bool shared_memory_is_uav, bool primitive_polygonal, uint32_t line_loop_closing_index,
+      xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
+      uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask,
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
+      int32_t window_offset_tiles);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
@@ -402,40 +406,79 @@ class D3D12CommandProcessor : public CommandProcessor {
     return (uint64_t(first_base_address_dwords) << 32) | uint64_t(total_size);
   }
 
-  bool InitializeOcclusionQueryResources();
-  void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address,
-                              xenos::xe_gpu_depth_sample_counts* sample_counts);
-  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
-  void DisableHostOcclusionQueries();
-  uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-  void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
-                                 uint64_t samples);
-  void InvalidateAllVertexBufferResidency();
-  void InvalidateVertexBufferResidency(uint32_t vfetch_index);
-  void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
-
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+  void WriteZPDCounterRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+
+  // Query segments backend for both ZPD occlusion query reports and
+  // VIZ visibility surveys & conditional rendering.
+  //
+  // BeginQuery/EndQuery must be in the same command list, segments split at
+  // EndSubmission, resume at BeginSubmission. Coalesced ResolveQueryData and
+  // counter copies are emitted at submit.
+  void EnsureQueryResources() override;
+  void ShutdownQueryResources() override {
+    query_resolves_in_flight_.clear();
+    active_query_index_ = UINT32_MAX;
+    active_query_generation_ = 0;
+    active_query_is_rov_ = false;
+    zpd_rov_path_ = false;
+    bindful_zpd_counter_buffer_ = nullptr;
+    bindful_zpd_counter_capacity_ = 0;
+    if (!bindless_resources_used_) {
+      draw_view_bindful_heap_index_ = ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
+    }
+    if (host_query_pool_) {
+      host_query_pool_->Shutdown();
+    }
+  }
+
+  bool IsQueryPoolReady() const override;
+  bool CanOpenQuery() const override;
+
+  QueryOpenResult OpenQuery(bool can_close_submission) override;
+  bool CloseQuery(ReportHandle report_handle, const VIZQueryHandle& viz,
+                  uint64_t& out_submission) override;
+  void PumpQueryResolves() override;
+  bool AwaitQueryResolve(ReportHandle report_handle, uint64_t wait_for_submission) override;
+
+  bool EnsureVIZPredicateBuffer();
+  void AwaitVIZQueryResolve(uint64_t wait_for_submission) override;
+  void ShutdownVIZQueryResources() {
+    viz_predicate_buffer_.Reset();
+    viz_predicate_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+    viz_predicate_buffer_failed_ = false;
+  }
 
   bool device_removed_ = false;
 
   bool cache_clear_requested_ = false;
 
-  HANDLE fence_completion_event_ = nullptr;
+  struct PendingQueryResolve {
+    uint64_t submission = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    uint32_t scale_area = 1;
+    bool rov = false;
+    bool hybrid = false;
+    ReportHandle report_handle = kInvalidReportHandle;
+    VIZQueryHandle viz;
+  };
+  uint32_t active_query_index_ = UINT32_MAX;
+  uint32_t active_query_generation_ = 0;
+  bool active_query_is_rov_ = false;
+  bool zpd_rov_path_ = false;
+  bool zpd_hybrid_supported_ = false;
+  std::deque<PendingQueryResolve> query_resolves_in_flight_;
 
+  std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline> completion_timeline_;
   bool submission_open_ = false;
-  // Values of submission_fence_.
-  uint64_t submission_current_ = 1;
-  uint64_t submission_completed_ = 0;
-  ID3D12Fence* submission_fence_ = nullptr;
 
   // For awaiting non-submission queue operations such as UpdateTileMappings in
   // AwaitAllQueueOperationsCompletion when they're queued after the latest
   // ExecuteCommandLists + Signal, thus won't be awaited by just awaiting the
   // submission.
-  ID3D12Fence* queue_operations_since_submission_fence_ = nullptr;
-  uint64_t queue_operations_since_submission_fence_last_ = 0;
+  std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline>
+      queue_operations_since_submission_completion_timeline_;
   bool queue_operations_done_since_submission_signal_ = false;
 
   bool frame_open_ = false;
@@ -457,6 +500,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   CommandAllocator* command_allocator_submitted_last_ = nullptr;
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
+  ID3D12GraphicsCommandList2* command_list_2_ = nullptr;
   DeferredCommandList deferred_command_list_;
 
   bool debug_markers_enabled_ = false;
@@ -471,7 +515,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t pa_sc_window_offset;
     uint32_t normalized_depth_control;
     uint32_t vport_regs[6];  // XSCALE, XOFFSET, YSCALE, YOFFSET, ZSCALE, ZOFFSET
-    uint32_t flags;          // packed: convert_z_to_float24, full_float24, ps_writes_depth
+    uint32_t flags;  // packed: convert_z_to_float24, full_float24, ps_writes_depth, draw scale x/y
     bool operator==(const ViewportCacheKey&) const = default;
   };
   ViewportCacheKey previous_viewport_key_{};
@@ -484,9 +528,23 @@ class D3D12CommandProcessor : public CommandProcessor {
   // of UpdateBindings time, and that's outside the emulator's control even).
   bool bindless_resources_used_ = false;
 
+  // SetSamplePositions and ResolveSubresourceRegion remove the device
+  // without tier 1 support.
+  bool xenos_sample_positions_used_ = false;
+
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
+
+  std::unique_ptr<D3D12QueryPool> host_query_pool_;
+  ID3D12Resource* bindful_zpd_counter_buffer_ = nullptr;
+  uint32_t bindful_zpd_counter_capacity_ = 0;
+
+  // The tracked state is only valid within the recorded submission. Buffers
+  // decay to COMMON when the previous submission's command list finishes.
+  Microsoft::WRL::ComPtr<ID3D12Resource> viz_predicate_buffer_;
+  D3D12_RESOURCE_STATES viz_predicate_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+  bool viz_predicate_buffer_failed_ = false;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 
@@ -597,25 +655,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_extreme_pipeline_;
 
-  struct ResolveDownscaleConstants {
-    uint32_t scale_x;
-    uint32_t scale_y;
-    uint32_t pixel_size_log2;
-    uint32_t tile_count;
-    uint32_t half_pixel_offset;
-  };
-  enum class ResolveDownscaleRootParameter : UINT {
-    kConstants,
-    kSource,
-    kDestination,
-
-    kCount,
-  };
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> resolve_downscale_root_signature_;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> resolve_downscale_pipeline_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> resolve_downscale_buffer_;
-  uint32_t resolve_downscale_buffer_size_ = 0;
-
   // PWL gamma ramp can result in values with more precision than 10bpc. Though
   // those sub-10bpc bits don't have any noticeable visual effect, so normally
   // R10G10B10A2_UNORM is enough. But what's the most important is that for the
@@ -630,6 +669,56 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Kept in NON_PIXEL_SHADER_RESOURCE state.
   Microsoft::WRL::ComPtr<ID3D12Resource> fxaa_source_texture_;
   uint64_t fxaa_source_texture_submission_ = 0;
+
+  // SMAA swap post effect (src/graphics/shaders/smaa*.xesl), three passes after
+  // the gamma ramp: edge detection, blending weight calculation, neighborhood
+  // blending into the guest output.
+  struct SmaaConstants {
+    uint32_t size[2];
+    float size_inv[2];
+  };
+  enum class SmaaRootParameter : UINT {
+    kConstants,
+    kSource0,
+    kSource1,
+    kSource2,
+    kDestination,
+
+    kCount,
+  };
+  enum SmaaPass : size_t {
+    kSmaaPassEdgeDetection,
+    kSmaaPassBlendingWeightCalculation,
+    kSmaaPassNeighborhoodBlending,
+
+    kSmaaPassCount,
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> smaa_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> smaa_pipelines_[kSmaaPassCount];
+  // Intermediate textures at the guest output size, kept in
+  // NON_PIXEL_SHADER_RESOURCE state.
+  enum SmaaTexture : size_t {
+    // Gamma-corrected color (the output of the gamma ramp).
+    kSmaaTextureColor,
+    kSmaaTextureEdges,
+    kSmaaTextureWeights,
+
+    kSmaaTextureCount,
+  };
+  static constexpr DXGI_FORMAT kSmaaTextureFormats[kSmaaTextureCount] = {
+      DXGI_FORMAT_R10G10B10A2_UNORM,
+      DXGI_FORMAT_R10G10B10A2_UNORM,
+      DXGI_FORMAT_R16G16B16A16_FLOAT,
+  };
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_textures_[kSmaaTextureCount];
+  uint64_t smaa_textures_submission_ = 0;
+  // AreaTex and SearchTex, uploaded on the first use, then kept in
+  // NON_PIXEL_SHADER_RESOURCE state.
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_area_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_search_texture_;
+  // Creates the intermediate textures for the size and uploads the lookup
+  // textures if needed. Must be called within an open submission.
+  bool EnsureSmaaResources(uint32_t width, uint32_t height);
 
   // Unsubmitted barrier batch.
   std::vector<D3D12_RESOURCE_BARRIER> barriers_;
@@ -648,23 +737,33 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
-  static constexpr uint32_t kMaxOcclusionQueries = 8192;
-  Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_;
-  uint64_t* occlusion_query_readback_mapping_ = nullptr;
-  uint32_t occlusion_query_cursor_ = 0;
-  bool occlusion_query_resources_available_ = false;
-  struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
-    uint32_t host_index = UINT32_MAX;
-    bool valid = false;
-  } active_occlusion_query_;
-  struct VertexBufferState {
-    uint32_t address = UINT32_MAX;
-    uint32_t size = UINT32_MAX;
+  // Resolve downscale compute shader for scaled resolution readback,
+  // reversing the scaled resolve buffer packing back to 1x on the GPU.
+  struct ResolveDownscaleConstants {
+    uint32_t scale_x;          // 1 to kMaxDrawResolutionScaleAlongAxis
+    uint32_t scale_y;          // 1 to kMaxDrawResolutionScaleAlongAxis
+    uint32_t pixel_size_log2;  // 0=8bit, 1=16bit, 2=32bit, 3=64bit
+    uint32_t tile_count;       // Number of 32x32 tiles to process
+    // Byte offset into the source buffer. Always 0 on D3D12 (the offset is
+    // baked into the source SRV). Kept for a shader shared with Vulkan.
+    uint32_t source_offset_bytes;
+    // When non-zero, sample from (scale/2, scale/2) within each scaled block
+    // instead of (0, 0).
+    uint32_t half_pixel_offset;
   };
-  std::array<VertexBufferState, 96> vertex_buffer_states_{};
-  uint64_t vertex_buffers_in_sync_[2] = {};
+  enum class ResolveDownscaleRootParameter : UINT {
+    kConstants,
+    kSource,
+    kDestination,
+
+    kCount,
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> resolve_downscale_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> resolve_downscale_pipeline_;
+  // Intermediate buffer for downscaled output (DEFAULT heap, UAV-capable),
+  // kept in UNORDERED_ACCESS state between resolves.
+  Microsoft::WRL::ComPtr<ID3D12Resource> resolve_downscale_buffer_;
+  uint32_t resolve_downscale_buffer_size_ = 0;
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;
@@ -757,6 +856,9 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Current primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology_;
+
+  // MSAA mode the command list's sample positions are programmed for.
+  xenos::MsaaSamples current_sample_positions_ = xenos::MsaaSamples::k1X;
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;

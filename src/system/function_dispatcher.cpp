@@ -13,7 +13,10 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <fstream>
+
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -22,6 +25,10 @@
 #include <rex/runtime.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
+
+REXCVAR_DEFINE_STRING(unregistered_function_log, "", "Runtime",
+                      "Append each guest address called without a recompiled function to this "
+                      "file, as a [functions] entry for the project config");
 
 namespace rex::runtime {
 
@@ -34,9 +41,20 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
 
 }  // namespace
 
+// Codegen registers the code addresses it can find; one the program only
+// computes at run time cannot be found, and the call lands here. LR is the
+// return address of the call (for a tail call, of the call before it).
 static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
-            ctx.last_indirect_target);
+  const uint32_t target = ctx.last_indirect_target;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  if (const std::string path = REXCVAR_GET(unregistered_function_log); !path.empty()) {
+    std::ofstream(path, std::ios::app) << fmt::format(
+        "0x{:08X} = {{}}  # called with LR 0x{:08X}\n", target, lr);
+  }
+  REX_FATAL(
+      "Call to invalid or unregistered function at guest address 0x{:08X} (LR 0x{:08X}). If it "
+      "is code, add `0x{:08X} = {{}}` under [functions] in the project config and regenerate",
+      target, lr, target);
 }
 
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
@@ -220,6 +238,7 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
       .image_size = image_size,
       .next_thunk_address = code_base + code_size,
       .thunk_limit = code_base + code_size + kThunkReserveSize,
+      .thunks = {},
   });
 
   if (is_entrypoint) {
@@ -303,6 +322,12 @@ uint32_t FunctionDispatcher::AllocateThunk(::PPCFunc* func, uint32_t caller_addr
     }
   }
 
+  // Titles may look the same export up every frame (XexGetProcedureAddress);
+  // a new thunk per lookup would run the reserve out after a few minutes.
+  if (auto it = mod->thunks.find(func); it != mod->thunks.end()) {
+    return it->second;
+  }
+
   if (mod->next_thunk_address >= mod->thunk_limit) {
     REXLOG_ERROR("Thunk address space exhausted for module at {:08X}", mod->code_base);
     return 0;
@@ -313,6 +338,7 @@ uint32_t FunctionDispatcher::AllocateThunk(::PPCFunc* func, uint32_t caller_addr
     mod->next_thunk_address -= 4;
     return 0;
   }
+  mod->thunks.emplace(func, addr);
   return addr;
 }
 

@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <queue>
 
 #include <rex/kernel.h>
@@ -78,13 +79,20 @@ class AudioSystem : public system::IAudioSystem {
 
   rex::thread::global_critical_region global_critical_region_;
   static const size_t kMaximumClientCount = 8;
-  struct {
-    AudioDriver* driver;
-    uint32_t callback;
-    uint32_t callback_arg;
-    uint32_t wrapped_callback_arg;
-    bool in_use;
-  } clients_[kMaximumClientCount];
+  struct ClientSlot {
+    AudioDriver* driver = nullptr;
+    uint32_t callback = 0;
+    uint32_t callback_arg = 0;
+    uint32_t wrapped_callback_arg = 0;
+    bool in_use = false;
+    // Held by the worker while it runs the callback; UnregisterClient waits on
+    // it. Recursive, as a callback may unregister its own client.
+    std::recursive_mutex callback_mutex;
+  };
+  ClientSlot clients_[kMaximumClientCount];
+
+  // Clears everything but the mutex.
+  static void ResetClient(ClientSlot& client);
 
   int FindFreeClient();
 

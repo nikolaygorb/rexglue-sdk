@@ -12,7 +12,9 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 
 #include <rex/assert.h>
 #include <rex/audio/downmix.h>
@@ -21,7 +23,22 @@
 
 namespace rex::audio::conversion {
 
+// Clamp a mixed sample to [-1, 1], with NaN and infinity going to silence. A
+// non-finite guest mix must not reach the device as a full-scale value: that
+// is a DC step, heard as a pop followed by silence.
+inline float clamp_unit(float v) {
+  return std::isfinite(v) ? std::clamp(v, -1.0f, 1.0f) : 0.0f;
+}
+
 #if REX_ARCH_AMD64
+// maxps/minps return their second operand when either one is NaN, so a bare
+// min(max(v, -1), 1) turns NaN into -1. Zero non-finite lanes first.
+inline __m128 clamp_unit(__m128 v) {
+  const __m128 magnitude = _mm_andnot_ps(_mm_set1_ps(-0.0f), v);
+  v = _mm_and_ps(v, _mm_cmplt_ps(magnitude, _mm_set1_ps(std::numeric_limits<float>::infinity())));
+  return _mm_min_ps(_mm_max_ps(v, _mm_set1_ps(-1.0f)), _mm_set1_ps(1.0f));
+}
+
 inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
                                                 size_t ch_sample_count, const SurroundMix& mix,
                                                 float gain) {
@@ -59,12 +76,10 @@ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* inpu
   const float l = mix.lfe * gain;
   const __m128 w[3] = {_mm_setr_ps(gain, gain, c, l), _mm_setr_ps(s, s, gain, gain),
                        _mm_setr_ps(c, l, s, s)};
-  const __m128 lo = _mm_set1_ps(-1.0f);
-  const __m128 hi = _mm_set1_ps(1.0f);
   const size_t count = ch_sample_count * 6;
   for (size_t i = 0, phase = 0; i < count; i += 4, phase = (phase + 1) % 3) {
     const __m128 v = _mm_mul_ps(_mm_loadu_ps(&output[i]), w[phase]);
-    _mm_storeu_ps(&output[i], _mm_min_ps(_mm_max_ps(v, lo), hi));
+    _mm_storeu_ps(&output[i], clamp_unit(v));
   }
 }
 
@@ -79,8 +94,6 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
   const __m128 lfe = _mm_set1_ps(fold.lfe);
   const __m128 surround = _mm_set1_ps(fold.surround);
   const __m128 scale = _mm_set1_ps(fold.scale * gain);
-  const __m128 lo = _mm_set1_ps(-1.0f);
-  const __m128 hi = _mm_set1_ps(1.0f);
 
   for (size_t sample = 0; sample < ch_sample_count; sample += 4) {
     // load 4 samples from 6 channels each
@@ -102,8 +115,8 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
     const __m128 mid = _mm_add_ps(_mm_mul_ps(fc, center), _mm_mul_ps(lf, lfe));
     __m128 left = _mm_mul_ps(_mm_add_ps(_mm_add_ps(fl, mid), _mm_mul_ps(bl, surround)), scale);
     __m128 right = _mm_mul_ps(_mm_add_ps(_mm_add_ps(fr, mid), _mm_mul_ps(br, surround)), scale);
-    left = _mm_min_ps(_mm_max_ps(left, lo), hi);
-    right = _mm_min_ps(_mm_max_ps(right, lo), hi);
+    left = clamp_unit(left);
+    right = clamp_unit(right);
 
     _mm_storeu_ps(&output[sample * 2], _mm_unpacklo_ps(left, right));
     _mm_storeu_ps(&output[(sample + 2) * 2], _mm_unpackhi_ps(left, right));
@@ -118,7 +131,7 @@ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* inpu
   for (size_t sample = 0; sample < ch_sample_count; sample++) {
     for (size_t channel = 0; channel < 6; channel++) {
       const float v = rex::byte_swap(input[channel * ch_sample_count + sample]) * w[channel];
-      output[sample * 6 + channel] = std::clamp(v, -1.0f, 1.0f);
+      output[sample * 6 + channel] = clamp_unit(v);
     }
   }
 }
@@ -138,8 +151,8 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
     const float br = rex::byte_swap(input[5 * ch_sample_count + sample]);
     // Center and LFE land on both sides.
     const float mid = fc * fold.center + lf * fold.lfe;
-    output[sample * 2] = std::clamp((fl + mid + bl * fold.surround) * scale, -1.0f, 1.0f);
-    output[sample * 2 + 1] = std::clamp((fr + mid + br * fold.surround) * scale, -1.0f, 1.0f);
+    output[sample * 2] = clamp_unit((fl + mid + bl * fold.surround) * scale);
+    output[sample * 2 + 1] = clamp_unit((fr + mid + br * fold.surround) * scale);
   }
 }
 #endif

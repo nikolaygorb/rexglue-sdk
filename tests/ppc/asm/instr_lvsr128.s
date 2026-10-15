@@ -1,0 +1,6 @@
+test_lvsr128_1:
+  #_ REGISTER_IN r4 0x1070
+  lvsr128 v5, r4, r0
+  blr
+  #_ REGISTER_OUT r4 0x1070
+  #_ REGISTER_OUT v5 [10111213, 14151617, 18191A1B, 1C1D1E1F]

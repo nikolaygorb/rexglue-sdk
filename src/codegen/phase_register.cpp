@@ -417,6 +417,77 @@ void detectSaveRestoreHelpers(const BinaryView& binary, AnalysisState& state) {
 // Register Phase: imports, helpers, PDATA, config functions
 //=============================================================================
 
+// The XDK CRT's setjmp stores f14-f31 at 0..136(r3) right after `mflr r0;
+// mfcr r4`, then r13 at 152(r3); its longjmp reloads them from the same
+// offsets of r7. Codegen needs both addresses to translate calls to them
+// (setjmp_address/longjmp_address), so when the config leaves one out it is
+// taken from the binary: the entry is the start of the function holding the
+// only match, found by walking back to the previous end of flow or padding.
+void detectSetjmpLongjmp(const BinaryView& binary, RecompilerConfig& config) {
+  auto makePattern = [](std::initializer_list<uint32_t> head, uint32_t fprBase, uint32_t gprR13) {
+    std::vector<uint32_t> pattern(head);
+    for (uint32_t k = 0; k < 18; k++)
+      pattern.push_back(fprBase + (k << 21) + k * 8);
+    pattern.push_back(gprR13);
+    return pattern;
+  };
+  // stfd f14+k, 8k(r3) / lfd f14+k, 8k(r7); std / ld r13, 152(rN)
+  const auto setjmpPattern = makePattern({0x7C0802A6, 0x7C800026}, 0xD9C30000, 0xF9A30098);
+  const auto longjmpPattern = makePattern({}, 0xC9C70000, 0xE9A70098);
+
+  auto endsFlow = [](uint32_t word) {
+    auto insn = decode_instruction(0, word);
+    return word == 0 || insn.is_return() || insn.opcode == Opcode::b ||
+           ((insn.opcode == Opcode::bcctr || insn.opcode == Opcode::bclr) && !insn.is_conditional());
+  };
+
+  auto find = [&](const std::vector<uint32_t>& pattern) -> std::vector<uint32_t> {
+    std::vector<uint32_t> entries;
+    for (const auto& section : binary.sections()) {
+      if (!section.executable || !section.data)
+        continue;
+      for (uint32_t offset = 0; offset + pattern.size() * 4 <= section.size; offset += 4) {
+        bool match = true;
+        for (size_t i = 0; i < pattern.size() && match; i++)
+          match = load_and_swap<uint32_t>(section.data + offset + i * 4) == pattern[i];
+        if (!match)
+          continue;
+        constexpr uint32_t kMaxPrologue = 32;
+        uint32_t entry = offset;
+        for (uint32_t n = 0; n < kMaxPrologue && entry >= 4; n++) {
+          if (endsFlow(load_and_swap<uint32_t>(section.data + entry - 4)))
+            break;
+          entry -= 4;
+        }
+        if (entry >= 4 && !endsFlow(load_and_swap<uint32_t>(section.data + entry - 4)))
+          continue;
+        entries.push_back(section.baseAddress + entry);
+      }
+    }
+    return entries;
+  };
+
+  auto apply = [&](uint32_t& address, const std::vector<uint32_t>& pattern, const char* key) {
+    auto entries = find(pattern);
+    if (address != 0) {
+      if (entries.size() == 1 && entries[0] != address)
+        REXCODEGEN_WARN("{} = 0x{:08X} from the config, but the CRT's is at 0x{:08X}", key,
+                        address, entries[0]);
+      return;
+    }
+    if (entries.size() == 1) {
+      address = entries[0];
+      REXCODEGEN_DEBUG("Found {} at 0x{:08X}", key, address);
+    } else if (entries.size() > 1) {
+      REXCODEGEN_WARN("{}: {} candidates in the binary; set it in the config", key,
+                      entries.size());
+    }
+  };
+
+  apply(config.setJmpAddress, setjmpPattern, "setjmp_address");
+  apply(config.longJmpAddress, longjmpPattern, "longjmp_address");
+}
+
 VoidResult registerEntryPoints(CodegenContext& ctx) {
   REXCODEGEN_TRACE("Analyze: registering entry points...");
 
@@ -445,6 +516,7 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
   }
 
   detectSaveRestoreHelpers(binary, state);
+  detectSetjmpLongjmp(binary, config);
 
   // Register imports
   {

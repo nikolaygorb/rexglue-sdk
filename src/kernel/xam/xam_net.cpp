@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
 #include <cstring>
 
 #if REX_PLATFORM_MAC
@@ -936,6 +937,132 @@ void NetDll_WSASetLastError_entry(u32 error_code) {
   XThread::SetLastError(error_code);
 }
 
+//=============================================================================
+// Ported from xenia-canary (xam_net.cc) for the ReXGlue fork
+//=============================================================================
+
+u32 NetDll_WSAStartupEx_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_ptr,
+                              u32 version_requested) {
+  return NetDll_WSAStartup_entry(caller, version, data_ptr);
+}
+
+u32 NetDll_XNetStartupEx_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params,
+                               u32 version_requested) {
+  return NetDll_XNetStartup_entry(caller, params);
+}
+
+u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr_ptr,
+                             mapped_u32 addrlen_ptr) {
+  if (!addr_ptr || !addrlen_ptr) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    // WSAENOTSOCK
+    XThread::SetLastError(0x2736);
+    return -1;
+  }
+
+  // As in NetDll_accept: the host address comes back with the family in host
+  // byte order and goes to the guest big-endian.
+  N_XSOCKADDR native_addr;
+  int native_len = static_cast<int>(sizeof(native_addr));
+  if (XFAILED(socket->GetSockName(&native_addr, &native_len))) {
+    XThread::SetLastError(0x2726);  // WSAEINVAL
+    return -1;
+  }
+  const uint32_t guest_len = *addrlen_ptr;
+  if (guest_len >= sizeof(addr_ptr->address_family)) {
+    addr_ptr->address_family = native_addr.address_family;
+    std::memcpy(addr_ptr->sa_data, native_addr.sa_data,
+                std::min<size_t>(guest_len - sizeof(addr_ptr->address_family),
+                                 sizeof(native_addr.sa_data)));
+  }
+  *addrlen_ptr = native_len;
+  return 0;
+}
+
+u32 NetDll_getsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
+                            mapped_void optval_ptr, mapped_u32 optlen_ptr) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    // WSAENOTSOCK
+    XThread::SetLastError(0x2736);
+    return -1;
+  }
+  if (!optval_ptr || !optlen_ptr) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
+  uint32_t native_len = *optlen_ptr;
+  if (XFAILED(socket->GetOption(level, optname, optval_ptr, &native_len))) {
+    return -1;
+  }
+  *optlen_ptr = native_len;
+  return 0;
+}
+
+u32 NetDll_XHttpStartup_entry(u32 caller, u32 reserved, u32 reserved_ptr) {
+  XThread::SetLastError(X_ERROR_SUCCESS);
+  return 1;
+}
+
+u32 NetDll_XHttpOpen_entry(u32 caller, mapped_string user_agent, u32 access_type,
+                           mapped_string proxy_name, mapped_string proxy_bypass, u32 flags) {
+  // No XHTTP: a null session handle.
+  XThread::SetLastError(X_RESULT_FROM_WIN32(0x00000032L) /* ERROR_NOT_SUPPORTED */);
+  return 0;
+}
+
+u32 NetDll_XNetCreateKey_entry(u32 caller, mapped_void key_id, mapped_void exchange_key) {
+  if (key_id) {
+    std::memset(key_id, 0xBE, 8);
+  }
+  if (exchange_key) {
+    std::memset(exchange_key, 0xBE, 16);
+  }
+  return 0;
+}
+
+u32 NetDll_XNetRegisterKey_entry(u32 caller, mapped_void key_id, mapped_void exchange_key) {
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterKey_entry(u32 caller, mapped_void key_id) {
+  return 0;
+}
+
+u32 XNetLogonGetMachineID_entry(mapped_u64 machine_id_ptr) {
+  if (machine_id_ptr) {
+    *machine_id_ptr = 0;
+  }
+  return 0x80151802;  // X_ONLINE_E_LOGON_NOT_LOGGED_ON
+}
+
+u32 XampXAuthStartup_entry(mapped_u32 settings) {
+  // XAUTH_SETTINGS starts with its size, which must be 8.
+  if (!settings || *settings != 8) {
+    return 0x80158401;
+  }
+  return 0x80158406;
+}
+
+void XampXAuthShutdown_entry(mapped_u32 xauth_count_ptr) {
+  if (xauth_count_ptr) {
+    *xauth_count_ptr = 0;
+  }
+}
+
+u32 XampXAuthGetTitleBuffer_entry() {
+  // Non-zero crashes titles: there is no buffer from XampXAuthStartup.
+  return 0;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -988,6 +1115,19 @@ REX_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
 REX_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
 REX_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
 REX_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
+REX_EXPORT(__imp__NetDll_WSAStartupEx, rex::kernel::xam::NetDll_WSAStartupEx_entry)
+REX_EXPORT(__imp__NetDll_XNetStartupEx, rex::kernel::xam::NetDll_XNetStartupEx_entry)
+REX_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
+REX_EXPORT(__imp__NetDll_getsockopt, rex::kernel::xam::NetDll_getsockopt_entry)
+REX_EXPORT(__imp__NetDll_XHttpStartup, rex::kernel::xam::NetDll_XHttpStartup_entry)
+REX_EXPORT(__imp__NetDll_XHttpOpen, rex::kernel::xam::NetDll_XHttpOpen_entry)
+REX_EXPORT(__imp__NetDll_XNetCreateKey, rex::kernel::xam::NetDll_XNetCreateKey_entry)
+REX_EXPORT(__imp__NetDll_XNetRegisterKey, rex::kernel::xam::NetDll_XNetRegisterKey_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
+REX_EXPORT(__imp__XNetLogonGetMachineID, rex::kernel::xam::XNetLogonGetMachineID_entry)
+REX_EXPORT(__imp__XampXAuthStartup, rex::kernel::xam::XampXAuthStartup_entry)
+REX_EXPORT(__imp__XampXAuthShutdown, rex::kernel::xam::XampXAuthShutdown_entry)
+REX_EXPORT(__imp__XampXAuthGetTitleBuffer, rex::kernel::xam::XampXAuthGetTitleBuffer_entry)
 
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);
@@ -1008,7 +1148,6 @@ REX_EXPORT_STUB(__imp__NetDll_WSAEventSelect);
 REX_EXPORT_STUB(__imp__NetDll_WSAGetOverlappedResult);
 REX_EXPORT_STUB(__imp__NetDll_WSARecv);
 REX_EXPORT_STUB(__imp__NetDll_WSASend);
-REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XHttpCloseHandle);
 REX_EXPORT_STUB(__imp__NetDll_XHttpConnect);
 REX_EXPORT_STUB(__imp__NetDll_XHttpCrackUrl);
@@ -1017,7 +1156,6 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpCreateUrl);
 REX_EXPORT_STUB(__imp__NetDll_XHttpCreateUrlW);
 REX_EXPORT_STUB(__imp__NetDll_XHttpDoWork);
 REX_EXPORT_STUB(__imp__NetDll_XHttpGetPerfCounters);
-REX_EXPORT_STUB(__imp__NetDll_XHttpOpen);
 REX_EXPORT_STUB(__imp__NetDll_XHttpOpenRequest);
 REX_EXPORT_STUB(__imp__NetDll_XHttpOpenRequestUsingMemory);
 REX_EXPORT_STUB(__imp__NetDll_XHttpQueryAuthSchemes);
@@ -1031,10 +1169,8 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetCredentials);
 REX_EXPORT_STUB(__imp__NetDll_XHttpSetOption);
 REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
 REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
-REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
 REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
-REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
@@ -1044,14 +1180,11 @@ REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
-REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
-REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
@@ -1101,5 +1234,3 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
 REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
 REX_EXPORT_STUB(__imp__NetDll_getpeername);
-REX_EXPORT_STUB(__imp__NetDll_getsockname);
-REX_EXPORT_STUB(__imp__NetDll_getsockopt);

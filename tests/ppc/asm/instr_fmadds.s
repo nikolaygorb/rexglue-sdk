@@ -45,3 +45,12 @@ test_fmadds_4:
   #_ REGISTER_OUT f2 9999.99
   #_ REGISTER_OUT f3 9999.99
   #_ REGISTER_OUT f4 9999.99
+
+test_fmadds_nan:
+  # A NaN addend comes back quieted and rounded to single
+  #_ REGISTER_IN f2 2.0
+  #_ REGISTER_IN f3 3.0
+  #_ REGISTER_IN f4 0x7FF0000020000000
+  fmadds f1, f2, f3, f4
+  blr
+  #_ REGISTER_OUT f1 0x7FF8000020000000

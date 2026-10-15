@@ -66,3 +66,9 @@
 [submodule "thirdparty/tracy"]
 	path = thirdparty/tracy
 	url = https://github.com/wolfpld/tracy.git
+[submodule "thirdparty/FidelityFX-CAS"]
+	path = thirdparty/FidelityFX-CAS
+	url = https://github.com/GPUOpen-Effects/FidelityFX-CAS.git
+[submodule "thirdparty/FidelityFX-FSR"]
+	path = thirdparty/FidelityFX-FSR
+	url = https://github.com/GPUOpen-Effects/FidelityFX-FSR.git

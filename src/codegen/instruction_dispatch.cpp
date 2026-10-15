@@ -83,6 +83,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_EXTSW, build_extsw},
       {PPC_INST_CLRLWI, build_clrlwi},
       {PPC_INST_RLDCL, build_rldcl},
+      {PPC_INST_ROTLD, build_rldcl},  // rldcl with mb = 0
       {PPC_INST_RLDCR, build_rldcr},
       {PPC_INST_RLDIC, build_rldic},
       {PPC_INST_RLDICL, build_rldicl},
@@ -114,6 +115,10 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_CROR, build_cror},
       {PPC_INST_CRORC, build_crorc},
       {PPC_INST_CRXOR, build_crxor},
+      {PPC_INST_CRSET, build_crset},
+      {PPC_INST_CRCLR, build_crclr},
+      {PPC_INST_CRNOT, build_crnot},
+      {PPC_INST_CRMOVE, build_crmove},
 
       //=====================================================================
       // Comparison
@@ -232,6 +237,8 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_LDU, build_ldu},
       {PPC_INST_LDX, build_ldx},
       {PPC_INST_LDUX, build_ldux},
+      {PPC_INST_LDBRX, build_ldbrx},
+      {PPC_INST_LMW, build_lmw},
       {PPC_INST_LWARX, build_lwarx},
       {PPC_INST_LDARX, build_ldarx},
       {PPC_INST_LFD, build_lfd},
@@ -267,6 +274,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_STDU, build_stdu},
       {PPC_INST_STDX, build_stdx},
       {PPC_INST_STDUX, build_stdux},
+      {PPC_INST_STDBRX, build_stdbrx},
       {PPC_INST_STFD, build_stfd},
       {PPC_INST_STFDU, build_stfdu},
       {PPC_INST_STFDUX, build_stfdux},
@@ -280,16 +288,23 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       //=====================================================================
       // Memory - Vector Loads
       //=====================================================================
+      // The "l" (LRU hint) forms behave like the plain ones.
       {PPC_INST_LVX, build_lvx},
       {PPC_INST_LVX128, build_lvx},
       {PPC_INST_LVXL, build_lvx},
       {PPC_INST_LVXL128, build_lvx},
       {PPC_INST_LVLX, build_lvlx},
       {PPC_INST_LVLX128, build_lvlx},
+      {PPC_INST_LVLXL, build_lvlx},
+      {PPC_INST_LVLXL128, build_lvlx},
       {PPC_INST_LVRX, build_lvrx},
       {PPC_INST_LVRX128, build_lvrx},
+      {PPC_INST_LVRXL, build_lvrx},
+      {PPC_INST_LVRXL128, build_lvrx},
       {PPC_INST_LVSL, build_lvsl},
+      {PPC_INST_LVSL128, build_lvsl},
       {PPC_INST_LVSR, build_lvsr},
+      {PPC_INST_LVSR128, build_lvsr},
       {PPC_INST_LVEBX, build_lvx},
       {PPC_INST_LVEHX, build_lvx},
       {PPC_INST_LVEWX, build_lvx},
@@ -304,12 +319,16 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_STVEWX128, build_stvewx},
       {PPC_INST_STVLX, build_stvlx},
       {PPC_INST_STVLX128, build_stvlx},
+      {PPC_INST_STVLXL, build_stvlx},
       {PPC_INST_STVLXL128, build_stvlx},
       {PPC_INST_STVRX, build_stvrx},
       {PPC_INST_STVRX128, build_stvrx},
+      {PPC_INST_STVRXL, build_stvrx},
+      {PPC_INST_STVRXL128, build_stvrx},
       {PPC_INST_STVX, build_stvx},
       {PPC_INST_STVX128, build_stvx},
       {PPC_INST_STVXL, build_stvx},
+      {PPC_INST_STVXL128, build_stvx},
 
       //=====================================================================
       // System
@@ -319,7 +338,11 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_SYNC, build_sync},
       {PPC_INST_LWSYNC, build_lwsync},
       {PPC_INST_EIEIO, build_eieio},
+      {PPC_INST_ISYNC, build_isync},
       {PPC_INST_DB16CYC, build_db16cyc},
+      {PPC_INST_DB12CYC, build_db16cyc},
+      {PPC_INST_DB10CYC, build_db16cyc},
+      {PPC_INST_DB8CYC, build_db16cyc},
       {PPC_INST_CCTPL, build_cctpl},
       {PPC_INST_CCTPM, build_cctpm},
       {PPC_INST_CCTPH, build_cctph},
@@ -357,6 +380,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_TDNEI, build_tdi},
       // Trap word register (all variants map to generic TW)
       {PPC_INST_TW, build_tw},
+      {PPC_INST_TRAP, build_tw},  // tw 31, 0, 0
       {PPC_INST_TWGE, build_tw},
       {PPC_INST_TWGT, build_tw},
       {PPC_INST_TWLE, build_tw},
@@ -380,11 +404,19 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_TDLLE, build_td},
       {PPC_INST_TDLLT, build_td},
       {PPC_INST_DCBF, build_dcbf},
+      {PPC_INST_DCBFL, build_dcbf},
       {PPC_INST_DCBT, build_dcbt},
       {PPC_INST_DCBTST, build_dcbtst},
       {PPC_INST_DCBZ, build_dcbz},
       {PPC_INST_DCBZL, build_dcbzl},
       {PPC_INST_DCBST, build_dcbst},
+      {PPC_INST_ICBI, build_icbi},
+      {PPC_INST_DST, build_dst},
+      {PPC_INST_DSTT, build_dst},
+      {PPC_INST_DSTST, build_dst},
+      {PPC_INST_DSTSTT, build_dst},
+      {PPC_INST_DSS, build_dss},
+      {PPC_INST_DSSALL, build_dss},
       {PPC_INST_MR, build_mr},
       {PPC_INST_MCRF, build_mcrf},
       {PPC_INST_MFXER, build_mfxer},
@@ -396,6 +428,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_MFFS, build_mffs},
       {PPC_INST_MFTB, build_mftb},
       {PPC_INST_MFTBU, build_mftbu},
+      {PPC_INST_MFVRSAVE, build_mfvrsave},
       {PPC_INST_MTCR, build_mtcr},
       {PPC_INST_MTCRF, build_mtcrf},
       {PPC_INST_MTOCRF, build_mtcrf},
@@ -403,7 +436,12 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_MTLR, build_mtlr},
       {PPC_INST_MTMSRD, build_mtmsrd},
       {PPC_INST_MTFSF, build_mtfsf},
+      {PPC_INST_MTFSFI, build_mtfsfi},
+      {PPC_INST_MTFSB0, build_mtfsb0},
+      {PPC_INST_MTFSB1, build_mtfsb1},
+      {PPC_INST_MCRFS, build_mcrfs},
       {PPC_INST_MTXER, build_mtxer},
+      {PPC_INST_MTVRSAVE, build_mtvrsave},
       {PPC_INST_CLRLDI, build_clrldi},
 
       //=====================================================================
@@ -634,8 +672,48 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_VUPKLSB128, build_vupklsb},
       {PPC_INST_VUPKLSH, build_vupklsh},
       {PPC_INST_VUPKLSH128, build_vupklsh},
+
+      //=====================================================================
+      // Vector - Integer (vector_integer.cpp)
+      //=====================================================================
+      {PPC_INST_VRLB, build_vrlb},
+      {PPC_INST_VADDCUW, build_vaddcuw},
+      {PPC_INST_VSUBCUW, build_vsubcuw},
+      {PPC_INST_VAVGUW, build_vavguw},
+      {PPC_INST_VMAXUW, build_vmaxuw},
+      {PPC_INST_VMULEUB, build_vmuleub},
+      {PPC_INST_VMULOUB, build_vmuloub},
+      {PPC_INST_VMULESB, build_vmulesb},
+      {PPC_INST_VMULOSB, build_vmulosb},
+      {PPC_INST_VMULEUH, build_vmuleuh},
+      {PPC_INST_VMULOUH, build_vmulouh},
+      {PPC_INST_VMULESH, build_vmulesh},
+      {PPC_INST_VMULOSH, build_vmulosh},
+      {PPC_INST_VMLADDUHM, build_vmladduhm},
+      {PPC_INST_VMHADDSHS, build_vmhaddshs},
+      {PPC_INST_VMHRADDSHS, build_vmhraddshs},
+      {PPC_INST_VMSUMUBM, build_vmsumubm},
+      {PPC_INST_VMSUMMBM, build_vmsummbm},
+      {PPC_INST_VMSUMUHM, build_vmsumuhm},
+      {PPC_INST_VMSUMUHS, build_vmsumuhs},
+      {PPC_INST_VMSUMSHM, build_vmsumshm},
+      {PPC_INST_VMSUMSHS, build_vmsumshs},
+      {PPC_INST_VSUM4SBS, build_vsum4sbs},
+      {PPC_INST_VSUM4UBS, build_vsum4ubs},
+      {PPC_INST_VSUM4SHS, build_vsum4shs},
+      {PPC_INST_VSUM2SWS, build_vsum2sws},
+      {PPC_INST_VSUMSWS, build_vsumsws},
+      {PPC_INST_VPKPX, build_vpkpx},
+      {PPC_INST_VUPKHPX, build_vupkhpx},
+      {PPC_INST_VUPKLPX, build_vupklpx},
+      {PPC_INST_MFVSCR, build_mfvscr},
+      {PPC_INST_MTVSCR, build_mtvscr},
   };
   return table;
+}
+
+bool CanDispatchInstruction(int id) {
+  return GetDispatchTable().contains(id);
 }
 
 bool DispatchInstruction(int id, BuilderContext& ctx) {

@@ -493,6 +493,11 @@ class PrimitiveProcessor {
   static constexpr uint32_t GetTriangleFanListIndexCount(uint32_t fan_index_count) {
     return fan_index_count > 2 ? (fan_index_count - 2) * 3 : 0;
   }
+  // Triangle strip to triangle list conversion.
+  // A strip with N vertices produces (N-2) triangles, each needing 3 indices.
+  static constexpr uint32_t GetTriangleStripListIndexCount(uint32_t strip_index_count) {
+    return strip_index_count > 2 ? (strip_index_count - 2) * 3 : 0;
+  }
   template <typename Index, typename IndexTransform>
   static void TriangleFanToList(Index* dest, const Index* source, uint32_t source_index_count,
                                 const IndexTransform& index_transform) {
@@ -795,7 +800,7 @@ class PrimitiveProcessor {
   // Modified by the processor, read by the invalidation callback.
   uint32_t cache_currently_processing_base_ = 0;
   // 0 if not in a cache transaction that hasn't found an existing entry
-  // currently.
+  // currently, or if the range was invalidated during the transaction.
   uint32_t cache_currently_processing_size_bytes_ = 0;
   // Modified by both the processor and the invalidation callback.
   size_t cache_bucket_free_first_entry_ = SIZE_MAX;

@@ -158,7 +158,18 @@ struct FPSCRRegister {
   static constexpr uint32_t GuestMask = uint32_t(RoundMaskVal) | uint32_t(FlushMask);
 
   inline uint32_t getcsr() noexcept { return Platform::getcsr(); }
-  inline void setcsr(uint32_t csr) noexcept { Platform::setcsr(csr); }
+  inline void setcsr(uint32_t csr) noexcept {
+    // Keep host FP exceptions masked on every write, not just in InitHost.
+    // Recompiled guest code reaches setcsr via storeFromGuest /
+    // enableFlushMode / etc., and a csr value that still has the exception
+    // bits in their trapping state (e.g. a context whose fpscr.csr field was
+    // zero-initialized before InitHost ran) would otherwise re-arm host FP
+    // traps and raise SIGFPE on the next FP op. InitHostExceptions applies the
+    // per-arch polarity (x86: 1 = masked, ARM: 1 = trap enabled), so it is used
+    // here rather than open-coding a mask that is correct on only one of them.
+    Platform::InitHostExceptions(csr);
+    Platform::setcsr(csr);
+  }
 
   // Restoring the whole word would unmask every FP exception when csr is 0.
   inline void restoreGuestBits(uint32_t saved) noexcept {
@@ -439,6 +450,10 @@ struct alignas(0x40) PPCContext {
   PPCVRegister v125;
   PPCVRegister v126;
   PPCVRegister v127;
+
+  // VRSAVE (SPR 256): a software-only mask of the vector registers in use.
+  // Kept last so that adding it moved no other field.
+  uint32_t vrsave = 0;
 
   //--- Non-volatile register save/restore --------
   // Layout: r14-r31 (144) | f14-f31 (144) | v14-v31 (288) | v64-v127 (1024)

@@ -14,6 +14,8 @@
 #include "ppc/opcode.h"
 
 #include <algorithm>
+#include <array>
+#include <optional>
 #include <queue>
 #include <set>
 #include <stack>
@@ -1295,6 +1297,9 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       bctrAddr, region.start, region.end, funcStart, expectedReg);
 
   uint32_t scanAddr = bctrAddr;
+  // Nearest bound seen so far for each register: the index may be a copy
+  // (`mr idx, src`) of the register the bounds check compared.
+  std::array<std::optional<uint32_t>, 32> boundOf{};
   for (int i = 0; i < backwardScanLimit && scanAddr >= scanLowerBound + 4; i++) {
     scanAddr -= 4;
     auto* insn = decoded.get(scanAddr);
@@ -1302,11 +1307,39 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       break;
 
     // Stop at unconditional terminators - scanning past basic block boundaries
-    // risks finding unrelated comparisons on the index register
-    if (isTerminator(*insn) && !isConditional(*insn))
-      break;
+    // risks finding unrelated comparisons on the index register. Except where a
+    // conditional branch right before it enters the dispatch block:
+    // `cmplwi idx,N; ble dispatch; b default; dispatch: ...`. The registers at
+    // the dispatch block are those at that branch, so go on from there (PD
+    // Remaster 0x824B0698 and Wet 0x832C3AC8 read 50 entries instead of 35).
+    if (isTerminator(*insn) && !isConditional(*insn)) {
+      const auto* entry = scanAddr >= scanLowerBound + 4 ? decoded.get(scanAddr - 4) : nullptr;
+      if (!entry || !isConditional(*entry) || entry->branch_target != scanAddr + 4)
+        break;
+      scanAddr -= 4;
+      continue;
+    }
 
     using namespace rex::codegen::ppc;
+
+    // mr idx, src: before this point the index lives in src. A bound on src
+    // found after the copy holds for the index too; otherwise look for src's.
+    if ((insn->opcode == Opcode::mr || insn->opcode == Opcode::or_) &&
+        insn->X.RA == expectedReg && insn->X.RT == insn->X.RB && insn->X.RT != expectedReg) {
+      uint8_t source = static_cast<uint8_t>(insn->X.RT);
+      if (boundOf[source]) {
+        result.maxEntries = *boundOf[source];
+        result.indexReg = expectedReg;
+        result.found = true;
+        REXCODEGEN_DEBUG("scanForBounds: bctr=0x{:08X} bound {} from r{}, copied to r{} at 0x{:08X}",
+                         bctrAddr, result.maxEntries, source, expectedReg, scanAddr);
+        return result;
+      }
+      REXCODEGEN_DEBUG("scanForBounds: bctr=0x{:08X} index r{} is a copy of r{} (0x{:08X})",
+                       bctrAddr, expectedReg, source, scanAddr);
+      expectedReg = source;
+      continue;
+    }
 
     // Look for cmpli/cmpi followed by conditional branch
     if (insn->opcode == Opcode::cmpli) {
@@ -1314,6 +1347,8 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       REXCODEGEN_TRACE("scanForBounds: found cmpli at 0x{:08X} RA=r{} UIMM={} (expecting r{})",
                        scanAddr, static_cast<unsigned>(insn->D.RA), static_cast<int>(insn->D.d),
                        expectedReg);
+      if (!boundOf[insn->D.RA])
+        boundOf[insn->D.RA] = static_cast<uint32_t>(insn->D.d) + 1;
       if (insn->D.RA == expectedReg) {
         result.maxEntries = static_cast<uint32_t>(insn->D.d) + 1;
         result.indexReg = expectedReg;
@@ -1328,6 +1363,8 @@ BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRe
       REXCODEGEN_TRACE("scanForBounds: found cmpi at 0x{:08X} RA=r{} SIMM={} (expecting r{})",
                        scanAddr, static_cast<unsigned>(insn->D.RA), static_cast<int>(insn->D.d),
                        expectedReg);
+      if (!boundOf[insn->D.RA])
+        boundOf[insn->D.RA] = static_cast<uint32_t>(insn->D.d) + 1;
       if (insn->D.RA == expectedReg) {
         result.maxEntries = static_cast<uint32_t>(insn->D.d) + 1;
         result.indexReg = expectedReg;

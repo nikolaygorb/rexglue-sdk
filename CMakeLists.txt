@@ -23,6 +23,7 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+option(REXGLUE_BUILD_SHADERS              "Add the rexglue_shaders target that regenerates the built-in shader headers" OFF)
 # Propagate profiling defines globally (compiled out in Release)
 if(REXGLUE_ENABLE_TRACY)
     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
@@ -266,6 +267,53 @@ add_subdirectory(src/system)
 add_subdirectory(src/kernel)
 add_subdirectory(src/codegen)
 add_subdirectory(src/rexglue)
+
+#==========================================================
+# Built-in shader regeneration (maintainers only)
+#==========================================================
+# The generated headers are checked in. With REXGLUE_BUILD_SHADERS=ON,
+# `cmake --build <dir> --target rexglue_shaders` rebuilds them from the sources
+# in src/graphics/shaders and src/ui/shaders (tools/shaders/build_shaders.py).
+# SPIR-V tools come from the Vulkan SDK in VULKAN_SDK if set, otherwise they are
+# built from the thirdparty submodules by tools/shaders/CMakeLists.txt.
+if(REXGLUE_BUILD_SHADERS)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    find_program(REXGLUE_CLANG_FORMAT NAMES clang-format)
+    set(REXGLUE_SHADERS_ARGS)
+    if(REXGLUE_CLANG_FORMAT)
+        list(APPEND REXGLUE_SHADERS_ARGS --clang-format "${REXGLUE_CLANG_FORMAT}")
+    endif()
+    if(NOT DEFINED ENV{VULKAN_SDK})
+        set(REXGLUE_SHADER_TOOLS_DIR "${CMAKE_BINARY_DIR}/shader-tools")
+        set(REXGLUE_SHADER_TOOLS_CONFIGURE_ARGS
+            -S "${PROJECT_SOURCE_DIR}/tools/shaders"
+            -B "${REXGLUE_SHADER_TOOLS_DIR}"
+            -G "${CMAKE_GENERATOR}"
+            -DCMAKE_BUILD_TYPE=Release
+            "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+            "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}")
+        if(CMAKE_GENERATOR_PLATFORM)
+            list(APPEND REXGLUE_SHADER_TOOLS_CONFIGURE_ARGS -A "${CMAKE_GENERATOR_PLATFORM}")
+        endif()
+        add_custom_target(rexglue_shader_tools
+            COMMAND "${CMAKE_COMMAND}" ${REXGLUE_SHADER_TOOLS_CONFIGURE_ARGS}
+            COMMAND "${CMAKE_COMMAND}" --build "${REXGLUE_SHADER_TOOLS_DIR}" --config Release
+            COMMENT "Building the SPIR-V shader tools from thirdparty..."
+            USES_TERMINAL
+            VERBATIM)
+        list(APPEND REXGLUE_SHADERS_ARGS --tools-dir "${REXGLUE_SHADER_TOOLS_DIR}/bin")
+    endif()
+    add_custom_target(rexglue_shaders
+        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/shaders/build_shaders.py"
+                ${REXGLUE_SHADERS_ARGS}
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+        COMMENT "Regenerating the built-in shader headers..."
+        USES_TERMINAL
+        VERBATIM)
+    if(TARGET rexglue_shader_tools)
+        add_dependencies(rexglue_shaders rexglue_shader_tools)
+    endif()
+endif()
 
 # Add tests subdirectory if tests are enabled
 if(REXGLUE_BUILD_TESTS)

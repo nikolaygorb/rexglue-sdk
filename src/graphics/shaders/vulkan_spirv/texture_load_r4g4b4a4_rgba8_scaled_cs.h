@@ -1,5 +1,7 @@
-// Derived from texture_load_r5g6b5_rgba8_scaled with the R4G4B4A4 transform.
+// Generated with `spirv-as` from texture_load_r4g4b4a4_rgba8_scaled.cs.spvasm.
 #if 0
+; Derived from texture_load_r5g6b5_rgba8_scaled with the R4G4B4A4 transform.
+; MoltenVK texture load variant, hand-edited SPIR-V assembly (rexglue, 5f5d7f6).
 ; SPIR-V
 ; Version: 1.0
 ; Generator: Khronos SPIR-V Tools Assembler; 0

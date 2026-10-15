@@ -63,14 +63,6 @@ namespace rex::graphics::vulkan {
 
 namespace {
 
-constexpr std::string_view kPlaceholderPixelShaderSource = R"(#version 460
-layout(location = 0) out vec4 oC0;
-void main() {
-  // Avoid full-screen black flashes while async pipelines are warming up.
-  discard;
-}
-)";
-
 constexpr bool IsTriangleDomainHostVertexShaderType(
     Shader::HostVertexShaderType host_vertex_shader_type) {
   return host_vertex_shader_type == Shader::HostVertexShaderType::kTriangleDomainCPIndexed ||
@@ -91,7 +83,11 @@ constexpr bool IsPatchIndexedHostVertexShaderType(
 
 std::string GetTessellationSystemConstantsBlockGlsl() {
   std::string source;
-  source += "layout(set = 0, binding = 0, std140) uniform XeSystemConstants {\n";
+  // Set 0 is shared memory and EDRAM - the system constants are in the
+  // constants set, like in the translated shaders.
+  source += fmt::format("layout(set = {}, binding = {}, std140) uniform XeSystemConstants {{\n",
+                        uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
+                        uint32_t(SpirvShaderTranslator::kConstantBufferSystem));
   source += fmt::format("  layout(offset = {}) uint xe_vertex_index_endian;\n",
                         offsetof(SpirvShaderTranslator::SystemConstants, vertex_index_endian));
   source += fmt::format("  layout(offset = {}) int xe_vertex_base_index;\n",
@@ -275,11 +271,13 @@ void main() {
 VulkanPipelineCache::VulkanPipelineCache(VulkanCommandProcessor& command_processor,
                                          const RegisterFile& register_file,
                                          VulkanRenderTargetCache& render_target_cache,
-                                         VkShaderStageFlags guest_shader_vertex_stages)
+                                         VkShaderStageFlags guest_shader_vertex_stages,
+                                         bool zpd_hybrid_supported)
     : command_processor_(command_processor),
       register_file_(register_file),
       render_target_cache_(render_target_cache),
-      guest_shader_vertex_stages_(guest_shader_vertex_stages) {}
+      guest_shader_vertex_stages_(guest_shader_vertex_stages),
+      zpd_hybrid_supported_(zpd_hybrid_supported) {}
 
 VulkanPipelineCache::~VulkanPipelineCache() {
   Shutdown();
@@ -298,7 +296,7 @@ bool VulkanPipelineCache::Initialize() {
       render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y());
 
-  if (edram_fragment_shader_interlock) {
+  {
     std::vector<uint8_t> depth_only_fragment_shader_code =
         shader_translator_->CreateDepthOnlyFragmentShader();
     depth_only_fragment_shader_ = ui::vulkan::util::CreateShaderModule(
@@ -307,11 +305,49 @@ bool VulkanPipelineCache::Initialize() {
     if (depth_only_fragment_shader_ == VK_NULL_HANDLE) {
       REXGPU_ERROR(
           "VulkanPipelineCache: Failed to create the depth/stencil-only "
-          "fragment shader for the fragment shader interlock render backend "
-          "implementation");
+          "fragment shader");
       return false;
     }
-  } else {
+  }
+
+  if (edram_fragment_shader_interlock) {
+    using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
+    std::vector<uint8_t> code = shader_translator_->CreateDepthOnlyFragmentShader(
+        DepthStencilMode::kNoModifiers, false, true);
+    viz_survey_depth_only_fragment_shader_ = ui::vulkan::util::CreateShaderModule(
+        vulkan_device, reinterpret_cast<const uint32_t*>(code.data()), code.size());
+    if (viz_survey_depth_only_fragment_shader_ == VK_NULL_HANDLE) {
+      REXGPU_ERROR(
+          "VulkanPipelineCache: Failed to create the VIZ survey depth-only "
+          "fragment shader");
+      return false;
+    }
+  }
+
+  if (zpd_hybrid_supported_) {
+    using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
+    auto build = [&](DepthStencilMode mode, VkShaderModule& out) -> bool {
+      std::vector<uint8_t> code = shader_translator_->CreateDepthOnlyFragmentShader(mode, true);
+      out = ui::vulkan::util::CreateShaderModule(
+          vulkan_device, reinterpret_cast<const uint32_t*>(code.data()), code.size());
+      return out != VK_NULL_HANDLE;
+    };
+    if (!build(DepthStencilMode::kNoModifiers, zpd_total_depth_only_fragment_shader_) ||
+        (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+         (!build(DepthStencilMode::kFloat24Truncating,
+                 zpd_total_float24_truncate_fragment_shader_) ||
+          !build(DepthStencilMode::kFloat24Rounding, zpd_total_float24_round_fragment_shader_)))) {
+      REXGPU_ERROR(
+          "VulkanPipelineCache: Failed to create a ZPD Total depth-only "
+          "fragment shader");
+      return false;
+    }
+  }
+
+  if (!edram_fragment_shader_interlock &&
+      render_target_cache_.depth_float24_convert_in_pixel_shader()) {
+    // Substitutes for guest depth-only draws, keeping the depth buffer encoding
+    // consistent with draws converting depth in the pixel shader.
     std::vector<uint8_t> depth_float24_truncate_fragment_shader_code =
         shader_translator_->CreateDepthOnlyFragmentShader(
             SpirvShaderTranslator::Modification::DepthStencilMode::kFloat24Truncating);
@@ -340,22 +376,20 @@ bool VulkanPipelineCache::Initialize() {
     }
   }
 
-  std::vector<uint32_t> placeholder_pixel_shader_spirv;
-  std::string placeholder_pixel_shader_compile_error;
-  if (command_processor_.CompileGlslToSpirv(
-          VK_SHADER_STAGE_FRAGMENT_BIT, kPlaceholderPixelShaderSource,
-          placeholder_pixel_shader_spirv, placeholder_pixel_shader_compile_error)) {
-    placeholder_pixel_shader_ = ui::vulkan::util::CreateShaderModule(
-        vulkan_device, placeholder_pixel_shader_spirv.data(),
-        placeholder_pixel_shader_spirv.size() * sizeof(uint32_t));
-  } else {
-    REXGPU_WARN("VulkanPipelineCache: Failed to compile placeholder pixel shader: {}",
-                placeholder_pixel_shader_compile_error);
-  }
-  if (placeholder_pixel_shader_ == VK_NULL_HANDLE) {
+  if (REXCVAR_GET(force_depth_clamp) && !vulkan_device->properties().depthClamp) {
     REXGPU_WARN(
-        "VulkanPipelineCache: Failed to create placeholder pixel shader - "
-        "async placeholder hot-swap will be unavailable");
+        "force_depth_clamp is enabled, but the device doesn't support depth "
+        "clamping - guest draws with clipping enabled will still be clipped "
+        "to the host planes");
+  }
+
+  VkPipelineCacheCreateInfo pipeline_cache_create_info = {};
+  pipeline_cache_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  if (vulkan_device->functions().vkCreatePipelineCache(vulkan_device->device(),
+                                                       &pipeline_cache_create_info, nullptr,
+                                                       &vk_pipeline_cache_) != VK_SUCCESS) {
+    REXGPU_WARN("VulkanPipelineCache: Failed to create pipeline cache");
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
   }
 
   uint32_t logical_processor_count = rex::thread::logical_processor_count();
@@ -389,372 +423,270 @@ bool VulkanPipelineCache::Initialize() {
 }
 
 void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
-                                                  uint32_t title_id, bool blocking) {
+                                                  uint32_t title_id, bool blocking,
+                                                  std::function<void()> completion_callback) {
   ShutdownShaderStorage();
-  {
-    std::lock_guard<std::mutex> lock(creation_request_lock_);
-    startup_loading_ = false;
-  }
 
-  auto shader_storage_root = cache_root / "shaders";
-  auto shader_storage_shareable_root = shader_storage_root / "shareable";
-  if (!std::filesystem::exists(shader_storage_shareable_root)) {
-    if (!std::filesystem::create_directories(shader_storage_shareable_root)) {
-      REXGPU_ERROR(
-          "Failed to create the shareable shader storage directory, persistent "
-          "shader storage will be disabled: {}",
-          rex::path_to_utf8(shader_storage_shareable_root));
-      return;
-    }
-  }
+  shader_storage_title_id_ = title_id;
 
-  bool edram_fragment_shader_interlock =
-      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-
-  // Initialize the pipeline storage stream - read pipeline descriptions and
-  // collect used shader modifications to translate.
-  std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
-  // <Shader hash, modification bits>.
-  std::set<std::pair<uint64_t, uint64_t>> shader_translations_needed;
-  auto pipeline_storage_file_path =
-      shader_storage_shareable_root /
-      fmt::format("{:08X}.{}.vk.xpso", title_id, edram_fragment_shader_interlock ? "fsi" : "fbo");
-  pipeline_storage_file_ = rex::filesystem::OpenFile(pipeline_storage_file_path, "a+b");
-  if (!pipeline_storage_file_) {
-    REXGPU_ERROR(
-        "Failed to open the Vulkan pipeline description storage file for "
-        "writing, persistent shader storage will be disabled: {}",
-        rex::path_to_utf8(pipeline_storage_file_path));
-    return;
-  }
-  pipeline_storage_file_flush_needed_ = false;
-  // 'XEPS'.
-  const uint32_t pipeline_storage_magic = 0x53504558;
-  const uint32_t pipeline_storage_magic_api = edram_fragment_shader_interlock ? 1u : 0u;
-  const uint32_t pipeline_storage_version_swapped = rex::byte_swap(
-      std::max(PipelineDescription::kVersion, SpirvShaderTranslator::Modification::kVersion));
-  struct {
-    uint32_t magic;
-    uint32_t magic_api;
-    uint32_t version_swapped;
-  } pipeline_storage_file_header;
-  if (fread(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
-            pipeline_storage_file_) &&
-      pipeline_storage_file_header.magic == pipeline_storage_magic &&
-      pipeline_storage_file_header.magic_api == pipeline_storage_magic_api &&
-      pipeline_storage_file_header.version_swapped == pipeline_storage_version_swapped) {
-    rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
-    int64_t pipeline_storage_told_end = rex::filesystem::Tell(pipeline_storage_file_);
-    size_t pipeline_storage_told_count =
-        size_t(pipeline_storage_told_end >= int64_t(sizeof(pipeline_storage_file_header))
-                   ? (uint64_t(pipeline_storage_told_end) - sizeof(pipeline_storage_file_header)) /
-                         sizeof(PipelineStoredDescription)
-                   : 0);
-    if (pipeline_storage_told_count &&
-        rex::filesystem::Seek(pipeline_storage_file_, int64_t(sizeof(pipeline_storage_file_header)),
-                              SEEK_SET)) {
-      pipeline_stored_descriptions.resize(pipeline_storage_told_count);
-      pipeline_stored_descriptions.resize(
-          fread(pipeline_stored_descriptions.data(), sizeof(PipelineStoredDescription),
-                pipeline_storage_told_count, pipeline_storage_file_));
-      size_t pipeline_storage_read_count = pipeline_stored_descriptions.size();
-      size_t pipeline_storage_kept_count = 0;
-      size_t pipeline_storage_skipped_unsupported_count = 0;
-      size_t pipeline_storage_skipped_corrupted_count = 0;
-      for (size_t i = 0; i < pipeline_storage_read_count; ++i) {
-        const PipelineStoredDescription pipeline_stored_description =
-            pipeline_stored_descriptions[i];
-        // Validate file integrity, stop and truncate the stream if data is
-        // corrupted.
-        if (XXH3_64bits(&pipeline_stored_description.description,
-                        sizeof(pipeline_stored_description.description)) !=
-            pipeline_stored_description.description_hash) {
-          pipeline_storage_skipped_corrupted_count = pipeline_storage_read_count - i;
-          pipeline_storage_read_count = i;
-          break;
-        }
-        if (!ArePipelineRequirementsMet(pipeline_stored_description.description)) {
-          ++pipeline_storage_skipped_unsupported_count;
-          continue;
-        }
-        pipeline_stored_descriptions[pipeline_storage_kept_count++] = pipeline_stored_description;
-        // Mark the shader modifications as needed for translation.
-        shader_translations_needed.emplace(
-            pipeline_stored_description.description.vertex_shader_hash,
-            pipeline_stored_description.description.vertex_shader_modification);
-        if (pipeline_stored_description.description.pixel_shader_hash) {
-          shader_translations_needed.emplace(
-              pipeline_stored_description.description.pixel_shader_hash,
-              pipeline_stored_description.description.pixel_shader_modification);
-        }
-      }
-      pipeline_stored_descriptions.resize(pipeline_storage_kept_count);
-      if (pipeline_storage_skipped_unsupported_count || pipeline_storage_skipped_corrupted_count) {
-        REXGPU_INFO(
-            "VulkanPipelineCache: Pipeline storage filtering kept {} descriptions (skipped {} "
-            "unsupported, {} corrupted)",
-            pipeline_storage_kept_count, pipeline_storage_skipped_unsupported_count,
-            pipeline_storage_skipped_corrupted_count);
-      }
-    }
-  }
-
-  // Initialize the Xenos shader storage stream.
-  auto shader_storage_file_path =
-      shader_storage_shareable_root / fmt::format("{:08X}.xsh", title_id);
-  shader_storage_file_ = rex::filesystem::OpenFile(shader_storage_file_path, "a+b");
-  if (!shader_storage_file_) {
-    REXGPU_ERROR(
-        "Failed to open the guest shader storage file for writing, persistent "
-        "shader storage will be disabled: {}",
-        rex::path_to_utf8(shader_storage_file_path));
-    fclose(pipeline_storage_file_);
-    pipeline_storage_file_ = nullptr;
-    return;
-  }
-  ++shader_storage_index_;
-  shader_storage_file_flush_needed_ = false;
-  struct {
-    uint32_t magic;
-    uint32_t version_swapped;
-  } shader_storage_file_header;
-  // 'XESH'.
-  const uint32_t shader_storage_magic = 0x48534558;
-  if (fread(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
-            shader_storage_file_) &&
-      shader_storage_file_header.magic == shader_storage_magic &&
-      rex::byte_swap(shader_storage_file_header.version_swapped) == ShaderStoredHeader::kVersion) {
-    uint64_t shader_storage_valid_bytes = sizeof(shader_storage_file_header);
-    // Load shaders written by previous runs until the end of the file or until
-    // a corrupted one is detected.
-    ShaderStoredHeader shader_header;
-    std::vector<uint32_t> ucode_dwords;
-    ucode_dwords.reserve(0xFFFF);
-    while (true) {
-      if (!fread(&shader_header, sizeof(shader_header), 1, shader_storage_file_)) {
-        break;
-      }
-      size_t ucode_byte_count = shader_header.ucode_dword_count * sizeof(uint32_t);
-      ucode_dwords.resize(shader_header.ucode_dword_count);
-      if (shader_header.ucode_dword_count &&
-          !fread(ucode_dwords.data(), ucode_byte_count, 1, shader_storage_file_)) {
-        break;
-      }
-      uint64_t ucode_data_hash = XXH3_64bits(ucode_dwords.data(), ucode_byte_count);
-      if (shader_header.ucode_data_hash != ucode_data_hash) {
-        // Validation failed.
-        break;
-      }
-      shader_storage_valid_bytes += sizeof(shader_header) + ucode_byte_count;
-      VulkanShader* shader = LoadShader(shader_header.type, ucode_dwords.data(),
-                                        shader_header.ucode_dword_count, ucode_data_hash);
-      if (shader->ucode_storage_index() == shader_storage_index_) {
-        // Appeared twice in this file for some reason - skip.
-        continue;
-      }
-      // Loaded from the current storage - don't write again.
-      shader->set_ucode_storage_index(shader_storage_index_);
-    }
-    rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
-  } else {
-    rex::filesystem::TruncateStdioFile(shader_storage_file_, 0);
-    shader_storage_file_header.magic = shader_storage_magic;
-    shader_storage_file_header.version_swapped = rex::byte_swap(ShaderStoredHeader::kVersion);
-    fwrite(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
-           shader_storage_file_);
-  }
-
-  // Translate shader modifications needed for stored pipelines.
-  for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
-    auto shader_it = shaders_.find(translation_needed.first);
-    if (shader_it == shaders_.end()) {
-      continue;
-    }
-    auto* shader = shader_it->second;
-    if (!shader->is_ucode_analyzed()) {
-      shader->AnalyzeUcode(ucode_disasm_buffer_);
-    }
-    bool translation_is_new = false;
-    auto* translation = static_cast<VulkanShader::VulkanTranslation*>(
-        shader->GetOrCreateTranslation(translation_needed.second, &translation_is_new));
-    if (!translation->is_translated() &&
-        !TranslateAnalyzedShader(*shader_translator_, *translation)) {
-      if (translation_is_new) {
-        shader->DestroyTranslation(translation_needed.second);
-      }
-    }
-  }
-
-  // Create the pipelines.
-  std::vector<PipelineCreationArguments> pipeline_creations;
-  pipeline_creations.reserve(pipeline_stored_descriptions.size());
-  for (const PipelineStoredDescription& pipeline_stored_description :
-       pipeline_stored_descriptions) {
-    const PipelineDescription& pipeline_description = pipeline_stored_description.description;
-
-    auto find_it = pipelines_.find(pipeline_description);
-    if (find_it != pipelines_.end()) {
-      continue;
-    }
-    auto& pipeline = *pipelines_.emplace(pipeline_description, Pipeline()).first;
-    PipelineCreationArguments creation_arguments;
-    if (!TryGetPipelineCreationArgumentsForDescription(pipeline_description, &pipeline,
-                                                       creation_arguments)) {
-      pipelines_.erase(pipeline_description);
-      continue;
-    }
-    uint32_t bound_rts = 0;
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      if (pipeline_description.render_targets[i].color_write_mask) {
-        bound_rts |= uint32_t(1) << i;
-      }
-    }
-    uint32_t shader_writes_color_targets =
-        creation_arguments.pixel_shader
-            ? creation_arguments.pixel_shader->shader().writes_color_targets()
-            : 0;
-    bool shader_writes_depth = creation_arguments.pixel_shader
-                                   ? creation_arguments.pixel_shader->shader().writes_depth()
-                                   : pipeline_description.depth_write_enable != 0;
-    creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
-        bound_rts, shader_writes_color_targets, shader_writes_depth);
-    pipeline_creations.push_back(creation_arguments);
-  }
-
-  if (!pipeline_creations.empty()) {
+  if (!blocking) {
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       startup_loading_ = true;
     }
-    uint32_t logical_processor_count = rex::thread::logical_processor_count();
-    if (!logical_processor_count) {
-      // Pick some reasonable amount if couldn't determine the number of cores.
-      logical_processor_count = 6;
-    }
-    size_t creation_thread_count;
-    if (REXCVAR_GET(vulkan_pipeline_creation_threads) == 0) {
-      creation_thread_count = 1;
-    } else if (REXCVAR_GET(vulkan_pipeline_creation_threads) < 0) {
-      creation_thread_count = std::max(logical_processor_count * 3 / 4, uint32_t(1));
-    } else {
-      creation_thread_count = std::min(uint32_t(REXCVAR_GET(vulkan_pipeline_creation_threads)),
-                                       logical_processor_count);
-    }
-    if (!blocking) {
-      // Vulkan currently doesn't support deferred pipeline handles at draw time,
-      // so complete preload creation regardless of blocking mode.
-      creation_thread_count = std::max(creation_thread_count, size_t(1));
-    }
-    creation_thread_count = std::min(creation_thread_count, pipeline_creations.size());
-
-    std::atomic<size_t> next_creation_index(0);
-    std::atomic<size_t> created_pipeline_count(0);
-    auto creation_worker = [this, &pipeline_creations, &next_creation_index,
-                            &created_pipeline_count]() {
-      while (true) {
-        size_t creation_index = next_creation_index.fetch_add(1);
-        if (creation_index >= pipeline_creations.size()) {
-          break;
-        }
-        if (EnsurePipelineCreated(pipeline_creations[creation_index])) {
-          created_pipeline_count.fetch_add(1);
-        }
+    completion_callback = [this, orig = std::move(completion_callback)]() {
+      {
+        std::lock_guard<std::mutex> lock(creation_request_lock_);
+        startup_loading_ = false;
+      }
+      if (orig) {
+        orig();
       }
     };
+  }
 
-    if (creation_thread_count <= 1) {
-      creation_worker();
-    } else {
-      std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads;
-      creation_threads.reserve(creation_thread_count);
-      for (size_t i = 0; i < creation_thread_count; ++i) {
-        std::unique_ptr<rex::thread::Thread> creation_thread =
-            rex::thread::Thread::Create({}, creation_worker);
-        assert_not_null(creation_thread);
-        creation_thread->set_name("Vulkan Pipelines");
-        creation_threads.push_back(std::move(creation_thread));
-      }
-      for (const auto& creation_thread : creation_threads) {
-        rex::thread::Wait(creation_thread.get(), false);
-      }
+  bool edram_fsi_used =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+
+  ShaderStorageWriter<PipelineStoredDescription>::PipelineStorageConfig pipeline_config;
+  // Full ZPD counters change every FSI fragment shader, so they get their own
+  // storage.
+  pipeline_config.file_suffix =
+      fmt::format(".{}{}.vk.xpso", edram_fsi_used ? "fsi" : "fbo",
+                  edram_fsi_used && REXCVAR_GET(occlusion_query_full_counters) ? "-fc" : "");
+  pipeline_config.api_magic = kPipelineStorageAPIMagicVulkan;
+  pipeline_config.version =
+      std::max(PipelineDescription::kVersion, SpirvShaderTranslator::Modification::kVersion);
+
+  uint32_t storage_index = storage_writer_.storage_index() + 1;
+
+  std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
+  if (!storage_writer_.InitializeShaderStorage(
+          cache_root, title_id, pipeline_config,
+          // Shader load callback.
+          [&](xenos::ShaderType type, const uint32_t* ucode_dwords, uint32_t ucode_dword_count,
+              uint64_t ucode_data_hash) {
+            VulkanShader* shader =
+                LoadShader(type, ucode_dwords, ucode_dword_count, ucode_data_hash);
+            if (!shader || shader->ucode_storage_index() == storage_index) {
+              return true;  // Continue reading.
+            }
+            shader->set_ucode_storage_index(storage_index);
+            if (!shader->is_ucode_analyzed()) {
+              shader->AnalyzeUcode(ucode_disasm_buffer_);
+            }
+            return true;
+          },
+          // Shader translate callback - handles parallel translation.
+          [this,
+           edram_fsi_used](const std::set<std::pair<uint64_t, uint64_t>>& translations_needed) {
+            TranslateShadersForStorage(translations_needed, edram_fsi_used);
+          },
+          pipeline_stored_descriptions)) {
+    if (completion_callback) {
+      completion_callback();
     }
+    return;
+  }
+  shader_storage_file_flush_needed_ = false;
+  pipeline_storage_file_flush_needed_ = false;
 
-    REXGPU_INFO("Created {} graphics pipelines from Vulkan storage ({} requested)",
-                created_pipeline_count.load(), pipeline_creations.size());
-    {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
-      startup_loading_ = false;
+  // Load VkPipelineCache from disk if available.
+  auto shader_storage_local_root = GetShaderStorageLocalRoot(cache_root);
+  if (!std::filesystem::exists(shader_storage_local_root)) {
+    std::error_code ec;
+    std::filesystem::create_directories(shader_storage_local_root, ec);
+  }
+  vk_pipeline_cache_path_ =
+      shader_storage_local_root / fmt::format("{:08X}.vk.bin", shader_storage_title_id_);
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // Try to load existing VkPipelineCache data.
+  std::vector<uint8_t> pipeline_cache_data;
+  if (FILE* cache_file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "rb")) {
+    rex::filesystem::Seek(cache_file, 0, SEEK_END);
+    int64_t cache_size = rex::filesystem::Tell(cache_file);
+    if (cache_size > 0) {
+      pipeline_cache_data.resize(size_t(cache_size));
+      rex::filesystem::Seek(cache_file, 0, SEEK_SET);
+      pipeline_cache_data.resize(
+          fread(pipeline_cache_data.data(), 1, pipeline_cache_data.size(), cache_file));
+    }
+    fclose(cache_file);
+    REXGPU_INFO("Loaded {} bytes of VkPipelineCache data", pipeline_cache_data.size());
+  }
+
+  // Recreate the VkPipelineCache with the loaded data. Pipelines queued
+  // before (by draws, or by a previous storage) may be using the current one,
+  // so let them finish first.
+  AwaitPipelineCreation();
+  if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineCache(device, vk_pipeline_cache_, nullptr);
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
+  VkPipelineCacheCreateInfo pipeline_cache_create_info = {};
+  pipeline_cache_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  pipeline_cache_create_info.initialDataSize = pipeline_cache_data.size();
+  pipeline_cache_create_info.pInitialData =
+      pipeline_cache_data.empty() ? nullptr : pipeline_cache_data.data();
+  if (dfn.vkCreatePipelineCache(device, &pipeline_cache_create_info, nullptr,
+                                &vk_pipeline_cache_) != VK_SUCCESS) {
+    REXGPU_WARN(
+        "VulkanPipelineCache: Failed to create pipeline cache with "
+        "initial data, creating empty cache");
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+    pipeline_cache_create_info.initialDataSize = 0;
+    pipeline_cache_create_info.pInitialData = nullptr;
+    if (dfn.vkCreatePipelineCache(device, &pipeline_cache_create_info, nullptr,
+                                  &vk_pipeline_cache_) != VK_SUCCESS) {
+      vk_pipeline_cache_ = VK_NULL_HANDLE;
     }
   }
 
-  // If any pipeline descriptions were corrupted (or the whole file has excess
-  // bytes in the end), truncate to the last valid pipeline description.
-  rex::filesystem::TruncateStdioFile(
-      pipeline_storage_file_,
-      uint64_t(sizeof(pipeline_storage_file_header) +
-               sizeof(PipelineStoredDescription) * pipeline_stored_descriptions.size()));
-  if (pipeline_stored_descriptions.empty()) {
-    rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
-    pipeline_storage_file_header.magic = pipeline_storage_magic;
-    pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
-    pipeline_storage_file_header.version_swapped = pipeline_storage_version_swapped;
-    fwrite(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
-           pipeline_storage_file_);
+  // Create pipelines from stored descriptions.
+  if (!pipeline_stored_descriptions.empty()) {
+    uint64_t pipeline_creation_start = rex::chrono::Clock::QueryHostTickCount();
+
+    size_t pipelines_created = 0;
+    size_t pipelines_already_exist = 0;
+    size_t pipelines_requirements_not_met = 0;
+    size_t pipelines_arguments_failed = 0;
+
+    for (const PipelineStoredDescription& pipeline_stored_description :
+         pipeline_stored_descriptions) {
+      const PipelineDescription& pipeline_description = pipeline_stored_description.description;
+
+      // Skip pipelines not supported by this device.
+      if (!ArePipelineRequirementsMet(pipeline_description)) {
+        ++pipelines_requirements_not_met;
+        continue;
+      }
+
+      // Skip already known pipelines.
+      if (pipelines_.find(pipeline_description) != pipelines_.end()) {
+        ++pipelines_already_exist;
+        continue;
+      }
+
+      // Shaders, layout, render pass, tessellation and geometry shaders.
+      auto& pipeline_pair = *pipelines_.emplace(pipeline_description, Pipeline()).first;
+      PipelineCreationArguments creation_arguments;
+      if (!TryGetPipelineCreationArgumentsForDescription(pipeline_description, &pipeline_pair,
+                                                         creation_arguments)) {
+        pipelines_.erase(pipeline_description);
+        ++pipelines_arguments_failed;
+        continue;
+      }
+
+      // Queue for creation.
+      if (!creation_threads_.empty()) {
+        // Calculate priority based on whether shader writes to visible RTs.
+        if (creation_arguments.pixel_shader) {
+          const Shader& pixel_shader = creation_arguments.pixel_shader->shader();
+          uint32_t bound_rts = (pipeline_description.render_targets[0].color_write_mask ? 1 : 0) |
+                               (pipeline_description.render_targets[1].color_write_mask ? 2 : 0) |
+                               (pipeline_description.render_targets[2].color_write_mask ? 4 : 0) |
+                               (pipeline_description.render_targets[3].color_write_mask ? 8 : 0);
+          creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
+              bound_rts, pixel_shader.writes_color_targets(), pixel_shader.writes_depth());
+        }
+        pipeline_pair.second.creation_pending.store(true, std::memory_order_release);
+        {
+          std::lock_guard<std::mutex> lock(creation_request_lock_);
+          creation_queue_.push(creation_arguments);
+        }
+        creation_request_cond_.notify_one();
+      } else {
+        // No creation threads - create synchronously.
+        EnsurePipelineCreated(creation_arguments);
+      }
+
+      ++pipelines_created;
+    }
+
+    if (!creation_threads_.empty()) {
+      if (blocking) {
+        // Blocking mode: wait for all pipelines to be created.
+        bool await_creation_completion_event;
+        {
+          std::lock_guard<std::mutex> lock(creation_request_lock_);
+          await_creation_completion_event = !creation_queue_.empty() || creation_threads_busy_ != 0;
+          if (await_creation_completion_event) {
+            creation_completion_event_->Reset();
+            creation_completion_set_event_ = true;
+          }
+        }
+        if (await_creation_completion_event) {
+          creation_request_cond_.notify_one();
+          rex::thread::Wait(creation_completion_event_.get(), false);
+        }
+      } else {
+        // Non-blocking mode: store callback for later invocation.
+        std::lock_guard<std::mutex> lock(creation_request_lock_);
+        if (creation_queue_.empty() && creation_threads_busy_ == 0) {
+          // No work pending - callback will be invoked at end of function.
+        } else {
+          creation_completion_callback_ = std::move(completion_callback);
+          completion_callback = nullptr;  // Prevent invocation at end
+        }
+      }
+    }
+
+    REXGPU_INFO("Pipeline cache: {} created, {} already exist, {} total in {} ms",
+                pipelines_created, pipelines_already_exist, pipeline_stored_descriptions.size(),
+                (rex::chrono::Clock::QueryHostTickCount() - pipeline_creation_start) * 1000 /
+                    rex::chrono::Clock::QueryHostTickFrequency());
+
+    if (pipelines_requirements_not_met || pipelines_arguments_failed) {
+      REXGPU_INFO("Pipeline cache skipped: {} requirements not met, {} shaders or state missing",
+                  pipelines_requirements_not_met, pipelines_arguments_failed);
+    }
   }
 
-  shader_storage_cache_root_ = cache_root;
-  shader_storage_title_id_ = title_id;
-
-  // Start the storage writing thread.
-  storage_write_flush_shaders_ = false;
-  storage_write_flush_pipelines_ = false;
-  storage_write_thread_shutdown_ = false;
-  storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
-  assert_not_null(storage_write_thread_);
-  storage_write_thread_->set_name("Vulkan Storage writer");
+  // Invoke completion callback if no async work was queued.
+  if (completion_callback) {
+    completion_callback();
+  }
 }
 
 void VulkanPipelineCache::ShutdownShaderStorage() {
-  if (storage_write_thread_) {
-    {
-      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-      storage_write_thread_shutdown_ = true;
+  // Save VkPipelineCache to disk before shutting down storage.
+  if (vk_pipeline_cache_ != VK_NULL_HANDLE && !vk_pipeline_cache_path_.empty()) {
+    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+
+    size_t cache_size = 0;
+    if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size, nullptr) ==
+            VK_SUCCESS &&
+        cache_size > 0) {
+      std::vector<uint8_t> cache_data(cache_size);
+      if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size, cache_data.data()) ==
+          VK_SUCCESS) {
+        if (FILE* cache_file = rex::filesystem::OpenFile(vk_pipeline_cache_path_, "wb")) {
+          fwrite(cache_data.data(), 1, cache_size, cache_file);
+          fclose(cache_file);
+          REXGPU_INFO("Saved {} bytes of VkPipelineCache data", cache_size);
+        }
+      }
     }
-    storage_write_request_cond_.notify_all();
-    rex::thread::Wait(storage_write_thread_.get(), false);
-    storage_write_thread_.reset();
   }
-  storage_write_shader_queue_.clear();
-  storage_write_pipeline_queue_.clear();
+  vk_pipeline_cache_path_.clear();
 
-  if (pipeline_storage_file_) {
-    fclose(pipeline_storage_file_);
-    pipeline_storage_file_ = nullptr;
-    pipeline_storage_file_flush_needed_ = false;
-  }
-
-  if (shader_storage_file_) {
-    fclose(shader_storage_file_);
-    shader_storage_file_ = nullptr;
-    shader_storage_file_flush_needed_ = false;
-  }
-
-  shader_storage_cache_root_.clear();
+  // Shut down the storage writer (closes files, stops write thread).
+  storage_writer_.ShutdownShaderStorage();
+  shader_storage_file_flush_needed_ = false;
+  pipeline_storage_file_flush_needed_ = false;
   shader_storage_title_id_ = 0;
 }
 
 void VulkanPipelineCache::EndSubmission() {
   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
-    {
-      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-      if (shader_storage_file_flush_needed_) {
-        storage_write_flush_shaders_ = true;
-      }
-      if (pipeline_storage_file_flush_needed_) {
-        storage_write_flush_pipelines_ = true;
-      }
-    }
-    storage_write_request_cond_.notify_one();
+    storage_writer_.RequestFlush(shader_storage_file_flush_needed_,
+                                 pipeline_storage_file_flush_needed_);
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
@@ -765,7 +697,9 @@ void VulkanPipelineCache::EndSubmission() {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       startup_loading = startup_loading_;
     }
-    if (startup_loading) {
+    if (startup_loading || REXCVAR_GET(async_shader_compilation)) {
+      // Don't wait for pipeline creation - let background threads work
+      // asynchronously. Draws are skipped until pipelines are ready.
       creation_request_cond_.notify_one();
     } else {
       // Help worker threads on the processor thread to reduce warm-up latency.
@@ -787,8 +721,6 @@ void VulkanPipelineCache::EndSubmission() {
       }
     }
   }
-
-  ProcessDeferredPipelineDestructions(false);
 }
 
 void VulkanPipelineCache::Shutdown() {
@@ -813,6 +745,8 @@ void VulkanPipelineCache::Shutdown() {
     startup_loading_ = false;
     creation_completion_set_event_ = false;
     creation_threads_shutdown_from_ = SIZE_MAX;
+    // Clear any pending completion callback (may capture 'this').
+    creation_completion_callback_ = nullptr;
   }
   creation_completion_event_.reset();
 
@@ -822,7 +756,10 @@ void VulkanPipelineCache::Shutdown() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  ProcessDeferredPipelineDestructions(true);
+  if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineCache(device, vk_pipeline_cache_, nullptr);
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
 
   // Destroy all pipelines.
   last_pipeline_ = nullptr;
@@ -838,11 +775,17 @@ void VulkanPipelineCache::Shutdown() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          depth_only_fragment_shader_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         zpd_total_depth_only_fragment_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         viz_survey_depth_only_fragment_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         zpd_total_float24_truncate_fragment_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         zpd_total_float24_round_fragment_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          depth_float24_truncate_fragment_shader_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          depth_float24_round_fragment_shader_);
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
-                                         placeholder_pixel_shader_);
   if (tessellation_indexed_vertex_shader_ != VK_NULL_HANDLE) {
     dfn.vkDestroyShaderModule(device, tessellation_indexed_vertex_shader_, nullptr);
     tessellation_indexed_vertex_shader_ = VK_NULL_HANDLE;
@@ -871,7 +814,6 @@ void VulkanPipelineCache::Shutdown() {
     delete it.second;
   }
   shaders_.clear();
-  shader_storage_index_ = 0;
   texture_binding_layout_map_.clear();
   texture_binding_layouts_.clear();
 
@@ -960,7 +902,7 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
 
 SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
-    reg::RB_DEPTHCONTROL normalized_depth_control) const {
+    reg::RB_DEPTHCONTROL normalized_depth_control, bool apply_polygon_offset_in_shader) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
   const auto& regs = register_file_;
@@ -988,21 +930,58 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
   }
 
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    // Whether this draw is native res due to a scale threshold. (FBO only)
+    modification.pixel.resolution_scale_native = uint32_t(render_target_cache_.IsDrawScaleNative());
+
     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
         normalized_depth_control.z_enable &&
         regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
       // For host D32 depth, emulate guest D24FS8 float24 depth behavior.
-      modification.pixel.depth_stencil_mode = render_target_cache_.depth_float24_round()
-                                                  ? DepthStencilMode::kFloat24Rounding
-                                                  : DepthStencilMode::kFloat24Truncating;
+      modification.pixel.depth_stencil_mode =
+          apply_polygon_offset_in_shader
+              ? (render_target_cache_.depth_float24_round()
+                     ? DepthStencilMode::kFloat24RoundingPolygonOffset
+                     : DepthStencilMode::kFloat24TruncatingPolygonOffset)
+              : (render_target_cache_.depth_float24_round() ? DepthStencilMode::kFloat24Rounding
+                                                            : DepthStencilMode::kFloat24Truncating);
     } else {
-      if (shader.implicit_early_z_write_allowed() &&
-          (!shader.writes_color_target(0) ||
-           !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()))) {
+      if (apply_polygon_offset_in_shader) {
+        modification.pixel.depth_stencil_mode = DepthStencilMode::kPolygonOffset;
+      } else if (shader.implicit_early_z_write_allowed() &&
+                 (!shader.writes_color_target(0) ||
+                  !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()))) {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
       } else {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
+      }
+    }
+
+    // Check if MIN/MAX blend is used with non-trivial source factors.
+    // Vulkan/D3D12 fixed-function blend ignores factors for MIN/MAX, but
+    // Xbox 360 applies them. If the destination factor is ONE (or ZERO), we can
+    // pre-multiply the shader output by the source factor to emulate this.
+    // Only RT0 is supported for now.
+    modification.pixel.rt0_blend_rgb_factor_for_premult = xenos::BlendFactor::kOne;
+    modification.pixel.rt0_blend_a_factor_for_premult = xenos::BlendFactor::kOne;
+
+    if (shader.writes_color_target(0)) {
+      auto blend_control =
+          regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
+
+      // Pre-multiply by kSrcAlpha for MIN/MAX blend ops when dstFactor is ONE.
+      if ((blend_control.color_comb_fcn == xenos::BlendOp::kMin ||
+           blend_control.color_comb_fcn == xenos::BlendOp::kMax) &&
+          blend_control.color_srcblend == xenos::BlendFactor::kSrcAlpha &&
+          blend_control.color_destblend == xenos::BlendFactor::kOne) {
+        modification.pixel.rt0_blend_rgb_factor_for_premult = xenos::BlendFactor::kSrcAlpha;
+      }
+
+      if ((blend_control.alpha_comb_fcn == xenos::BlendOp::kMin ||
+           blend_control.alpha_comb_fcn == xenos::BlendOp::kMax) &&
+          blend_control.alpha_srcblend == xenos::BlendFactor::kSrcAlpha &&
+          blend_control.alpha_destblend == xenos::BlendFactor::kOne) {
+        modification.pixel.rt0_blend_a_factor_for_premult = xenos::BlendFactor::kSrcAlpha;
       }
     }
   }
@@ -1049,8 +1028,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
     VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-    VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
-    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out) {
+    VulkanRenderTargetCache::RenderPassKey render_pass_key, bool zpd_total, bool viz_survey,
+    Pipeline** pipeline_out) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -1059,33 +1038,22 @@ bool VulkanPipelineCache::ConfigurePipeline(
   if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
     return false;
   }
-  if (shader_storage_file_ &&
-      vertex_shader->shader().ucode_storage_index() != shader_storage_index_) {
-    vertex_shader->shader().set_ucode_storage_index(shader_storage_index_);
-    assert_not_null(storage_write_thread_);
-    shader_storage_file_flush_needed_ = true;
-    {
-      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-      storage_write_shader_queue_.push_back(&vertex_shader->shader());
+  if (storage_writer_.is_active()) {
+    if (vertex_shader->shader().try_set_ucode_storage_index(storage_writer_.storage_index())) {
+      shader_storage_file_flush_needed_ = true;
+      storage_writer_.QueueShaderWrite(&vertex_shader->shader());
     }
-    storage_write_request_cond_.notify_all();
-  }
-  if (pixel_shader && shader_storage_file_ &&
-      pixel_shader->shader().ucode_storage_index() != shader_storage_index_) {
-    pixel_shader->shader().set_ucode_storage_index(shader_storage_index_);
-    assert_not_null(storage_write_thread_);
-    shader_storage_file_flush_needed_ = true;
-    {
-      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-      storage_write_shader_queue_.push_back(&pixel_shader->shader());
+    if (pixel_shader &&
+        pixel_shader->shader().try_set_ucode_storage_index(storage_writer_.storage_index())) {
+      shader_storage_file_flush_needed_ = true;
+      storage_writer_.QueueShaderWrite(&pixel_shader->shader());
     }
-    storage_write_request_cond_.notify_all();
   }
 
   PipelineDescription description;
   if (!GetCurrentStateDescription(vertex_shader, pixel_shader, primitive_processing_result,
                                   normalized_depth_control, normalized_color_mask, render_pass_key,
-                                  description)) {
+                                  zpd_total, viz_survey, description)) {
     REXGPU_ERROR(
         "VulkanPipelineCache: GetCurrentStateDescription failed "
         "(guest_prim={}, host_prim={}, host_vs_type={}, tess_mode={}, host_reset={}, "
@@ -1098,111 +1066,57 @@ bool VulkanPipelineCache::ConfigurePipeline(
     return false;
   }
   if (last_pipeline_ && last_pipeline_->first == description) {
-    VkPipeline last_pipeline = last_pipeline_->second.pipeline.load(std::memory_order_acquire);
-    const PipelineLayoutProvider* last_pipeline_layout =
-        last_pipeline_->second.pipeline_layout.load(std::memory_order_acquire);
-    if (last_pipeline != VK_NULL_HANDLE && last_pipeline_layout != nullptr) {
-      pipeline_out = last_pipeline;
-      pipeline_layout_out = last_pipeline_layout;
-      if (pipeline_handle_out) {
-        *pipeline_handle_out = const_cast<Pipeline*>(&last_pipeline_->second);
-      }
-      return true;
-    }
+    *pipeline_out = &last_pipeline_->second;
+    return true;
   }
-
-  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
-                   pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
-  uint8_t async_priority = pipeline_util::kPriorityLowest;
-  if (use_async) {
-    uint32_t bound_rts =
-        pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask);
-    uint32_t shader_writes_color_targets =
-        pixel_shader ? pixel_shader->shader().writes_color_targets() : 0;
-    bool shader_writes_depth = pixel_shader ? pixel_shader->shader().writes_depth()
-                                            : normalized_depth_control.z_write_enable != 0;
-    async_priority = pipeline_util::CalculatePipelinePriority(
-        bound_rts, shader_writes_color_targets, shader_writes_depth);
-  }
-
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
-    VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
-    if (found_pipeline == VK_NULL_HANDLE) {
-      PipelineCreationArguments creation_arguments;
-      if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
-          !EnsurePipelineCreated(creation_arguments)) {
-        return false;
-      }
-      found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
-    }
-    const PipelineLayoutProvider* found_pipeline_layout =
-        it->second.pipeline_layout.load(std::memory_order_acquire);
     last_pipeline_ = &*it;
-    pipeline_out = found_pipeline;
-    pipeline_layout_out = found_pipeline_layout;
-    if (pipeline_handle_out) {
-      *pipeline_handle_out = &it->second;
-    }
-    return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
+    *pipeline_out = &it->second;
+    return true;
   }
 
-  // Create the pipeline if not already existing.
+  // Create the pipeline if not the latest and not already existing.
   auto& pipeline = *pipelines_.emplace(description, Pipeline()).first;
-  PipelineCreationArguments creation_arguments_real;
-  if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
-                                                     creation_arguments_real)) {
+  PipelineCreationArguments creation_arguments;
+  if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline, creation_arguments)) {
     pipelines_.erase(description);
     return false;
   }
 
-  bool queued_async_creation = false;
+  // With async compilation, the pipeline is created on a creation thread, and
+  // draws with it are skipped until it's ready (like on Direct3D 12). Only
+  // when there's a pixel shader - pipelines without one are fast to create.
+  bool use_async =
+      REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() && pixel_shader;
   if (use_async) {
-    creation_arguments_real.priority = async_priority;
-    PipelineCreationArguments creation_arguments_placeholder;
-    if (TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
-                                                      creation_arguments_placeholder, true)) {
-      pipeline.second.is_placeholder.store(true, std::memory_order_release);
-      if (EnsurePipelineCreated(creation_arguments_placeholder, placeholder_pixel_shader_)) {
-        {
-          std::lock_guard<std::mutex> lock(creation_request_lock_);
-          creation_queue_.push(creation_arguments_real);
-        }
-        creation_request_cond_.notify_one();
-        queued_async_creation = true;
-      } else {
-        pipeline.second.is_placeholder.store(false, std::memory_order_release);
-      }
+    // Calculate priority based on whether shader writes to visible RTs.
+    uint32_t bound_rts =
+        pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask);
+    creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
+        bound_rts, pixel_shader->shader().writes_color_targets(),
+        pixel_shader->shader().writes_depth());
+    pipeline.second.creation_pending.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      creation_queue_.push(creation_arguments);
     }
-  }
-
-  if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
+    creation_request_cond_.notify_one();
+  } else if (!EnsurePipelineCreated(creation_arguments)) {
     pipelines_.erase(description);
     return false;
   }
-  if (!queued_async_creation) {
-    pipeline.second.is_placeholder.store(false, std::memory_order_release);
-  }
 
-  if (pipeline_storage_file_) {
-    assert_not_null(storage_write_thread_);
+  if (storage_writer_.is_active()) {
     pipeline_storage_file_flush_needed_ = true;
-    {
-      std::lock_guard<std::mutex> lock(storage_write_request_lock_);
-      storage_write_pipeline_queue_.emplace_back();
-      PipelineStoredDescription& stored_description = storage_write_pipeline_queue_.back();
-      stored_description.description_hash = description.GetHash();
-      std::memcpy(&stored_description.description, &description, sizeof(description));
-    }
-    storage_write_request_cond_.notify_all();
+    PipelineStoredDescription stored_description;
+    stored_description.description_hash = description.GetHash();
+    std::memcpy(&stored_description.description, &description, sizeof(description));
+    storage_writer_.QueuePipelineWrite(stored_description);
   }
   last_pipeline_ = &pipeline;
-  pipeline_out = pipeline.second.pipeline.load(std::memory_order_acquire);
-  pipeline_layout_out = pipeline.second.pipeline_layout.load(std::memory_order_acquire);
-  if (pipeline_handle_out) {
-    *pipeline_handle_out = &pipeline.second;
-  }
-  return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
+  *pipeline_out = &pipeline.second;
+  return true;
 }
 
 bool VulkanPipelineCache::IsCreatingPipelines() const {
@@ -1213,22 +1127,24 @@ bool VulkanPipelineCache::IsCreatingPipelines() const {
   return startup_loading_ || !creation_queue_.empty() || creation_threads_busy_ != 0;
 }
 
-void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
-    void* handle, VkPipeline& pipeline_out, const PipelineLayoutProvider*& pipeline_layout_out,
-    bool* is_placeholder_out) const {
-  if (!handle) {
-    pipeline_out = VK_NULL_HANDLE;
-    pipeline_layout_out = nullptr;
-    if (is_placeholder_out) {
-      *is_placeholder_out = false;
-    }
+void VulkanPipelineCache::AwaitPipelineCompletion() {
+  if (creation_threads_.empty()) {
     return;
   }
-  const auto* pipeline = reinterpret_cast<const Pipeline*>(handle);
-  pipeline_out = pipeline->pipeline.load(std::memory_order_acquire);
-  pipeline_layout_out = pipeline->pipeline_layout.load(std::memory_order_acquire);
-  if (is_placeholder_out) {
-    *is_placeholder_out = pipeline->is_placeholder.load(std::memory_order_acquire);
+
+  bool await_creation_completion_event;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    await_creation_completion_event = !creation_queue_.empty() || creation_threads_busy_ != 0;
+    if (await_creation_completion_event) {
+      creation_completion_event_->Reset();
+      creation_completion_set_event_ = true;
+    }
+  }
+
+  if (await_creation_completion_event) {
+    creation_request_cond_.notify_one();
+    rex::thread::Wait(creation_completion_event_.get(), false);
   }
 }
 
@@ -1262,6 +1178,9 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
           texture_binding_count * sizeof(*texture_bindings.data());
       uint64_t texture_binding_layout_hash =
           XXH3_64bits(texture_bindings.data(), texture_binding_layout_bytes);
+      // The layout vector and map are shared by every thread translating
+      // shaders for the storage at startup.
+      std::lock_guard<std::mutex> layouts_lock(layouts_mutex_);
       auto found_range = texture_binding_layout_map_.equal_range(texture_binding_layout_hash);
       for (auto it = found_range.first; it != found_range.second; ++it) {
         if (it->second.vector_span_length == texture_binding_count &&
@@ -1301,6 +1220,116 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
   return true;
 }
 
+void VulkanPipelineCache::TranslateShadersForStorage(
+    const std::set<std::pair<uint64_t, uint64_t>>& translations_needed, bool edram_fsi_used) {
+  uint64_t translation_start = rex::chrono::Clock::QueryHostTickCount();
+
+  std::vector<std::pair<VulkanShader*, uint64_t>> translations_to_do;
+  translations_to_do.reserve(translations_needed.size());
+  for (const auto& needed : translations_needed) {
+    auto shader_it = shaders_.find(needed.first);
+    if (shader_it == shaders_.end()) {
+      continue;
+    }
+    VulkanShader* shader = shader_it->second;
+    VulkanShader::VulkanTranslation* translation = static_cast<VulkanShader::VulkanTranslation*>(
+        shader->GetOrCreateTranslation(needed.second));
+    if (translation && !translation->is_translated()) {
+      translations_to_do.emplace_back(shader, needed.second);
+    }
+  }
+
+  if (translations_to_do.empty()) {
+    return;
+  }
+
+  std::atomic<size_t> translation_index{0};
+  std::atomic<size_t> translations_completed{0};
+
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  bool msaa_2x_attachments = render_target_cache_.msaa_2x_attachments_supported();
+  bool msaa_2x_no_attachments = render_target_cache_.msaa_2x_no_attachments_supported();
+  uint32_t draw_res_x = render_target_cache_.draw_resolution_scale_x();
+  uint32_t draw_res_y = render_target_cache_.draw_resolution_scale_y();
+
+  auto translate_function = [this, &translations_to_do, &translation_index, &translations_completed,
+                             vulkan_device, msaa_2x_attachments, msaa_2x_no_attachments,
+                             edram_fsi_used, draw_res_x, draw_res_y]() {
+    // Each thread needs its own translator.
+    SpirvShaderTranslator translator(SpirvShaderTranslator::Features(vulkan_device),
+                                     msaa_2x_attachments, msaa_2x_no_attachments, edram_fsi_used,
+                                     draw_res_x, draw_res_y);
+
+    while (true) {
+      size_t index = translation_index.fetch_add(1);
+      if (index >= translations_to_do.size()) {
+        break;
+      }
+      VulkanShader* shader = translations_to_do[index].first;
+      uint64_t modification = translations_to_do[index].second;
+      VulkanShader::VulkanTranslation* translation =
+          static_cast<VulkanShader::VulkanTranslation*>(shader->GetTranslation(modification));
+      if (translation && !translation->is_translated()) {
+        if (TranslateAnalyzedShader(translator, *translation)) {
+          translations_completed.fetch_add(1);
+        }
+      }
+    }
+  };
+
+  size_t thread_count = 0;
+  if (REXCVAR_GET(vulkan_pipeline_creation_threads) != 0) {
+    uint32_t logical_processor_count =
+        std::max(uint32_t(1), rex::thread::logical_processor_count());
+    if (REXCVAR_GET(vulkan_pipeline_creation_threads) < 0) {
+      thread_count = std::max(logical_processor_count * 3 / 4, uint32_t(1));
+    } else {
+      thread_count = std::min(uint32_t(REXCVAR_GET(vulkan_pipeline_creation_threads)),
+                              logical_processor_count);
+    }
+    thread_count = std::min(thread_count, translations_to_do.size());
+  }
+
+  std::vector<std::unique_ptr<rex::thread::Thread>> translation_threads;
+  for (size_t i = 0; i < thread_count; ++i) {
+    auto thread = rex::thread::Thread::Create({}, translate_function);
+    if (thread) {
+      thread->set_name("Shader Translation");
+      translation_threads.push_back(std::move(thread));
+    }
+  }
+
+  // Main thread also participates.
+  translate_function();
+
+  for (auto& thread : translation_threads) {
+    rex::thread::Wait(thread.get(), false);
+  }
+
+  REXGPU_INFO("Translated {} shaders in {} ms", translations_completed.load(),
+              (rex::chrono::Clock::QueryHostTickCount() - translation_start) * 1000 /
+                  rex::chrono::Clock::QueryHostTickFrequency());
+}
+
+void VulkanPipelineCache::AwaitPipelineCreation() {
+  if (creation_threads_.empty()) {
+    return;
+  }
+  bool await_creation_completion_event;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    await_creation_completion_event = !creation_queue_.empty() || creation_threads_busy_ != 0;
+    if (await_creation_completion_event) {
+      creation_completion_event_->Reset();
+      creation_completion_set_event_ = true;
+    }
+  }
+  if (await_creation_completion_event) {
+    creation_request_cond_.notify_one();
+    rex::thread::Wait(creation_completion_event_.get(), false);
+  }
+}
+
 void VulkanPipelineCache::WritePipelineRenderTargetDescription(
     reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
     PipelineRenderTarget& render_target_out) const {
@@ -1326,15 +1355,37 @@ void VulkanPipelineCache::WritePipelineRenderTargetDescription(
         /* 15 */ PipelineBlendFactor::kOneMinusConstantAlpha,
         /* 16 */ PipelineBlendFactor::kSrcAlphaSaturate,
     };
+    // Like kBlendFactorMap, but with the color factors changed to their alpha
+    // equivalents. Alpha is scalar, so hardware treats a _COLOR factor in the
+    // alpha slot as the matching _ALPHA factor.
+    static const PipelineBlendFactor kBlendFactorAlphaMap[32] = {
+        /*  0 */ PipelineBlendFactor::kZero,
+        /*  1 */ PipelineBlendFactor::kOne,
+        /*  2 */ PipelineBlendFactor::kZero,  // ?
+        /*  3 */ PipelineBlendFactor::kZero,  // ?
+        /*  4 */ PipelineBlendFactor::kSrcAlpha,
+        /*  5 */ PipelineBlendFactor::kOneMinusSrcAlpha,
+        /*  6 */ PipelineBlendFactor::kSrcAlpha,
+        /*  7 */ PipelineBlendFactor::kOneMinusSrcAlpha,
+        /*  8 */ PipelineBlendFactor::kDstAlpha,
+        /*  9 */ PipelineBlendFactor::kOneMinusDstAlpha,
+        /* 10 */ PipelineBlendFactor::kDstAlpha,
+        /* 11 */ PipelineBlendFactor::kOneMinusDstAlpha,
+        /* 12 */ PipelineBlendFactor::kConstantAlpha,
+        /* 13 */ PipelineBlendFactor::kOneMinusConstantAlpha,
+        /* 14 */ PipelineBlendFactor::kConstantAlpha,
+        /* 15 */ PipelineBlendFactor::kOneMinusConstantAlpha,
+        /* 16 */ PipelineBlendFactor::kSrcAlphaSaturate,
+    };
     render_target_out.src_color_blend_factor =
         kBlendFactorMap[uint32_t(blend_control.color_srcblend)];
     render_target_out.dst_color_blend_factor =
         kBlendFactorMap[uint32_t(blend_control.color_destblend)];
     render_target_out.color_blend_op = blend_control.color_comb_fcn;
     render_target_out.src_alpha_blend_factor =
-        kBlendFactorMap[uint32_t(blend_control.alpha_srcblend)];
+        kBlendFactorAlphaMap[uint32_t(blend_control.alpha_srcblend)];
     render_target_out.dst_alpha_blend_factor =
-        kBlendFactorMap[uint32_t(blend_control.alpha_destblend)];
+        kBlendFactorAlphaMap[uint32_t(blend_control.alpha_destblend)];
     render_target_out.alpha_blend_op = blend_control.alpha_comb_fcn;
     if (!command_processor_.GetVulkanDevice()->properties().constantAlphaColorBlendFactors) {
       if (blend_control.color_srcblend == xenos::BlendFactor::kConstantAlpha) {
@@ -1364,7 +1415,7 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     const VulkanShader::VulkanTranslation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-    VulkanRenderTargetCache::RenderPassKey render_pass_key,
+    VulkanRenderTargetCache::RenderPassKey render_pass_key, bool zpd_total, bool viz_survey,
     PipelineDescription& description_out) const {
   description_out.Reset();
 
@@ -1386,13 +1437,19 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     SpirvShaderTranslator::Modification pixel_shader_modification(
         description_out.pixel_shader_modification);
     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
+    DepthStencilMode depth_stencil_mode = pixel_shader_modification.pixel.depth_stencil_mode;
     description_out.sample_rate_shading =
         !pixel_shader->shader().writes_depth() &&
-        (pixel_shader_modification.pixel.depth_stencil_mode ==
-             DepthStencilMode::kFloat24Truncating ||
-         pixel_shader_modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Rounding);
+        (depth_stencil_mode == DepthStencilMode::kFloat24Truncating ||
+         depth_stencil_mode == DepthStencilMode::kFloat24TruncatingPolygonOffset ||
+         depth_stencil_mode == DepthStencilMode::kFloat24Rounding ||
+         depth_stencil_mode == DepthStencilMode::kFloat24RoundingPolygonOffset);
   }
   description_out.render_pass_key = render_pass_key;
+  description_out.zpd_total = uint32_t(zpd_total);
+  description_out.viz_survey =
+      uint32_t(viz_survey &&
+               render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock);
 
   bool tessellated = primitive_processing_result.IsTessellated();
   PipelineGeometryShader geometry_shader = PipelineGeometryShader::kNone;
@@ -1460,8 +1517,15 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   description_out.primitive_topology = primitive_topology;
   description_out.primitive_restart = primitive_processing_result.host_primitive_reset_enabled;
 
+  // With force_depth_clamp, use the host viewport clamp instead of near and far
+  // Z plane clipping. X/Y/W clipping is unchanged. Both 494707EE and 41560881
+  // have passes that rely on alpha inputs that currently gets dropped by
+  // near-plane clipping.
+  // TODO(boma): Investigate whether the difference is in shader arithmetic or
+  // the clipper itself.
   description_out.depth_clamp_enable =
-      device_properties.depthClamp && regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+      device_properties.depthClamp &&
+      (regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable || REXCVAR_GET(force_depth_clamp));
 
   // Tessellated draws are patch-domain polygonal primitives regardless of guest
   // register ambiguity in non-explicit major mode configurations.
@@ -1569,6 +1633,13 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
 }
 
 bool VulkanPipelineCache::ArePipelineRequirementsMet(const PipelineDescription& description) const {
+  if (description.zpd_total && !zpd_hybrid_supported_) {
+    return false;
+  }
+  if (description.viz_survey && viz_survey_depth_only_fragment_shader_ == VK_NULL_HANDLE) {
+    return false;
+  }
+
   VkShaderStageFlags vertex_shader_stage =
       Shader::IsHostVertexShaderTypeDomain(
           SpirvShaderTranslator::Modification(description.vertex_shader_modification)
@@ -1862,7 +1933,8 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
   bool denorm_flush_to_zero_float32 = device_properties.shaderDenormFlushToZeroFloat32;
   bool signed_zero_inf_nan_preserve_float32 =
       device_properties.shaderSignedZeroInfNanPreserveFloat32;
-  bool rounding_mode_rte_float32 = device_properties.shaderRoundingModeRTEFloat32;
+  bool rounding_mode_rte_float32 = device_properties.shaderRoundingModeRTEFloat32 &&
+                                   !REXCVAR_GET(spirv_disable_rounding_mode_rte);
   if (spirv_version < spv::Spv_1_4) {
     if (denorm_flush_to_zero_float32 || signed_zero_inf_nan_preserve_float32 ||
         rounding_mode_rte_float32) {
@@ -2879,16 +2951,15 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
 bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
     const PipelineDescription& description,
     std::pair<const PipelineDescription, Pipeline>* pipeline,
-    PipelineCreationArguments& creation_arguments, bool for_placeholder) {
+    PipelineCreationArguments& creation_arguments) {
   auto fail = [&](const char* reason) {
     REXGPU_ERROR(
         "VulkanPipelineCache: TryGetPipelineCreationArgumentsForDescription "
         "failed: {} (vs={:016X}, ps={:016X}, topo={}, geom={}, tess_mode={}, "
-        "for_placeholder={}, render_pass_key=0x{:08X})",
+        "render_pass_key=0x{:08X})",
         reason, description.vertex_shader_hash, description.pixel_shader_hash,
         uint32_t(description.primitive_topology), uint32_t(description.geometry_shader),
-        uint32_t(description.tessellation_mode), uint32_t(for_placeholder),
-        description.render_pass_key.key);
+        uint32_t(description.tessellation_mode), description.render_pass_key.key);
     return false;
   };
 
@@ -2915,7 +2986,7 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   bool tessellated = Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type);
 
   VulkanShader::VulkanTranslation* pixel_shader = nullptr;
-  if (description.pixel_shader_hash && !for_placeholder) {
+  if (description.pixel_shader_hash) {
     auto pixel_shader_it = shaders_.find(description.pixel_shader_hash);
     if (pixel_shader_it == shaders_.end()) {
       return fail("pixel_shader_not_found");
@@ -2976,14 +3047,14 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   }
 
   const PipelineLayoutProvider* pipeline_layout = command_processor_.GetPipelineLayout(
-      (!for_placeholder && pixel_shader) ? static_cast<const VulkanShader&>(pixel_shader->shader())
-                                               .GetTextureBindingsAfterTranslation()
-                                               .size()
-                                         : 0,
-      (!for_placeholder && pixel_shader) ? static_cast<const VulkanShader&>(pixel_shader->shader())
-                                               .GetSamplerBindingsAfterTranslation()
-                                               .size()
-                                         : 0,
+      pixel_shader ? static_cast<const VulkanShader&>(pixel_shader->shader())
+                         .GetTextureBindingsAfterTranslation()
+                         .size()
+                   : 0,
+      pixel_shader ? static_cast<const VulkanShader&>(pixel_shader->shader())
+                         .GetSamplerBindingsAfterTranslation()
+                         .size()
+                   : 0,
       static_cast<const VulkanShader&>(vertex_shader->shader())
           .GetTextureBindingsAfterTranslation()
           .size(),
@@ -2997,7 +3068,7 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   creation_arguments.pipeline = pipeline;
   creation_arguments.pipeline_layout = pipeline_layout;
   creation_arguments.vertex_shader = vertex_shader;
-  creation_arguments.pixel_shader = for_placeholder ? nullptr : pixel_shader;
+  creation_arguments.pixel_shader = pixel_shader;
   creation_arguments.tessellation_vertex_shader = tessellation_vertex_shader;
   creation_arguments.tessellation_control_shader = tessellation_control_shader;
   creation_arguments.tessellation_patch_control_points = tessellation_patch_control_points;
@@ -3006,17 +3077,11 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   return true;
 }
 
-bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
-                                                VkShaderModule fragment_shader_override) {
-  VkPipeline existing_pipeline =
-      creation_arguments.pipeline->second.pipeline.load(std::memory_order_acquire);
-  bool is_placeholder =
-      creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
-  bool creating_placeholder = fragment_shader_override != VK_NULL_HANDLE;
-  if (existing_pipeline != VK_NULL_HANDLE) {
-    if (!is_placeholder || creating_placeholder) {
-      return true;
-    }
+bool VulkanPipelineCache::EnsurePipelineCreated(
+    const PipelineCreationArguments& creation_arguments) {
+  if (creation_arguments.pipeline->second.pipeline.load(std::memory_order_acquire) !=
+      VK_NULL_HANDLE) {
+    return true;
   }
 
   // This function preferably should validate the description to prevent
@@ -3125,9 +3190,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   shader_stage_fragment.module = VK_NULL_HANDLE;
   shader_stage_fragment.pName = "main";
   shader_stage_fragment.pSpecializationInfo = nullptr;
-  if (fragment_shader_override != VK_NULL_HANDLE) {
-    shader_stage_fragment.module = fragment_shader_override;
-  } else if (creation_arguments.pixel_shader) {
+  if (creation_arguments.pixel_shader) {
     assert_true(creation_arguments.pixel_shader->is_translated());
     if (!creation_arguments.pixel_shader->is_valid()) {
       return false;
@@ -3135,8 +3198,23 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     shader_stage_fragment.module = creation_arguments.pixel_shader->shader_module();
     assert_true(shader_stage_fragment.module != VK_NULL_HANDLE);
   } else {
-    if (edram_fragment_shader_interlock) {
-      shader_stage_fragment.module = depth_only_fragment_shader_;
+    if (description.zpd_total) {
+      // Native ZPD query without a guest pixel shader.
+      // Coverage still has to be counted.
+      shader_stage_fragment.module = zpd_total_depth_only_fragment_shader_;
+      if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+          (description.depth_write_enable ||
+           description.depth_compare_op != xenos::CompareFunction::kAlways) &&
+          (description.render_pass_key.depth_and_color_used & 0b1) &&
+          description.render_pass_key.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+        shader_stage_fragment.module = render_target_cache_.depth_float24_round()
+                                           ? zpd_total_float24_round_fragment_shader_
+                                           : zpd_total_float24_truncate_fragment_shader_;
+      }
+    } else if (edram_fragment_shader_interlock) {
+      // VIZ surveys only use the ZPass counter.
+      shader_stage_fragment.module = description.viz_survey ? viz_survey_depth_only_fragment_shader_
+                                                            : depth_only_fragment_shader_;
     } else if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
                (description.render_pass_key.depth_and_color_used & 1) &&
                (description.depth_compare_op != xenos::CompareFunction::kAlways ||
@@ -3149,6 +3227,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       if (shader_stage_fragment.module == VK_NULL_HANDLE) {
         return false;
       }
+    } else if (!description.depth_write_enable) {
+      // Bind an empty PS to force rasterization.
+      // D3D drops PS-less draws without depth/stencil writes,
+      // breaking occlusion queries (4541096E, 5553083B).
+      // Vulkan stencil write mask is dynamic state. Only check depth.
+      shader_stage_fragment.module = depth_only_fragment_shader_;
     }
   }
   if (shader_stage_fragment.module == VK_NULL_HANDLE) {
@@ -3278,9 +3362,8 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
   } else if (description.render_pass_key.msaa_samples == xenos::MsaaSamples::k2X &&
              !render_target_cache_.IsMsaa2xSupported(subpass_has_attachments)) {
-    // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
-    // sample locations, but still top-left and bottom-right - however, this can
-    // be adjusted with custom sample locations).
+    // Using samples 0 and 3 as 0 and 1 for 2x instead with attachments, and 2
+    // and 1 with interlock (see GetHostSampleXenosPositions).
     multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
     // Keep parity with D3D12 ROV: sample masks are ignored without attachments.
     if (subpass_has_attachments) {
@@ -3295,6 +3378,22 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       multisample_state.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT) {
     multisample_state.sampleShadingEnable = VK_TRUE;
     multisample_state.minSampleShading = 1.0f;
+  }
+
+  // Xenos sample locations. Draws forced to 1x (rasterizer discard, host render
+  // target draws without attachments) keep the default locations.
+  VkPipelineSampleLocationsStateCreateInfoEXT sample_locations_state;
+  const VkSampleLocationsInfoEXT* sample_locations_info =
+      render_target_cache_.GetSampleLocationsInfo(description.render_pass_key.msaa_samples,
+                                                  subpass_has_attachments);
+  if (sample_locations_info &&
+      sample_locations_info->sampleLocationsPerPixel == multisample_state.rasterizationSamples) {
+    sample_locations_state.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT;
+    sample_locations_state.pNext = nullptr;
+    sample_locations_state.sampleLocationsEnable = VK_TRUE;
+    sample_locations_state.sampleLocationsInfo = *sample_locations_info;
+    multisample_state.pNext = &sample_locations_state;
   }
 
   VkPipelineDepthStencilStateCreateInfo depth_stencil_state = {};
@@ -3362,6 +3461,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
                                               VK_BLEND_OP_ADD,
                                               VK_BLEND_OP_ADD};
       assert_true(vulkan_device->properties().independentBlend);
+      // Check if the shader pre-multiplies by blend factors for MIN/MAX.
+      SpirvShaderTranslator::Modification pixel_shader_modification(
+          description.pixel_shader_modification);
+      bool rt0_rgb_premult = pixel_shader_modification.pixel.rt0_blend_rgb_factor_for_premult !=
+                             xenos::BlendFactor::kOne;
+      bool rt0_a_premult = pixel_shader_modification.pixel.rt0_blend_a_factor_for_premult !=
+                           xenos::BlendFactor::kOne;
+
       uint32_t color_rts_remaining = color_rts_used;
       uint32_t color_rt_index;
       while (rex::bit_scan_forward(color_rts_remaining, &color_rt_index)) {
@@ -3386,6 +3493,18 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
           color_blend_attachment.dstAlphaBlendFactor =
               kBlendFactorMap[uint32_t(color_rt.dst_alpha_blend_factor)];
           color_blend_attachment.alphaBlendOp = kBlendOpMap[uint32_t(color_rt.alpha_blend_op)];
+
+          // If the shader pre-multiplies by the source blend factor for RT0
+          // MIN/MAX, set the pipeline source factor to ONE since it's already
+          // applied in the shader.
+          if (color_rt_index == 0) {
+            if (rt0_rgb_premult) {
+              color_blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            }
+            if (rt0_a_premult) {
+              color_blend_attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            }
+          }
         }
         color_blend_attachment.colorWriteMask = VkColorComponentFlags(color_rt.color_write_mask);
       }
@@ -3480,7 +3599,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, vk_pipeline_cache_, 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
@@ -3497,23 +3616,11 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         uint32_t(use_dynamic_rendering));
     return false;
   }
-  bool was_placeholder =
-      creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
-  VkPipeline old_pipeline =
-      creation_arguments.pipeline->second.pipeline.exchange(pipeline, std::memory_order_acq_rel);
+  // The layout is published before the pipeline, the processor thread reads
+  // them in this order.
   creation_arguments.pipeline->second.pipeline_layout.store(creation_arguments.pipeline_layout,
                                                             std::memory_order_release);
-  if (creating_placeholder) {
-    creation_arguments.pipeline->second.is_placeholder.store(true, std::memory_order_release);
-  } else {
-    creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
-    if (was_placeholder && old_pipeline != VK_NULL_HANDLE) {
-      std::lock_guard<std::mutex> lock(deferred_destroy_lock_);
-      deferred_destroy_pipelines_.emplace_back(command_processor_.GetCurrentSubmission(),
-                                               old_pipeline);
-    }
-  }
-
+  creation_arguments.pipeline->second.pipeline.store(pipeline, std::memory_order_release);
   return true;
 }
 
@@ -3523,9 +3630,21 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
     {
       std::unique_lock<std::mutex> lock(creation_request_lock_);
       if (thread_index >= creation_threads_shutdown_from_ || creation_queue_.empty()) {
-        if (creation_completion_set_event_ && creation_threads_busy_ == 0) {
-          creation_completion_set_event_ = false;
-          creation_completion_event_->Set();
+        if (creation_threads_busy_ == 0) {
+          // All pipelines created.
+          if (creation_completion_set_event_) {
+            // Signal the event (blocking mode).
+            creation_completion_set_event_ = false;
+            creation_completion_event_->Set();
+          }
+          if (creation_completion_callback_) {
+            // Invoke completion callback (non-blocking mode).
+            auto callback = std::move(creation_completion_callback_);
+            creation_completion_callback_ = nullptr;
+            lock.unlock();
+            callback();
+            lock.lock();
+          }
         }
         if (thread_index >= creation_threads_shutdown_from_) {
           return;
@@ -3538,20 +3657,10 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
       ++creation_threads_busy_;
     }
 
-    bool created = EnsurePipelineCreated(creation_arguments);
-    if (!created) {
-      bool has_placeholder =
-          creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
-      VkPipeline pipeline =
-          creation_arguments.pipeline->second.pipeline.load(std::memory_order_acquire);
-      if (has_placeholder && pipeline != VK_NULL_HANDLE) {
-        // Keep the placeholder resident and stop waiting for a real pipeline.
-        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
-      } else {
-        creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
-                                                           std::memory_order_release);
-      }
-    }
+    // If creation fails, the pipeline stays VK_NULL_HANDLE and draws with it
+    // fail.
+    EnsurePipelineCreated(creation_arguments);
+    creation_arguments.pipeline->second.creation_pending.store(false, std::memory_order_release);
 
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -3572,130 +3681,8 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       creation_arguments = creation_queue_.top();
       creation_queue_.pop();
     }
-    bool created = EnsurePipelineCreated(creation_arguments);
-    if (!created) {
-      bool has_placeholder =
-          creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
-      VkPipeline pipeline =
-          creation_arguments.pipeline->second.pipeline.load(std::memory_order_acquire);
-      if (has_placeholder && pipeline != VK_NULL_HANDLE) {
-        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
-      } else {
-        creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
-                                                           std::memory_order_release);
-      }
-    }
-  }
-}
-
-void VulkanPipelineCache::ProcessDeferredPipelineDestructions(bool force_all) {
-  std::vector<VkPipeline> pipelines_to_destroy;
-  uint64_t completed_submission = command_processor_.GetCompletedSubmission();
-  {
-    std::lock_guard<std::mutex> lock(deferred_destroy_lock_);
-    if (deferred_destroy_pipelines_.empty()) {
-      return;
-    }
-    auto it = deferred_destroy_pipelines_.begin();
-    while (it != deferred_destroy_pipelines_.end()) {
-      if (force_all || it->first <= completed_submission) {
-        pipelines_to_destroy.push_back(it->second);
-        it = deferred_destroy_pipelines_.erase(it);
-      } else if (!force_all) {
-        // The queue is sorted by submission index.
-        break;
-      } else {
-        ++it;
-      }
-    }
-  }
-  if (pipelines_to_destroy.empty()) {
-    return;
-  }
-  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-  for (VkPipeline pipeline : pipelines_to_destroy) {
-    if (pipeline != VK_NULL_HANDLE) {
-      dfn.vkDestroyPipeline(device, pipeline, nullptr);
-    }
-  }
-}
-
-void VulkanPipelineCache::StorageWriteThread() {
-  ShaderStoredHeader shader_header;
-  // Don't leak anything in unused bits.
-  std::memset(&shader_header, 0, sizeof(shader_header));
-
-  std::vector<uint32_t> ucode_guest_endian;
-  ucode_guest_endian.reserve(0xFFFF);
-
-  bool flush_shaders = false;
-  bool flush_pipelines = false;
-
-  while (true) {
-    if (flush_shaders) {
-      flush_shaders = false;
-      assert_not_null(shader_storage_file_);
-      fflush(shader_storage_file_);
-    }
-    if (flush_pipelines) {
-      flush_pipelines = false;
-      assert_not_null(pipeline_storage_file_);
-      fflush(pipeline_storage_file_);
-    }
-
-    const Shader* shader = nullptr;
-    PipelineStoredDescription pipeline_description;
-    bool write_pipeline = false;
-    {
-      std::unique_lock<std::mutex> lock(storage_write_request_lock_);
-      if (storage_write_thread_shutdown_) {
-        return;
-      }
-      if (!storage_write_shader_queue_.empty()) {
-        shader = storage_write_shader_queue_.front();
-        storage_write_shader_queue_.pop_front();
-      } else if (storage_write_flush_shaders_) {
-        storage_write_flush_shaders_ = false;
-        flush_shaders = true;
-      }
-      if (!storage_write_pipeline_queue_.empty()) {
-        std::memcpy(&pipeline_description, &storage_write_pipeline_queue_.front(),
-                    sizeof(pipeline_description));
-        storage_write_pipeline_queue_.pop_front();
-        write_pipeline = true;
-      } else if (storage_write_flush_pipelines_) {
-        storage_write_flush_pipelines_ = false;
-        flush_pipelines = true;
-      }
-      if (!shader && !write_pipeline) {
-        storage_write_request_cond_.wait(lock);
-        continue;
-      }
-    }
-
-    if (shader) {
-      shader_header.ucode_data_hash = shader->ucode_data_hash();
-      shader_header.ucode_dword_count = shader->ucode_dword_count();
-      shader_header.type = shader->type();
-      assert_not_null(shader_storage_file_);
-      fwrite(&shader_header, sizeof(shader_header), 1, shader_storage_file_);
-      if (shader_header.ucode_dword_count) {
-        ucode_guest_endian.resize(shader_header.ucode_dword_count);
-        // Need to swap because the hash is calculated for the shader with guest
-        // endianness.
-        memory::copy_and_swap(ucode_guest_endian.data(), shader->ucode_dwords(),
-                              shader_header.ucode_dword_count);
-        fwrite(ucode_guest_endian.data(), shader_header.ucode_dword_count * sizeof(uint32_t), 1,
-               shader_storage_file_);
-      }
-    }
-
-    if (write_pipeline) {
-      assert_not_null(pipeline_storage_file_);
-      fwrite(&pipeline_description, sizeof(pipeline_description), 1, pipeline_storage_file_);
-    }
+    EnsurePipelineCreated(creation_arguments);
+    creation_arguments.pipeline->second.creation_pending.store(false, std::memory_order_release);
   }
 }
 

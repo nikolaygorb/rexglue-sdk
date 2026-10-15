@@ -1,0 +1,47 @@
+/**
+ * @file        graphics/shaders/smaa_blending_weight_calculation.cs.xesl
+ * @brief       SMAA swap post effect, pass 2: blending weight calculation
+ *
+ * @copyright   Copyright (c) 2026 ReXGlue fork contributors
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
+
+#include "smaa.xesli"
+
+entry_bindings_begin_compute_xe
+  push_const_binding_xe(buffer(0))
+  entry_binding_next_xe
+  texture_xe(texture_2d_xe, xe_smaa_edges, set=1, binding=0, t0, space0,
+             texture(0))
+  entry_binding_next_xe
+  // AreaTex, R8G8_UNORM, 160x560.
+  texture_xe(texture_2d_xe, xe_smaa_area, set=1, binding=1, t1, space0,
+             texture(1))
+  entry_binding_next_xe
+  // SearchTex, R8_UNORM, 64x16.
+  texture_xe(texture_2d_xe, xe_smaa_search, set=1, binding=2, t2, space0,
+             texture(2))
+  entry_binding_next_xe
+  image_wo_xe(image_2d_xe, image_format_rgba16f_xe, xe_smaa_weights, set=2,
+              binding=0, u0, space0, texture(3))
+entry_bindings_end_inputs_begin_compute_xe
+  entry_in_global_thread_id_xe
+entry_inputs_end_code_begin_compute_xe
+  uint2_xe pixel = in_global_thread_id_xe.xy;
+  dont_flatten_xe
+  if (any(greater_than_equal_xe(pixel, push_const_xe(xe_smaa_size)))) {
+    return;
+  }
+  float2_xe texcoord = XeSmaaTexcoord(pixel);
+  float2_xe pixcoord;
+  float4_xe offset[3];
+  SMAABlendingWeightCalculationVS(texcoord, pixcoord, offset);
+  // No temporal subsample indices (SMAA 1x).
+  float4_xe weights = SMAABlendingWeightCalculationPS(
+      texcoord, pixcoord, offset, xe_smaa_edges, xe_smaa_area, xe_smaa_search,
+      float4_xe(0.0, 0.0, 0.0, 0.0));
+  image_store_2d_rgba_xe(xe_smaa_weights, pixel, weights);
+entry_code_end_compute_xe

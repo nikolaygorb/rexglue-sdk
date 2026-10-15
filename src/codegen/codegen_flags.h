@@ -28,6 +28,7 @@ REXCVAR_DECLARE(uint32_t, max_eh_states);
 REXCVAR_DECLARE(uint32_t, max_eh_try_blocks);
 REXCVAR_DECLARE(uint32_t, max_eh_ip_map_entries);
 REXCVAR_DECLARE(uint32_t, max_seh_scope_entries);
+REXCVAR_DECLARE(std::string, analysis_report);
 
 // Codegen/Discovery
 REXCVAR_DECLARE(uint32_t, backward_scan_limit);

@@ -201,6 +201,36 @@ bool build_ldux(BuilderContext& ctx) {
   return true;
 }
 
+bool build_ldbrx(BuilderContext& ctx) {
+  ctx.print("\t{}.u64 = __builtin_bswap64({}(", ctx.r(ctx.insn.operands[0]),
+            ctx.mmio_check_x_form() ? "REX_MM_LOAD_U64" : "REX_LOAD_U64");
+  if (ctx.insn.operands[1] != 0)
+    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
+  ctx.println("{}.u32));", ctx.r(ctx.insn.operands[2]));
+  return true;
+}
+
+//=============================================================================
+// Multiple Word Load
+//=============================================================================
+
+bool build_lmw(BuilderContext& ctx) {
+  // EA = (rA == 0 ? 0 : r[rA]) + EXTS(d); load r[rD]..r[31] from EA, EA+4, ...
+  // EA is computed first, so rA in the loaded range (an invalid form) still
+  // reads from the original address.
+  uint32_t rD = ctx.insn.operands[0];
+  int32_t offset = static_cast<int32_t>(ctx.insn.operands[1]);
+  uint32_t rA = ctx.insn.operands[2];
+  if (rA != 0)
+    ctx.println("\t{} = {}.u32 + {};", ctx.ea(), ctx.r(rA), offset);
+  else
+    ctx.println("\t{} = {};", ctx.ea(), offset);
+  for (uint32_t i = rD; i <= 31; ++i) {
+    ctx.println("\t{}.u64 = REX_LOAD_U32({} + {});", ctx.r(i), ctx.ea(), (i - rD) * 4);
+  }
+  return true;
+}
+
 //=============================================================================
 // Atomic Load and Reserve
 //=============================================================================
@@ -439,6 +469,15 @@ bool build_stdx(BuilderContext& ctx) {
 
 bool build_stdux(BuilderContext& ctx) {
   emitStoreXFormWithUpdate(ctx, "REX_STORE_U64", "REX_MM_STORE_U64", "u64");
+  return true;
+}
+
+bool build_stdbrx(BuilderContext& ctx) {
+  ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U64(" : "\tREX_STORE_U64(");
+  if (ctx.insn.operands[1] != 0)
+    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
+  ctx.println("{}.u32, __builtin_bswap64({}.u64));", ctx.r(ctx.insn.operands[2]),
+              ctx.r(ctx.insn.operands[0]));
   return true;
 }
 

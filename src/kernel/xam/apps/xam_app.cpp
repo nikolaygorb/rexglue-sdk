@@ -9,9 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstring>
+#include <string>
+
 #include <rex/kernel/xam/apps/app.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xam/content_device.h>
 #include <rex/system/xenumerator.h>
 #include <rex/thread.h>
 
@@ -60,27 +64,42 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       uint32_t item_count = 0;
       auto result = e->WriteItems(data->buffer_ptr, buffer, &item_count);
 
+      // The caller reads the count whatever the result, so always write it.
+      if (data->length_ptr) {
+        auto length_ptr = memory_->TranslateVirtual<be<uint32_t>*>(data->length_ptr);
+        *length_ptr = (result == X_ERROR_SUCCESS && item_count >= 1) ? 1 : 0;
+      }
       if (result == X_ERROR_SUCCESS && item_count >= 1) {
-        if (data->length_ptr) {
-          auto length_ptr = memory_->TranslateVirtual<be<uint32_t>*>(data->length_ptr);
-          *length_ptr = 1;
-        }
         return X_E_SUCCESS;
       }
       return X_E_NO_MORE_FILES;
     }
     case 0x00020021: {
-      struct message_data {
-        char unk_00[64];
-        rex::be<uint32_t> unk_40;  // KeGetCurrentProcessType() < 1 ? 1 : 0
-        rex::be<uint32_t> unk_44;  // ? output_ptr ?
-        rex::be<uint32_t> unk_48;  // ? overlapped_ptr ?
-      }* data = reinterpret_cast<message_data*>(buffer);
-      assert_true(buffer_length == sizeof(message_data));
-      auto unk = memory_->TranslateVirtual<rex::be<uint32_t>*>(data->unk_44);
-      *unk = 0;
-      REXKRNL_DEBUG("XamApp(0x00020021)('{}', {:08X}, {:08X}, {:08X})", data->unk_00,
-                    (uint32_t)data->unk_40, (uint32_t)data->unk_44, (uint32_t)data->unk_48);
+      // XContentQueryVolumeDeviceType, as xenia-canary answers it.
+      struct XContentQueryVolumeDeviceType {
+        char root_name[64];
+        rex::be<uint32_t> is_title_process;
+        rex::be<uint32_t> device_type_ptr;
+        rex::be<uint32_t> overlapped_ptr;
+      }* data = reinterpret_cast<XContentQueryVolumeDeviceType*>(buffer);
+      assert_true(buffer_length == sizeof(XContentQueryVolumeDeviceType));
+      REXKRNL_DEBUG("XContentQueryVolumeDeviceType('{}', {:08X}, {:08X}, {:08X})", data->root_name,
+                    (uint32_t)data->is_title_process, (uint32_t)data->device_type_ptr,
+                    (uint32_t)data->overlapped_ptr);
+
+      // Only a root that links to an XContent package has a volume device
+      // type; a title running from disc (an extracted image) gets an error.
+      std::string target;
+      const std::string root(data->root_name, strnlen(data->root_name, sizeof(data->root_name)));
+      if (!REX_KERNEL_FS()->FindSymbolicLink(root + ':', target) ||
+          !target.starts_with("\\Device\\Package_")) {
+        return X_E_INVALIDARG;
+      }
+      // Packages live on the (emulated) hard drive.
+      if (data->device_type_ptr) {
+        *memory_->TranslateVirtual<rex::be<uint32_t>*>(data->device_type_ptr) =
+            static_cast<uint32_t>(DeviceType::HDD);
+      }
       return X_E_SUCCESS;
     }
     case 0x00021012: {

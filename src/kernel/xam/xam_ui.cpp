@@ -548,6 +548,29 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
       overlapped.guest_address());
 }
 
+// There is no marketplace or achievements UI to show from here. As in
+// xenia-canary's headless path, after its argument checks the UI opens and
+// closes at once (XN_SYS_UI on, then off), so the title gets a defined answer
+// and returns to its menu.
+u32 XamShowMarketplaceUI_entry(u32 user_index, u32 ui_type, u64 /*offer_id*/, u32 /*offer_type*/,
+                               u32 /*content_category*/, u32 /*title_id*/) {
+  constexpr uint32_t kMarketplaceEntrypointCount = 25;
+  if (user_index >= 4 || ui_type >= kMarketplaceEntrypointCount) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!xeXamUserGetSigninState(user_index)) {
+    return X_ERROR_NO_SUCH_USER;
+  }
+  return xeXamDispatchHeadless([]() -> X_RESULT { return X_ERROR_SUCCESS; }, 0);
+}
+
+u32 XamShowAchievementsUI_entry(u32 user_index, u32 /*title_id*/) {
+  if (!xeXamUserGetSigninState(user_index)) {
+    return X_ERROR_NO_SUCH_USER;
+  }
+  return xeXamDispatchHeadless([]() -> X_RESULT { return X_ERROR_SUCCESS; }, 0);
+}
+
 void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
   REXKRNL_ERROR("XamShowDirtyDiscErrorUI called! user_index={}", uint32_t(user_index));
   REXKRNL_ERROR("This indicates a disc/file read error - check that all game files exist");
@@ -597,6 +620,8 @@ uint32_t XamShowMessageBoxUIEx_entry() {
 }  // namespace rex
 
 REX_EXPORT(__imp__XamIsUIActive, rex::kernel::xam::XamIsUIActive_entry)
+REX_EXPORT(__imp__XamShowMarketplaceUI, rex::kernel::xam::XamShowMarketplaceUI_entry)
+REX_EXPORT(__imp__XamShowAchievementsUI, rex::kernel::xam::XamShowAchievementsUI_entry)
 REX_EXPORT(__imp__XamShowMessageBoxUI, rex::kernel::xam::XamShowMessageBoxUI_entry)
 REX_EXPORT(__imp__XamShowKeyboardUI, rex::kernel::xam::XamShowKeyboardUI_entry)
 REX_EXPORT(__imp__XamShowDeviceSelectorUI, rex::kernel::xam::XamShowDeviceSelectorUI_entry)
@@ -615,7 +640,6 @@ REX_EXPORT_STUB(__imp__XamNavigate);
 REX_EXPORT_STUB(__imp__XamNavigateBack);
 REX_EXPORT_STUB(__imp__XamOverrideHudOpenType);
 REX_EXPORT_STUB(__imp__XamShowAchievementDetailsUI);
-REX_EXPORT_STUB(__imp__XamShowAchievementsUI);
 REX_EXPORT_STUB(__imp__XamShowAchievementsUIEx);
 REX_EXPORT_STUB(__imp__XamShowAndWaitForMessageBoxEx);
 REX_EXPORT_STUB(__imp__XamShowAvatarAwardGamesUI);
@@ -664,7 +688,6 @@ REX_EXPORT_STUB(__imp__XamShowMarketplaceDownloadItemsUI);
 REX_EXPORT_STUB(__imp__XamShowMarketplaceGetOrderReceipts);
 REX_EXPORT_STUB(__imp__XamShowMarketplacePurchaseOrderUI);
 REX_EXPORT_STUB(__imp__XamShowMarketplacePurchaseOrderUIEx);
-REX_EXPORT_STUB(__imp__XamShowMarketplaceUI);
 REX_EXPORT_STUB(__imp__XamShowMarketplaceUIEx);
 REX_EXPORT_STUB(__imp__XamShowMessageBox);
 REX_EXPORT_STUB(__imp__XamShowMessageComposeUI);
@@ -713,7 +736,6 @@ REX_EXPORT_STUB(__imp__XamShowRecentMessageUI);
 REX_EXPORT_STUB(__imp__XamShowRecentMessageUIEx);
 REX_EXPORT_STUB(__imp__XamShowReputationUI);
 REX_EXPORT_STUB(__imp__XamShowSigninUIEx);
-REX_EXPORT_STUB(__imp__XamShowSigninUIp);
 REX_EXPORT_STUB(__imp__XamShowSignupCreditCardUI);
 REX_EXPORT_STUB(__imp__XamShowSocialPostUI);
 REX_EXPORT_STUB(__imp__XamShowStorePickerUI);

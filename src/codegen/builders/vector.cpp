@@ -90,38 +90,62 @@ bool build_vmulfp128(BuilderContext& ctx) {
   return true;
 }
 
-bool build_vmaddfp(BuilderContext& ctx) {
+// vD = +-(vA * vC +- vB), with the NaN rules of rex::ppc::vec_madd_result: the
+// first NaN operand in vA, vB, vC order wins, and a negation never reaches a
+// NaN. Operands are (vD, vA, vC, vB) in encoding order.
+static void emit_vec_madd(BuilderContext& ctx, bool negate) {
   ctx.emit_set_flush_mode(true);
-  ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));",
-      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
-      ctx.v(ctx.insn.operands[3]));
+  ctx.println("\t{{");
+  ctx.println("\t\tsimde__m128 a = simde_mm_load_ps({}.f32);", ctx.v(ctx.insn.operands[1]));
+  ctx.println("\t\tsimde__m128 c = simde_mm_load_ps({}.f32);", ctx.v(ctx.insn.operands[2]));
+  ctx.println("\t\tsimde__m128 b = simde_mm_load_ps({}.f32);", ctx.v(ctx.insn.operands[3]));
+  ctx.println("\t\tsimde__m128 r = simde_mm_{}_ps(simde_mm_mul_ps(a, c), b);",
+              negate ? "sub" : "add");
+  ctx.println("\t\tsimde_mm_store_ps({}.f32, rex::ppc::vec_madd_result(r, a, b, c, {}));",
+              ctx.v(ctx.insn.operands[0]), negate ? "true" : "false");
+  ctx.println("\t}}");
+}
+
+bool build_vmaddfp(BuilderContext& ctx) {
+  emit_vec_madd(ctx, false);
   return true;
 }
 
 bool build_vnmsubfp(BuilderContext& ctx) {
-  // vnmsubfp: vD = -(vA * vB - vC) - negation done by XOR with sign bit (0x80000000)
-  ctx.emit_set_flush_mode(true);
-  ctx.println(
-      "\tsimde_mm_store_ps({}.f32, "
-      "simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)), "
-      "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));",
-      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
-      ctx.v(ctx.insn.operands[3]));
+  // vnmsubfp: vD = -(vA * vC - vB)
+  emit_vec_madd(ctx, true);
   return true;
 }
 
-bool build_vmaxfp(BuilderContext& ctx) {
+// vmaxfp/vminfp as the hardware does them, not as maxps/minps: a NaN operand
+// is returned quieted (vA's when both are), and max(+0, -0) is +0 while
+// min(+0, -0) is -0 in either operand order. maxps/minps return their second
+// operand for a NaN or for equal values, so both orders are combined: AND
+// keeps +0 for max, OR keeps -0 for min.
+static void emit_vec_fp_max_min(BuilderContext& ctx, bool is_max) {
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("max");
+  const char* op = is_max ? "max" : "min";
+  ctx.println("\t{{");
+  ctx.println("\t\tsimde__m128 a = simde_mm_load_ps({}.f32);", ctx.v(ctx.insn.operands[1]));
+  ctx.println("\t\tsimde__m128 b = simde_mm_load_ps({}.f32);", ctx.v(ctx.insn.operands[2]));
+  ctx.println("\t\tsimde__m128 r = simde_mm_{}_ps(simde_mm_{}_ps(a, b), simde_mm_{}_ps(b, a));",
+              is_max ? "and" : "or", op, op);
+  ctx.println(
+      "\t\tsimde__m128 qnan = simde_mm_or_ps(simde_mm_blendv_ps(b, a, simde_mm_cmpunord_ps(a, a)), "
+      "simde_mm_castsi128_ps(simde_mm_set1_epi32(0x00400000)));");
+  ctx.println(
+      "\t\tsimde_mm_store_ps({}.f32, simde_mm_blendv_ps(r, qnan, simde_mm_cmpunord_ps(a, b)));",
+      ctx.v(ctx.insn.operands[0]));
+  ctx.println("\t}}");
+}
+
+bool build_vmaxfp(BuilderContext& ctx) {
+  emit_vec_fp_max_min(ctx, true);
   return true;
 }
 
 bool build_vminfp(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("min");
+  emit_vec_fp_max_min(ctx, false);
   return true;
 }
 
@@ -148,10 +172,16 @@ bool build_vexptefp(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(true);
   ctx.println("\t{{");
   ctx.println("\t\tsimde__m128 x = simde_mm_load_ps({}.f32);", vA);
+  // The exponent field only holds n in [-126, 127]: clamp x into that range
+  // (NaN passes through, max/min return the second operand) and fix up the
+  // out-of-range lanes after.
   ctx.println(
-      "\t\tsimde__m128 n = simde_mm_round_ps(x, "
+      "\t\tsimde__m128 xc = simde_mm_min_ps(simde_mm_set1_ps(127.99999f), "
+      "simde_mm_max_ps(simde_mm_set1_ps(-126.0f), x));");
+  ctx.println(
+      "\t\tsimde__m128 n = simde_mm_round_ps(xc, "
       "SIMDE_MM_FROUND_TO_NEG_INF | SIMDE_MM_FROUND_NO_EXC);");
-  ctx.println("\t\tsimde__m128 f = simde_mm_sub_ps(x, n);");
+  ctx.println("\t\tsimde__m128 f = simde_mm_sub_ps(xc, n);");
   // 4th-order minimax polynomial for 2^f, f in [0,1), ~12-bit accuracy
   ctx.println("\t\tsimde__m128 p = simde_mm_set1_ps(1.8775767e-3f);");
   ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(8.9893397e-3f));");
@@ -162,10 +192,15 @@ bool build_vexptefp(BuilderContext& ctx) {
   // Construct 2^n by adding n to the IEEE 754 exponent bias and shifting into place
   ctx.println("\t\tsimde__m128i exp_bits = simde_mm_slli_epi32(");
   ctx.println("\t\t\tsimde_mm_add_epi32(simde_mm_cvttps_epi32(n), simde_mm_set1_epi32(127)), 23);");
+  ctx.println("\t\tsimde__m128 r = simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits));");
+  // Below 2^-126 flush to 0 (non-Java mode), from 2^128 up +inf.
   ctx.println(
-      "\t\tsimde_mm_store_ps({}.f32, "
-      "simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits)));",
-      vD);
+      "\t\tr = simde_mm_blendv_ps(r, simde_mm_setzero_ps(), "
+      "simde_mm_cmplt_ps(x, simde_mm_set1_ps(-126.0f)));");
+  ctx.println(
+      "\t\tr = simde_mm_blendv_ps(r, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7F800000)), "
+      "simde_mm_cmpge_ps(x, simde_mm_set1_ps(128.0f)));");
+  ctx.println("\t\tsimde_mm_store_ps({}.f32, r);", vD);
   ctx.println("\t}}");
   return true;
 }
@@ -183,24 +218,53 @@ bool build_vlogefp(BuilderContext& ctx) {
 // Vector Dot Products
 //=============================================================================
 
+// Xenon's dot products return QNaN where the sum of finite inputs overflows; dpps gives an
+// infinity there (or NaN, when products overflow both ways). The dpps result is kept when it
+// is finite, which is one well-predicted branch on its exponent. Otherwise the sum is redone
+// as Xenia's x64 backend does (DOT_PRODUCT_3/4): float64 products and sums in its order,
+// (x + z) + y or (x + z) + (y + w), rounded to float32; a float32 overflow of that finite sum
+// is QNaN 0x7FC00000, and an infinity or NaN that came from the inputs is kept. Host lanes
+// 3..0 hold the guest's x, y, z, w.
+static void emit_dot_product(BuilderContext& ctx, const char* mask, bool four) {
+  auto vD = ctx.v(ctx.insn.operands[0]);
+  auto vA = ctx.v(ctx.insn.operands[1]);
+  auto vB = ctx.v(ctx.insn.operands[2]);
+  ctx.emit_set_flush_mode(true);
+  ctx.println("\t{{");
+  ctx.println(
+      "\t\tsimde__m128 d = simde_mm_dp_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), "
+      "{});",
+      vA, vB, mask);
+  ctx.println(
+      "\t\tif ((uint32_t(simde_mm_cvtsi128_si32(simde_mm_castps_si128(d))) << 1) >= "
+      "0xFF000000u) [[unlikely]] {{");
+  ctx.println("\t\t\tdouble s = double({0}.f32[3]) * {1}.f32[3] + double({0}.f32[1]) * {1}.f32[1];",
+              vA, vB);
+  if (four) {
+    ctx.println("\t\t\ts += double({0}.f32[2]) * {1}.f32[2] + double({0}.f32[0]) * {1}.f32[0];", vA,
+                vB);
+  } else {
+    ctx.println("\t\t\ts += double({0}.f32[2]) * {1}.f32[2];", vA, vB);
+  }
+  ctx.println("\t\t\tfloat f = float(s);");
+  ctx.println(
+      "\t\t\td = std::isinf(f) && std::isfinite(s) ? "
+      "simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7FC00000)) : simde_mm_set1_ps(f);");
+  ctx.println("\t\t}}");
+  ctx.println("\t\tsimde_mm_store_ps({}.f32, d);", vD);
+  ctx.println("\t}}");
+}
+
 bool build_vmsum3fp128(BuilderContext& ctx) {
   // 3-element dot product accounting for guest->host vector element reversal
   // 0xEF = dot(yzw) with result broadcast to all elements (see constants doc)
-  ctx.emit_set_flush_mode(true);
-  ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_dp_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32), 0xEF));",
-      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
+  emit_dot_product(ctx, "0xEF", false);
   return true;
 }
 
 bool build_vmsum4fp128(BuilderContext& ctx) {
   // 4-element dot product: 0xFF = all 4 elements, result to all (see constants doc)
-  ctx.emit_set_flush_mode(true);
-  ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_dp_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32), 0xFF));",
-      ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
+  emit_dot_product(ctx, "0xFF", true);
   return true;
 }
 
@@ -557,40 +621,33 @@ bool build_vcmpbfp(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(true);
   // vcmpbfp: Vector Compare Bounds Floating Point
   // For each element i:
-  //   bit 0 (0x80000000) = 1 if vSrcA[i] > vSrcB[i]
-  //   bit 1 (0x40000000) = 1 if vSrcA[i] < -vSrcB[i]
-  auto vA = ctx.v(ctx.insn.operands[1]);
-  auto vB = ctx.v(ctx.insn.operands[2]);
-  auto vD = ctx.v(ctx.insn.operands[0]);
-
-  // Use v_temp as intermediate storage
-  // gt_mask = (vA > vB) & 0x80000000
+  //   bit 0 (0x80000000) = 1 if vA[i] > vB[i]
+  //   bit 1 (0x40000000) = 1 if vA[i] < -vB[i]
+  // A NaN in either operand is out of bounds both ways, so both bits are set.
+  ctx.println("\t{{");
+  ctx.println("\t\tsimde__m128 a = simde_mm_load_ps({}.f32);", ctx.v(ctx.insn.operands[1]));
+  ctx.println("\t\tsimde__m128 b = simde_mm_load_ps({}.f32);", ctx.v(ctx.insn.operands[2]));
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_and_ps(simde_mm_cmpgt_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));",
-      ctx.v_temp(), vA, vB);
-  // lt_neg_mask = (vA < -vB) & 0x40000000
+      "\t\tsimde__m128 sign = simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)));");
+  ctx.println("\t\tsimde__m128 unord = simde_mm_cmpunord_ps(a, b);");
+  ctx.println("\t\tsimde__m128 gt = simde_mm_or_ps(simde_mm_cmpgt_ps(a, b), unord);");
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_and_ps(simde_mm_cmplt_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_xor_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))))), "
-      "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x40000000)))));",
-      vD, vA, vB);
-  // result = gt_mask | lt_neg_mask
+      "\t\tsimde__m128 lt = simde_mm_or_ps(simde_mm_cmplt_ps(a, simde_mm_xor_ps(b, sign)), "
+      "unord);");
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_or_ps(simde_mm_load_ps({}.f32), "
-      "simde_mm_load_ps({}.f32)));",
-      vD, ctx.v_temp(), vD);
-
-  // CR6 from vD: movemask_ps only checks bit 31, but lower-bound violations only
-  // set bit 30. Shift left by 1 to move bit 30 into bit 31, then OR with original
-  // so movemask detects both upper and lower bound violations.
-  if (isRecordForm(ctx.insn))
+      "\t\tsimde__m128 r = simde_mm_or_ps(simde_mm_and_ps(gt, sign), "
+      "simde_mm_and_ps(lt, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x40000000))));");
+  ctx.println("\t\tsimde_mm_store_ps({}.f32, r);", ctx.v(ctx.insn.operands[0]));
+  // CR6[2] is set when every element is in bounds; vcmpbfp writes no other
+  // bit. movemask_ps only sees bit 31, so bit 30 is shifted up into it first.
+  if (isRecordForm(ctx.insn)) {
     ctx.println(
-        "\t{}.setFromMask(simde_mm_castsi128_ps(simde_mm_or_si128("
-        "simde_mm_load_si128((simde__m128i*){}.f32), "
-        "simde_mm_slli_epi32(simde_mm_load_si128((simde__m128i*){}.f32), 1))), 0xF);",
-        ctx.cr(6), vD, vD);
+        "\t\t{}.setFromMask(simde_mm_castsi128_ps(simde_mm_or_si128(simde_mm_castps_si128(r), "
+        "simde_mm_slli_epi32(simde_mm_castps_si128(r), 1))), 0xF);",
+        ctx.cr(6));
+    ctx.println("\t\t{}.lt = 0;", ctx.cr(6));
+  }
+  ctx.println("\t}}");
   return true;
 }
 
@@ -1501,20 +1558,21 @@ bool build_vupkd3d128(BuilderContext& ctx) {
     {
       auto vSrc = ctx.v(ctx.insn.operands[1]);
       auto vDst = ctx.v(ctx.insn.operands[0]);
-      // Format: w(4 bits):z(20 bits):y(20 bits):x(20 bits) in 64 bits
-      // x, y, z --> floats, w --> float
-      ctx.println("\t{}.u64[0] = {}.u64[1];", ctx.v_temp(), vSrc);
-      // x (bits 0-19) - sign extend from 20 bits
-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 44) >> 44);", ctx.temp(), ctx.v_temp());
-      ctx.println("\t{}.f32[0] = float({}.s32);", vDst, ctx.temp());
-      // y (bits 20-39) - sign extend from 20 bits
-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 24) >> 44);", ctx.temp(), ctx.v_temp());
-      ctx.println("\t{}.f32[1] = float({}.s32);", vDst, ctx.temp());
-      // z (bits 40-59) - sign extend from 20 bits
-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 4) >> 44);", ctx.temp(), ctx.v_temp());
-      ctx.println("\t{}.f32[2] = float({}.s32);", vDst, ctx.temp());
-      // w (bits 60-63) - 4 bits
-      ctx.println("\t{}.f32[3] = float({}.u64[0] >> 60);", vDst, ctx.v_temp());
+      // Format: w(4 bits):z(20 bits):y(20 bits):x(20 bits) in Guest elements 2-3 (host u64[0])
+      // x, y, z --> 3.0+X form (signed 20-bit), w --> 1.0+w form; -0x80000 gives QNaN
+      // Output: x --> Guest element 0 (host u32[3]), y --> Guest element 1 (host u32[2]),
+      //         z --> Guest element 2 (host u32[1]), w --> Guest element 3 (host u32[0])
+      ctx.println("\t{}.u64[0] = {}.u64[0];", ctx.v_temp(), vSrc);
+      for (size_t i = 0; i < 3; i++) {
+        // Field i at bits 20*i .. 20*i+19, sign extended from 20 bits
+        ctx.println("\t{}.s32 = int32_t(int64_t({}.u64[0] << {}) >> 44);", ctx.temp(),
+                    ctx.v_temp(), 44 - 20 * i);
+        ctx.println(
+            "\t{}.u32[{}] = {}.s32 == -0x80000 ? 0x7FC00000u : uint32_t({}.s32 + 0x40400000);",
+            vDst, 3 - i, ctx.temp(), ctx.temp());
+      }
+      // w (bits 60-63) - 4 bits, 1.0+w form
+      ctx.println("\t{}.u32[0] = uint32_t({}.u64[0] >> 60) | 0x3F800000;", vDst, ctx.v_temp());
       break;
     }
 

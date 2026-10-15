@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/filesystem/device.h>
+#include <rex/kernel/xboxkrnl/ob.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -121,8 +122,15 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   rex::filesystem::Entry* root_entry = nullptr;
 
+  const bool has_root_handle = object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
+                               object_attrs->root_directory != 0;
+
   // Compute path, possibly attrs relative.
   auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  // A name relative to a directory handle is never under \??\.
+  if (!has_root_handle) {
+    xeObStripDosDevicesPrefix(target_path);
+  }
   REXKRNL_IMPORT_TRACE(
       "NtCreateFile", "path={} access={:#x} attrs={:#x} share={:#x} disp={:#x} options={:#x}",
       target_path, (uint32_t)desired_access, (uint32_t)file_attributes, (uint32_t)share_access,
@@ -133,8 +141,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     return X_STATUS_OBJECT_NAME_INVALID;
   }
 
-  if (object_attrs->root_directory != 0xFFFFFFFD &&  // ObDosDevices
-      object_attrs->root_directory != 0) {
+  if (has_root_handle) {
     auto root_file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(object_attrs->root_directory);
     assert_not_null(root_file);
     assert_true(root_file->type() == XObject::Type::File);
@@ -178,9 +185,11 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
 u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
                      ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attributes,
-                     ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, u32 open_options) {
+                     ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, u32 share_access,
+                     u32 open_options) {
   return NtCreateFile_entry(handle_out, desired_access, object_attributes, io_status_block, nullptr,
-                            0, 0, static_cast<uint32_t>(rex::filesystem::FileDisposition::kOpen),
+                            0, share_access,
+                            static_cast<uint32_t>(rex::filesystem::FileDisposition::kOpen),
                             open_options);
 }
 
@@ -529,6 +538,10 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
   }
 
   auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  // A name relative to a directory handle is never under \??\.
+  if (!root_file) {
+    xeObStripDosDevicesPrefix(target_path);
+  }
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
@@ -539,6 +552,7 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
   auto entry = REX_KERNEL_FS()->ResolvePath(target_path);
   if (entry) {
     // Found.
+    entry->update();
     file_info->creation_time = entry->create_timestamp();
     file_info->last_access_time = entry->access_timestamp();
     file_info->last_write_time = entry->write_timestamp();
@@ -620,7 +634,9 @@ u32 NtOpenSymbolicLinkObject_entry(mapped_u32 handle_out,
 
   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
 
-  auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+  // The prefix goes before the check: IsValidPath rejects '?'.
+  auto target_path =
+      xeObSymbolicLinkName(util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name));
 
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
@@ -629,10 +645,6 @@ u32 NtOpenSymbolicLinkObject_entry(mapped_u32 handle_out,
 
   if (object_attrs->root_directory != 0) {
     assert_always();
-  }
-
-  if (rex::string::utf8_starts_with(target_path, "\\??\\")) {
-    target_path = target_path.substr(4);  // Strip the full qualifier
   }
 
   std::string link_path;
@@ -758,6 +770,18 @@ u32 StfsControlDevice_entry(mapped_void device_object, u32 ioctl, mapped_void in
   return X_STATUS_SUCCESS;
 }
 
+void IoDeleteDevice_entry(mapped_void device_ptr) {
+  if (device_ptr) {
+    REX_KERNEL_MEMORY()->SystemHeapFree(device_ptr.guest_address());
+  }
+}
+
+u32 NtCancelIoFile_entry(u32 handle) {
+  // I/O completes synchronously here, so there is never anything to cancel.
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(handle);
+  return file ? X_STATUS_SUCCESS : X_STATUS_INVALID_HANDLE;
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__NtCreateFile, rex::kernel::xboxkrnl::NtCreateFile_entry)
@@ -784,6 +808,8 @@ REX_EXPORT(__imp__IoSynchronousDeviceIoControlRequest,
            rex::kernel::xboxkrnl::IoSynchronousDeviceIoControlRequest_entry)
 REX_EXPORT(__imp__StfsCreateDevice, rex::kernel::xboxkrnl::StfsCreateDevice_entry)
 REX_EXPORT(__imp__StfsControlDevice, rex::kernel::xboxkrnl::StfsControlDevice_entry)
+REX_EXPORT(__imp__IoDeleteDevice, rex::kernel::xboxkrnl::IoDeleteDevice_entry)
+REX_EXPORT(__imp__NtCancelIoFile, rex::kernel::xboxkrnl::NtCancelIoFile_entry)
 
 REX_EXPORT_STUB(__imp__IoAcquireDeviceObjectLock);
 REX_EXPORT_STUB(__imp__IoAllocateIrp);
@@ -794,7 +820,6 @@ REX_EXPORT_STUB(__imp__IoCallDriver);
 REX_EXPORT_STUB(__imp__IoCheckShareAccess);
 REX_EXPORT_STUB(__imp__IoCompleteRequest);
 REX_EXPORT_STUB(__imp__IoCreateFile);
-REX_EXPORT_STUB(__imp__IoDeleteDevice);
 REX_EXPORT_STUB(__imp__IoDismountVolume);
 REX_EXPORT_STUB(__imp__IoFreeIrp);
 REX_EXPORT_STUB(__imp__IoInitializeIrp);
@@ -813,7 +838,6 @@ REX_EXPORT_STUB(__imp__NtSetSystemTime);
 REX_EXPORT_STUB(__imp__NtWriteFileGather);
 REX_EXPORT_STUB(__imp__IoAcquireCancelSpinLock);
 REX_EXPORT_STUB(__imp__IoReleaseCancelSpinLock);
-REX_EXPORT_STUB(__imp__NtCancelIoFile);
 REX_EXPORT_STUB(__imp__NtCancelIoFileEx);
 REX_EXPORT_STUB(__imp__SvodCreateDevice);
 

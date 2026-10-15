@@ -60,8 +60,20 @@ bool build_eieio(BuilderContext& ctx) {
   return true;
 }
 
+bool build_isync(BuilderContext& ctx) {
+  // isync: context synchronization. There is no instruction context to
+  // discard here; what remains is its use as an import barrier after a lock
+  // acquire (lwarx/stwcx./bne/isync): later loads must not move above it.
+  //
+  // x86_64: no instruction (compiler barrier only).
+  // ARM64:  emits dmb ishld.
+  ctx.println("\tstd::atomic_thread_fence(std::memory_order_acquire);");
+  return true;
+}
+
 bool build_db16cyc(BuilderContext& ctx) {
-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
+  // Xenon-specific delay hints (db8cyc, db10cyc, db12cyc, db16cyc), no effect
+  // in recompiled code
   (void)ctx;
   return true;
 }
@@ -159,16 +171,6 @@ bool build_dcbtst(BuilderContext& ctx) {
   return true;
 }
 
-bool build_dcbz(BuilderContext& ctx) {
-  // Compute EA, align to 32-byte cache line, apply physical offset
-  ctx.print("\t{} = (", ctx.ea());
-  if (ctx.insn.operands[0] != 0)
-    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[0]));
-  ctx.println("{}.u32) & ~31;", ctx.r(ctx.insn.operands[1]));
-  ctx.println("\tmemset((void*)REX_RAW_ADDR({}), 0, 32);", ctx.ea());
-  return true;
-}
-
 bool build_dcbzl(BuilderContext& ctx) {
   // Compute EA, align to 128-byte cache line, apply physical offset
   ctx.print("\t{} = (", ctx.ea());
@@ -179,8 +181,32 @@ bool build_dcbzl(BuilderContext& ctx) {
   return true;
 }
 
+bool build_dcbz(BuilderContext& ctx) {
+  // Xenon has no short cache line: plain dcbz clears 128 bytes too.
+  return build_dcbzl(ctx);
+}
+
 bool build_dcbst(BuilderContext& ctx) {
   // Hint instruction, access violation callback handlers take care of this on write
+  (void)ctx;
+  return true;
+}
+
+bool build_icbi(BuilderContext& ctx) {
+  // Instruction cache block invalidate: guest code is recompiled ahead of
+  // time, so there is no translated copy to invalidate
+  (void)ctx;
+  return true;
+}
+
+bool build_dst(BuilderContext& ctx) {
+  // Data stream touch (dst, dstt, dstst, dststt): prefetch hint, no semantic effect
+  (void)ctx;
+  return true;
+}
+
+bool build_dss(BuilderContext& ctx) {
+  // Data stream stop (dss, dssall): ends a dst prefetch, no semantic effect
   (void)ctx;
   return true;
 }
@@ -224,6 +250,11 @@ bool build_mfxer(BuilderContext& ctx) {
 
 bool build_mfctr(BuilderContext& ctx) {
   ctx.println("\t{}.u64 = {}.u64;", ctx.r(ctx.insn.operands[0]), ctx.ctr());
+  return true;
+}
+
+bool build_mfvrsave(BuilderContext& ctx) {
+  ctx.println("\t{}.u64 = ctx.vrsave;", ctx.r(ctx.insn.operands[0]));
   return true;
 }
 
@@ -343,11 +374,22 @@ bool build_mtmsrd(BuilderContext& ctx) {
   return true;
 }
 
+// FPSCR is modelled as its rounding mode (RN, the low two bits of field 7);
+// the exception and status bits are not tracked and read as zero. So CR1 of a
+// record-form FPSCR instruction (FX, FEX, VX, OX) is always clear.
+static void emit_fpscr_record(BuilderContext& ctx) {
+  if (isRecordForm(ctx.insn)) {
+    ctx.println("\t{0}.lt = 0; {0}.gt = 0; {0}.eq = 0; {0}.so = 0;", ctx.cr(1));
+  }
+}
+
 bool build_mtfsf(BuilderContext& ctx) {
+  // FM bit 7 (the leftmost) selects field 0, the top nibble of FPSCR; bit 0
+  // selects field 7, the low nibble with RN.
   uint32_t fm = ctx.insn.operands[0];
   uint32_t mask = 0;
   for (int j = 0; j < 8; j++) {
-    if (fm & (1 << (7 - j)))
+    if (fm & (1 << j))
       mask |= 0xF << (4 * j);
   }
   if (mask == 0xFFFFFFFF) {
@@ -357,6 +399,58 @@ bool build_mtfsf(BuilderContext& ctx) {
         "\tctx.fpscr.storeFromGuest((ctx.fpscr.loadFromHost() & 0x{:08X}) | ({}.u32 & 0x{:08X}));",
         ~mask, ctx.f(ctx.insn.operands[1]), mask);
   }
+  emit_fpscr_record(ctx);
+  return true;
+}
+
+bool build_mtfsfi(BuilderContext& ctx) {
+  // FPSCR[BF] <- U. Only field 7 holds modelled bits.
+  const uint32_t field = ctx.insn.operands[0];
+  const uint32_t imm = ctx.insn.operands[1] & 0xF;
+  if (field == 7) {
+    ctx.println("\tctx.fpscr.storeFromGuest({});", imm);
+  }
+  emit_fpscr_record(ctx);
+  return true;
+}
+
+static void emit_mtfsb(BuilderContext& ctx, bool set) {
+  // FPSCR bit BT (0 = leftmost). Bits 30 and 31 are RN; the rest are not
+  // modelled.
+  const uint32_t bt = ctx.insn.operands[0];
+  if (bt == 30 || bt == 31) {
+    const uint32_t bit = 1u << (31 - bt);
+    if (set) {
+      ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() | {});", bit);
+    } else {
+      ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() & ~{}u);", bit);
+    }
+  }
+  emit_fpscr_record(ctx);
+}
+
+bool build_mtfsb0(BuilderContext& ctx) {
+  emit_mtfsb(ctx, false);
+  return true;
+}
+
+bool build_mtfsb1(BuilderContext& ctx) {
+  emit_mtfsb(ctx, true);
+  return true;
+}
+
+bool build_mcrfs(BuilderContext& ctx) {
+  // CR[BF] <- FPSCR[BFA]. Field 7 is (0, NI, RN); NI is not modelled. The
+  // exception bits mcrfs would clear are not tracked either.
+  const auto cr = ctx.cr(ctx.insn.operands[0]);
+  if (ctx.insn.operands[1] == 7) {
+    ctx.println("\t{{");
+    ctx.println("\t\tuint32_t rn = ctx.fpscr.loadFromHost();");
+    ctx.println("\t\t{0}.lt = 0; {0}.gt = 0; {0}.eq = (rn >> 1) & 1; {0}.so = rn & 1;", cr);
+    ctx.println("\t}}");
+  } else {
+    ctx.println("\t{0}.lt = 0; {0}.gt = 0; {0}.eq = 0; {0}.so = 0;", cr);
+  }
   return true;
 }
 
@@ -364,6 +458,11 @@ bool build_mtxer(BuilderContext& ctx) {
   ctx.println("\t{}.so = ({}.u64 & 0x80000000) != 0;", ctx.xer(), ctx.r(ctx.insn.operands[0]));
   ctx.println("\t{}.ov = ({}.u64 & 0x40000000) != 0;", ctx.xer(), ctx.r(ctx.insn.operands[0]));
   ctx.println("\t{}.ca = ({}.u64 & 0x20000000) != 0;", ctx.xer(), ctx.r(ctx.insn.operands[0]));
+  return true;
+}
+
+bool build_mtvrsave(BuilderContext& ctx) {
+  ctx.println("\tctx.vrsave = {}.u32;", ctx.r(ctx.insn.operands[0]));
   return true;
 }
 

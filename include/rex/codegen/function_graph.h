@@ -187,8 +187,12 @@ class FunctionGraph {
   // target: address being branched to
   // callerAddr: address of the branch instruction
   // isCallInstruction: true for bl (expects return), false for b (no return)
+  // caller: the function whose code holds the branch; when null, the function
+  //   containing callerAddr. Pass it when emitting: functions can overlap, and
+  //   the one containing an address is not always the one being emitted.
   // Returns how the target should be treated during code generation.
-  TargetKind classifyTarget(uint32_t target, uint32_t callerAddr, bool isCallInstruction) const;
+  TargetKind classifyTarget(uint32_t target, uint32_t callerAddr, bool isCallInstruction,
+                            const FunctionNode* caller = nullptr) const;
 
  private:
   std::vector<CodeBuffer> codeBuffers_;

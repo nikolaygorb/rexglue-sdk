@@ -24,6 +24,9 @@ struct BuilderContext;
  */
 bool DispatchInstruction(int id, BuilderContext& ctx);
 
+/// True if the dispatch table has a builder for this PPC instruction ID.
+bool CanDispatchInstruction(int id);
+
 //=============================================================================
 // Comparison Builders (CMP*, CMPL*)
 //=============================================================================
@@ -110,6 +113,10 @@ bool build_crnor(BuilderContext& ctx);
 bool build_cror(BuilderContext& ctx);
 bool build_crorc(BuilderContext& ctx);
 bool build_crxor(BuilderContext& ctx);
+bool build_crset(BuilderContext& ctx);
+bool build_crclr(BuilderContext& ctx);
+bool build_crnot(BuilderContext& ctx);
+bool build_crmove(BuilderContext& ctx);
 
 // Equivalence (XNOR)
 bool build_eqv(BuilderContext& ctx);
@@ -301,6 +308,10 @@ bool build_ld(BuilderContext& ctx);
 bool build_ldu(BuilderContext& ctx);
 bool build_ldx(BuilderContext& ctx);
 bool build_ldux(BuilderContext& ctx);
+bool build_ldbrx(BuilderContext& ctx);
+
+// Multiple word load
+bool build_lmw(BuilderContext& ctx);
 
 // Atomic load and reserve
 bool build_lwarx(BuilderContext& ctx);
@@ -346,6 +357,7 @@ bool build_std(BuilderContext& ctx);
 bool build_stdu(BuilderContext& ctx);
 bool build_stdx(BuilderContext& ctx);
 bool build_stdux(BuilderContext& ctx);
+bool build_stdbrx(BuilderContext& ctx);
 
 // Floating point stores
 bool build_stfd(BuilderContext& ctx);
@@ -383,6 +395,7 @@ bool build_attn(BuilderContext& ctx);
 bool build_sync(BuilderContext& ctx);
 bool build_lwsync(BuilderContext& ctx);
 bool build_eieio(BuilderContext& ctx);
+bool build_isync(BuilderContext& ctx);
 bool build_db16cyc(BuilderContext& ctx);
 bool build_cctpl(BuilderContext& ctx);
 bool build_cctpm(BuilderContext& ctx);
@@ -401,6 +414,9 @@ bool build_dcbtst(BuilderContext& ctx);
 bool build_dcbz(BuilderContext& ctx);
 bool build_dcbzl(BuilderContext& ctx);
 bool build_dcbst(BuilderContext& ctx);
+bool build_icbi(BuilderContext& ctx);
+bool build_dst(BuilderContext& ctx);
+bool build_dss(BuilderContext& ctx);
 
 // Move register
 bool build_mr(BuilderContext& ctx);
@@ -418,6 +434,7 @@ bool build_mfmsr(BuilderContext& ctx);
 bool build_mffs(BuilderContext& ctx);
 bool build_mftb(BuilderContext& ctx);
 bool build_mftbu(BuilderContext& ctx);
+bool build_mfvrsave(BuilderContext& ctx);
 
 // Move to special registers
 bool build_mtcr(BuilderContext& ctx);
@@ -426,7 +443,12 @@ bool build_mtctr(BuilderContext& ctx);
 bool build_mtlr(BuilderContext& ctx);
 bool build_mtmsrd(BuilderContext& ctx);
 bool build_mtfsf(BuilderContext& ctx);
+bool build_mtfsfi(BuilderContext& ctx);
+bool build_mtfsb0(BuilderContext& ctx);
+bool build_mtfsb1(BuilderContext& ctx);
+bool build_mcrfs(BuilderContext& ctx);
 bool build_mtxer(BuilderContext& ctx);
+bool build_mtvrsave(BuilderContext& ctx);
 
 // Clear left double word immediate
 bool build_clrldi(BuilderContext& ctx);
@@ -582,5 +604,39 @@ bool build_vupkhsb(BuilderContext& ctx);
 bool build_vupkhsh(BuilderContext& ctx);
 bool build_vupklsb(BuilderContext& ctx);
 bool build_vupklsh(BuilderContext& ctx);
+
+// Vector integer (vector_integer.cpp)
+bool build_vrlb(BuilderContext& ctx);
+bool build_vaddcuw(BuilderContext& ctx);
+bool build_vsubcuw(BuilderContext& ctx);
+bool build_vavguw(BuilderContext& ctx);
+bool build_vmaxuw(BuilderContext& ctx);
+bool build_vmuleub(BuilderContext& ctx);
+bool build_vmuloub(BuilderContext& ctx);
+bool build_vmulesb(BuilderContext& ctx);
+bool build_vmulosb(BuilderContext& ctx);
+bool build_vmuleuh(BuilderContext& ctx);
+bool build_vmulouh(BuilderContext& ctx);
+bool build_vmulesh(BuilderContext& ctx);
+bool build_vmulosh(BuilderContext& ctx);
+bool build_vmladduhm(BuilderContext& ctx);
+bool build_vmhaddshs(BuilderContext& ctx);
+bool build_vmhraddshs(BuilderContext& ctx);
+bool build_vmsumubm(BuilderContext& ctx);
+bool build_vmsummbm(BuilderContext& ctx);
+bool build_vmsumuhm(BuilderContext& ctx);
+bool build_vmsumuhs(BuilderContext& ctx);
+bool build_vmsumshm(BuilderContext& ctx);
+bool build_vmsumshs(BuilderContext& ctx);
+bool build_vsum4sbs(BuilderContext& ctx);
+bool build_vsum4ubs(BuilderContext& ctx);
+bool build_vsum4shs(BuilderContext& ctx);
+bool build_vsum2sws(BuilderContext& ctx);
+bool build_vsumsws(BuilderContext& ctx);
+bool build_vpkpx(BuilderContext& ctx);
+bool build_vupkhpx(BuilderContext& ctx);
+bool build_vupklpx(BuilderContext& ctx);
+bool build_mfvscr(BuilderContext& ctx);
+bool build_mtvscr(BuilderContext& ctx);
 
 }  // namespace rex::codegen

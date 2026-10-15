@@ -924,16 +924,16 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
                                       timeout_ptr ? &timeout : nullptr);
 }
 
-u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
-                                           u32 r6, mapped_u64 timeout_ptr) {
+u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 wait_mode,
+                                           u32 alertable, mapped_u64 timeout_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);
   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
   if (signal_object && wait_object) {
     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-    result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
-                                    timeout_ptr ? &timeout : nullptr);
+    result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, wait_mode,
+                                    alertable, timeout_ptr ? &timeout : nullptr);
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
@@ -1011,7 +1011,11 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2, uint32_t pr
   }
   auto* mem = rex::system::kernel_state()->memory();
   auto target_thread = mem->TranslateVirtual<X_KTHREAD*>(thread_guest_pointer);
-  auto old_irql = xeKeKfAcquireSpinLock(ctx, &target_thread->apc_lock);
+  // A host thread, such as an I/O worker or a timer callback, queues with the
+  // target's context (XThread::EnqueueApc). It must leave the target's IRQL
+  // alone, as the target may change it at the same time.
+  const bool change_irql = rex::runtime::ThreadState::Get() != nullptr;
+  auto old_irql = xeKeKfAcquireSpinLock(ctx, &target_thread->apc_lock, change_irql);
   uint32_t result;
   if (!target_thread->may_queue_apcs || apc->enqueued) {
     result = 0;
@@ -1042,7 +1046,7 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2, uint32_t pr
     apc->enqueued = 1;
     result = 1;
   }
-  xeKeKfReleaseSpinLock(ctx, &target_thread->apc_lock, old_irql);
+  xeKeKfReleaseSpinLock(ctx, &target_thread->apc_lock, old_irql, change_irql);
   return result;
 }
 
@@ -1430,6 +1434,26 @@ u32 KeSuspendThread_entry(mapped_void kthread_ptr) {
   return old_suspend_count;
 }
 
+u64 KeQueryInterruptTime_entry() {
+  // Time since boot in 100 ns units, on the guest clock.
+  return chrono::Clock::QueryGuestSystemTime() - chrono::Clock::guest_system_time_base();
+}
+
+u32 KeSetPriorityThread_entry(ppc_ptr_t<X_KTHREAD> thread_ptr, u32 new_priority) {
+  if (!thread_ptr) {
+    REXKRNL_ERROR("KeSetPriorityThread: invalid thread");
+    return 0;
+  }
+  const uint8_t old_priority = thread_ptr->priority;
+  auto thread = XObject::GetNativeObject<XThread>(REX_KERNEL_STATE(), thread_ptr);
+  if (thread) {
+    thread->SetPriority(static_cast<int32_t>(new_priority));
+  } else {
+    REXKRNL_WARN("KeSetPriorityThread: no native thread for {:08X}", thread_ptr.guest_address());
+  }
+  return old_priority;
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__ExCreateThread, rex::kernel::xboxkrnl::ExCreateThread_entry)
@@ -1534,7 +1558,6 @@ REX_EXPORT_STUB(__imp__KeInitializeQueue);
 // REX_EXPORT_STUB(__imp__KeInitializeTimerEx); -- implemented below
 REX_EXPORT_STUB(__imp__KeIpiGenericCall);
 REX_EXPORT_STUB(__imp__KeQueryBackgroundProcessors);
-REX_EXPORT_STUB(__imp__KeQueryInterruptTime);
 REX_EXPORT_STUB(__imp__KeRegisterDriverNotification);
 REX_EXPORT_STUB(__imp__KeRestoreFloatingPointState);
 REX_EXPORT_STUB(__imp__KeRestoreVectorUnitState);
@@ -1544,7 +1567,6 @@ REX_EXPORT_STUB(__imp__KeSaveFloatingPointState);
 REX_EXPORT_STUB(__imp__KeSaveVectorUnitState);
 REX_EXPORT_STUB(__imp__KeSetBackgroundProcessors);
 REX_EXPORT_STUB(__imp__KeSetPriorityClassThread);
-REX_EXPORT_STUB(__imp__KeSetPriorityThread);
 REX_EXPORT_STUB(__imp__KeSetTimer);
 REX_EXPORT_STUB(__imp__KeSetTimerEx);
 REX_EXPORT_STUB(__imp__KeStallExecutionProcessor);
@@ -1552,3 +1574,5 @@ REX_EXPORT_STUB(__imp__KeSweepDcacheRange);
 REX_EXPORT_STUB(__imp__KeSweepIcacheRange);
 REX_EXPORT_STUB(__imp__KeTestAlertThread);
 REX_EXPORT(__imp__KfRaiseIrql, rex::kernel::xboxkrnl::KfRaiseIrql_entry)
+REX_EXPORT(__imp__KeQueryInterruptTime, rex::kernel::xboxkrnl::KeQueryInterruptTime_entry)
+REX_EXPORT(__imp__KeSetPriorityThread, rex::kernel::xboxkrnl::KeSetPriorityThread_entry)

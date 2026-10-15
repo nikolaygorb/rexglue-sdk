@@ -48,6 +48,7 @@ set(CODEGEN_BUILDER_SOURCES
     builders/memory.cpp
     builders/system.cpp
     builders/vector.cpp
+    builders/vector_integer.cpp
 )
 
 # Inja templates

@@ -13,6 +13,8 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <cstring>
+#include <cwctype>
 #include <string>
 
 #include <rex/chrono/chrono_steady_cast.h>
@@ -30,6 +32,7 @@
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
+#include <rex/system/thread_state.h>
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -427,7 +430,13 @@ u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
-  assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
+  // Retail RtlLeaveCriticalSection does not check ownership, it just
+  // decrements. A non-owner leave is a caller error but titles rely on it.
+  const uint32_t leaving_thread = XThread::GetCurrentThread()->guest_object();
+  if (cs->owning_thread != leaving_thread) {
+    REXKRNL_DEBUG("RtlLeaveCriticalSection {:08X} left by non-owner (owner {:08X}, caller {:08X})",
+                  cs.guest_address(), uint32_t(cs->owning_thread), leaving_thread);
+  }
 
   // Drop recursion count - if it isn't zero we still have the lock.
   assert_true(cs->recursion_count > 0);
@@ -577,21 +586,102 @@ REX_EXPORT_STUB(__imp__RtlCompareUnicodeString);
 REX_EXPORT_STUB(__imp__RtlCompareUnicodeStringN);
 REX_EXPORT_STUB(__imp__RtlCompareUtf8ToUnicode);
 REX_EXPORT_STUB(__imp__RtlCreateUnicodeString);
-REX_EXPORT_STUB(__imp__RtlDowncaseUnicodeChar);
 REX_EXPORT_STUB(__imp__RtlGetCallersAddress);
-REX_EXPORT_STUB(__imp__RtlGetStackLimits);
 REX_EXPORT_STUB(__imp__RtlLookupFunctionEntry);
 REX_EXPORT_STUB(__imp__RtlMultiByteToUnicodeSize);
 REX_EXPORT_STUB(__imp__RtlUnicodeToMultiByteSize);
 REX_EXPORT_STUB(__imp__RtlUnicodeToUtf8);
 REX_EXPORT_STUB(__imp__RtlUnicodeToUtf8Size);
 REX_EXPORT_STUB(__imp__RtlUnwind2);
-REX_EXPORT_STUB(__imp__RtlUpcaseUnicodeChar);
 REX_EXPORT_STUB(__imp__RtlVirtualUnwind);
-REX_EXPORT_STUB(__imp__RtlImageDirectoryEntryToData);
 REX_EXPORT_STUB(__imp__RtlCaptureStackBackTrace);
 REX_EXPORT_STUB(__imp__RtlSetVectoredExceptionHandler);
 REX_EXPORT_STUB(__imp__RtlClearVectoredExceptionHandler);
+
+u32 RtlDowncaseUnicodeChar_entry(u32 unicode_char) {
+  return static_cast<uint32_t>(std::towlower(static_cast<wint_t>(unicode_char & 0xFFFF)));
+}
+
+u32 RtlUpcaseUnicodeChar_entry(u32 unicode_char) {
+  return static_cast<uint32_t>(std::towupper(static_cast<wint_t>(unicode_char & 0xFFFF)));
+}
+
+void RtlGetStackLimits_entry(mapped_u32 out_end, mapped_u32 out_base) {
+  auto* ctx = rex::runtime::current_ppc_context();
+  auto* pcr = REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
+  const bool alternative = pcr->use_alternative_stack != 0;
+  if (out_base) {
+    *out_base = alternative ? uint32_t(pcr->alt_stack_base_ptr) : uint32_t(pcr->stack_base_ptr);
+  }
+  if (out_end) {
+    *out_end = alternative ? uint32_t(pcr->alt_stack_end_ptr) : uint32_t(pcr->stack_end_ptr);
+  }
+}
+
+// The PE headers of a module image are little-endian, as in RtlImageNtHeader.
+u32 RtlImageDirectoryEntryToData_entry(u32 base, u32 mapped_as_image_in, u32 directory_entry,
+                                       mapped_u32 size_out) {
+  bool mapped_as_image = (mapped_as_image_in & 0xFF) != 0;
+  uint32_t aligned_base = base;
+  if (base & 1) {
+    aligned_base = base & ~1u;
+    mapped_as_image = false;
+  }
+  if (!aligned_base) {
+    return 0;
+  }
+
+  const auto* image = REX_KERNEL_MEMORY()->TranslateVirtual<const uint8_t*>(aligned_base);
+  auto read16 = [](const uint8_t* p) {
+    uint16_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+  };
+  auto read32 = [](const uint8_t* p) {
+    uint32_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+  };
+  if (read16(image) != 0x5A4D) {  // 'MZ'
+    return 0;
+  }
+  const uint8_t* nt = image + read32(image + 0x3C);
+  if (read32(nt) != 0x4550) {  // 'PE'
+    return 0;
+  }
+  const uint8_t* file_header = nt + 4;
+  const uint8_t* optional_header = nt + 24;
+  if (read16(optional_header) != 0x10B) {  // IMAGE_NT_OPTIONAL_HDR32_MAGIC
+    return 0;
+  }
+  const uint32_t entry = directory_entry & 0xFFFF;
+  if (entry >= read32(optional_header + 92)) {  // NumberOfRvaAndSizes
+    return 0;
+  }
+  const uint8_t* directory = optional_header + 96 + entry * 8;
+  const uint32_t address = read32(directory);
+  if (!address) {
+    return 0;
+  }
+  if (size_out) {
+    *size_out = read32(directory + 4);
+  }
+  if (mapped_as_image || address < read32(optional_header + 60)) {  // SizeOfHeaders
+    return aligned_base + address;
+  }
+
+  // A file layout: find the section holding the address.
+  const uint32_t section_count = read16(file_header + 2);
+  const uint8_t* section = optional_header + read16(file_header + 16);  // SizeOfOptionalHeader
+  for (uint32_t i = 0; i < section_count; i++, section += 40) {
+    const uint32_t virtual_address = read32(section + 12);
+    const uint32_t raw_size = read32(section + 16);
+    if (address >= virtual_address && address < virtual_address + raw_size) {
+      return aligned_base + address - virtual_address;
+    }
+  }
+  return 0;
+}
 
 }  // namespace rex::kernel::xboxkrnl
 
@@ -628,3 +718,8 @@ REX_EXPORT(__imp__RtlComputeCrc32, rex::kernel::xboxkrnl::RtlComputeCrc32_entry)
 REX_EXPORT(__imp__RtlCaptureContext, rex::kernel::xboxkrnl::RtlCaptureContext_entry)
 REX_EXPORT(__imp__RtlUnwind, rex::kernel::xboxkrnl::RtlUnwind_entry)
 REX_EXPORT(__imp____C_specific_handler, rex::kernel::xboxkrnl::__C_specific_handler_entry)
+REX_EXPORT(__imp__RtlDowncaseUnicodeChar, rex::kernel::xboxkrnl::RtlDowncaseUnicodeChar_entry)
+REX_EXPORT(__imp__RtlUpcaseUnicodeChar, rex::kernel::xboxkrnl::RtlUpcaseUnicodeChar_entry)
+REX_EXPORT(__imp__RtlGetStackLimits, rex::kernel::xboxkrnl::RtlGetStackLimits_entry)
+REX_EXPORT(__imp__RtlImageDirectoryEntryToData,
+           rex::kernel::xboxkrnl::RtlImageDirectoryEntryToData_entry)

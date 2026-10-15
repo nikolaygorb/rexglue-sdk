@@ -155,12 +155,18 @@ void KeBugCheck_entry(u32 code) {
   KeBugCheckEx_entry(code, 0, 0, 0, 0);
 }
 
+void RtlRip_entry(mapped_string message_1, mapped_string message_2) {
+  REXKRNL_ERROR("RtlRip called, arg1 = {}, arg2 = {}", message_1 ? message_1.value() : "",
+                message_2 ? message_2.value() : "");
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__DbgBreakPoint, rex::kernel::xboxkrnl::DbgBreakPoint_entry)
 REX_EXPORT(__imp__RtlRaiseException, rex::kernel::xboxkrnl::RtlRaiseException_entry)
 REX_EXPORT(__imp__KeBugCheckEx, rex::kernel::xboxkrnl::KeBugCheckEx_entry)
 REX_EXPORT(__imp__KeBugCheck, rex::kernel::xboxkrnl::KeBugCheck_entry)
+REX_EXPORT(__imp__RtlRip, rex::kernel::xboxkrnl::RtlRip_entry)
 
 REX_EXPORT_STUB(__imp__DbgBreakPointWithStatus);
 REX_EXPORT_STUB(__imp__DbgPrompt);
@@ -176,4 +182,3 @@ REX_EXPORT_STUB(__imp__DumpWriteDump);
 REX_EXPORT_STUB(__imp__DumpXitThread);
 REX_EXPORT_STUB(__imp__RtlAssert);
 REX_EXPORT_STUB(__imp__RtlRaiseStatus);
-REX_EXPORT_STUB(__imp__RtlRip);

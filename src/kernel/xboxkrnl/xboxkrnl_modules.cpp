@@ -214,6 +214,23 @@ u32 XexLoadImageHeaders_entry(mapped_string path, mapped_void headers) {
   return X_STATUS_NOT_IMPLEMENTED;
 }
 
+u32 XexLoadExecutable_entry(mapped_string module_name, u32 module_flags, u32 min_version,
+                            mapped_u32 hmodule_ptr) {
+  return XexLoadImage_entry(module_name, module_flags, min_version, hmodule_ptr);
+}
+
+u32 XexLoadImageFromMemory_entry(mapped_void buffer, u32 size, mapped_string module_name,
+                                 u32 module_flags, u32 min_version, mapped_u32 hmodule_ptr) {
+  // Statically recompiled titles can only run modules recompiled ahead of time,
+  // not an image handed over in memory.
+  REXKRNL_ERROR("XexLoadImageFromMemory({}): loading a module from memory is not supported",
+                module_name ? module_name.value() : "");
+  if (hmodule_ptr) {
+    *hmodule_ptr = 0;
+  }
+  return X_STATUS_NOT_IMPLEMENTED;
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__XexCheckExecutablePrivilege,
@@ -226,9 +243,9 @@ REX_EXPORT(__imp__XexGetProcedureAddress, rex::kernel::xboxkrnl::XexGetProcedure
 REX_EXPORT(__imp__ExRegisterTitleTerminateNotification,
            rex::kernel::xboxkrnl::ExRegisterTitleTerminateNotification_entry)
 REX_EXPORT(__imp__XexLoadImageHeaders, rex::kernel::xboxkrnl::XexLoadImageHeaders_entry)
+REX_EXPORT(__imp__XexLoadExecutable, rex::kernel::xboxkrnl::XexLoadExecutable_entry)
+REX_EXPORT(__imp__XexLoadImageFromMemory, rex::kernel::xboxkrnl::XexLoadImageFromMemory_entry)
 
-REX_EXPORT_STUB(__imp__XexLoadExecutable);
-REX_EXPORT_STUB(__imp__XexLoadImageFromMemory);
 REX_EXPORT_STUB(__imp__XexPcToFileHeader);
 REX_EXPORT_STUB(__imp__XexRegisterPatchDescriptor);
 REX_EXPORT_STUB(__imp__XexSendDeferredNotifications);

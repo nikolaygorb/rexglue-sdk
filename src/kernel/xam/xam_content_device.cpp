@@ -9,6 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+// Disable warnings about unused parameters for kernel functions
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+
+#include <algorithm>
+#include <cstring>
+#include <string_view>
+
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -155,6 +162,52 @@ u32 XamContentCreateDeviceEnumerator_entry(u32 content_type, u32 content_flags, 
   return X_ERROR_SUCCESS;
 }
 
+//=============================================================================
+// Ported from xenia-canary for the ReXGlue fork
+//=============================================================================
+
+u32 XamContentGetLocalizedDeviceData_entry(u32 device_id,
+                                           ppc_ptr_t<X_CONTENT_DEVICE_DATA> device_data) {
+  auto device_info = GetDummyDeviceInfo(device_id);
+  if (device_info == nullptr) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  device_data.Zero();
+  device_data->device_id = static_cast<uint32_t>(device_info->device_id);
+  device_data->device_type = static_cast<uint32_t>(device_info->device_type);
+  device_data->total_bytes = device_info->total_bytes;
+  device_data->free_bytes = device_info->free_bytes;
+  // The localized name goes by device type.
+  std::u16string_view name = u"Storage Device";
+  switch (device_info->device_type) {
+    case DeviceType::HDD:
+      name = u"Hard Drive";
+      break;
+    case DeviceType::ODD:
+      name = u"Optical Drive";
+      break;
+    default:
+      break;
+  }
+  rex::string::copy_and_swap_truncating(device_data->name_chars, name,
+                                        rex::countof(device_data->name_chars));
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamContentGetDeviceVolumePath_entry(u32 device_id, mapped_string path_ptr, u32 path_size,
+                                        u32 append_backslash) {
+  if (device_id != static_cast<uint32_t>(DummyDeviceId::HDD)) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  if (path_ptr && path_size) {
+    const std::string_view volume_path = "hdd0\\";
+    const size_t count = std::min<size_t>(volume_path.size(), path_size - 1);
+    std::memcpy(path_ptr, volume_path.data(), count);
+    static_cast<char*>(path_ptr)[count] = 0;
+  }
+  return X_ERROR_SUCCESS;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -177,11 +230,13 @@ REX_EXPORT(__imp__XamContentGetDeviceState, rex::kernel::xam::XamContentGetDevic
 REX_EXPORT(__imp__XamContentGetDeviceData, rex::kernel::xam::XamContentGetDeviceData_entry)
 REX_EXPORT(__imp__XamContentCreateDeviceEnumerator,
            rex::kernel::xam::XamContentCreateDeviceEnumerator_entry)
+REX_EXPORT(__imp__XamContentGetLocalizedDeviceData,
+           rex::kernel::xam::XamContentGetLocalizedDeviceData_entry)
+REX_EXPORT(__imp__XamContentGetDeviceVolumePath,
+           rex::kernel::xam::XamContentGetDeviceVolumePath_entry)
 
 REX_EXPORT_STUB(__imp__XamContentAddCacheDevice);
 REX_EXPORT_STUB(__imp__XamContentDeviceCheckUpdates);
 REX_EXPORT_STUB(__imp__XamContentGetDefaultDevice);
 REX_EXPORT_STUB(__imp__XamContentGetDeviceSerialNumber);
-REX_EXPORT_STUB(__imp__XamContentGetDeviceVolumePath);
-REX_EXPORT_STUB(__imp__XamContentGetLocalizedDeviceData);
 REX_EXPORT_STUB(__imp__XamContentRemoveCacheDevice);

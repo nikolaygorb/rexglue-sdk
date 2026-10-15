@@ -9,7 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/assert.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/nop/nop_audio_driver.h>
 #include <rex/audio/nop/nop_audio_system.h>
 
 namespace rex::audio::nop {
@@ -24,14 +26,17 @@ NopAudioSystem::NopAudioSystem(runtime::FunctionDispatcher* function_dispatcher)
 
 NopAudioSystem::~NopAudioSystem() = default;
 
-X_STATUS NopAudioSystem::CreateDriver(size_t /*index*/, rex::thread::Semaphore* /*semaphore*/,
-                                      AudioDriver** /*out_driver*/) {
-  return X_STATUS_NOT_IMPLEMENTED;
+// A title registering an audio client must get a driver, or it goes on with a
+// handle that was never written.
+X_STATUS NopAudioSystem::CreateDriver(size_t /*index*/, rex::thread::Semaphore* semaphore,
+                                      AudioDriver** out_driver) {
+  assert_not_null(out_driver);
+  *out_driver = new NopAudioDriver(memory(), semaphore);
+  return X_STATUS_SUCCESS;
 }
 
 void NopAudioSystem::DestroyDriver(AudioDriver* driver) {
-  (void)driver;
-  assert_always();
+  delete driver;
 }
 
 }  // namespace rex::audio::nop

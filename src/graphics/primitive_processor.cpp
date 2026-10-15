@@ -295,17 +295,18 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
   xenos::TessellationMode tessellation_mode = regs.Get<reg::VGT_HOS_CNTL>().tess_mode;
   Shader::HostVertexShaderType host_vertex_shader_type;
   if (tessellation_enabled) {
-    // Currently only supporting tessellation in known cases for safety, and not
-    // yet converting patch strips / fans to patch lists until games using them
-    // are found for easier debugging when it actually happens.
-    // TODO(Triang3l): Conversion of patch strips / fans if found.
+    // Currently only supporting tessellation in known cases for safety.
     host_vertex_shader_type = Shader::HostVertexShaderType(-1);
     switch (guest_primitive_type) {
       case xenos::PrimitiveType::kTriangleList:
+      case xenos::PrimitiveType::kTriangleFan:
+      case xenos::PrimitiveType::kTriangleStrip:
         // Also supported by triangle strips and fans according to:
         // https://www.khronos.org/registry/OpenGL/extensions/AMD/AMD_vertex_shader_tessellator.txt
-        // Would need to convert those to triangle lists, but haven't seen any
-        // games using tessellated strips / fans so far.
+        // Convert strips and fans to triangle lists for tessellation.
+        if (guest_primitive_type != xenos::PrimitiveType::kTriangleList) {
+          host_primitive_type = xenos::PrimitiveType::kTriangleList;
+        }
         switch (tessellation_mode) {
           case xenos::TessellationMode::kDiscrete:
             // - 415607E1 - nets above barrels in the beginning of the first
@@ -510,9 +511,30 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           assert_true(host_primitive_type == xenos::PrimitiveType::kTriangleList);
           cacheable.host_draw_vertex_count =
               GetTriangleFanListIndexCount(cacheable.host_draw_vertex_count);
-          cacheable.index_buffer_type = ProcessedIndexBufferType::kHostBuiltinForAuto;
-          assert_true(builtin_ib_offset_triangle_fans_to_lists_ != SIZE_MAX);
-          cacheable.host_index_buffer_handle = builtin_ib_offset_triangle_fans_to_lists_;
+          if (builtin_ib_offset_triangle_fans_to_lists_ != SIZE_MAX) {
+            cacheable.index_buffer_type = ProcessedIndexBufferType::kHostBuiltinForAuto;
+            cacheable.host_index_buffer_handle = builtin_ib_offset_triangle_fans_to_lists_;
+          } else if (cacheable.host_draw_vertex_count) {
+            // The backend didn't request the builtin fan to list conversion
+            // at initialization, so there's no prebuilt index buffer. This is
+            // only reached via the tessellation path above, which forces
+            // host_primitive_type to kTriangleList, so build the conversion at
+            // runtime.
+            cacheable.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
+            auto host_indices =
+                reinterpret_cast<uint16_t*>(RequestHostConvertedIndexBufferForCurrentFrame(
+                    xenos::IndexFormat::kInt16, cacheable.host_draw_vertex_count, false, 0,
+                    cacheable.host_index_buffer_handle));
+            if (!host_indices) {
+              return false;
+            }
+            uint16_t* host_indices_write = host_indices;
+            for (uint32_t i = 2; i < guest_draw_vertex_count; ++i) {
+              *(host_indices_write++) = uint16_t(i - 1);
+              *(host_indices_write++) = uint16_t(i);
+              *(host_indices_write++) = 0;
+            }
+          }
           break;
         case xenos::PrimitiveType::kLineLoop:
           // Plus 1 element (if there's anything to draw) in the strip, still
@@ -532,6 +554,37 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           cacheable.index_buffer_type = ProcessedIndexBufferType::kHostBuiltinForAuto;
           assert_true(builtin_ib_offset_quad_lists_to_triangle_lists_ != SIZE_MAX);
           cacheable.host_index_buffer_handle = builtin_ib_offset_quad_lists_to_triangle_lists_;
+          break;
+        case xenos::PrimitiveType::kTriangleStrip:
+          assert_true(host_primitive_type == xenos::PrimitiveType::kTriangleList);
+          cacheable.host_draw_vertex_count =
+              GetTriangleStripListIndexCount(cacheable.host_draw_vertex_count);
+          if (cacheable.host_draw_vertex_count) {
+            // There's no prebuilt strip to list index buffer. This is only
+            // reached via the tessellation path above, which forces
+            // host_primitive_type to kTriangleList, so build the conversion at
+            // runtime.
+            cacheable.index_buffer_type = ProcessedIndexBufferType::kHostConverted;
+            auto host_indices =
+                reinterpret_cast<uint16_t*>(RequestHostConvertedIndexBufferForCurrentFrame(
+                    xenos::IndexFormat::kInt16, cacheable.host_draw_vertex_count, false, 0,
+                    cacheable.host_index_buffer_handle));
+            if (!host_indices) {
+              return false;
+            }
+            uint16_t* host_indices_write = host_indices;
+            for (uint32_t i = 2; i < guest_draw_vertex_count; ++i) {
+              if ((i & 1) == 0) {
+                *(host_indices_write++) = uint16_t(i - 2);
+                *(host_indices_write++) = uint16_t(i - 1);
+                *(host_indices_write++) = uint16_t(i);
+              } else {
+                *(host_indices_write++) = uint16_t(i - 1);
+                *(host_indices_write++) = uint16_t(i - 2);
+                *(host_indices_write++) = uint16_t(i);
+              }
+            }
+          }
           break;
         default:
           assert_always();
@@ -1372,10 +1425,13 @@ PrimitiveProcessor::CacheTransaction::~CacheTransaction() {
 
   std::lock_guard<std::mutex> cache_lock(processor_.cache_mutex_);
 
+  // The invalidation callback zeroes the size if the range was written during
+  // processing, which may have read the old indices.
+  const bool written = !processor_.cache_currently_processing_size_bytes_;
   processor_.cache_currently_processing_base_ = 0;
   processor_.cache_currently_processing_size_bytes_ = 0;
 
-  if (result_type_ == ResultType::kNewSet) {
+  if (result_type_ == ResultType::kNewSet && !written) {
     size_t new_entry_index;
     if (processor_.cache_bucket_free_first_entry_ != SIZE_MAX) {
       new_entry_index = processor_.cache_bucket_free_first_entry_;
@@ -1444,6 +1500,12 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
   uint32_t bucket_l2_bits_index_first = bucket_index_first >> 12;
   uint32_t bucket_l2_bits_index_last = bucket_index_last >> 12;
   std::lock_guard<std::mutex> cache_lock(cache_mutex_);
+  if (cache_currently_processing_size_bytes_ &&
+      cache_currently_processing_base_ < physical_address_end &&
+      cache_currently_processing_base_ + cache_currently_processing_size_bytes_ >
+          physical_address_start) {
+    cache_currently_processing_size_bytes_ = 0;
+  }
   for (uint32_t bucket_l2_bits_index = bucket_l2_bits_index_first;
        bucket_l2_bits_index <= bucket_l2_bits_index_last; ++bucket_l2_bits_index) {
     uint64_t bucket_l2_bits_mask = UINT64_MAX;
@@ -1501,7 +1563,7 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
           // the specified range.
           if (entry_key.base < physical_address_end) {
             uint32_t entry_end = entry_key.base + entry_key.GetSizeBytes();
-            if (entry_end > physical_address_end) {
+            if (entry_end > physical_address_start) {
               // Invalidate the entry.
               any_invalidated = true;
               // Remove the entry from the cache map.

@@ -107,6 +107,12 @@ bool ReXApp::OnInitialize() {
 bool ReXApp::SetupEnvironment() {
   auto exe_dir = rex::filesystem::GetExecutableFolder();
 
+  // The default config can set the path cvars read below, so it is loaded
+  // before them.
+  auto default_config_path = exe_dir / (std::string(GetName()) + ".toml");
+  if (std::filesystem::exists(default_config_path))
+    rex::cvar::LoadConfig(default_config_path);
+
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
   if (!game_data_cvar.empty()) {
@@ -145,7 +151,7 @@ bool ReXApp::SetupEnvironment() {
   }
 
   PathConfig path_config{game_dir,  user_dir,     update_dir,
-                         cache_dir, metadata_dir, exe_dir / (std::string(GetName()) + ".toml")};
+                         cache_dir, metadata_dir, default_config_path};
   OnConfigurePaths(path_config);
   game_data_root_ = path_config.game_data_root;
   user_data_root_ = path_config.user_data_root;
@@ -155,8 +161,9 @@ bool ReXApp::SetupEnvironment() {
   config_path_ = path_config.config_path;
   resolved_defaults_ = std::move(path_config);
 
-  // Load config FIRST so log cvars have final values
-  if (std::filesystem::exists(config_path_))
+  // A config path moved by OnConfigurePaths is loaded here, still before the
+  // log cvars are read.
+  if (config_path_ != default_config_path && std::filesystem::exists(config_path_))
     rex::cvar::LoadConfig(config_path_);
 
   std::string log_level_str = REXCVAR_GET(log_level);
@@ -487,8 +494,12 @@ void ReXApp::LaunchModule() {
     if (graphics_system && !runtime_->cache_root().empty()) {
       uint32_t title_id = runtime_->kernel_state()->title_id();
       if (title_id != 0) {
+        // Initialize shader storage asynchronously - pipeline compilation happens
+        // in background while the game goes through its normal startup (loading
+        // screens, intro videos, etc.). With async_shader_compilation enabled,
+        // draws are skipped until pipelines are ready, so this is safe.
         REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
-        graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+        graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, false);
       }
     }
 

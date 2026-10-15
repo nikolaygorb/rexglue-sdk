@@ -342,6 +342,29 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  // Lockless fast path: nothing to upload if every requested page is already
+  // valid, which is the common case. Writers still change the flags under the
+  // global lock; a page invalidated right after this check is the same race as
+  // one invalidated right after the locked check below. Host memory is still
+  // allocated first: a range marked valid as a whole (memexport with unknown
+  // ranges) may not be backed by sparse memory yet.
+  bool all_valid = true;
+  for (size_t i = 0; i < count && all_valid; ++i) {
+    uint32_t start = ranges[i].first;
+    uint32_t length = ranges[i].second;
+    if (!length) {
+      continue;
+    }
+    if (start > kBufferSize || (kBufferSize - start) < length ||
+        !EnsureHostGpuMemoryAllocated(start, length)) {
+      return false;
+    }
+    all_valid = IsRangeValid(start, length);
+  }
+  if (all_valid) {
+    return true;
+  }
+
   // Some texture or buffer is empty, for example - safe to draw in this case.
   std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
   merged_ranges.reserve(count);
@@ -471,6 +494,34 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
+}
+
+bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) const {
+  if (!length) {
+    return true;
+  }
+  if (start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+
+  for (uint32_t i = block_first; i <= block_last; ++i) {
+    uint64_t valid_mask = UINT64_MAX;
+    if (i == block_first) {
+      valid_mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == block_last && (page_last & 63) != 63) {
+      valid_mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if ((system_page_flags_valid_[i] & valid_mask) != valid_mask) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(

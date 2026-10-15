@@ -31,6 +31,7 @@
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
+#include <rex/graphics/vulkan/query_pool.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shared_memory.h>
@@ -38,10 +39,12 @@
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/vulkan/gpu_completion_timeline.h>
 #include <rex/ui/vulkan/linked_type_descriptor_set_allocator.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
+#include <rex/ui/vulkan/util.h>
 
 namespace rex::graphics::vulkan {
 
@@ -133,7 +136,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
-                               bool blocking) override;
+                               bool blocking,
+                               std::function<void()> completion_callback = nullptr) override;
+
+  void PollCompletedSubmission() override;
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
@@ -151,10 +157,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
 
   bool submission_open() const { return submission_open_; }
-  uint64_t GetCurrentSubmission() const {
-    return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
+  uint64_t GetCurrentSubmission() const { return completion_timeline_.GetUpcomingSubmission(); }
+  uint64_t GetCompletedSubmission() const override {
+    return completion_timeline_.GetCompletedSubmissionFromLastUpdate();
   }
-  uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
   // Sparse binds are:
   // - In a single submission, all submitted in one vkQueueBindSparse.
@@ -179,6 +185,7 @@ class VulkanCommandProcessor : public CommandProcessor {
                                uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
                                uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
                                bool skip_if_equal = true);
+  // sample_locations has to stay valid until barriers are submitted.
   bool PushImageMemoryBarrier(VkImage image, const VkImageSubresourceRange& subresource_range,
                               VkPipelineStageFlags src_stage_mask,
                               VkPipelineStageFlags dst_stage_mask, VkAccessFlags src_access_mask,
@@ -186,7 +193,8 @@ class VulkanCommandProcessor : public CommandProcessor {
                               VkImageLayout new_layout,
                               uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
                               uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
-                              bool skip_if_equal = true);
+                              bool skip_if_equal = true,
+                              const VkSampleLocationsInfoEXT* sample_locations = nullptr);
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
@@ -250,8 +258,6 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
-  bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
-                                          uint32_t count) override;
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -386,6 +392,43 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t size[2];
     float size_inv[2];
   };
+  // SMAA swap post effect (src/graphics/shaders/smaa*.xesl), three compute
+  // passes after the gamma ramp: edge detection, blending weight calculation,
+  // neighborhood blending into the guest output.
+  enum SwapSmaaDescriptorSet : uint32_t {
+    // The linear clamp sampler (immutable).
+    kSwapSmaaDescriptorSetSampler,
+    // kSwapSmaaSourceCount sampled images.
+    kSwapSmaaDescriptorSetSources,
+    kSwapSmaaDescriptorSetDestination,
+
+    kSwapSmaaDescriptorSetCount,
+  };
+  static constexpr uint32_t kSwapSmaaSourceCount = 3;
+  struct SwapSmaaConstants {
+    uint32_t size[2];
+    float size_inv[2];
+  };
+  enum SwapSmaaPass : size_t {
+    kSwapSmaaPassEdgeDetection,
+    kSwapSmaaPassBlendingWeightCalculation,
+    kSwapSmaaPassNeighborhoodBlending,
+
+    kSwapSmaaPassCount,
+  };
+  enum SwapSmaaImage : size_t {
+    // Intermediate images of the guest output size, fully rewritten every frame.
+    // Gamma-corrected color (the output of the gamma ramp).
+    kSwapSmaaImageColor,
+    kSwapSmaaImageEdges,
+    kSwapSmaaImageWeights,
+    kSwapSmaaImageIntermediateCount,
+    // Lookup textures, uploaded once, then kept in SHADER_READ_ONLY_OPTIMAL.
+    kSwapSmaaImageArea = kSwapSmaaImageIntermediateCount,
+    kSwapSmaaImageSearch,
+
+    kSwapSmaaImageCount,
+  };
 
   // Framebuffer for the current presenter's guest output image revision, and
   // its usage tracking.
@@ -406,7 +449,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass
   // GetCurrentSubmission() to wait for all queue operations to be completed.
-  void CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission);
+  void CheckSubmissionCompletionAndDeviceLoss(uint64_t await_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -417,8 +460,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
   bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
-    return !submission_open_ && submissions_in_flight_fences_.empty();
+    CheckSubmissionCompletionAndDeviceLoss(GetCurrentSubmission());
+    return !submission_open_ && GetCompletedSubmission() + 1u >= GetCurrentSubmission();
   }
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
@@ -432,17 +475,52 @@ class VulkanCommandProcessor : public CommandProcessor {
   void SplitPendingBarrier();
 
   void DestroyScratchBuffer();
-  bool InitializeOcclusionQueryResources();
-  void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address);
-  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
-  void DisableHostOcclusionQueries();
-  uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-  void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
-  void InvalidateAllVertexBufferResidency();
-  void InvalidateVertexBufferResidency(uint32_t vfetch_index);
-  void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
+
+  // Query segments backend for both ZPD occlusion query reports and
+  // VIZ visibility surveys & conditional rendering.
+  //
+  // vkCmdBeginQuery is only valid inside a render pass, so segments split at
+  // pass end and resume at the next pass begin. If a report or survey starts
+  // outside a pass, the segment waits for the next. FSI queries clear a
+  // dedicated counter with vkCmdFillBuffer, so they may need to open before a
+  // pass begins or split an active pass around the clear.
+  void EnsureQueryResources() override;
+  void ShutdownQueryResources() override {
+    query_resolves_in_flight_.clear();
+    active_query_index_ = UINT32_MAX;
+    active_query_generation_ = 0;
+    active_query_is_fsi_ = false;
+    zpd_fsi_path_ = false;
+    zpd_counter_index_force_update_ = true;
+    if (host_query_pool_) {
+      host_query_pool_->Shutdown();
+    }
+  }
+
+  bool IsQueryPoolReady() const override;
+  bool CanOpenQuery() const override;
+
+  QueryOpenResult OpenQuery(bool can_close_submission) override;
+  bool CloseQuery(ReportHandle report_handle, const VIZQueryHandle& viz,
+                  uint64_t& out_submission) override;
+  void PumpQueryResolves() override;
+  bool AwaitQueryResolve(ReportHandle report_handle, uint64_t wait_for_submission) override;
+
+  bool EnsureVIZPredicateBuffer();
+  // Drains the queued predicate copies.
+  void RecordVIZPredicateCopies();
+  // Drains the queued copies if the draw's predicate is among them.
+  VkBuffer BindVIZPredicate(VkDeviceSize& offset_out);
+  void AwaitVIZQueryResolve(uint64_t wait_for_submission) override;
+  void ShutdownVIZQueryResources() {
+    viz_pending_copies_.clear();
+    const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, viz_predicate_buffer_);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, viz_predicate_buffer_memory_);
+    viz_predicate_buffer_failed_ = false;
+  }
   struct ReadbackBuffer {
     VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -482,16 +560,24 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t half_pixel_offset;
   };
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
+  // Creates the SMAA intermediate images for the size and uploads the lookup
+  // textures if needed. Must be called within an open submission.
+  bool EnsureSwapSmaaResources(uint32_t width, uint32_t height);
+  // Destroys the images in the range immediately or after their last usage.
+  void DestroySwapSmaaImages(size_t first, size_t count, bool immediately);
   void DestroySwapFxaaSourceImage();
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
-                          reg::RB_DEPTHCONTROL normalized_depth_control);
+                          reg::RB_DEPTHCONTROL normalized_depth_control,
+                          bool depth_bias_in_pixel_shader, bool window_offset_in_edram);
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
-      reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
+      reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
+      int32_t window_offset_tiles);
   bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
@@ -518,23 +604,45 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipelineStageFlags guest_shader_pipeline_stages_ = 0;
   VkShaderStageFlags guest_shader_vertex_stages_ = 0;
 
-  std::vector<VkFence> fences_free_;
   std::vector<VkSemaphore> semaphores_free_;
 
+  struct PendingQueryResolve {
+    uint64_t submission = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    uint32_t scale_area = 1;
+    bool fsi = false;
+    bool hybrid = false;
+    ReportHandle report_handle = kInvalidReportHandle;
+    VIZQueryHandle viz;
+  };
+  uint32_t active_query_index_ = UINT32_MAX;
+  uint32_t active_query_generation_ = 0;
+  bool active_query_is_fsi_ = false;
+  bool zpd_fsi_path_ = false;
+  bool zpd_hybrid_supported_ = false;
+  bool zpd_counter_index_force_update_ = true;
+  std::deque<PendingQueryResolve> query_resolves_in_flight_;
+  // Fallback buffer for ZPD counter descriptor binding 1.
+  VkBuffer zpd_counter_sink_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory zpd_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
+  // Currently installed binding 1 buffer.
+  VkBuffer zpd_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize zpd_counter_descriptor_range_ = 0;
+
+  ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
   bool submission_open_ = false;
-  uint64_t submission_completed_ = 0;
   // In case vkQueueSubmit fails after something like a successful
   // vkQueueBindSparse, to wait correctly on the next attempt.
   std::vector<VkSemaphore> current_submission_wait_semaphores_;
   std::vector<VkPipelineStageFlags> current_submission_wait_stage_masks_;
-  std::vector<VkFence> submissions_in_flight_fences_;
   std::deque<std::pair<uint64_t, VkSemaphore>> submissions_in_flight_semaphores_;
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
   bool frame_open_ = false;
-  // Tracks whether any draw in the current frame used an async placeholder
-  // graphics pipeline and may have produced incomplete output.
-  bool frame_used_async_placeholder_pipeline_ = false;
+  // Tracks whether any draw in the current frame was skipped because its
+  // graphics pipeline was still being created, so the output is incomplete.
+  bool frame_used_pending_pipeline_ = false;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
@@ -587,7 +695,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // No specific reason for 32768, just the "too much" descriptor count from
   // Direct3D 12 PIX warnings.
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
-  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_uniform_buffer_;
@@ -610,6 +718,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<VulkanPrimitiveProcessor> primitive_processor_;
 
   std::unique_ptr<VulkanRenderTargetCache> render_target_cache_;
+
+  std::unique_ptr<VulkanQueryPool> host_query_pool_;
+
+  VkBuffer viz_predicate_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory viz_predicate_buffer_memory_ = VK_NULL_HANDLE;
+  bool viz_predicate_buffer_failed_ = false;
+  struct PendingVIZCopy {
+    uint32_t id;
+    uint32_t query_index;
+    bool fsi;
+  };
+  std::vector<PendingVIZCopy> viz_pending_copies_;
 
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
@@ -643,6 +763,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDescriptorSetLayout swap_descriptor_set_layout_sampled_image_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout swap_descriptor_set_layout_combined_image_sampler_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout swap_descriptor_set_layout_storage_image_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout swap_smaa_descriptor_set_layout_sampler_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout swap_smaa_descriptor_set_layout_sources_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout swap_descriptor_set_layout_uniform_texel_buffer_ = VK_NULL_HANDLE;
 
   // Descriptor pool for allocating descriptors needed for presentation, such as
@@ -686,6 +808,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_smaa_pipeline_layout_ = VK_NULL_HANDLE;
+  std::array<VkPipeline, kSwapSmaaPassCount> swap_smaa_pipelines_{};
+  VkDescriptorSet swap_smaa_descriptor_sampler_ = VK_NULL_HANDLE;
+  // Per frame in flight and pass, written every frame like the FXAA ones.
+  std::array<std::array<VkDescriptorSet, kSwapSmaaPassCount>, kMaxFramesInFlight>
+      swap_smaa_descriptors_sources_{};
+  std::array<std::array<VkDescriptorSet, kSwapSmaaPassCount>, kMaxFramesInFlight>
+      swap_smaa_descriptors_destination_{};
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;
@@ -701,6 +831,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipelineStageFlags swap_fxaa_source_stage_mask_ = 0;
   VkAccessFlags swap_fxaa_source_access_mask_ = 0;
   VkImageLayout swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+
+  std::array<VkImage, kSwapSmaaImageCount> swap_smaa_images_{};
+  std::array<VkDeviceMemory, kSwapSmaaImageCount> swap_smaa_image_memory_{};
+  std::array<VkImageView, kSwapSmaaImageCount> swap_smaa_image_views_{};
+  uint32_t swap_smaa_image_width_ = 0;
+  uint32_t swap_smaa_image_height_ = 0;
+  // Last submission using any of the SMAA images.
+  uint64_t swap_smaa_images_submission_ = 0;
 
   std::array<SwapFramebuffer, ui::vulkan::VulkanPresenter::kMaxActiveGuestOutputImageVersions>
       swap_framebuffers_;
@@ -727,28 +865,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t scratch_buffer_last_usage_submission_ = 0;
   bool scratch_buffer_used_ = false;
 
-  static constexpr uint32_t kMaxOcclusionQueries = 8192;
-  VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
-  VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-  uint32_t occlusion_query_readback_memory_type_ = UINT32_MAX;
-  VkDeviceSize occlusion_query_readback_memory_size_ = 0;
-  uint8_t* occlusion_query_readback_mapping_ = nullptr;
-  uint32_t occlusion_query_cursor_ = 0;
-  bool occlusion_query_resources_available_ = false;
-  struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
-    uint32_t host_index = UINT32_MAX;
-    bool valid = false;
-  } active_occlusion_query_;
-  struct VertexBufferState {
-    uint32_t address = UINT32_MAX;
-    uint32_t size = UINT32_MAX;
-  };
-  std::array<VertexBufferState, 96> vertex_buffer_states_{};
-  uint64_t vertex_buffers_in_sync_[2] = {};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+
+  // Persistently mapped buffer for the synchronous memexport readback, grown on
+  // demand like D3D12's RequestReadbackBuffer instead of being allocated per
+  // draw.
+  VkBuffer memexport_full_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory memexport_full_readback_memory_ = VK_NULL_HANDLE;
+  void* memexport_full_readback_mapping_ = nullptr;
+  uint32_t memexport_full_readback_size_ = 0;
+  bool RequestMemexportFullReadbackBuffer(uint32_t size);
+  void ReadMemexportRanges(const void* readback_mapping);
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's
@@ -806,8 +934,12 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // Pipeline layout of the current guest graphics pipeline.
   const PipelineLayout* current_guest_graphics_pipeline_layout_;
+  // The bindings are VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, so the infos
+  // describe only the pool page and the size - the offset within the page is
+  // passed when binding and the info offset stays 0.
   VkDescriptorBufferInfo
-      current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferCount];
+      current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferCount]{};
+  uint32_t current_constant_buffer_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferCount]{};
   // Whether up-to-date data has been written to constant (uniform) buffers, and
   // the buffer infos in current_constant_buffer_infos_ point to them.
   uint32_t current_constant_buffers_up_to_date_;
@@ -829,6 +961,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   static_assert(SpirvShaderTranslator::kDescriptorSetCount <=
                     sizeof(current_graphics_descriptor_sets_bound_up_to_date_) * CHAR_BIT,
                 "Bit fields storing descriptor set validity must be large enough");
+  // For reusing the texture/sampler descriptor sets across draws while their
+  // contents stay valid - the shaders and the samplers the currently valid
+  // texture descriptor sets were written for (texture image view changes are
+  // tracked separately via VulkanTextureCache::texture_bindings_changed).
+  const VulkanShader* current_textures_vertex_shader_ = nullptr;
+  const VulkanShader* current_textures_pixel_shader_ = nullptr;
+  std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>
+      current_written_samplers_vertex_;
+  std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>
+      current_written_samplers_pixel_;
 
   // Float constant usage masks of the last draw call.
   uint64_t current_float_constant_map_vertex_[4];

@@ -1,0 +1,102 @@
+/**
+ * @file        graphics/shaders/smaa.xesli
+ * @brief       Common part of the SMAA swap post effect compute shaders
+ *
+ * @copyright   Copyright (c) 2026 ReXGlue fork contributors
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
+
+// SMAA (thirdparty/smaa) in compute shaders, as the swap post effect after the
+// gamma ramp is applied (so the colors are gamma-corrected, as the luma edge
+// detection expects). Three passes, all at the guest output size:
+// 1. smaa_edge_detection: color -> edges (RG).
+// 2. smaa_blending_weight_calculation: edges + AreaTex + SearchTex -> weights.
+// 3. smaa_neighborhood_blending: color + weights -> guest output.
+//
+// Bindings shared by all passes:
+// - Push constants (b0): xe_smaa_size, xe_smaa_size_inv.
+// - Linear clamp sampler: set 0, binding 0 (s0). SMAA requires linear
+//   filtering and clamping for all its samplers.
+// - Source textures: set 1, bindings 0 to 2 (t0 to t2), declared by each pass.
+// - Destination image: set 2, binding 0 (u0), declared by each pass.
+
+#ifndef XENIA_GPU_SHADERS_SMAA_XESLI_
+#define XENIA_GPU_SHADERS_SMAA_XESLI_
+
+#include "../../ui/shaders/xesl.xesli"
+
+push_const_begin_xe(b0, space0)
+  uint2_xe xe_smaa_size;
+  float2_xe xe_smaa_size_inv;
+push_const_end_xe
+
+sampler_state_xe(xe_smaa_sampler_linear, set=0, binding=0, s0, space0,
+                 sampler(0))
+
+#define LOCAL_SIZE_X_XE 16
+#define LOCAL_SIZE_Y_XE 8
+#define LOCAL_SIZE_Z_XE 1
+
+#define SMAA_CUSTOM_SL 1
+#define SMAA_PRESET_HIGH 1
+// Only the functions the passes use; the vertex shader functions calculate the
+// offsets in the compute shaders.
+#define SMAA_INCLUDE_VS 1
+#define SMAA_INCLUDE_PS 1
+
+#define SMAA_RT_METRICS                                                        \
+  float4_xe(push_const_xe(xe_smaa_size_inv), float2_xe(push_const_xe(xe_smaa_size)))
+
+#define SMAATexture2D(tex) texture_2d_xe tex
+#define SMAATexturePass2D(tex) tex
+// No implicit derivatives in compute shaders - always sample the top level.
+#define SMAASampleLevelZero(tex, coord)                                        \
+  sample_sep_lod_2d_xe(tex, xe_smaa_sampler_linear, coord, 0.0)
+#define SMAASampleLevelZeroPoint(tex, coord) SMAASampleLevelZero(tex, coord)
+#define SMAASampleLevelZeroOffset(tex, coord, offset)                          \
+  SMAASampleLevelZero(tex, (coord) + float2_xe(offset) * SMAA_RT_METRICS.xy)
+#define SMAASample(tex, coord) SMAASampleLevelZero(tex, coord)
+#define SMAASamplePoint(tex, coord) SMAASampleLevelZero(tex, coord)
+#define SMAASampleOffset(tex, coord, offset)                                   \
+  SMAASampleLevelZeroOffset(tex, coord, offset)
+#define SMAA_FLATTEN flatten_xe
+#define SMAA_BRANCH dont_flatten_xe
+
+#if SHADING_LANGUAGE_HLSL_XE
+  // "use of potentially uninitialized variable" in the edge detection due to
+  // the early exit (replacing `discard`) - an FXC bug, same as with FXAA.
+  #pragma warning(disable: 4000)
+#endif
+
+#if SHADING_LANGUAGE_GLSL_XE
+  #define lerp(a, b, t) mix(a, b, t)
+  #define saturate(a) clamp(a, 0.0, 1.0)
+  #define mad(a, b, c) fma(a, b, c)
+  #define float2 vec2
+  #define float3 vec3
+  #define float4 vec4
+  #define int2 ivec2
+  #define int3 ivec3
+  #define int4 ivec4
+  #define bool2 bvec2
+  #define bool3 bvec3
+  #define bool4 bvec4
+#endif
+
+// The edge detection functions of SMAA discard pixels without edges, which is
+// not possible in compute shaders (and an error in GLSL even in functions that
+// are not called). The passes write all pixels, so no edges is just zero.
+#define discard return float2_xe(0.0, 0.0)
+
+#include "../../../thirdparty/smaa/SMAA.hlsl"
+
+#undef discard
+
+float2_xe XeSmaaTexcoord(uint2_xe pixel) {
+  return (float2_xe(pixel) + 0.5) * push_const_xe(xe_smaa_size_inv);
+}
+
+#endif  // XENIA_GPU_SHADERS_SMAA_XESLI_

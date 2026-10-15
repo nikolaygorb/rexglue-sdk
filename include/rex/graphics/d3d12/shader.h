@@ -29,6 +29,24 @@ class D3D12Shader : public DxbcShader {
                                 IDxbcConverter* dxbc_converter = nullptr,
                                 IDxcUtils* dxc_utils = nullptr,
                                 IDxcCompiler* dxc_compiler = nullptr);
+
+    // For background thread translation: atomically claim the right to
+    // translate. Returns true if caller should translate, false if another
+    // thread claimed it.
+    bool TryClaimTranslation() {
+      return !translation_claimed_.test_and_set(std::memory_order_acq_rel);
+    }
+    // Set by the pipeline cache after the translation and everything done with
+    // it (binding layouts, disassembly) is complete - is_translated() becomes
+    // true earlier, in the middle of that work.
+    void MarkTranslationComplete() { translation_complete_.store(true, std::memory_order_release); }
+    bool is_translation_complete() const {
+      return translation_complete_.load(std::memory_order_acquire);
+    }
+
+   private:
+    std::atomic_flag translation_claimed_ = ATOMIC_FLAG_INIT;
+    std::atomic<bool> translation_complete_{false};
   };
 
   D3D12Shader(xenos::ShaderType shader_type, uint64_t ucode_data_hash, const uint32_t* ucode_dwords,

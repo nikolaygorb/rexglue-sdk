@@ -13,9 +13,11 @@
 
 #pragma once
 
+#include <bit>
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 
 #include <simde/x86/avx.h>
 #include <simde/x86/avx2.h>
@@ -391,6 +393,49 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
   r_lo = simde_mm_and_si128(r_lo, mask8);
   r_hi = simde_mm_and_si128(r_hi, mask8);
   return simde_mm_packus_epi16(r_lo, r_hi);
+}
+
+//=============================================================================
+// Multiply-add NaN rules
+//=============================================================================
+// fmadd/fmsub/fnmadd/fnmsub (and their single forms), vmaddfp and vnmsubfp
+// compute D = +-(A * C +- B). When an operand is a NaN, the hardware returns
+// the first NaN operand in A, B, C order, quieted, with its sign left alone;
+// that is not the host's order. An invalid operation with no NaN operand
+// (infinity times zero) gives the default QNaN, which is positive on PPC and
+// negative on x86. The negated forms never negate a NaN result.
+
+// Fixes up the result `r` of a scalar multiply-add with operands a, b, c.
+inline double fp_madd_result(double r, double a, double b, double c, bool negate) {
+  if (!std::isnan(r)) [[likely]] {
+    return negate ? -r : r;
+  }
+  constexpr uint64_t kQuietBit = 0x0008000000000000ull;
+  for (double x : {a, b, c}) {
+    if (std::isnan(x)) {
+      return std::bit_cast<double>(std::bit_cast<uint64_t>(x) | kQuietBit);
+    }
+  }
+  return std::bit_cast<double>(0x7FF8000000000000ull);
+}
+
+// Fixes up the result `r` of a vector multiply-add with operands a, b, c.
+inline simde__m128 vec_madd_result(simde__m128 r, simde__m128 a, simde__m128 b, simde__m128 c,
+                                   bool negate) {
+  if (negate) {
+    r = simde_mm_xor_ps(r, simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))));
+  }
+  const simde__m128 r_nan = simde_mm_cmpunord_ps(r, r);
+  if (simde_mm_movemask_ps(r_nan) == 0) [[likely]] {
+    return r;
+  }
+  // Later blends win, so the operands go in reverse priority order.
+  simde__m128 nan = simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7FC00000));
+  nan = simde_mm_blendv_ps(nan, c, simde_mm_cmpunord_ps(c, c));
+  nan = simde_mm_blendv_ps(nan, b, simde_mm_cmpunord_ps(b, b));
+  nan = simde_mm_blendv_ps(nan, a, simde_mm_cmpunord_ps(a, a));
+  nan = simde_mm_or_ps(nan, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x00400000)));
+  return simde_mm_blendv_ps(r, nan, r_nan);
 }
 
 }  // namespace rex::ppc

@@ -19,6 +19,9 @@ namespace xam {
 
 bool xeXamIsUIActive();
 
+// XamUserGetSigninState for user_index; 0 when nobody is signed in there.
+uint32_t xeXamUserGetSigninState(uint32_t user_index);
+
 rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
 
 // Registration functions, one per file.

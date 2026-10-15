@@ -283,13 +283,20 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
     FileInfo info;
 
     info.name = ent->d_name;
-    struct stat st;
-    stat((path / info.name).c_str(), &st);
+    struct stat st = {};
+    // stat() follows symlinks, so a symlinked directory reports S_ISDIR here even
+    // though readdir() gives it d_type DT_LNK (and some filesystems only ever give
+    // DT_UNKNOWN). Trusting d_type alone listed such directories as files, which
+    // left everything under a symlinked folder unreachable.
+    const bool have_stat = stat((path / info.name).c_str(), &st) == 0;
     info.create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
     info.access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
     info.write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
     info.path = path;
-    if (ent->d_type == DT_DIR) {
+    const bool is_dir =
+        ent->d_type == DT_DIR ||
+        ((ent->d_type == DT_LNK || ent->d_type == DT_UNKNOWN) && have_stat && S_ISDIR(st.st_mode));
+    if (is_dir) {
       info.type = FileInfo::Type::kDirectory;
       info.total_size = 0;
     } else {

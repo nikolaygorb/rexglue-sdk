@@ -10,6 +10,7 @@ add_library(rexaudio OBJECT
     xma_decoder.cpp
     xma_register_file.cpp
     # NOP backend (always available)
+    nop/nop_audio_driver.cpp
     nop/nop_audio_system.cpp
     # SDL backend
     sdl/sdl_audio_system.cpp

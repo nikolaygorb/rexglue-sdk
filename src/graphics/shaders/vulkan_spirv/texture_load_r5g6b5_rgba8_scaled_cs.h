@@ -1,5 +1,7 @@
-// Generated with `spirv-as` from the R5G6B5 texture load shader.
+// Generated with `spirv-as` from texture_load_r5g6b5_rgba8_scaled.cs.spvasm.
 #if 0
+; Generated with `spirv-as` from the R5G6B5 texture load shader.
+; MoltenVK texture load variant, hand-edited SPIR-V assembly (rexglue, 5f5d7f6).
 ; SPIR-V
 ; Version: 1.0
 ; Generator: Khronos Glslang Reference Front End; 11
@@ -467,7 +469,7 @@
 #endif
 
 const uint32_t texture_load_r5g6b5_rgba8_scaled_cs[] = {
-    0x07230203, 0x00010000, 0x0008000B, 0x00000182, 0x00000000, 0x00020011, 0x00000001, 0x0006000B,
+    0x07230203, 0x00010000, 0x00070000, 0x00000182, 0x00000000, 0x00020011, 0x00000001, 0x0006000B,
     0x00000001, 0x4C534C47, 0x6474732E, 0x3035342E, 0x00000000, 0x0003000E, 0x00000000, 0x00000001,
     0x0006000F, 0x00000005, 0x00000002, 0x6E69616D, 0x00000000, 0x00000003, 0x00060010, 0x00000002,
     0x00000011, 0x00000004, 0x00000020, 0x00000001, 0x00030003, 0x00000002, 0x000001CC, 0x00090004,

@@ -197,67 +197,63 @@ bool build_fdivs(BuilderContext& ctx) {
 // Fused Multiply-Add
 //=============================================================================
 
-bool build_fmadd(BuilderContext& ctx) {
+// D = +-(A * C +- B), with the NaN rules of rex::ppc::fp_madd_result: the
+// first NaN operand in A, B, C order wins, and a negation never reaches a NaN.
+// Operands are (D, A, C, B) in encoding order.
+static void emit_fp_madd(BuilderContext& ctx, bool subtract, bool negate, bool single) {
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = std::fma({}.f64, {}.f64, {}.f64);", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
-              ctx.f(ctx.insn.operands[3]));
+  const auto d = ctx.f(ctx.insn.operands[0]);
+  const auto a = ctx.f(ctx.insn.operands[1]);
+  const auto c = ctx.f(ctx.insn.operands[2]);
+  const auto b = ctx.f(ctx.insn.operands[3]);
+  const auto result = fmt::format(
+      "rex::ppc::fp_madd_result(std::fma({0}.f64, {1}.f64, {2}{3}.f64), {0}.f64, "
+      "{3}.f64, {1}.f64, {4})",
+      a, c, subtract ? "-" : "", b, negate ? "true" : "false");
+  if (single) {
+    ctx.println("\t{}.f64 = double(float({}));", d, result);
+  } else {
+    ctx.println("\t{}.f64 = {};", d, result);
+  }
+}
+
+bool build_fmadd(BuilderContext& ctx) {
+  emit_fp_madd(ctx, false, false, false);
   return true;
 }
 
 bool build_fmadds(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float(std::fma({}.f64, {}.f64, {}.f64)));",
-              ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
-              ctx.f(ctx.insn.operands[3]));
+  emit_fp_madd(ctx, false, false, true);
   return true;
 }
 
 bool build_fmsub(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = std::fma({}.f64, {}.f64, -{}.f64);", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
-              ctx.f(ctx.insn.operands[3]));
+  emit_fp_madd(ctx, true, false, false);
   return true;
 }
 
 bool build_fmsubs(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float(std::fma({}.f64, {}.f64, -{}.f64)));",
-              ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
-              ctx.f(ctx.insn.operands[3]));
+  emit_fp_madd(ctx, true, false, true);
   return true;
 }
 
 bool build_fnmadd(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = -std::fma({}.f64, {}.f64, {}.f64);", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
-              ctx.f(ctx.insn.operands[3]));
+  emit_fp_madd(ctx, false, true, false);
   return true;
 }
 
 bool build_fnmadds(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float(-std::fma({}.f64, {}.f64, {}.f64)));",
-              ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
-              ctx.f(ctx.insn.operands[3]));
+  emit_fp_madd(ctx, false, true, true);
   return true;
 }
 
 bool build_fnmsub(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = -std::fma({}.f64, {}.f64, -{}.f64);", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
-              ctx.f(ctx.insn.operands[3]));
+  emit_fp_madd(ctx, true, true, false);
   return true;
 }
 
 bool build_fnmsubs(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float(-std::fma({}.f64, {}.f64, -{}.f64)));",
-              ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
-              ctx.f(ctx.insn.operands[3]));
+  emit_fp_madd(ctx, true, true, true);
   return true;
 }
 

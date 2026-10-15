@@ -58,8 +58,11 @@ class D3D12TextureCache final : public TextureCache {
       xenos::AnisoFilter aniso_filter : 3;  // 17
       uint32_t mip_min_level : 4;           // 21
       uint32_t mip_base_map : 1;            // 22
+      // Force the border color alpha to 1.0 (only meaningful with a border
+      // clamp mode).
+      uint32_t force_bc_w_to_max : 1;  // 23
       // Maximum mip level is in the texture resource itself, but mip_base_map
-      // can be used to limit fetching to mip_min_level.
+      // limits fetching to mip_min_level (level 0 when the base is available).
     };
 
     SamplerParameters() : value(0) { static_assert_size(*this, sizeof(value)); }
@@ -116,9 +119,6 @@ class D3D12TextureCache final : public TextureCache {
   SamplerParameters GetSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
-  // Returns whether the actual scale is not smaller than the requested one.
-  static bool ClampDrawResolutionScaleToMaxSupported(uint32_t& scale_x, uint32_t& scale_y,
-                                                     const ui::d3d12::D3D12Provider& provider);
   // Ensures the tiles backing the range in the buffers are allocated.
   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
                                           uint32_t length_scaled_alignment_log2 = 0) override;
@@ -128,29 +128,34 @@ class D3D12TextureCache final : public TextureCache {
   // barriers are required.
   bool MakeScaledResolveRangeCurrent(uint32_t start_unscaled, uint32_t length_unscaled,
                                      uint32_t length_scaled_alignment_log2 = 0);
-  // These functions create a view of the range specified in the last successful
-  // MakeScaledResolveRangeCurrent call because that function must be called
-  // before this.
-  void CreateCurrentScaledResolveRangeUintPow2SRV(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                                  uint32_t element_size_bytes_pow2);
-  void CreateCurrentScaledResolveRangeUintPow2UAV(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                                  uint32_t element_size_bytes_pow2);
+  // Returns the GPU address of the range specified in the last successful
+  // MakeScaledResolveRangeCurrent call.
+  D3D12_GPU_VIRTUAL_ADDRESS GetCurrentScaledResolveRangeGPUAddress() const;
   void TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATES new_state);
-  uint64_t GetCurrentScaledResolveRangeStartScaled() const {
-    return scaled_resolve_current_range_start_scaled_;
-  }
-  uint64_t GetCurrentScaledResolveRangeLengthScaled() const {
-    return scaled_resolve_current_range_length_scaled_;
-  }
-  ID3D12Resource* GetCurrentScaledResolveBufferResource() {
-    return GetCurrentScaledResolveBuffer().resource();
-  }
-  size_t GetCurrentScaledResolveBufferIndexPublic() const {
-    return GetCurrentScaledResolveBufferIndex();
-  }
   void MarkCurrentScaledResolveRangeUAVWritesCommitNeeded() {
     assert_true(IsDrawResolutionScaled());
     GetCurrentScaledResolveBuffer().SetUAVBarrierPending();
+  }
+  // The range specified in the last successful MakeScaledResolveRangeCurrent
+  // call, in the scaled physical memory address space.
+  uint64_t GetCurrentScaledResolveRangeStartScaled() const {
+    assert_true(IsDrawResolutionScaled());
+    return scaled_resolve_current_range_start_scaled_;
+  }
+  uint64_t GetCurrentScaledResolveRangeLengthScaled() const {
+    assert_true(IsDrawResolutionScaled());
+    return scaled_resolve_current_range_length_scaled_;
+  }
+  // The resource of the buffer containing the current scaled resolve range,
+  // and the offset of the start of the buffer within the scaled physical
+  // memory address space (the buffer index is also its gigabyte offset).
+  ID3D12Resource* GetCurrentScaledResolveBufferResource() {
+    assert_true(IsDrawResolutionScaled());
+    return GetCurrentScaledResolveBuffer().resource();
+  }
+  uint64_t GetCurrentScaledResolveBufferBaseOffset() const {
+    assert_true(IsDrawResolutionScaled());
+    return uint64_t(GetCurrentScaledResolveBufferIndex()) << 30;
   }
 
   // Returns the ID3D12Resource of the front buffer texture (in
@@ -201,10 +206,10 @@ class D3D12TextureCache final : public TextureCache {
     LoadShaderIndex load_shader_signed;
 
     // Do NOT add integer DXGI formats to this - they are not filterable, can
-    // only be read with Load, not Sample! If any game is seen using num_format
-    // 1 for fixed-point formats (for floating-point, it's normally set to 1
-    // though), add a constant buffer containing multipliers for the
-    // textures and multiplication to the tfetch implementation.
+    // only be read with Load, not Sample! Games that fetch fixed-point formats
+    // are handled after sampling by scaling the normalized host value back to
+    // the guest integer range (see GetIntegerScaleBits). Keep these as
+    // sampled float/normalized views.
 
     // Whether the DXGI format, if not uncompressing the texture, consists of
     // blocks, thus copy regions must be aligned to block size (assuming it's
@@ -456,6 +461,10 @@ class D3D12TextureCache final : public TextureCache {
 
   D3D12CommandProcessor& command_processor_;
   bool bindless_resources_used_;
+
+  // Bits per format, for checking if the host format should be point-filtered.
+  uint64_t host_filterable_unsigned_ = 0;
+  uint64_t host_filterable_signed_ = 0;
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;

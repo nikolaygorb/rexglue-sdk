@@ -23,7 +23,7 @@
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/instance.h>
-#include <rex/ui/vulkan/submission_tracker.h>
+#include <rex/ui/vulkan/gpu_completion_timeline.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 
 namespace rex {
@@ -110,7 +110,7 @@ class VulkanPresenter final : public Presenter {
   };
 
   static std::unique_ptr<VulkanPresenter> Create(HostGpuLossCallback host_gpu_loss_callback,
-                                                 const VulkanDevice* vulkan_device,
+                                                 VulkanDevice* vulkan_device,
                                                  const UISamplers* ui_samplers) {
     auto presenter = std::unique_ptr<VulkanPresenter>(
         new VulkanPresenter(host_gpu_loss_callback, vulkan_device, ui_samplers));
@@ -122,7 +122,7 @@ class VulkanPresenter final : public Presenter {
 
   ~VulkanPresenter();
 
-  const VulkanDevice* vulkan_device() const { return vulkan_device_; }
+  VulkanDevice* vulkan_device() const { return vulkan_device_; }
 
   static Surface::TypeFlags GetSurfaceTypesSupportedByInstance(
       const VulkanInstance::Extensions& instance_extensions);
@@ -131,7 +131,7 @@ class VulkanPresenter final : public Presenter {
   bool CaptureGuestOutput(RawImage& image_out) override;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
-    ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
+    ui_completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission_index);
   }
   VkCommandBuffer AcquireUISetupCommandBufferFromUIThread();
 
@@ -230,12 +230,10 @@ class VulkanPresenter final : public Presenter {
 
   enum GuestOutputPaintPipelineLayoutIndex : size_t {
     kGuestOutputPaintPipelineLayoutIndexBilinear,
-#if defined(REX_HAS_FIDELITYFX_SDK)
     kGuestOutputPaintPipelineLayoutIndexCasSharpen,
     kGuestOutputPaintPipelineLayoutIndexCasResample,
     kGuestOutputPaintPipelineLayoutIndexFsrEasu,
     kGuestOutputPaintPipelineLayoutIndexFsrRcas,
-#endif
 
     kGuestOutputPaintPipelineLayoutCount,
   };
@@ -246,7 +244,6 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kBilinear:
       case GuestOutputPaintEffect::kBilinearDither:
         return kGuestOutputPaintPipelineLayoutIndexBilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
       case GuestOutputPaintEffect::kCasSharpenDither:
         return kGuestOutputPaintPipelineLayoutIndexCasSharpen;
@@ -258,7 +255,6 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kFsrRcas:
       case GuestOutputPaintEffect::kFsrRcasDither:
         return kGuestOutputPaintPipelineLayoutIndexFsrRcas;
-#endif
       default:
         assert_unhandled_case(effect);
         return kGuestOutputPaintPipelineLayoutCount;
@@ -281,7 +277,6 @@ class VulkanPresenter final : public Presenter {
       ~Submission();
 
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
-      VkSemaphore present_semaphore() const { return present_semaphore_; }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const { return draw_command_buffer_; }
 
@@ -292,7 +287,6 @@ class VulkanPresenter final : public Presenter {
 
       const VulkanDevice* vulkan_device_;
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
-      VkSemaphore present_semaphore_ = VK_NULL_HANDLE;
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
     };
@@ -340,8 +334,8 @@ class VulkanPresenter final : public Presenter {
       VkFramebuffer framebuffer;
     };
 
-    explicit PaintContext(const VulkanDevice* const vulkan_device)
-        : vulkan_device(vulkan_device), submission_tracker(vulkan_device) {}
+    explicit PaintContext(VulkanDevice* const vulkan_device)
+        : vulkan_device(vulkan_device), completion_timeline(vulkan_device) {}
     PaintContext(const PaintContext& paint_context) = delete;
     PaintContext& operator=(const PaintContext& paint_context) = delete;
 
@@ -364,10 +358,10 @@ class VulkanPresenter final : public Presenter {
 
     // Connection-indepedent.
 
-    const VulkanDevice* vulkan_device;
+    VulkanDevice* vulkan_device;
 
     std::array<std::unique_ptr<PaintContext::Submission>, kSubmissionCount> submissions;
-    VulkanSubmissionTracker submission_tracker;
+    VulkanGPUCompletionTimeline completion_timeline;
 
     std::array<GuestOutputPaintPipeline, size_t(GuestOutputPaintEffect::kCount)>
         guest_output_paint_pipelines;
@@ -416,15 +410,16 @@ class VulkanPresenter final : public Presenter {
     bool swapchain_is_fifo = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+    std::vector<VkSemaphore> swapchain_image_present_semaphores;
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
-                           const VulkanDevice* vulkan_device, const UISamplers* ui_samplers)
+                           VulkanDevice* vulkan_device, const UISamplers* ui_samplers)
       : Presenter(host_gpu_loss_callback),
         vulkan_device_(vulkan_device),
         ui_samplers_(ui_samplers),
-        guest_output_image_refresher_submission_tracker_(vulkan_device),
-        ui_submission_tracker_(vulkan_device),
+        guest_output_image_refresher_completion_timeline_(vulkan_device),
+        ui_completion_timeline_(vulkan_device),
         paint_context_(vulkan_device) {
     assert_not_null(vulkan_device);
     assert_not_null(ui_samplers);
@@ -445,7 +440,7 @@ class VulkanPresenter final : public Presenter {
   void DestroyTemporalUpscalerContext();
 #endif
 
-  const VulkanDevice* vulkan_device_;
+  VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
 
   // Static objects for guest output presentation, used only when painting the
@@ -469,11 +464,11 @@ class VulkanPresenter final : public Presenter {
   // destruction.
   uint64_t guest_output_image_next_version_ = 0;
   std::array<GuestOutputImageInstance, kGuestOutputMailboxSize> guest_output_images_;
-  VulkanSubmissionTracker guest_output_image_refresher_submission_tracker_;
+  VulkanGPUCompletionTimeline guest_output_image_refresher_completion_timeline_;
 
-  // UI submission tracker with the submission index that can be given to UI
-  // drawers (accessible from the UI thread only, at any time).
-  VulkanSubmissionTracker ui_submission_tracker_;
+  // UI submission completion timeline with the submission index that can be
+  // given to UI drawers (accessible from the UI thread only, at any time).
+  VulkanGPUCompletionTimeline ui_completion_timeline_;
 
   // Accessible only by painting and by surface connection lifetime management
   // (ConnectOrReconnectPaintingToSurfaceFromUIThread,

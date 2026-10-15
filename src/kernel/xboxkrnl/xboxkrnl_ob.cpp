@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/assert.h>
+#include <rex/kernel/xboxkrnl/ob.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -154,6 +155,29 @@ u32 ObReferenceObjectByName_entry(mapped_string name, u32 attributes, u32 object
   return result;
 }
 
+// The object behind a guest object pointer, as ObReferenceObject and
+// ObDereferenceObject receive it.
+static object_ref<XObject> LookupObjectByNativePointer(uint32_t native_ptr) {
+  // Objects allocated by XObject::CreateNative keep their handle in the header in front of
+  // them. Some have no dispatch header (enumerators), so the handle stashed in the body is
+  // not reliable for those: it may be overwritten by the object's own fields.
+  object_ref<XObject> object;
+  // (Not for an object at the start of a page: the header would be on the previous one.)
+  if ((native_ptr & 0xFFF) >= sizeof(X_OBJECT_HEADER)) {
+    auto header = REX_KERNEL_MEMORY()->TranslateVirtual<X_OBJECT_HEADER*>(native_ptr -
+                                                                          sizeof(X_OBJECT_HEADER));
+    object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(header->unk_04);
+    if (object && object->guest_object() != native_ptr) {
+      object.reset();
+    }
+  }
+  if (!object) {
+    object = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(),
+                                               REX_KERNEL_MEMORY()->TranslateVirtual(native_ptr));
+  }
+  return object;
+}
+
 u32 ObDereferenceObject_entry(u32 native_ptr) {
   REXKRNL_IMPORT_TRACE("ObDereferenceObject", "ptr={:#x}", (uint32_t)native_ptr);
   // Check if a dummy value from ObReferenceObjectByHandle.
@@ -161,24 +185,41 @@ u32 ObDereferenceObject_entry(u32 native_ptr) {
     return 0;
   }
 
-  auto object = XObject::GetNativeObject<XObject>(
-      REX_KERNEL_STATE(), REX_KERNEL_MEMORY()->TranslateVirtual(native_ptr));
-  if (object) {
+  if (auto object = LookupObjectByNativePointer(native_ptr)) {
     object->ReleaseHandle();
   }
 
   return 0;
 }
 
+void ObReferenceObject_entry(u32 native_ptr) {
+  // Check if a dummy value from ObReferenceObjectByHandle.
+  if (!native_ptr || native_ptr == 0xDEADF00D) {
+    return;
+  }
+
+  if (auto object = LookupObjectByNativePointer(native_ptr)) {
+    object->RetainHandle();
+  } else {
+    REXKRNL_WARN("Unregistered guest object provided to ObReferenceObject {:08X}",
+                 uint32_t(native_ptr));
+  }
+}
+
+u32 ObLookupAnyThreadByThreadId_entry(u32 thread_id, mapped_u32 out_object_ptr) {
+  return ObLookupThreadByThreadId_entry(thread_id, out_object_ptr);
+}
+
 u32 ObCreateSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr,
                                ppc_ptr_t<X_ANSI_STRING> target_ptr) {
-  auto path = rex::string::utf8_canonicalize_guest_path(
-      util::TranslateAnsiPath(REX_KERNEL_MEMORY(), path_ptr));
+  auto path = xeObSymbolicLinkName(util::TranslateAnsiPath(REX_KERNEL_MEMORY(), path_ptr));
   auto target = rex::string::utf8_canonicalize_guest_path(
       util::TranslateAnsiPath(REX_KERNEL_MEMORY(), target_ptr));
 
-  if (rex::string::utf8_starts_with(path, u8"\\??\\")) {
-    path = path.substr(4);  // Strip the full qualifier
+  // A link that is already registered is not an error (4D5307DC expects success).
+  std::string existing_target;
+  if (REX_KERNEL_FS()->FindSymbolicLink(path, existing_target)) {
+    return X_STATUS_SUCCESS;
   }
 
   if (!REX_KERNEL_FS()->RegisterSymbolicLink(path, target)) {
@@ -189,7 +230,7 @@ u32 ObCreateSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr,
 }
 
 u32 ObDeleteSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr) {
-  auto path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), path_ptr);
+  auto path = xeObSymbolicLinkName(util::TranslateAnsiPath(REX_KERNEL_MEMORY(), path_ptr));
   if (!REX_KERNEL_FS()->UnregisterSymbolicLink(path)) {
     return X_STATUS_UNSUCCESSFUL;
   }
@@ -250,6 +291,9 @@ REX_EXPORT(__imp__ObLookupThreadByThreadId, rex::kernel::xboxkrnl::ObLookupThrea
 REX_EXPORT(__imp__ObReferenceObjectByHandle, rex::kernel::xboxkrnl::ObReferenceObjectByHandle_entry)
 REX_EXPORT(__imp__ObReferenceObjectByName, rex::kernel::xboxkrnl::ObReferenceObjectByName_entry)
 REX_EXPORT(__imp__ObDereferenceObject, rex::kernel::xboxkrnl::ObDereferenceObject_entry)
+REX_EXPORT(__imp__ObReferenceObject, rex::kernel::xboxkrnl::ObReferenceObject_entry)
+REX_EXPORT(__imp__ObLookupAnyThreadByThreadId,
+           rex::kernel::xboxkrnl::ObLookupAnyThreadByThreadId_entry)
 REX_EXPORT(__imp__ObCreateSymbolicLink, rex::kernel::xboxkrnl::ObCreateSymbolicLink_entry)
 REX_EXPORT(__imp__ObDeleteSymbolicLink, rex::kernel::xboxkrnl::ObDeleteSymbolicLink_entry)
 REX_EXPORT(__imp__NtDuplicateObject, rex::kernel::xboxkrnl::NtDuplicateObject_entry)
@@ -260,9 +304,7 @@ REX_EXPORT_STUB(__imp__ObCreateObject);
 REX_EXPORT_STUB(__imp__ObGetWaitableObject);
 REX_EXPORT_STUB(__imp__ObInsertObject);
 REX_EXPORT_STUB(__imp__ObIsTitleObject);
-REX_EXPORT_STUB(__imp__ObLookupAnyThreadByThreadId);
 REX_EXPORT_STUB(__imp__ObMakeTemporaryObject);
-REX_EXPORT_STUB(__imp__ObReferenceObject);
 REX_EXPORT_STUB(__imp__ObTranslateSymbolicLink);
 REX_EXPORT_STUB(__imp__NtCreateDirectoryObject);
 REX_EXPORT_STUB(__imp__NtCreateSymbolicLinkObject);

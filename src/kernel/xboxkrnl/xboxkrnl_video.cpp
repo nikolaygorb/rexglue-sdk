@@ -99,7 +99,6 @@ REX_EXPORT_STUB(__imp__VdGetDisplayDiscoveryData);
 REX_EXPORT_STUB(__imp__VdStartDisplayDiscovery);
 REX_EXPORT_STUB(__imp__VdSetHDCPRevocationList);
 REX_EXPORT_STUB(__imp__VdEnableWMAProOverHDMI);
-REX_EXPORT_STUB(__imp__VdQueryRealVideoMode);
 REX_EXPORT_STUB(__imp__VdSetCGMSState);
 REX_EXPORT_STUB(__imp__VdSetSCMSState);
 REX_EXPORT_STUB(__imp__VdGetOption);
@@ -529,6 +528,10 @@ void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
   xeRtlInitializeCriticalSectionAndSpinCount(hsio_lock, pVdHSIOCalibrationLock, 10000);
 }
 
+void VdQueryRealVideoMode_entry(ppc_ptr_t<X_VIDEO_MODE> video_mode) {
+  VdQueryVideoMode(video_mode);
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__VdGetCurrentDisplayGamma, rex::kernel::xboxkrnl::VdGetCurrentDisplayGamma_entry)
@@ -560,3 +563,4 @@ REX_EXPORT(__imp__VdPersistDisplay, rex::kernel::xboxkrnl::VdPersistDisplay_entr
 REX_EXPORT(__imp__VdRetrainEDRAMWorker, rex::kernel::xboxkrnl::VdRetrainEDRAMWorker_entry)
 REX_EXPORT(__imp__VdRetrainEDRAM, rex::kernel::xboxkrnl::VdRetrainEDRAM_entry)
 REX_EXPORT(__imp__VdSwap, rex::kernel::xboxkrnl::VdSwap_entry)
+REX_EXPORT(__imp__VdQueryRealVideoMode, rex::kernel::xboxkrnl::VdQueryRealVideoMode_entry)

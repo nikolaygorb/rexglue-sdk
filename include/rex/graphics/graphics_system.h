@@ -81,7 +81,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
   virtual void InvalidateGpuMemory();
 
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
-                               bool blocking) override;
+                               bool blocking,
+                               std::function<void()> completion_callback = nullptr) override;
 
   bool is_paused() const { return paused_; }
   void Pause();
@@ -120,6 +121,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   std::atomic<bool> vsync_worker_running_;
   system::object_ref<system::XHostThread> vsync_worker_thread_;
+  // Restart vblank deadline pacing from the current time after a pause.
+  std::atomic<bool> vblank_deadline_reset_{false};
 
   RegisterFile register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;

@@ -467,4 +467,42 @@ bool build_crxor(BuilderContext& ctx) {
   return true;
 }
 
+// The decoder matches these extended mnemonics before the base forms, and
+// their repeated fields are fake operands: only operands[0] (crD) and, for
+// crnot/crmove, operands[1] (crA) are filled.
+
+namespace {
+
+std::string crBitRef(BuilderContext& ctx, uint32_t bit) {
+  return fmt::format("{}.{}", ctx.cr(bit / 4), crBitName(bit % 4));
+}
+
+}  // namespace
+
+bool build_crset(BuilderContext& ctx) {
+  // crset crD = creqv crD, crD, crD
+  ctx.println("\t{} = 1;", crBitRef(ctx, ctx.insn.operands[0]));
+  return true;
+}
+
+bool build_crclr(BuilderContext& ctx) {
+  // crclr crD = crxor crD, crD, crD
+  ctx.println("\t{} = 0;", crBitRef(ctx, ctx.insn.operands[0]));
+  return true;
+}
+
+bool build_crnot(BuilderContext& ctx) {
+  // crnot crD, crA = crnor crD, crA, crA
+  ctx.println("\t{} = !{};", crBitRef(ctx, ctx.insn.operands[0]),
+              crBitRef(ctx, ctx.insn.operands[1]));
+  return true;
+}
+
+bool build_crmove(BuilderContext& ctx) {
+  // crmove crD, crA = cror crD, crA, crA
+  ctx.println("\t{} = {};", crBitRef(ctx, ctx.insn.operands[0]),
+              crBitRef(ctx, ctx.insn.operands[1]));
+  return true;
+}
+
 }  // namespace rex::codegen

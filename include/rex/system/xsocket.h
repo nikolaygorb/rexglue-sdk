@@ -99,6 +99,7 @@ class XSocket : public XObject {
   X_STATUS Initialize(AddressFamily af, Type type, Protocol proto);
   X_STATUS Close();
 
+  X_STATUS GetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t* optlen);
   X_STATUS SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen);
   X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
 
@@ -106,6 +107,7 @@ class XSocket : public XObject {
   X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
   X_STATUS Listen(int backlog);
   object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
+  X_STATUS GetSockName(N_XSOCKADDR* name, int* name_len);
   int Shutdown(int how);
 
   int Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags);

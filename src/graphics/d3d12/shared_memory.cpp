@@ -17,13 +17,10 @@
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
+#include <rex/graphics/flags.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_util.h>
-
-REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
-                    "Use tiled shared memory on D3D12")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::d3d12 {
 
@@ -45,7 +42,7 @@ bool D3D12SharedMemory::Initialize() {
   ui::d3d12::util::FillBufferResourceDesc(buffer_desc, kBufferSize,
                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   buffer_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
-  if (REXCVAR_GET(d3d12_tiled_shared_memory) &&
+  if (REXCVAR_GET(tiled_shared_memory) &&
       provider.GetTiledResourcesTier() != D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED &&
       !provider.GetGraphicsAnalysis()) {
     if (FAILED(device->CreateReservedResource(&buffer_desc, buffer_state_, nullptr,
@@ -98,41 +95,11 @@ bool D3D12SharedMemory::Initialize() {
       provider.OffsetViewDescriptor(buffer_descriptor_heap_start_,
                                     uint32_t(BufferDescriptorIndex::kRawSRV)),
       buffer_, kBufferSize);
-  ui::d3d12::util::CreateBufferTypedSRV(
-      device,
-      provider.OffsetViewDescriptor(buffer_descriptor_heap_start_,
-                                    uint32_t(BufferDescriptorIndex::kR32UintSRV)),
-      buffer_, DXGI_FORMAT_R32_UINT, kBufferSize >> 2);
-  ui::d3d12::util::CreateBufferTypedSRV(
-      device,
-      provider.OffsetViewDescriptor(buffer_descriptor_heap_start_,
-                                    uint32_t(BufferDescriptorIndex::kR32G32UintSRV)),
-      buffer_, DXGI_FORMAT_R32G32_UINT, kBufferSize >> 3);
-  ui::d3d12::util::CreateBufferTypedSRV(
-      device,
-      provider.OffsetViewDescriptor(buffer_descriptor_heap_start_,
-                                    uint32_t(BufferDescriptorIndex::kR32G32B32A32UintSRV)),
-      buffer_, DXGI_FORMAT_R32G32B32A32_UINT, kBufferSize >> 4);
   ui::d3d12::util::CreateBufferRawUAV(
       device,
       provider.OffsetViewDescriptor(buffer_descriptor_heap_start_,
                                     uint32_t(BufferDescriptorIndex::kRawUAV)),
       buffer_, kBufferSize);
-  ui::d3d12::util::CreateBufferTypedUAV(
-      device,
-      provider.OffsetViewDescriptor(buffer_descriptor_heap_start_,
-                                    uint32_t(BufferDescriptorIndex::kR32UintUAV)),
-      buffer_, DXGI_FORMAT_R32_UINT, kBufferSize >> 2);
-  ui::d3d12::util::CreateBufferTypedUAV(
-      device,
-      provider.OffsetViewDescriptor(buffer_descriptor_heap_start_,
-                                    uint32_t(BufferDescriptorIndex::kR32G32UintUAV)),
-      buffer_, DXGI_FORMAT_R32G32_UINT, kBufferSize >> 3);
-  ui::d3d12::util::CreateBufferTypedUAV(
-      device,
-      provider.OffsetViewDescriptor(buffer_descriptor_heap_start_,
-                                    uint32_t(BufferDescriptorIndex::kR32G32B32A32UintUAV)),
-      buffer_, DXGI_FORMAT_R32G32B32A32_UINT, kBufferSize >> 4);
 
   upload_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
       provider, rex::align(ui::d3d12::D3D12UploadBufferPool::kDefaultPageSize,
@@ -210,56 +177,6 @@ void D3D12SharedMemory::WriteRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
-void D3D12SharedMemory::WriteUintPow2SRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                                   uint32_t element_size_bytes_pow2) {
-  BufferDescriptorIndex descriptor_index;
-  switch (element_size_bytes_pow2) {
-    case 2:
-      descriptor_index = BufferDescriptorIndex::kR32UintSRV;
-      break;
-    case 3:
-      descriptor_index = BufferDescriptorIndex::kR32G32UintSRV;
-      break;
-    case 4:
-      descriptor_index = BufferDescriptorIndex::kR32G32B32A32UintSRV;
-      break;
-    default:
-      assert_unhandled_case(element_size_bytes_pow2);
-      return;
-  }
-  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
-  ID3D12Device* device = provider.GetDevice();
-  device->CopyDescriptorsSimple(
-      1, handle,
-      provider.OffsetViewDescriptor(buffer_descriptor_heap_start_, uint32_t(descriptor_index)),
-      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-}
-
-void D3D12SharedMemory::WriteUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                                   uint32_t element_size_bytes_pow2) {
-  BufferDescriptorIndex descriptor_index;
-  switch (element_size_bytes_pow2) {
-    case 2:
-      descriptor_index = BufferDescriptorIndex::kR32UintUAV;
-      break;
-    case 3:
-      descriptor_index = BufferDescriptorIndex::kR32G32UintUAV;
-      break;
-    case 4:
-      descriptor_index = BufferDescriptorIndex::kR32G32B32A32UintUAV;
-      break;
-    default:
-      assert_unhandled_case(element_size_bytes_pow2);
-      return;
-  }
-  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
-  ID3D12Device* device = provider.GetDevice();
-  device->CopyDescriptorsSimple(
-      1, handle,
-      provider.OffsetViewDescriptor(buffer_descriptor_heap_start_, uint32_t(descriptor_index)),
-      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-}
-
 bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                                          uint32_t length_allocations) {
   if (!length_allocations) {
@@ -312,6 +229,26 @@ bool D3D12SharedMemory::UploadRanges(
   for (auto upload_range : upload_page_ranges) {
     uint32_t upload_range_start = upload_range.first;
     uint32_t upload_range_length = upload_range.second;
+
+    if (upload_range_length > 0 && !REXCVAR_GET(gpu_allow_invalid_upload_range)) {
+      // Check both start and end of the range for unmapped memory.
+      const uint32_t range_start_addr = upload_range_start << page_size_log2();
+      const uint32_t upload_range_last_page = upload_range_start + upload_range_length - 1;
+      const uint32_t range_end_addr = upload_range_last_page << page_size_log2();
+
+      const rex::memory::PageAccess start_access =
+          memory().GetPhysicalHeap()->QueryRangeAccess(range_start_addr, range_start_addr);
+      const rex::memory::PageAccess end_access =
+          memory().GetPhysicalHeap()->QueryRangeAccess(range_end_addr, range_end_addr);
+
+      if (start_access == rex::memory::PageAccess::kNoAccess ||
+          end_access == rex::memory::PageAccess::kNoAccess) {
+        REXGPU_ERROR("Invalid upload range for GPU: {:08X} length {:08X}", upload_range_start,
+                     upload_range_length);
+        return false;
+      }
+    }
+
     while (upload_range_length != 0) {
       ID3D12Resource* upload_buffer;
       size_t upload_buffer_offset, upload_buffer_size;

@@ -20,6 +20,7 @@ set(REXGPU_XENOS_SOURCES
     command_processor.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
+    util/smaa_textures.cpp
     packet_disassembler.cpp
     primitive_processor.cpp
     pipeline/render_target/cache.cpp
@@ -48,6 +49,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
+    vulkan/query_pool.cpp
     vulkan/render_target_cache.cpp
     vulkan/shader.cpp
     vulkan/shared_memory.cpp
@@ -82,6 +84,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/texture_cache.cpp
         d3d12/deferred_command_list.cpp
         d3d12/pipeline_cache.cpp
+        d3d12/query_pool.cpp
     )
 endif()
 

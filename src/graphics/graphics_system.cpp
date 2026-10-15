@@ -31,8 +31,9 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
-REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
-    .allowed({"none", "fxaa", "fxaa_extreme"})
+REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU",
+                      "Swap post effect: none, fxaa, fxaa_extreme, smaa")
+    .allowed({"none", "fxaa", "fxaa_extreme", "smaa"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
@@ -53,6 +54,9 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
   }
   if (lowered == "fxaa_extreme" || lowered == "extreme") {
     return rex::graphics::CommandProcessor::SwapPostEffect::kFxaaExtreme;
+  }
+  if (lowered == "smaa") {
+    return rex::graphics::CommandProcessor::SwapPostEffect::kSmaa;
   }
   return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
 }
@@ -146,27 +150,71 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                                  reinterpret_cast<runtime::MMIOReadCallback>(ReadRegisterThunk),
                                  reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
 
-  // Guest vblank timer based on the configured guest video mode.
+  // Guest vblank timer based on the configured guest video mode, paced like
+  // xenia-canary's frame limiter: on Windows, missed vblanks are dropped rather
+  // than delivered in a burst, and 90% of the period is slept with the rest
+  // spun; elsewhere, paced to a deadline, giving up beats more than
+  // kMaxVblankCatchUp late.
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-        double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
-        uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
-        uint64_t vsync_interval_ticks =
+        const double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
+        const uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+        const uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
-        uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+#if REX_PLATFORM_WIN32
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+#else
+        using steady_time_point = std::chrono::steady_clock::time_point;
+        steady_time_point next_vblank_deadline{};
+        constexpr auto kMaxVblankCatchUp = std::chrono::seconds(1);
+#endif
         while (vsync_worker_running_) {
-          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          while (current_time - last_frame_time >= interval_ticks) {
+          if (!REXCVAR_GET(vsync)) {
+            // No vsync: as many vblanks as the guest can take.
             MarkVblank();
-            last_frame_time += interval_ticks;
+            rex::thread::Sleep(std::chrono::milliseconds(1));
+            continue;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          // Real time of one vblank period at the current guest speed.
+          const double period_ns =
+              1000000000.0 / (refresh_rate_hz * chrono::Clock::guest_time_scalar());
+#if REX_PLATFORM_WIN32
+          const uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          if (current_time - last_frame_time >= vsync_interval_ticks) {
+            // Drop the missed beats: a burst of vblanks after a stall would make
+            // the title fast-forward through several frames at once.
+            last_frame_time = current_time;
+            MarkVblank();
+            // Sleep for 90% of the period, spin for the rest.
+            rex::thread::Sleep(std::chrono::microseconds(int64_t(period_ns * 0.9 / 1000.0)));
+          }
+#else
+          MarkVblank();
+          const auto period = std::chrono::nanoseconds(std::max(int64_t(1), int64_t(period_ns)));
+          auto now = std::chrono::steady_clock::now();
+          // A pause is not missed beats: start again from now after one.
+          if (vblank_deadline_reset_.exchange(false) ||
+              next_vblank_deadline == steady_time_point()) {
+            next_vblank_deadline = now;
+          }
+          next_vblank_deadline += period;
+          if (next_vblank_deadline > now) {
+            rex::thread::Sleep(
+                std::chrono::duration_cast<std::chrono::microseconds>(next_vblank_deadline - now));
+          } else if (now - next_vblank_deadline > kMaxVblankCatchUp) {
+            // Further behind than catching up could hide: give the missed
+            // beats up rather than running the guest fast through what was a
+            // real freeze.
+            next_vblank_deadline = now + period;
+            rex::thread::Sleep(std::chrono::duration_cast<std::chrono::microseconds>(period));
+          }
+          // Otherwise loop straight round without sleeping, delivering the
+          // missed beats until the guest has had as many as real time says it
+          // should.
+#endif
         }
         return 0;
       }));
@@ -174,6 +222,14 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   // vsync_worker_thread_->set_can_debugger_suspend(true);
   vsync_worker_thread_->set_name("GPU VSync");
   vsync_worker_thread_->Create();
+  // The Windows branch spins for part of each period, which is what the lowest
+  // priority is for. The deadline branch only sleeps, so there it would only
+  // add wake-up latency.
+#if REX_PLATFORM_WIN32
+  vsync_worker_thread_->thread()->set_priority(rex::thread::ThreadPriority::kLowest);
+#else
+  vsync_worker_thread_->thread()->set_priority(rex::thread::ThreadPriority::kNormal);
+#endif
 
   return X_STATUS_SUCCESS;
 }
@@ -237,6 +293,8 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
       return 0x08100748;
     case 0x0F01:  // RB_BC_CONTROL
       return 0x0000200E;
+    case 0x0F2D:  // RB_HSIO_INTERFACE_ALIGNER_VALUE
+      return 0x00BBBBBB;
     case 0x194C: {  // R500_D1MODE_V_COUNTER
       system::X_VIDEO_MODE video_mode;
       kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
@@ -268,6 +326,10 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
       command_processor_->UpdateWritePointer(value);
+      break;
+    case 0x0F01:  // RB_BC_CONTROL
+      break;
+    case 0x0F2D:  // RB_HSIO_INTERFACE_ALIGNER_VALUE
       break;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
@@ -340,27 +402,38 @@ void GraphicsSystem::InvalidateGpuMemory() {
 }
 
 void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
-                                             uint32_t title_id, bool blocking) {
+                                             uint32_t title_id, bool blocking,
+                                             std::function<void()> completion_callback) {
   if (!REXCVAR_GET(store_shaders)) {
+    if (completion_callback) {
+      completion_callback();
+    }
     return;
   }
   if (blocking) {
     if (command_processor_->is_paused()) {
       // Safe to run on any thread while the command processor is paused, no
       // race condition.
-      command_processor_->InitializeShaderStorage(cache_root, title_id, true);
+      command_processor_->InitializeShaderStorage(cache_root, title_id, true,
+                                                  std::move(completion_callback));
     } else {
       rex::thread::Fence fence;
-      command_processor_->CallInThread([this, cache_root, title_id, &fence]() {
-        command_processor_->InitializeShaderStorage(cache_root, title_id, true);
-        fence.Signal();
-      });
+      command_processor_->CallInThread(
+          [this, cache_root, title_id, &fence,
+           completion_callback = std::move(completion_callback)]() mutable {
+            command_processor_->InitializeShaderStorage(cache_root, title_id, true,
+                                                        std::move(completion_callback));
+            fence.Signal();
+          });
       fence.Wait();
     }
   } else {
-    command_processor_->CallInThread([this, cache_root, title_id]() {
-      command_processor_->InitializeShaderStorage(cache_root, title_id, false);
-    });
+    command_processor_->CallInThread(
+        [this, cache_root, title_id,
+         completion_callback = std::move(completion_callback)]() mutable {
+          command_processor_->InitializeShaderStorage(cache_root, title_id, false,
+                                                      std::move(completion_callback));
+        });
   }
 }
 
@@ -371,6 +444,7 @@ void GraphicsSystem::Pause() {
 
 void GraphicsSystem::Resume() {
   paused_ = false;
+  vblank_deadline_reset_ = true;
   command_processor_->Resume();
 }
 

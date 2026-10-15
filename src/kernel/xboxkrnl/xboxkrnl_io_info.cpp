@@ -149,14 +149,19 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
       break;
     }
     case XFileXctdCompressionInformation: {
-      REXKRNL_ERROR(
-          "NtQueryInformationFile(XFileXctdCompressionInformation) "
-          "unimplemented");
-      // Files that are XCTD compressed begin with the magic 0x0FF512ED but we
-      // shouldn't detect this that way. There's probably a flag somewhere
-      // (attributes?) that defines if it's compressed or not.
-      status = X_STATUS_INVALID_PARAMETER;
-      out_length = 0;
+      // On real hardware the kernel decompresses XCTD (XCompress LZXTDECODE,
+      // magic 0x0FF512ED) transparently, and userland asks this to find out
+      // whether a file is stored that way. There is no transparent decompressor
+      // in the VFS: a title reads each file as stored, which for the titles
+      // seen so far is plain data. Answering INVALID_PARAMETER made the caller
+      // take neither path -- Captain America: Super Soldier queries this for
+      // every asset bundle and renders nothing usable. Report "not compressed"
+      // (upstream PR #438; the field's meaning is a guess, 0 works there). A
+      // file really stored as XCTD would reach the title still compressed,
+      // which it does not handle either way.
+      auto info = info_ptr.as<X_FILE_XCTD_COMPRESSION_INFORMATION*>();
+      info->unknown = 0;
+      out_length = sizeof(X_FILE_XCTD_COMPRESSION_INFORMATION);
       break;
     };
     case XFileNetworkOpenInformation: {
@@ -433,7 +438,11 @@ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
       auto info = info_ptr.as<X_FILE_FS_DEVICE_INFORMATION*>();
       REXKRNL_WARN("Stub XFileFsDeviceInformation!");
       info->device_type = FILE_DEVICE_UNKNOWN;
-      info->characteristics = 0;
+      // 58480880 deletes a content package it reopens unless its volume
+      // reports exactly 2. What the value means isn't known.
+      const bool is_content_package =
+          file->device()->mount_path().starts_with("\\Device\\Content\\");
+      info->characteristics = is_content_package ? 2 : 0;
       out_length = sizeof(X_FILE_FS_DEVICE_INFORMATION);
       break;
     }

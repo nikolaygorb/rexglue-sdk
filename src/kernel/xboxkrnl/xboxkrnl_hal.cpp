@@ -12,12 +12,19 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
+
+// Name and default as in xenia-canary.
+REXCVAR_DEFINE_INT32(avpack, 8, "Video",
+                     "Video modes (A/V pack): 0 = PAL-60 Component (SD), 1 = Unused, "
+                     "2 = PAL-60 SCART, 3 = 480p Component (HD), 4 = HDMI+A, "
+                     "5 = PAL-60 Composite/S-Video, 6 = VGA, 7 = TV PAL-60, 8 = HDMI");
 
 namespace rex::kernel::xboxkrnl {
 
@@ -34,11 +41,15 @@ void HalReturnToFirmware_entry(u32 routine) {
   exit(0);
 }
 
+u32 HalGetCurrentAVPack_entry() {
+  return static_cast<uint32_t>(REXCVAR_GET(avpack));
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__HalReturnToFirmware, rex::kernel::xboxkrnl::HalReturnToFirmware_entry)
+REX_EXPORT(__imp__HalGetCurrentAVPack, rex::kernel::xboxkrnl::HalGetCurrentAVPack_entry)
 
-REX_EXPORT_STUB(__imp__HalGetCurrentAVPack);
 REX_EXPORT_STUB(__imp__HalGpioControl);
 REX_EXPORT_STUB(__imp__HalOpenCloseODDTray);
 REX_EXPORT_STUB(__imp__HalReadWritePCISpace);

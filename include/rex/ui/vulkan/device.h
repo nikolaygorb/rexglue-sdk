@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -123,6 +124,10 @@ class VulkanDevice {
 
     bool scalarBlockLayout = false;
 
+    // VK_EXT_host_query_reset (promoted to 1.2)
+
+    bool hostQueryReset = false;
+
     // VK_KHR_portability_subset (#164)
 
     bool constantAlphaColorBlendFactors = false;
@@ -147,6 +152,11 @@ class VulkanDevice {
     bool fragmentShaderSampleInterlock = false;
     bool fragmentShaderPixelInterlock = false;
 
+    // VK_EXT_sample_locations (#144)
+
+    VkSampleCountFlags sampleLocationSampleCounts = 0;
+    bool variableSampleLocations = false;
+
     // VK_EXT_shader_demote_to_helper_invocation (#277, promoted to 1.3)
 
     bool shaderDemoteToHelperInvocation = false;
@@ -159,6 +169,10 @@ class VulkanDevice {
 
     bool nonSeamlessCubeMap = false;
 
+    // VK_KHR_fragment_shader_barycentric (#323) / VK_NV_fragment_shader_barycentric (#204)
+
+    bool fragmentShaderBarycentric = false;
+
     // VK_EXT_custom_border_color
 
     bool customBorderColors = false;
@@ -168,6 +182,10 @@ class VulkanDevice {
     // VK_EXT_robustness2
 
     bool nullDescriptor = false;
+
+    // VK_EXT_conditional_rendering (#82)
+
+    bool conditionalRendering = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -184,6 +202,7 @@ class VulkanDevice {
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
+    bool ext_EXT_sample_locations = false;              // #144
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
     bool ext_1_2_KHR_image_format_list = false;         // #148
     // Has optional features not implied by this being true.
@@ -191,6 +210,8 @@ class VulkanDevice {
     bool ext_1_1_KHR_bind_memory2 = false;              // #158
     bool ext_1_2_KHR_spirv_1_4 = false;                 // #237
     bool ext_EXT_memory_budget = false;                 // #238
+    bool ext_1_2_EXT_host_query_reset = false;          // promoted to 1.2
+    bool ext_EXT_conditional_rendering = false;         // #82
     // Has optional features not implied by this being true.
     bool ext_EXT_custom_border_color = false;
     // Has optional features not implied by this being true.
@@ -199,6 +220,10 @@ class VulkanDevice {
     bool ext_1_3_KHR_maintenance4 = false;  // #414
     // Has optional features not implied by this being true.
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
+#if REX_PLATFORM_WIN32
+    // VK_EXT_full_screen_exclusive (#256, Windows only)
+    bool ext_EXT_full_screen_exclusive = false;
+#endif
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -216,10 +241,14 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc>
     // VK_KHR_bind_memory2 (#158, promoted to 1.1)
 #include <rex/ui/vulkan/functions/device_1_1_khr_bind_memory2.inc>
+    // VK_EXT_host_query_reset (promoted to 1.2)
+#include <rex/ui/vulkan/functions/device_1_2_ext_host_query_reset.inc>
     // VK_KHR_maintenance4 (#414, promoted to 1.3)
 #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
 #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
+    // VK_EXT_conditional_rendering (#82)
+#include <rex/ui/vulkan/functions/device_ext_conditional_rendering.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };
@@ -288,6 +317,21 @@ class VulkanDevice {
 
   const MemoryTypes& memory_types() const { return memory_types_; }
 
+  // Returns whether a device loss has been observed for the first time, so, for
+  // instance, logging of the device loss can be limited only to the location
+  // where it was first caught.
+  bool SetLost() noexcept { return !lost_.exchange(true, std::memory_order_acq_rel); }
+  bool IsLost() const noexcept { return lost_.load(std::memory_order_acquire); }
+
+  VkResult SubmitAndUpdateLost(const VkQueue queue, const uint32_t submit_count,
+                               const VkSubmitInfo* const submits, const VkFence fence) {
+    const VkResult submit_result = functions().vkQueueSubmit(queue, submit_count, submits, fence);
+    if (submit_result == VK_ERROR_DEVICE_LOST) {
+      SetLost();
+    }
+    return submit_result;
+  }
+
  private:
   explicit VulkanDevice(const VulkanInstance* vulkan_instance, VkPhysicalDevice physical_device);
 
@@ -306,6 +350,8 @@ class VulkanDevice {
   uint32_t queue_family_sparse_binding_ = UINT32_MAX;
 
   MemoryTypes memory_types_;
+
+  std::atomic<bool> lost_{false};
 };
 
 }  // namespace vulkan

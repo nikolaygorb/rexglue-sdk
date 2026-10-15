@@ -26,6 +26,10 @@ namespace rex::graphics {
 
 class ShaderInterpreter {
  public:
+  // Reduces finite host approximations to a chosen mantissa width.
+  // We still don't know the exact precision or rounding.
+  static float ReduceFloatPrecision(float value, uint32_t mantissa_bits);
+
   ShaderInterpreter(const RegisterFile& register_file, const memory::Memory& memory)
       : register_file_(register_file), memory_(memory) {}
 

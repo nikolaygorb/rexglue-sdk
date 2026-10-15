@@ -195,6 +195,45 @@ i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
   }
 }
 
+//=============================================================================
+// Ported from xenia-canary for the ReXGlue fork
+//=============================================================================
+
+// Non-controller devices (5, 6) are the Skylanders portals; none is attached.
+u32 XamInputNonControllerGetRawEx_entry(u32 device_id, mapped_void buffer_ptr,
+                                        mapped_u32 buffer_length_ptr, mapped_u16 state_ptr) {
+  if (device_id != 5 && device_id != 6) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!state_ptr || !buffer_length_ptr || !buffer_ptr || *buffer_length_ptr == 0) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+u32 XamInputNonControllerGetRaw_entry(mapped_u16 state_ptr, mapped_u32 buffer_length_ptr,
+                                      mapped_void buffer_ptr) {
+  return XamInputNonControllerGetRawEx_entry(5, buffer_ptr, buffer_length_ptr, state_ptr);
+}
+
+u32 XamInputNonControllerSetRawEx_entry(u32 device_id, mapped_void buffer_ptr, u32 buffer_length) {
+  if (device_id != 5 && device_id != 6) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!buffer_ptr || !buffer_length) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+u32 XamInputNonControllerSetRaw_entry(u32 buffer_length, mapped_void buffer_ptr) {
+  return XamInputNonControllerSetRawEx_entry(5, buffer_ptr, buffer_length);
+}
+
+u32 XAutomationpUnbindController_entry(u32 user_index) {
+  return user_index < 4 ? 1 : 0;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -209,6 +248,14 @@ REX_EXPORT(__imp__XamInputSetState, rex::kernel::xam::XamInputSetState_entry)
 REX_EXPORT(__imp__XamInputGetKeystroke, rex::kernel::xam::XamInputGetKeystroke_entry)
 REX_EXPORT(__imp__XamInputGetKeystrokeEx, rex::kernel::xam::XamInputGetKeystrokeEx_entry)
 REX_EXPORT(__imp__XamUserGetDeviceContext, rex::kernel::xam::XamUserGetDeviceContext_entry)
+REX_EXPORT(__imp__XamInputNonControllerGetRawEx,
+           rex::kernel::xam::XamInputNonControllerGetRawEx_entry)
+REX_EXPORT(__imp__XamInputNonControllerGetRaw, rex::kernel::xam::XamInputNonControllerGetRaw_entry)
+REX_EXPORT(__imp__XamInputNonControllerSetRawEx,
+           rex::kernel::xam::XamInputNonControllerSetRawEx_entry)
+REX_EXPORT(__imp__XamInputNonControllerSetRaw, rex::kernel::xam::XamInputNonControllerSetRaw_entry)
+REX_EXPORT(__imp__XAutomationpUnbindController,
+           rex::kernel::xam::XAutomationpUnbindController_entry)
 
 REX_EXPORT_STUB(__imp__XamInputControl);
 REX_EXPORT_STUB(__imp__XamInputEnableAutobind);
@@ -218,10 +265,6 @@ REX_EXPORT_STUB(__imp__XamInputGetKeyLocks);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHud);
 REX_EXPORT_STUB(__imp__XamInputGetKeystrokeHudEx);
 REX_EXPORT_STUB(__imp__XamInputGetUserVibrationLevel);
-REX_EXPORT_STUB(__imp__XamInputNonControllerGetRaw);
-REX_EXPORT_STUB(__imp__XamInputNonControllerGetRawEx);
-REX_EXPORT_STUB(__imp__XamInputNonControllerSetRaw);
-REX_EXPORT_STUB(__imp__XamInputNonControllerSetRawEx);
 REX_EXPORT_STUB(__imp__XamInputRawState);
 REX_EXPORT_STUB(__imp__XamInputResetLayoutKeyboard);
 REX_EXPORT_STUB(__imp__XamInputSendStayAliveRequest);

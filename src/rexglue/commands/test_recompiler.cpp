@@ -375,13 +375,16 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
     functionsOut << recompiledCode << '\n';
   }
 
-  std::unordered_map<std::string, std::string> allSymbols;
+  // Each .s file is linked on its own, so a label only names a function of its
+  // own file; the same label in two files must not bind to the other one.
+  std::unordered_map<std::string, std::unordered_map<std::string, std::string>> symbolsByFile;
   for (const auto& [stem, addresses] : functionsByFile) {
+    auto& fileSymbols = symbolsByFile[stem];
     auto mapPath = fmt::format("{}/{}.map", binDir, stem);
     auto mapSymbols = ParseMapFile(mapPath);
     for (const auto& [addr, name] : mapSymbols) {
       if (addresses.count(addr))
-        allSymbols.emplace(name, fmt::format("{}_{:X}", stem, addr));
+        fileSymbols.emplace(name, fmt::format("{}_{:X}", stem, addr));
     }
     if (!mapSymbols.empty())
       continue;
@@ -401,7 +404,7 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
         continue;
       auto name = line.substr(0, colonIdx);
       if (functionIndex < sortedAddresses.size()) {
-        allSymbols.emplace(name, fmt::format("{}_{:X}", stem, sortedAddresses[functionIndex]));
+        fileSymbols.emplace(name, fmt::format("{}_{:X}", stem, sortedAddresses[functionIndex]));
         ++functionIndex;
       }
     }
@@ -420,7 +423,7 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
   templateData["tests"] = nlohmann::json::array();
   size_t totalTests = 0;
   for (const auto& [stem, addresses] : functionsByFile) {
-    auto specs = ParseTestSpecs(fmt::format("{}/{}.s", asmDir, stem), allSymbols);
+    auto specs = ParseTestSpecs(fmt::format("{}/{}.s", asmDir, stem), symbolsByFile[stem]);
     std::string category = CategoryFromStem(stem);
     for (const auto& spec : specs) {
       nlohmann::json testJson;

@@ -44,6 +44,19 @@ u32 XamVoiceHeadsetPresent_entry(mapped_void voice_ptr) {
   return 0;
 }
 
+//=============================================================================
+// Ported from xenia-canary for the ReXGlue fork
+//=============================================================================
+
+u32 XamVoiceGetMicArrayStatus_entry() {
+  // No mic array connected.
+  return 0;
+}
+
+u32 XamVoiceSubmitPacket_entry(mapped_u32 unk1, u32 unk2, mapped_u32 unk3) {
+  return 0x800700AA;  // ERROR_BUSY
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -52,6 +65,8 @@ REX_EXPORT(__imp__XamVoiceIsActiveProcess, rex::kernel::xam::XamVoiceIsActivePro
 REX_EXPORT(__imp__XamVoiceCreate, rex::kernel::xam::XamVoiceCreate_entry)
 REX_EXPORT(__imp__XamVoiceClose, rex::kernel::xam::XamVoiceClose_entry)
 REX_EXPORT(__imp__XamVoiceHeadsetPresent, rex::kernel::xam::XamVoiceHeadsetPresent_entry)
+REX_EXPORT(__imp__XamVoiceGetMicArrayStatus, rex::kernel::xam::XamVoiceGetMicArrayStatus_entry)
+REX_EXPORT(__imp__XamVoiceSubmitPacket, rex::kernel::xam::XamVoiceSubmitPacket_entry)
 
 REX_EXPORT_STUB(__imp__XamMuteSound);
 REX_EXPORT_STUB(__imp__XamVoiceDisableMicArray);
@@ -60,11 +75,9 @@ REX_EXPORT_STUB(__imp__XamVoiceGetDirectionalData);
 REX_EXPORT_STUB(__imp__XamVoiceGetMicArrayAudio);
 REX_EXPORT_STUB(__imp__XamVoiceGetMicArrayAudioEx);
 REX_EXPORT_STUB(__imp__XamVoiceGetMicArrayFilenameDesc);
-REX_EXPORT_STUB(__imp__XamVoiceGetMicArrayStatus);
 REX_EXPORT_STUB(__imp__XamVoiceGetMicArrayUnderrunStatus);
 REX_EXPORT_STUB(__imp__XamVoiceMuteMicArray);
 REX_EXPORT_STUB(__imp__XamVoiceRecordUserPrivileges);
 REX_EXPORT_STUB(__imp__XamVoiceSetAudioCaptureRoutine);
 REX_EXPORT_STUB(__imp__XamVoiceSetMicArrayBeamAngle);
 REX_EXPORT_STUB(__imp__XamVoiceSetMicArrayIdleUsers);
-REX_EXPORT_STUB(__imp__XamVoiceSubmitPacket);

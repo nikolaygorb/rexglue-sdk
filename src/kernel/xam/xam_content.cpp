@@ -9,6 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+// Disable warnings about unused parameters for kernel functions
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+
+#include <string>
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -17,6 +21,7 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xthread.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xtypes.h>
@@ -141,8 +146,15 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     *disposition_ptr = 0;
   }
 
-  auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
-              disposition_ptr,
+  // root_name.value() is a std::string_view over GUEST memory. This lambda is
+  // handed to CompleteOverlappedDeferredEx and runs later on the dispatch
+  // thread, by which point the title has typically reused that buffer -- the
+  // view then reads whatever is there now. Gears of War Judgment hit this
+  // ~13s in: the stale bytes reached string_key_case::hash() -> utf8 iteration,
+  // which threw utf8::invalid_utf8 out of the deferred call and tripped
+  // REX_FATAL. Own the bytes so the deferred run sees the name it was given.
+  auto run = [content_manager, xuid, root_name = std::string(root_name.value()), flags,
+              content_data, disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
@@ -407,6 +419,70 @@ u32 XamContentDeleteInternal_entry(mapped_void content_data_ptr, mapped_void ove
   }
 }
 
+//=============================================================================
+// Ported from xenia-canary for the ReXGlue fork
+//=============================================================================
+
+void XamLoaderGetMediaInfoEx_entry(mapped_u32 media_type, mapped_u32 title_id, mapped_u32 unk3) {
+  if (media_type) {
+    *media_type = 1;  // X_DVD_DISC_STATE: XBOX_360_GAME_DISC
+  }
+  if (title_id) {
+    *title_id = 0;
+  }
+  if (unk3) {
+    *unk3 = 0;
+  }
+}
+
+void XamLoaderGetMediaInfo_entry(mapped_u32 media_type, mapped_u32 title_id) {
+  XamLoaderGetMediaInfoEx_entry(media_type, title_id, mapped_u32());
+}
+
+// Media verification: the disc is always intact.
+struct X_SECURITY_FAILURE_INFORMATION {
+  rex::be<uint32_t> size;
+  rex::be<uint32_t> failed_reads;
+  rex::be<uint32_t> failed_hashes;
+  rex::be<uint32_t> blocks_checked;
+  rex::be<uint32_t> total_blocks;
+  rex::be<uint32_t> complete;
+};
+
+u32 XamMediaVerificationCreate_entry(u32 creation_flags) {
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamMediaVerificationClose_entry() {
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamMediaVerificationInject_entry(u32 r3, u32 r4) {
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamMediaVerificationFailedBlocks_entry(
+    ppc_ptr_t<X_SECURITY_FAILURE_INFORMATION> failure_information) {
+  if (failure_information) {
+    if (failure_information->size != sizeof(X_SECURITY_FAILURE_INFORMATION)) {
+      return X_RESULT_FROM_WIN32(0x00000008L);  // ERROR_NOT_ENOUGH_MEMORY
+    }
+    failure_information->failed_reads = 0;
+    failure_information->failed_hashes = 0;
+    failure_information->blocks_checked = 0;
+    failure_information->total_blocks = 0;
+    failure_information->complete = 1;
+  }
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamMediaVerificationVerify_entry(u32 r3, mapped_void overlapped, u32 callback) {
+  if (callback) {
+    XThread::GetCurrentThread()->EnqueueApc(callback & ~1u, 0, 0, 0);
+  }
+  return X_ERROR_SUCCESS;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -425,6 +501,14 @@ REX_EXPORT(__imp__XamContentGetThumbnail, rex::kernel::xam::XamContentGetThumbna
 REX_EXPORT(__imp__XamContentSetThumbnail, rex::kernel::xam::XamContentSetThumbnail_entry)
 REX_EXPORT(__imp__XamContentDelete, rex::kernel::xam::XamContentDelete_entry)
 REX_EXPORT(__imp__XamContentDeleteInternal, rex::kernel::xam::XamContentDeleteInternal_entry)
+REX_EXPORT(__imp__XamLoaderGetMediaInfoEx, rex::kernel::xam::XamLoaderGetMediaInfoEx_entry)
+REX_EXPORT(__imp__XamLoaderGetMediaInfo, rex::kernel::xam::XamLoaderGetMediaInfo_entry)
+REX_EXPORT(__imp__XamMediaVerificationCreate, rex::kernel::xam::XamMediaVerificationCreate_entry)
+REX_EXPORT(__imp__XamMediaVerificationClose, rex::kernel::xam::XamMediaVerificationClose_entry)
+REX_EXPORT(__imp__XamMediaVerificationInject, rex::kernel::xam::XamMediaVerificationInject_entry)
+REX_EXPORT(__imp__XamMediaVerificationFailedBlocks,
+           rex::kernel::xam::XamMediaVerificationFailedBlocks_entry)
+REX_EXPORT(__imp__XamMediaVerificationVerify, rex::kernel::xam::XamMediaVerificationVerify_entry)
 
 REX_EXPORT_STUB(__imp__XamContentClosePackageFile);
 REX_EXPORT_STUB(__imp__XamContentCopyInternal);

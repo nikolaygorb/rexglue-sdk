@@ -218,7 +218,7 @@ u32 NtProtectVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_siz
   }
 
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(*base_addr_ptr);
-  if (heap->heap_type() != memory::HeapType::kGuestVirtual) {
+  if (!heap || heap->heap_type() != memory::HeapType::kGuestVirtual) {
     return X_STATUS_INVALID_PARAMETER;
   }
   // Adjust the base downwards to the nearest page boundary.
@@ -260,21 +260,31 @@ u32 NtFreeVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_p
   // _In_     ULONG FreeType
   // _In_     BOOLEAN DebugMemory
 
-  // Set to TRUE when freeing external devkit memory.
-  assert_true(debug_memory == 0);
+  // Set to TRUE when freeing external devkit memory. There is no separate
+  // devkit region, so the flag is ignored (as on the allocation path).
+  if (debug_memory) {
+    REXKRNL_WARN("NtFreeVirtualMemory: devkit debug flag set (base: {:08X}, size: {:08X})",
+                 base_addr_value, region_size_value);
+  }
 
   if (!base_addr_value) {
     return X_STATUS_MEMORY_NOT_ALLOCATED;
   }
 
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_addr_value);
-  if (heap->heap_type() != memory::HeapType::kGuestVirtual) {
+  if (!heap || heap->heap_type() != memory::HeapType::kGuestVirtual) {
+    REXKRNL_WARN("NtFreeVirtualMemory: {:08X} is not in a guest virtual heap", base_addr_value);
     return X_STATUS_INVALID_PARAMETER;
   }
   bool result = false;
   if (free_type == X_MEM_DECOMMIT) {
-    // If zero, we may need to query size (free whole region).
-    assert_not_zero(region_size_value);
+    if (!region_size_value) {
+      // NT decommits the whole region containing the base when the size is
+      // zero. Not implemented; refuse instead of dropping the call silently.
+      REXKRNL_WARN("NtFreeVirtualMemory: MEM_DECOMMIT with size 0 (base: {:08X}) not implemented",
+                   base_addr_value);
+      return X_STATUS_INVALID_PARAMETER;
+    }
 
     region_size_value = rex::round_up(region_size_value, heap->page_size());
     result = heap->Decommit(base_addr_value, region_size_value);
@@ -629,6 +639,8 @@ u32 KeGetImagePageTableEntry_entry(mapped_void address) {
   result /= heap->page_size();
   if (heap->page_size() < 65536) {
     result |= 0x40000000;
+    // Not verified for read-only pages; dashboard 14xxx and later need bit 0 set.
+    result |= 1;
   }
   return result & 0x400FFFFF;
 }

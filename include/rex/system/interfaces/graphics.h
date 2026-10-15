@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 
 #include <rex/system/xtypes.h>
 
@@ -72,11 +73,17 @@ class IGraphicsSystem {
   }
 
   // Persistent shader/pipeline storage under the cache root. Default: none.
+  // completion_callback (may be null) is called when the storage is fully
+  // loaded, possibly on another thread when not blocking.
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
-                                       bool blocking) {
+                                       bool blocking,
+                                       std::function<void()> completion_callback = nullptr) {
     (void)cache_root;
     (void)title_id;
     (void)blocking;
+    if (completion_callback) {
+      completion_callback();
+    }
   }
 
   // One-shot convenience for callers that don't care about the split.

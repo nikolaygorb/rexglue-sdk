@@ -113,9 +113,11 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
   uint_vector_temp_.push_back(1);
   uint_vector_temp_.push_back(0);
   uint_vector_temp_.push_back(3);
+  spv::Id swap_red_blue_bool4 =
+      builder_->smearScalar(spv::NoPrecision, swap_red_blue, type_bool4_);
   for_each_eM([&](uint32_t eM_index) {
     eM_swapped[eM_index] = builder_->createTriOp(
-        spv::OpSelect, type_float4_, swap_red_blue,
+        spv::OpSelect, type_float4_, swap_red_blue_bool4,
         builder_->createRvalueSwizzle(spv::NoPrecision, type_float4_, eM_original[eM_index],
                                       uint_vector_temp_),
         eM_original[eM_index]);
@@ -534,7 +536,8 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
     add_format_case(fixed16_packed, 3);
   }
 
-  // TODO(Triang3l): Use the extended range float16 conversion.
+  // Xbox 360 float16 uses extended range: exponent 31 is a large finite value,
+  // not Inf/NaN. See PackFloat16x2ExtendedRange.
 
   // k_16_FLOAT
   format_switch.makeBeginCase(static_cast<unsigned int>(xenos::ColorFormat::k_16_FLOAT));
@@ -545,8 +548,7 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
       id_vector_temp_.push_back(
           builder_->createCompositeExtract(eM_swapped[eM_index], type_float_, 0));
       id_vector_temp_.push_back(const_float_0_);
-      spv::Id format_packed_16_float_x = builder_->createUnaryBuiltinCall(
-          type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16,
+      spv::Id format_packed_16_float_x = PackFloat16x2ExtendedRange(
           builder_->createCompositeConstruct(type_float2_, id_vector_temp_));
       id_vector_temp_.clear();
       id_vector_temp_.resize(4, const_uint_0_);
@@ -565,10 +567,9 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
       uint_vector_temp_.clear();
       uint_vector_temp_.push_back(0);
       uint_vector_temp_.push_back(1);
-      spv::Id format_packed_16_16_float_xy = builder_->createUnaryBuiltinCall(
-          type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16,
-          builder_->createRvalueSwizzle(spv::NoPrecision, type_float2_, eM_swapped[eM_index],
-                                        uint_vector_temp_));
+      spv::Id format_packed_16_16_float_xy =
+          PackFloat16x2ExtendedRange(builder_->createRvalueSwizzle(
+              spv::NoPrecision, type_float2_, eM_swapped[eM_index], uint_vector_temp_));
       id_vector_temp_.clear();
       id_vector_temp_.resize(4, const_uint_0_);
       id_vector_temp_.front() = format_packed_16_16_float_xy;
@@ -588,10 +589,9 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
         uint_vector_temp_.clear();
         uint_vector_temp_.push_back(2 * component_index);
         uint_vector_temp_.push_back(2 * component_index + 1);
-        format_packed_16_16_16_16_float_xy_zw[component_index] = builder_->createUnaryBuiltinCall(
-            type_uint_, ext_inst_glsl_std_450_, GLSLstd450PackHalf2x16,
-            builder_->createRvalueSwizzle(spv::NoPrecision, type_float2_, eM_swapped[eM_index],
-                                          uint_vector_temp_));
+        format_packed_16_16_16_16_float_xy_zw[component_index] =
+            PackFloat16x2ExtendedRange(builder_->createRvalueSwizzle(
+                spv::NoPrecision, type_float2_, eM_swapped[eM_index], uint_vector_temp_));
       }
       id_vector_temp_.clear();
       id_vector_temp_.push_back(format_packed_16_16_16_16_float_xy_zw[0]);

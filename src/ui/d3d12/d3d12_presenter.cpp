@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <utility>
 
@@ -39,7 +40,6 @@ namespace rex::ui::d3d12 {
 namespace shaders {
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_ps.h"
-#if defined(REX_HAS_FIDELITYFX_SDK)
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_resample_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_resample_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_sharpen_dither_ps.h"
@@ -47,17 +47,21 @@ namespace shaders {
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_easu_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_ps.h"
-#endif
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
 D3D12Presenter::~D3D12Presenter() {
-  // Await completion of the usage of everything before destroying anything.
+  // Await completion of the usage of everything before destroying anything,
+  // irrespective of the declaration order in the class.
   // From most likely the latest to most likely the earliest to be signaled, so
   // just one sleep will likely be needed.
   paint_context_.AwaitSwapChainUsageCompletion();
-  guest_output_resource_refresher_submission_tracker_.Shutdown();
-  ui_submission_tracker_.Shutdown();
+  if (guest_output_resource_refresher_completion_timeline_) {
+    guest_output_resource_refresher_completion_timeline_->AwaitAllSubmissions();
+  }
+  if (ui_completion_timeline_) {
+    ui_completion_timeline_->AwaitAllSubmissions();
+  }
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   DestroyTemporalUpscalerContext();
 #endif
@@ -283,25 +287,33 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
       return false;
     }
 
-    ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
-
-    // Make sure that if any work is submitted, any `return` will cause an await
-    // before releasing the command allocator / list and the resource the RAII
-    // way in the destruction of the submission tracker - so create after the
-    // objects referenced in the submission - but don't submit anything if
-    // failed to initialize the fence.
-    D3D12SubmissionTracker submission_tracker;
-    if (!submission_tracker.Initialize(device, direct_queue)) {
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    const HRESULT fence_create_result =
+        device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    if (FAILED(fence_create_result)) {
+      REXLOG_ERROR(
+          "D3D12Presenter: Failed to create the guest output capturing fence, "
+          "result 0x{:08X}",
+          static_cast<uint32_t>(fence_create_result));
       return false;
     }
+    ID3D12CommandQueue* const direct_queue = provider_.GetDirectQueue();
     ID3D12CommandList* execute_command_list = command_list.Get();
     direct_queue->ExecuteCommandLists(1, &execute_command_list);
-    if (!submission_tracker.NextSubmission()) {
-      REXLOG_ERROR("D3D12Presenter: Failed to signal the guest output capturing fence");
+    const HRESULT fence_signal_result = direct_queue->Signal(fence.Get(), 1);
+    if (FAILED(fence_signal_result)) {
+      REXLOG_ERROR(
+          "D3D12Presenter: Failed to enqueue signaling of the guest output "
+          "capturing fence, result 0x{:08X}",
+          static_cast<uint32_t>(fence_signal_result));
       return false;
     }
-    if (!submission_tracker.AwaitAllSubmissionsCompletion()) {
-      REXLOG_ERROR("D3D12Presenter: Failed to await the guest output capturing fence");
+    const HRESULT fence_wait_result = fence->SetEventOnCompletion(1, nullptr);
+    if (FAILED(fence_wait_result)) {
+      REXLOG_ERROR(
+          "D3D12Presenter: Failed to await the guest output capturing fence, "
+          "result 0x{:08X}",
+          static_cast<uint32_t>(fence_wait_result));
       return false;
     }
   }
@@ -491,7 +503,7 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
     std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) {
   assert_not_zero(frontbuffer_width);
   assert_not_zero(frontbuffer_height);
-  std::pair<UINT64, Microsoft::WRL::ComPtr<ID3D12Resource>>& guest_output_resource_ref =
+  std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>& guest_output_resource_ref =
       guest_output_resources_[mailbox_index];
   if (guest_output_resource_ref.second) {
     D3D12_RESOURCE_DESC guest_output_resource_current_desc =
@@ -499,8 +511,8 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
     if (guest_output_resource_current_desc.Width != frontbuffer_width ||
         guest_output_resource_current_desc.Height != frontbuffer_height) {
       // Main target painting has its own reference to the textures for reading
-      // in its own submission tracker timeline, safe to release here.
-      guest_output_resource_refresher_submission_tracker_.AwaitSubmissionCompletion(
+      // in its own completion timeline, safe to release here.
+      guest_output_resource_refresher_completion_timeline_->AwaitSubmissionAndUpdateCompleted(
           guest_output_resource_ref.first);
       guest_output_resource_ref.second.Reset();
     }
@@ -535,8 +547,9 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
   // signal and wait slightly longer, for nothing important, while shutting down
   // than to destroy the resource while it's still in use.
   guest_output_resource_ref.first =
-      guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
-  guest_output_resource_refresher_submission_tracker_.NextSubmission();
+      guest_output_resource_refresher_completion_timeline_->GetUpcomingSubmission();
+  guest_output_resource_refresher_completion_timeline_->SignalAndAdvance(
+      provider_.GetDirectQueue());
   return refresher_succeeded;
 }
 
@@ -557,12 +570,11 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
-  UINT64 current_paint_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();
-  UINT64 command_allocator_count = UINT64(paint_context_.command_allocators.size());
-  if (current_paint_submission >= command_allocator_count) {
-    paint_context_.paint_submission_tracker.AwaitSubmissionCompletion(current_paint_submission -
-                                                                      command_allocator_count);
-  }
+  const uint64_t current_paint_submission =
+      paint_context_.paint_completion_timeline->GetUpcomingSubmission();
+  const uint64_t command_allocator_count = UINT64(paint_context_.command_allocators.size());
+  paint_context_.paint_completion_timeline->AwaitMaxSubmissionsPendingAndUpdateCompleted(
+      command_allocator_count);
   ID3D12CommandAllocator* command_allocator =
       paint_context_.command_allocators[current_paint_submission % command_allocator_count].Get();
   command_allocator->Reset();
@@ -635,7 +647,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
       // Try to find the existing reference to the same texture, or an already
       // released (or a taken, but never actually used) slot.
       for (size_t i = 0; i < paint_context_.guest_output_resource_paint_refs.size(); ++i) {
-        const std::pair<UINT64, Microsoft::WRL::ComPtr<ID3D12Resource>>&
+        const std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>&
             guest_output_resource_paint_ref = paint_context_.guest_output_resource_paint_refs[i];
         if (guest_output_resource_paint_ref.second == guest_output_resource) {
           guest_output_resource_paint_ref_index = i;
@@ -661,7 +673,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           }
           // Await the completion of the usage of the old guest output
           // resource and its SRV descriptors.
-          paint_context_.paint_submission_tracker.AwaitSubmissionCompletion(
+          paint_context_.paint_completion_timeline->AwaitSubmissionAndUpdateCompleted(
               paint_context_
                   .guest_output_resource_paint_refs[guest_output_resource_paint_ref_new_index]
                   .first);
@@ -670,7 +682,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
         // The actual submission index will be set if the texture is actually
         // used, not dropped due to some error.
         paint_context_.guest_output_resource_paint_refs[guest_output_resource_paint_ref_index] =
-            std::make_pair(UINT64(0), guest_output_resource);
+            std::make_pair(uint64_t(0), guest_output_resource);
         // Create the SRV descriptor of the new texture.
         D3D12_SHADER_RESOURCE_VIEW_DESC guest_output_resource_srv_desc;
         guest_output_resource_srv_desc.Format = kGuestOutputFormat;
@@ -708,7 +720,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
             // Need to replace immediately as a new texture with the requested
             // size is needed.
             if (intermediate_texture_ptr_ref) {
-              paint_context_.paint_submission_tracker.AwaitSubmissionCompletion(
+              paint_context_.paint_completion_timeline->AwaitSubmissionAndUpdateCompleted(
                   paint_context_.guest_output_intermediate_texture_last_usage);
               intermediate_texture_ptr_ref.Reset();
             }
@@ -767,7 +779,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           } else {
             // Was previously needed, but not anymore - destroy when possible.
             if (intermediate_texture_ptr_ref &&
-                paint_context_.paint_submission_tracker.GetCompletedSubmission() >=
+                paint_context_.paint_completion_timeline->GetCompletedSubmissionFromLastUpdate() >=
                     paint_context_.guest_output_intermediate_texture_last_usage) {
               intermediate_texture_ptr_ref.Reset();
             }
@@ -796,12 +808,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
 #endif
       auto is_temporal_easu_effect = [&]([[maybe_unused]] size_t effect_index) {
-#if defined(REX_HAS_FIDELITYFX_SDK)
         return temporal_effect_selected &&
                guest_output_flow.effects[effect_index] == GuestOutputPaintEffect::kFsrEasu;
-#else
-        return false;
-#endif
       };
       for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
         bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
@@ -948,19 +956,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           UINT effect_constants_size = 0;
           union {
             BilinearConstants bilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
             CasSharpenConstants cas_sharpen;
             CasResampleConstants cas_resample;
             FsrEasuConstants fsr_easu;
             FsrRcasConstants fsr_rcas;
-#endif
           } effect_constants;
           switch (guest_output_paint_root_signature_index) {
             case kGuestOutputPaintRootSignatureIndexBilinear: {
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
             } break;
-#if defined(REX_HAS_FIDELITYFX_SDK)
             case kGuestOutputPaintRootSignatureIndexCasSharpen: {
               effect_constants_size = sizeof(effect_constants.cas_sharpen);
               effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
@@ -979,7 +984,6 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
               effect_constants_size = sizeof(effect_constants.fsr_rcas);
               effect_constants.fsr_rcas.Initialize(guest_output_flow, i, guest_output_paint_config);
             } break;
-#endif
             default:
               break;
           }
@@ -1081,11 +1085,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
 
   // Release main target guest output texture references that aren't needed
   // anymore (this is done after various potential guest-output-related main
-  // target submission tracker waits so the completed submission value is the
+  // target completion timeline waits so the completed submission value is the
   // most actual).
-  UINT64 completed_paint_submission =
-      paint_context_.paint_submission_tracker.GetCompletedSubmission();
-  for (std::pair<UINT64, Microsoft::WRL::ComPtr<ID3D12Resource>>& guest_output_resource_paint_ref :
+  uint64_t completed_paint_submission =
+      paint_context_.paint_completion_timeline->GetCompletedSubmissionFromLastUpdate();
+  for (std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>&
+           guest_output_resource_paint_ref :
        paint_context_.guest_output_resource_paint_refs) {
     if (!guest_output_resource_paint_ref.second ||
         guest_output_resource_paint_ref.second == guest_output_resource) {
@@ -1124,8 +1129,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     }
     D3D12UIDrawContext ui_draw_context(*this, paint_context_.swap_chain_width,
                                        paint_context_.swap_chain_height, command_list,
-                                       ui_submission_tracker_.GetCurrentSubmission(),
-                                       ui_submission_tracker_.GetCompletedSubmission());
+                                       ui_completion_timeline_->GetUpcomingSubmission(),
+                                       ui_completion_timeline_->UpdateAndGetCompletedSubmission());
     ExecuteUIDrawersFromUIThread(ui_draw_context);
   }
 
@@ -1140,13 +1145,15 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   command_list->ResourceBarrier(1, &barrier_rtv_to_present);
 
   // Execute and present.
+  // TODO(Triang3l): Error checking.
   command_list->Close();
+  ID3D12CommandQueue* const direct_queue = provider_.GetDirectQueue();
   ID3D12CommandList* execute_command_list = command_list;
-  provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
+  direct_queue->ExecuteCommandLists(1, &execute_command_list);
   if (execute_ui_drawers) {
-    ui_submission_tracker_.NextSubmission();
+    ui_completion_timeline_->SignalAndAdvance(direct_queue);
   }
-  paint_context_.paint_submission_tracker.NextSubmission();
+  paint_context_.paint_completion_timeline->SignalAndAdvance(direct_queue);
   // Present as soon as possible, without waiting for vsync (the host refresh
   // rate may be something like 144 Hz, which is not a multiple of the common
   // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
@@ -1161,7 +1168,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
-  paint_context_.present_submission_tracker.NextSubmission();
+  paint_context_.present_completion_timeline->SignalAndAdvance(direct_queue);
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;
@@ -1269,7 +1276,6 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear]
           .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
   }
-#if defined(REX_HAS_FIDELITYFX_SDK)
   // EASU (needs the sampler).
   guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
       sizeof(FsrEasuConstants) / sizeof(uint32_t);
@@ -1332,7 +1338,6 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexCasResample]
           .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
   }
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
   // Guest output painting pipelines.
   D3D12_GRAPHICS_PIPELINE_STATE_DESC guest_output_paint_pipeline_desc = {};
@@ -1363,7 +1368,6 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         guest_output_paint_pipeline_desc.PS.BytecodeLength =
             sizeof(shaders::guest_output_bilinear_dither_ps);
         break;
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
         guest_output_paint_pipeline_desc.PS.pShaderBytecode =
             shaders::guest_output_ffx_cas_sharpen_ps;
@@ -1404,7 +1408,6 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         guest_output_paint_pipeline_desc.PS.BytecodeLength =
             sizeof(shaders::guest_output_ffx_fsr_rcas_dither_ps);
         break;
-#endif
       default:
         // Not supported by this implementation.
         continue;
@@ -1441,11 +1444,10 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
 
   // Initialize connection-independent parts of the painting context.
 
-  ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
-
-  // Paint submission trackers.
-  if (!paint_context_.paint_submission_tracker.Initialize(device, direct_queue) ||
-      !paint_context_.present_submission_tracker.Initialize(device, direct_queue)) {
+  // Paint completion timelines.
+  paint_context_.paint_completion_timeline = D3D12GPUCompletionTimeline::Create(device);
+  paint_context_.present_completion_timeline = D3D12GPUCompletionTimeline::Create(device);
+  if (!paint_context_.paint_completion_timeline || !paint_context_.present_completion_timeline) {
     return false;
   }
 
@@ -1501,11 +1503,13 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     return false;
   }
 
-  if (!guest_output_resource_refresher_submission_tracker_.Initialize(device, direct_queue)) {
+  guest_output_resource_refresher_completion_timeline_ = D3D12GPUCompletionTimeline::Create(device);
+  if (!guest_output_resource_refresher_completion_timeline_) {
     return false;
   }
 
-  if (!ui_submission_tracker_.Initialize(device, direct_queue)) {
+  ui_completion_timeline_ = D3D12GPUCompletionTimeline::Create(device);
+  if (!ui_completion_timeline_) {
     return false;
   }
 

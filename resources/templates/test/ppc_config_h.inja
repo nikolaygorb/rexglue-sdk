@@ -115,7 +115,7 @@
 //=============================================================================
 
 #define REX_UNIMPLEMENTED(addr, opcode) \
-  throw std::runtime_error("Unimplemented PPC instruction: " opcode)
+  throw std::runtime_error(fmt::format("Unimplemented PPC instruction {} at {:08X}", opcode, uint32_t(addr)))
 
 #define REX_QUERY_TIMEBASE() rex::chrono::Clock::QueryGuestTickCount()
 

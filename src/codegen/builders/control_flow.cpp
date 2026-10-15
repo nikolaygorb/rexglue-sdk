@@ -29,7 +29,7 @@ bool build_b(BuilderContext& ctx) {
 
   // Use graph to classify the target - handles thunks that branch to nearby functions
   // false = branch instruction (not a call), so own-base means loop back
-  auto kind = ctx.graph().classifyTarget(target, ctx.base, false);
+  auto kind = ctx.graph().classifyTarget(target, ctx.base, false, &ctx.fn);
 
   switch (kind) {
     case TargetKind::InternalLabel:
@@ -67,7 +67,7 @@ bool build_bl(BuilderContext& ctx) {
 
   // Use graph to classify the target
   // true = call instruction, so own-base means recursive call (not loop back)
-  auto kind = ctx.graph().classifyTarget(target, ctx.base, true);
+  auto kind = ctx.graph().classifyTarget(target, ctx.base, true, &ctx.fn);
 
   switch (kind) {
     case TargetKind::InternalLabel:
@@ -138,7 +138,7 @@ bool build_bctr(BuilderContext& ctx) {
         continue;
       }
 
-      auto kind = ctx.graph().classifyTarget(label, ctx.base, false);
+      auto kind = ctx.graph().classifyTarget(label, ctx.base, false, &ctx.fn);
       switch (kind) {
         case TargetKind::InternalLabel:
           ctx.println("\t\tgoto loc_{:X};", label);
@@ -160,6 +160,21 @@ bool build_bctr(BuilderContext& ctx) {
           ctx.println("\t\treturn;");
           break;
         default:
+          // classifyTarget asks the graph which node CONTAINS the bctr, and that
+          // is not always the function being emitted. A routine with an embedded
+          // jump table gets split at the table's data, so the node containing the
+          // bctr can end right there while the emit walk -- driven by control flow
+          // from the real entry -- carries on well past it. Forza Horizon's
+          // sub_82FFFC38 emits `bctr 0x82FFFE28`, the graph hands back a node that
+          // stops at the table data at 0x82FFFE2C, and all five landings
+          // (0x82FFFE5C..0x82FFFE7C) came back Unknown -- even though they sit
+          // inside the function being emitted and DO get their `loc_` labels a few
+          // lines below. The REX_FATAL then killed the game at the first dispatch.
+          // Ask the function we are actually emitting before giving up.
+          if (label >= ctx.fn.base() && label < ctx.fn.end()) {
+            ctx.println("\t\tgoto loc_{:X};", label);
+            break;
+          }
           REXCODEGEN_ERROR("Jump target 0x{:08X} unresolved at bctr 0x{:08X}", label, ctx.base);
           ctx.println("\t\tREX_FATAL(\"Jump target 0x{:08X} unresolved at bctr 0x{:08X}\");", label,
                       ctx.base);
@@ -168,7 +183,17 @@ bool build_bctr(BuilderContext& ctx) {
     }
 
     ctx.println("\tdefault:");
-    ctx.println("\t\t__builtin_trap(); // Switch case out of range");
+    // A recovered jump table is a best-effort reconstruction, not a proof of the
+    // index's full range: the game can legitimately reach an index the table
+    // does not cover. __builtin_trap() lowers to `ud2`, so that case killed the
+    // process with STATUS_ILLEGAL_INSTRUCTION and nothing in the log -- Gears of
+    // War Judgment died ~5s in, at one of 121 such defaults, while the same
+    // title runs for minutes when the default dispatches instead. Fall back to
+    // the same indirect dispatch used when no table was recovered at all; the
+    // runtime already reports an unresolved target there, so a genuinely bad
+    // index is still diagnosed, just not with an illegal instruction.
+    ctx.println("\t\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
+    ctx.println("\t\treturn;");
     ctx.println("\t}}");
 
     ctx.reset_switch_table();

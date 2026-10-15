@@ -50,8 +50,6 @@ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()),
       function_dispatcher_(function_dispatcher),
       worker_running_(false) {
-  std::memset(clients_, 0, sizeof(clients_));
-
   queued_frames_ = std::min(
       static_cast<uint32_t>(kMaximumQueuedFrames),
       std::max(static_cast<uint32_t>(REXCVAR_GET(audio_maxqframes)), static_cast<uint32_t>(4)));
@@ -134,10 +132,19 @@ void AudioSystem::WorkerThreadMain() {
     if (result.first == rex::thread::WaitResult::kSuccess) {
       auto index = result.second;
 
-      auto global_lock = global_critical_region_.Acquire();
-      uint32_t client_callback = clients_[index].callback;
-      uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
-      global_lock.unlock();
+      // UnregisterClient waits on this after clearing in_use, so the client
+      // can't go away while its callback runs.
+      std::lock_guard<std::recursive_mutex> callback_lock(clients_[index].callback_mutex);
+
+      uint32_t client_callback = 0;
+      uint32_t client_callback_arg = 0;
+      {
+        auto global_lock = global_critical_region_.Acquire();
+        if (clients_[index].in_use) {
+          client_callback = clients_[index].callback;
+          client_callback_arg = clients_[index].wrapped_callback_arg;
+        }
+      }
 
       if (client_callback) {
         if (diag_pump_count < 10) {
@@ -186,6 +193,14 @@ int AudioSystem::FindFreeClient() {
 
 void AudioSystem::Initialize() {}
 
+void AudioSystem::ResetClient(ClientSlot& client) {
+  client.driver = nullptr;
+  client.callback = 0;
+  client.callback_arg = 0;
+  client.wrapped_callback_arg = 0;
+  client.in_use = false;
+}
+
 void AudioSystem::Shutdown() {
   if (!worker_running_) {
     return;
@@ -198,6 +213,8 @@ void AudioSystem::Shutdown() {
 
   worker_running_ = false;
   shutdown_event_->Set();
+  // A paused worker waits for the resume.
+  resume_event_->Set();
   if (worker_thread_) {
     // The worker may be stuck inside a guest callback that is itself blocked on
     // guest objects (e.g. KeWaitForMultipleObjects), so terminating is the last
@@ -222,7 +239,7 @@ void AudioSystem::Shutdown() {
       if (clients_[i].wrapped_callback_arg) {
         memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
       }
-      clients_[i] = {nullptr, 0, 0, 0, false};
+      ResetClient(clients_[i]);
     }
   }
 }
@@ -251,7 +268,12 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
-  clients_[index] = {driver, callback, callback_arg, ptr, true};
+  auto& client = clients_[index];
+  client.driver = driver;
+  client.callback = callback;
+  client.callback_arg = callback_arg;
+  client.wrapped_callback_arg = ptr;
+  client.in_use = true;
 
   if (out_index) {
     *out_index = index;
@@ -272,18 +294,33 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
 
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
-  assert_true(clients_[index].driver != NULL);
+  // A title can submit a last frame after unregistering its client.
+  if (!clients_[index].driver) {
+    return;
+  }
   (clients_[index].driver)->SubmitFrame(samples_ptr);
 }
 
 void AudioSystem::UnregisterClient(size_t index) {
   SCOPE_profile_cpu_f("apu");
 
-  auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
-  DestroyDriver(clients_[index].driver);
-  memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
-  clients_[index] = {nullptr, 0, 0, 0, false};
+  AudioDriver* driver;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    driver = clients_[index].driver;
+    // wrapped_callback_arg is leaked: a callback in flight may hold it.
+    ResetClient(clients_[index]);
+  }
+
+  // Wait for a callback in flight. Not under the global lock, which the
+  // callback can take.
+  clients_[index].callback_mutex.lock();
+  clients_[index].callback_mutex.unlock();
+
+  if (driver) {
+    DestroyDriver(driver);
+  }
 
   // Drain the semaphore of its count.
   auto client_semaphore = client_semaphores_[index].get();

@@ -9,7 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+// Disable warnings about unused parameters for kernel functions
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+
+#include <algorithm>
 #include <cstring>
+#include <iterator>
+#include <string>
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
@@ -17,11 +23,14 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xcontent.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_country, 103, "Kernel", "User's country ID");
+// Defined in xam_user.cpp.
+REXCVAR_DECLARE(uint32_t, user_language);
 
 // TODO(gibbed): put these forward decls in a header somewhere.
 
@@ -36,6 +45,7 @@ uint32_t xeXGetGameRegion();
 namespace rex {
 namespace kernel {
 namespace xam {
+using rex::system::XLanguage;
 
 // Table lookups.
 
@@ -390,6 +400,132 @@ u32 XamGetLocaleEx_entry(u32 max_country_id, u32 max_locale_id) {
                           static_cast<uint8_t>(max_locale_id));
 }
 
+//=============================================================================
+// Ported from xenia-canary (xam_locale.cc) for the ReXGlue fork
+//=============================================================================
+
+// The console language: the user_language cvar stands in for XConfig's user
+// language. Out of range, it falls back by game region like XAM does. Plain
+// XGetLanguage only knows the languages up to Portuguese.
+XLanguage xeGetLanguage(bool extended_languages_support) {
+  const auto desired_language = static_cast<XLanguage>(REXCVAR_GET(user_language));
+  const uint32_t max_language = extended_languages_support
+                                    ? static_cast<uint32_t>(XLanguage::kMaxLanguages)
+                                    : static_cast<uint32_t>(XLanguage::kSChinese);
+  if (desired_language != XLanguage::kInvalid &&
+      static_cast<uint32_t>(desired_language) < max_language) {
+    return desired_language;
+  }
+
+  const uint32_t region = xeXGetGameRegion();
+  if ((region & 0xFF00) != 0x100) {
+    return XLanguage::kEnglish;
+  }
+  switch (region) {
+    case 0x101:  // NTSC-J (Japan)
+      return XLanguage::kJapanese;
+    case 0x102:  // NTSC-J (China)
+      return extended_languages_support ? XLanguage::kSChinese : XLanguage::kEnglish;
+    default:
+      return XLanguage::kKorean;
+  }
+}
+
+u32 XamGetLanguage_entry() {
+  return static_cast<uint32_t>(xeGetLanguage(true));
+}
+
+u32 XTLGetLanguageV2_entry() {
+  return static_cast<uint32_t>(xeGetLanguage(true));
+}
+
+u32 XamGetLanguageTypeface_entry(u32 language, u32 buffer_size, mapped_wstring buffer) {
+  std::u16string path;
+  if (language == static_cast<uint32_t>(XLanguage::kSChinese)) {
+    path = u"file://media:/XenonSCLatin.xtt";
+  } else if (language == static_cast<uint32_t>(XLanguage::kTChinese)) {
+    path = u"file://media:/XenonCLatin.xtt";
+  } else {
+    path = u"file://media:/XenonJKLatin.xtt";
+  }
+  if (!buffer || !buffer_size) {
+    return X_STATUS_SUCCESS;
+  }
+  path.resize(std::min<size_t>(path.size(), buffer_size - 1));
+  memory::store_and_swap<std::u16string>(buffer, path);
+  static_cast<char16_t*>(buffer)[path.size()] = 0;
+  return X_STATUS_SUCCESS;
+}
+
+namespace {
+
+constexpr uint8_t kLocaleDateFormatTable[] = {
+    2, 1, 3, 1, 3, 3, 3, 3, 3, 3, 3, 2, 3, 2, 1, 4, 2, 3, 1, 2, 2, 3, 3, 3, 3, 3, 2, 1,
+    3, 2, 2, 3, 0, 3, 0, 3, 3, 5, 3, 1, 3, 2, 3, 3, 3, 2, 3, 3, 5, 3, 3, 5, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 3, 3, 0, 2, 1, 3, 3, 3, 3, 3, 5, 3, 2, 3, 3, 3, 2,
+    3, 5, 0, 3, 1, 3, 3, 3, 3, 3, 3, 3, 4, 3, 3, 3, 3, 3, 3, 3, 5, 1, 1, 1, 1};
+
+}  // namespace
+
+u32 XamGetLocaleDateFormat_entry(u32 locale) {
+  const uint32_t biased_locale = locale - 5;
+  // As in XAM: only locales 5..0x6D have an entry.
+  if (biased_locale > 0x68) {
+    return 3;
+  }
+  return kLocaleDateFormatTable[biased_locale];
+}
+
+u32 XamGetCountry_entry() {
+  return REXCVAR_GET(user_country);
+}
+
+u32 XamSetCountry_entry(u32 country) {
+  // In-memory only, as canary's XConfig write.
+  REXCVAR_GET(user_country) = country & 0xFF;
+  return 0;
+}
+
+void XamGetOnlineLanguageAndCountry_entry(u64 xuid, mapped_u8 language_buffer,
+                                          mapped_u8 country_buffer) {
+  if (country_buffer) {
+    *country_buffer = static_cast<uint8_t>(REXCVAR_GET(user_country));
+  }
+  if (language_buffer) {
+    *language_buffer = static_cast<uint8_t>(REXCVAR_GET(user_language));
+  }
+}
+
+u32 XamProfileGetLiveLegalLocale_entry(u64 xuid, u32 buffer_length, mapped_wstring buffer) {
+  return XamGetOnlineLanguageAndCountryString_entry(
+      REXCVAR_GET(user_language), REXCVAR_GET(user_country), buffer_length, buffer);
+}
+
+u32 XapipGetLocale_entry(u32 buffer_length, mapped_string buffer) {
+  // "ll-CC", as XamProfileGetLiveLegalLocale gives it, in ASCII.
+  const char16_t* language =
+      xeXamGetOnlineLanguageString(static_cast<uint8_t>(REXCVAR_GET(user_language)));
+  const char16_t* country =
+      xeXamGetOnlineCountryString(static_cast<uint8_t>(REXCVAR_GET(user_country)));
+  if (!language || !country) {
+    return X_E_NOTFOUND;
+  }
+  std::string locale;
+  for (const char16_t* c = language; *c; c++) {
+    locale += static_cast<char>(*c);
+  }
+  locale += '-';
+  for (const char16_t* c = country; *c; c++) {
+    locale += static_cast<char>(*c);
+  }
+  if (buffer && buffer_length) {
+    const size_t count = std::min<size_t>(locale.size(), buffer_length - 1);
+    std::memcpy(buffer, locale.data(), count);
+    static_cast<char*>(buffer)[count] = 0;
+  }
+  return X_E_SUCCESS;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -412,20 +548,26 @@ REX_EXPORT(__imp__XamGetOnlineLanguageString, rex::kernel::xam::XamGetOnlineLang
 REX_EXPORT(__imp__XamGetCountryFromOnlineCountry,
            rex::kernel::xam::XamGetCountryFromOnlineCountry_entry)
 REX_EXPORT(__imp__XamGetLocaleEx, rex::kernel::xam::XamGetLocaleEx_entry)
+REX_EXPORT(__imp__XamGetLanguage, rex::kernel::xam::XamGetLanguage_entry)
+REX_EXPORT(__imp__XTLGetLanguageV2, rex::kernel::xam::XTLGetLanguageV2_entry)
+REX_EXPORT(__imp__XamGetLanguageTypeface, rex::kernel::xam::XamGetLanguageTypeface_entry)
+REX_EXPORT(__imp__XamGetLocaleDateFormat, rex::kernel::xam::XamGetLocaleDateFormat_entry)
+REX_EXPORT(__imp__XamGetCountry, rex::kernel::xam::XamGetCountry_entry)
+REX_EXPORT(__imp__XamSetCountry, rex::kernel::xam::XamSetCountry_entry)
+REX_EXPORT(__imp__XamGetOnlineLanguageAndCountry,
+           rex::kernel::xam::XamGetOnlineLanguageAndCountry_entry)
+REX_EXPORT(__imp__XamProfileGetLiveLegalLocale,
+           rex::kernel::xam::XamProfileGetLiveLegalLocale_entry)
+REX_EXPORT(__imp__XapipGetLocale, rex::kernel::xam::XapipGetLocale_entry)
 
 REX_EXPORT_STUB(__imp__XamFormatCurrency);
 REX_EXPORT_STUB(__imp__XamFormatMessage);
 REX_EXPORT_STUB(__imp__XamFormatSystemDateString);
-REX_EXPORT_STUB(__imp__XamGetCountry);
 REX_EXPORT_STUB(__imp__XamGetCurrencyFormat);
-REX_EXPORT_STUB(__imp__XamGetLanguage);
 REX_EXPORT_STUB(__imp__XamGetLanguageLocaleFallbackString);
-REX_EXPORT_STUB(__imp__XamGetLanguageTypeface);
 REX_EXPORT_STUB(__imp__XamGetLanguageTypefacePatch);
-REX_EXPORT_STUB(__imp__XamGetLocaleDateFormat);
 REX_EXPORT_STUB(__imp__XamGetLocaleTimeFormat);
 REX_EXPORT_STUB(__imp__XamGetOnlineCountryFeatures);
-REX_EXPORT_STUB(__imp__XamGetOnlineLanguageAndCountry);
 REX_EXPORT_STUB(__imp__XamGetStoreFront);
 REX_EXPORT_STUB(__imp__XamUniSortCmpString);
 REX_EXPORT_STUB(__imp__XamValidateCountry);

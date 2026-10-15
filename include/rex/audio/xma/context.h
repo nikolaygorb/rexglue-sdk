@@ -164,10 +164,19 @@ struct kPacketInfo {
   uint8_t frame_count_ = 0;
   uint8_t current_frame_ = 0;
   uint32_t current_frame_size_ = 0;
+  // First frame starting at or after the requested offset.
+  uint32_t current_frame_offset_ = 0;
 
   bool isLastFrameInPacket() const {
     return frame_count_ == 0 || current_frame_ == frame_count_ - 1;
   }
+};
+
+// A packet located by index across the current and the next input buffer.
+struct kPacketHandle {
+  uint32_t buffer_index_ = 0;
+  uint32_t packet_index_ = 0;
+  bool is_valid_ = false;
 };
 
 static constexpr int kIdToSampleRate[4] = {24000, 32000, 44100, 48000};
@@ -215,6 +224,14 @@ class XmaContext {
 
   memory::Memory* memory() const { return memory_; }
 
+  // Packet parsing: pure functions of the packet bytes, public for unit tests.
+  static kPacketInfo GetPacketInfo(uint8_t* packet, uint32_t frame_offset);
+  // Scans `buffer` from next_packet_index for the first packet whose frame
+  // offset is valid; returns that frame's bit offset in the buffer, or
+  // kBitsPerPacketHeader when there is none.
+  static uint32_t GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
+                                          uint32_t current_input_packet_count);
+
   uint32_t id() { return id_; }
   uint32_t guest_ptr() { return guest_ptr_; }
   bool is_allocated() { return is_allocated_.load(std::memory_order_acquire); }
@@ -242,15 +259,20 @@ class XmaContext {
   static int16_t GetPacketNumber(size_t size, size_t bit_offset);
   static uint32_t GetCurrentInputBufferSize(XMA_CONTEXT_DATA* data);
 
-  kPacketInfo GetPacketInfo(uint8_t* packet, uint32_t frame_offset);
   uint32_t GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint32_t frame_size);
+  kPacketHandle GetPacketHandle(XMA_CONTEXT_DATA* data, uint32_t buffer_index,
+                                uint32_t packet_index, uint32_t current_input_packet_count);
   const uint8_t* GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
                                uint32_t current_input_packet_count);
-  uint32_t GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
+  // As GetNextPacketReadOffset(buffer, ...), but an index past the current
+  // buffer continues in the next one.
+  uint32_t GetNextPacketReadOffset(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
                                    uint32_t current_input_packet_count);
   uint8_t* GetCurrentInputBuffer(XMA_CONTEXT_DATA* data);
 
   void Decode(XMA_CONTEXT_DATA* data);
+  void EmitCarry(const XMA_CONTEXT_DATA* data, const uint8_t* head);
+  void FlushCarry(const XMA_CONTEXT_DATA* data);
   void Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data);
   void UpdateLoopStatus(XMA_CONTEXT_DATA* data);
   void ClearLocked(XMA_CONTEXT_DATA* data);

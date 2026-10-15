@@ -68,12 +68,6 @@ class D3D12SharedMemory : public SharedMemory {
 
   void WriteRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void WriteRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
-  // Due to the D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP limitation, the
-  // smallest supported formats are 32-bit.
-  void WriteUintPow2SRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                  uint32_t element_size_bytes_pow2);
-  void WriteUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                  uint32_t element_size_bytes_pow2);
 
  protected:
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -96,13 +90,7 @@ class D3D12SharedMemory : public SharedMemory {
   // rather than creation).
   enum class BufferDescriptorIndex : uint32_t {
     kRawSRV,
-    kR32UintSRV,
-    kR32G32UintSRV,
-    kR32G32B32A32UintSRV,
     kRawUAV,
-    kR32UintUAV,
-    kR32G32UintUAV,
-    kR32G32B32A32UintUAV,
 
     kCount,
   };

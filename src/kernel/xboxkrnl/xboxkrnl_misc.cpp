@@ -26,9 +26,23 @@ void KeEnableFpuExceptions_entry(u32 enabled) {
   // TODO(benvanik): can we do anything about exceptions?
 }
 
+u32 ExReadModifyWriteXConfigSettingUlong_entry(u32 category, u32 setting, u32 bit_affected,
+                                               u32 flag) {
+  // XConfig is read-only here (ExGetXConfigSetting serves fixed values), so the
+  // change is accepted and not stored.
+  REXKRNL_DEBUG(
+      "ExReadModifyWriteXConfigSettingUlong: category {:04X} setting {:04X} mask {:08X} "
+      "flag {:08X} not stored",
+      uint32_t(category) & 0xFFFF, uint32_t(setting) & 0xFFFF, uint32_t(bit_affected),
+      uint32_t(flag));
+  return X_STATUS_SUCCESS;
+}
+
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__KeEnableFpuExceptions, rex::kernel::xboxkrnl::KeEnableFpuExceptions_entry)
+REX_EXPORT(__imp__ExReadModifyWriteXConfigSettingUlong,
+           rex::kernel::xboxkrnl::ExReadModifyWriteXConfigSettingUlong_entry)
 
 REX_EXPORT_STUB(__imp__ExSetBetaFeaturesEnabled);
 REX_EXPORT_STUB(__imp__ExIsBetaFeatureEnabled);
@@ -64,7 +78,6 @@ REX_EXPORT_STUB(__imp__EmaExecute);
 REX_EXPORT_STUB(__imp__ExRegisterThreadNotification);
 REX_EXPORT_STUB(__imp__ExTerminateTitleProcess);
 REX_EXPORT_STUB(__imp__ExFreeDebugPool);
-REX_EXPORT_STUB(__imp__ExReadModifyWriteXConfigSettingUlong);
 REX_EXPORT_STUB(__imp__ExRegisterXConfigNotification);
 REX_EXPORT_STUB(__imp__ExCancelAlarm);
 REX_EXPORT_STUB(__imp__ExInitializeAlarm);

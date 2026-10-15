@@ -9,9 +9,11 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include "codegen_flags.h"
 #include "decoded_binary.h"
 
 #include <algorithm>
+#include <fstream>
 #include <map>
 
 #include <rex/codegen/analysis_errors.h>
@@ -22,6 +24,43 @@
 #include "codegen_logging.h"
 
 namespace rex::codegen {
+
+namespace {
+
+// One line per function: address, size, the source that registered it, then
+// one indented line per jump table (bctr, table, entries). The first module a
+// run analyzes truncates the file, later ones append.
+void writeAnalysisReport(const CodegenContext& ctx) {
+  const std::string path = REXCVAR_GET(analysis_report);
+  if (path.empty())
+    return;
+
+  static bool truncated = false;
+  std::ofstream out(path, truncated ? std::ios::app : std::ios::trunc);
+  if (!out) {
+    REXCODEGEN_WARN("analysis_report: cannot write {}", path);
+    return;
+  }
+  truncated = true;
+
+  std::vector<const FunctionNode*> nodes;
+  for (const auto& [addr, node] : ctx.graph.functions())
+    nodes.push_back(node.get());
+  std::sort(nodes.begin(), nodes.end(),
+            [](const FunctionNode* a, const FunctionNode* b) { return a->base() < b->base(); });
+
+  out << "# module " << ctx.Config().filePath << "\n";
+  for (const auto* node : nodes) {
+    out << fmt::format("{:08X} {:X} {}\n", node->base(), node->size(),
+                       AuthorityName(node->authority()));
+    for (const auto& jt : node->jumpTables()) {
+      out << fmt::format("  jt {:08X} {:08X} {}\n", jt.bctrAddress, jt.tableAddress,
+                         jt.targets.size());
+    }
+  }
+}
+
+}  // namespace
 
 Result<void> Analyze(CodegenContext& ctx, ProgressReporter* reporter) {
   REXCODEGEN_TRACE("Analyze: starting analysis...");
@@ -54,11 +93,7 @@ Result<void> Analyze(CodegenContext& ctx, ProgressReporter* reporter) {
     return discoverResult;
   }
 
-  // 3.5. Function pointer scan: find lis/addi pairs loading code addresses
-  // TODO(tomc): disabled for now, causes too many false positives
-  // functionPointerScan(ctx);
-
-  // 4. Gap fill uncovered regions + discover blocks for gap-filled functions + cleanup
+  // 4. Gap fill uncovered regions, branch and pointer targets, then discover them
   if (reporter)
     reporter->phaseChanged("GapFill");
   auto gapFillResult = phases::GapFill(ctx, reporter);
@@ -73,6 +108,9 @@ Result<void> Analyze(CodegenContext& ctx, ProgressReporter* reporter) {
   if (!mergeResult) {
     return mergeResult;
   }
+
+  // Before Validate, so the report also explains a failed validation.
+  writeAnalysisReport(ctx);
 
   // 6. Validate
   if (reporter)

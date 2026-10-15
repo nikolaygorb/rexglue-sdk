@@ -29,6 +29,8 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+// Defined in xam_locale.cpp.
+REXCVAR_DECLARE(uint32_t, user_country);
 
 namespace rex {
 namespace kernel {
@@ -65,7 +67,7 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   return result;
 }
 
-u32 XamUserGetSigninState_entry(u32 user_index) {
+uint32_t xeXamUserGetSigninState(uint32_t user_index) {
   uint32_t signin_state = 0;
   if (user_index < 4) {
     if (user_index == 0) {
@@ -74,6 +76,10 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
     }
   }
   return signin_state;
+}
+
+u32 XamUserGetSigninState_entry(u32 user_index) {
+  return xeXamUserGetSigninState(user_index);
 }
 
 typedef struct {
@@ -146,7 +152,7 @@ static_assert_size(X_USER_READ_PROFILE_SETTINGS, 8);
 // https://github.com/oukiar/freestyledash/blob/master/Freestyle/Tools/Generic/xboxtools.cpp
 uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, uint32_t xuid_count,
                                       be<uint64_t>* xuids, uint32_t setting_count,
-                                      be<uint32_t>* setting_ids, uint32_t unk,
+                                      be<uint32_t>* setting_ids, uint32_t /*unused*/,
                                       be<uint32_t>* buffer_size_ptr, uint8_t* buffer,
                                       XAM_OVERLAPPED* overlapped) {
   if (!xuid_count) {
@@ -161,7 +167,6 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     // until it's implemented for release builds...
     xuid_count = 1;
   }
-  assert_zero(unk);  // probably flags
 
   // must have at least 1 to 32 settings
   if (setting_count < 1 || setting_count > 32) {
@@ -294,11 +299,14 @@ u32 XamUserReadProfileSettings_entry(u32 title_id, u32 user_index, u32 xuid_coun
 
 u32 XamUserReadProfileSettingsEx_entry(u32 title_id, u32 user_index, u32 xuid_count,
                                        mapped_u64 xuids, u32 setting_count, mapped_u32 setting_ids,
-                                       mapped_u32 buffer_size_ptr, u32 unk_2,
-                                       mapped_void buffer_ptr,
+                                       mapped_u32 buffer_size_ptr,
+                                       mapped_u32 unkn_buffer_size_ptr, mapped_void buffer_ptr,
                                        ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
+  // Some callers pass the buffer size pointer as the eighth argument instead.
   return XamUserReadProfileSettingsEx(title_id, user_index, xuid_count, xuids, setting_count,
-                                      setting_ids, unk_2, buffer_size_ptr, buffer_ptr, overlapped);
+                                      setting_ids, 0,
+                                      buffer_size_ptr ? buffer_size_ptr : unkn_buffer_size_ptr,
+                                      buffer_ptr, overlapped);
 }
 
 u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_count,
@@ -339,14 +347,13 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
       case UserProfile::Setting::Type::BINARY: {
         uint8_t* binary_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(setting.data.binary.ptr);
         size_t binary_size = setting.data.binary.size;
-        std::vector<uint8_t> bytes;
-        if (setting.data.binary.ptr) {
-          // Copy provided data
-          bytes.resize(binary_size);
+        // Zero-filled when the data pointer is NULL. An empty vector has a
+        // null data(), and memcpy with a null pointer is undefined even for
+        // size 0 (clang then drops the size check from the allocation), so
+        // only copy when there is something to copy.
+        std::vector<uint8_t> bytes(binary_size);
+        if (setting.data.binary.ptr && binary_size) {
           std::memcpy(bytes.data(), binary_ptr, binary_size);
-        } else {
-          // Data pointer was NULL, so just fill with zeroes
-          bytes.resize(binary_size, 0);
         }
         user_profile->AddSetting(
             std::make_unique<xam::UserProfile::BinarySetting>(setting.setting_id, bytes));
@@ -485,6 +492,31 @@ u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
   // Games seem to sit and loop until we trigger this notification:
   // XN_SYS_UI (off)
   REX_KERNEL_STATE()->BroadcastNotification(0x00000009, 0);
+  return X_ERROR_SUCCESS;
+}
+
+// The same UI for a given user (xenia-canary forwards it the same way).
+u32 XamShowSigninUIp_entry(u32 /*user_index*/, u32 users_needed, u32 flags) {
+  return XamShowSigninUI_entry(users_needed, flags);
+}
+
+// No stats service: an enumerator with nothing in it, after xenia-canary's
+// argument checks (its XUserStatsEnumerator never yields an item either).
+u32 XamUserCreateStatsEnumerator_entry(u32 /*title_id*/, u32 user_index, u32 count, u32 flags,
+                                       u32 size, mapped_void stats_ptr, mapped_u32 buffer_size_ptr,
+                                       mapped_u32 handle_ptr) {
+  if (!count || !buffer_size_ptr || !handle_ptr || !stats_ptr || user_index >= 4 || !flags ||
+      flags > 0x64 || !size) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  *buffer_size_ptr = 0;
+
+  auto e = make_object<XStaticUntypedEnumerator>(REX_KERNEL_STATE(), 0, 0);
+  const X_STATUS result = e->Initialize(user_index, 0xFB, 0xB0023, 0xB0024, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+  *handle_ptr = e->handle();
   return X_ERROR_SUCCESS;
 }
 
@@ -725,6 +757,155 @@ u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
   return X_ERROR_SUCCESS;
 }
 
+//=============================================================================
+// Ported from xenia-canary (xam_user.cc, xam_nui.cc, xam_enum.cc) for the
+// ReXGlue fork. One local profile is signed in, as user 0.
+//=============================================================================
+
+namespace {
+
+constexpr uint32_t kSubscriptionTierGold = 6;
+
+bool IsSignedInUser(uint32_t user_index) {
+  return user_index == 0;
+}
+
+bool IsSignedInXuid(uint64_t xuid) {
+  return xuid && xuid == REX_KERNEL_STATE()->user_profile()->xuid();
+}
+
+// X_XAMACCOUNTINFO::cached_user_flags of the profile: country in bits 8..15,
+// subscription tier in 20..23, language in 25..29.
+uint32_t CachedUserFlags() {
+  return ((REXCVAR_GET(user_country) << 8) & 0xFF00) | (kSubscriptionTierGold << 20) |
+         ((REXCVAR_GET(user_language) << 25) & 0x3E000000);
+}
+
+}  // namespace
+
+u32 XamUserGetUserFlags_entry(u32 user_index) {
+  return IsSignedInUser(user_index) ? CachedUserFlags() : 0;
+}
+
+u32 XamUserGetCachedUserFlags_entry(u32 user_index) {
+  return XamUserGetUserFlags_entry(user_index);
+}
+
+u32 XamUserGetUserFlagsFromXUID_entry(u64 xuid) {
+  return IsSignedInXuid(xuid) ? CachedUserFlags() : 0;
+}
+
+u32 XamUserGetIndexFromXUID_entry(u64 xuid, u32 flags, mapped_u32 index) {
+  if (!index) {
+    return X_E_INVALIDARG;
+  }
+  if (!IsSignedInXuid(xuid)) {
+    return X_E_NO_SUCH_USER;
+  }
+  *index = 0;
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserGetMembershipTierFromXUID_entry(u64 xuid) {
+  return IsSignedInXuid(xuid) ? kSubscriptionTierGold : 0;
+}
+
+u32 XamUserGetOnlineCountryFromXUID_entry(u64 xuid) {
+  return REXCVAR_GET(user_country);
+}
+
+u32 XamUserGetOnlineLanguageFromXUID_entry(u64 xuid) {
+  return REXCVAR_GET(user_language);
+}
+
+u32 XamUserGetSubscriptionType_entry(u32 user_index, mapped_u32 subscription_length_ptr,
+                                     mapped_u32 subscription_payment_ptr) {
+  if (user_index >= 4 || !subscription_length_ptr || !subscription_payment_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (!IsSignedInUser(user_index)) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  // No subscription history is tracked.
+  *subscription_length_ptr = 0;
+  *subscription_payment_ptr = 0;
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserIsParentalControlled_entry(u32 user_index) {
+  return 0;
+}
+
+u32 XamUserIsUnsafeProgrammingAllowed_entry(u32 user_index, u32 pc_check, mapped_u32 result_ptr) {
+  if (!result_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  if (user_index != 0xFF && user_index >= 4) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  *result_ptr = 1;
+  return X_ERROR_SUCCESS;
+}
+
+u32 XamUserNuiGetUserIndexForSignin_entry(mapped_u32 user_index) {
+  if (!user_index) {
+    return X_E_INVALIDARG;
+  }
+  *user_index = 0;
+  return X_E_SUCCESS;
+}
+
+u32 XamUserLogonEx_entry(mapped_void profile_ptr, u32 flags, mapped_void overlapped_ptr) {
+  // The profile is already signed in.
+  auto run = [](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    extended_error = X_HRESULT_FROM_WIN32(X_ERROR_SUCCESS);
+    length = 0;
+    return X_ERROR_SUCCESS;
+  };
+  if (!overlapped_ptr) {
+    uint32_t extended_error, length;
+    return run(extended_error, length);
+  }
+  REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, overlapped_ptr.guest_address());
+  return X_ERROR_IO_PENDING;
+}
+
+u32 EnumerateMediaObjects_entry() {
+  return 0x80004001;  // E_NOTIMPL
+}
+
+u32 EnumerateMediaObjects__entry() {
+  return 0x80004001;
+}
+
+u32 EnumerateMediaObjects_0_entry() {
+  return 0x80004001;
+}
+
+u32 EnumerateMediaObjects_1_entry() {
+  return 0x80004001;
+}
+
+//=============================================================================
+// Ported from xenia-canary for the ReXGlue fork
+//=============================================================================
+
+// No Kinect: no NUI users.
+u32 XamUserNuiEnableBiometric_entry(u32 user_index, u32 enable) {
+  return X_E_INVALIDARG;
+}
+
+u32 XamUserNuiGetUserIndex_entry(u32 unk, mapped_u32 index) {
+  return X_E_NO_SUCH_USER;
+}
+
+u32 XamUserNuiGetUserIndexForBind_entry(mapped_u32 user_index) {
+  if (!user_index) {
+    return X_E_INVALIDARG;
+  }
+  return X_E_FAIL;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -749,6 +930,9 @@ REX_EXPORT(__imp__XamUserIsOnlineEnabled, rex::kernel::xam::XamUserIsOnlineEnabl
 REX_EXPORT(__imp__XamUserGetMembershipTier, rex::kernel::xam::XamUserGetMembershipTier_entry)
 REX_EXPORT(__imp__XamUserAreUsersFriends, rex::kernel::xam::XamUserAreUsersFriends_entry)
 REX_EXPORT(__imp__XamShowSigninUI, rex::kernel::xam::XamShowSigninUI_entry)
+REX_EXPORT(__imp__XamShowSigninUIp, rex::kernel::xam::XamShowSigninUIp_entry)
+REX_EXPORT(__imp__XamUserCreateStatsEnumerator,
+           rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
 REX_EXPORT(__imp__XamUserCreateAchievementEnumerator,
            rex::kernel::xam::XamUserCreateAchievementEnumerator_entry)
 REX_EXPORT(__imp__XamParseGamerTileKey, rex::kernel::xam::XamParseGamerTileKey_entry)
@@ -756,28 +940,44 @@ REX_EXPORT(__imp__XamReadTileToTexture, rex::kernel::xam::XamReadTileToTexture_e
 REX_EXPORT(__imp__XamWriteGamerTile, rex::kernel::xam::XamWriteGamerTile_entry)
 REX_EXPORT(__imp__XamSessionCreateHandle, rex::kernel::xam::XamSessionCreateHandle_entry)
 REX_EXPORT(__imp__XamSessionRefObjByHandle, rex::kernel::xam::XamSessionRefObjByHandle_entry)
+REX_EXPORT(__imp__XamUserGetUserFlags, rex::kernel::xam::XamUserGetUserFlags_entry)
+REX_EXPORT(__imp__XamUserGetCachedUserFlags, rex::kernel::xam::XamUserGetCachedUserFlags_entry)
+REX_EXPORT(__imp__XamUserGetUserFlagsFromXUID, rex::kernel::xam::XamUserGetUserFlagsFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetIndexFromXUID, rex::kernel::xam::XamUserGetIndexFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetMembershipTierFromXUID,
+           rex::kernel::xam::XamUserGetMembershipTierFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetOnlineCountryFromXUID,
+           rex::kernel::xam::XamUserGetOnlineCountryFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetOnlineLanguageFromXUID,
+           rex::kernel::xam::XamUserGetOnlineLanguageFromXUID_entry)
+REX_EXPORT(__imp__XamUserGetSubscriptionType, rex::kernel::xam::XamUserGetSubscriptionType_entry)
+REX_EXPORT(__imp__XamUserIsParentalControlled, rex::kernel::xam::XamUserIsParentalControlled_entry)
+REX_EXPORT(__imp__XamUserIsUnsafeProgrammingAllowed,
+           rex::kernel::xam::XamUserIsUnsafeProgrammingAllowed_entry)
+REX_EXPORT(__imp__XamUserNuiGetUserIndexForSignin,
+           rex::kernel::xam::XamUserNuiGetUserIndexForSignin_entry)
+REX_EXPORT(__imp__XamUserLogonEx, rex::kernel::xam::XamUserLogonEx_entry)
+REX_EXPORT(__imp__EnumerateMediaObjects, rex::kernel::xam::EnumerateMediaObjects_entry)
+REX_EXPORT(__imp__EnumerateMediaObjects_, rex::kernel::xam::EnumerateMediaObjects__entry)
+REX_EXPORT(__imp__EnumerateMediaObjects_0, rex::kernel::xam::EnumerateMediaObjects_0_entry)
+REX_EXPORT(__imp__EnumerateMediaObjects_1, rex::kernel::xam::EnumerateMediaObjects_1_entry)
+REX_EXPORT(__imp__XamUserNuiEnableBiometric, rex::kernel::xam::XamUserNuiEnableBiometric_entry)
+REX_EXPORT(__imp__XamUserNuiGetUserIndex, rex::kernel::xam::XamUserNuiGetUserIndex_entry)
+REX_EXPORT(__imp__XamUserNuiGetUserIndexForBind,
+           rex::kernel::xam::XamUserNuiGetUserIndexForBind_entry)
 
 REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);
 REX_EXPORT_STUB(__imp__XamUserGetAgeGroup);
-REX_EXPORT_STUB(__imp__XamUserGetCachedUserFlags);
 REX_EXPORT_STUB(__imp__XamUserGetDeviceId);
-REX_EXPORT_STUB(__imp__XamUserGetIndexFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetMembershipTierFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
-REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetOnlineXUIDFromOfflineXUID);
 REX_EXPORT_STUB(__imp__XamUserGetReportingInfo);
 REX_EXPORT_STUB(__imp__XamUserGetRequestedUserIndexMask);
-REX_EXPORT_STUB(__imp__XamUserGetSubscriptionType);
-REX_EXPORT_STUB(__imp__XamUserGetUserFlags);
-REX_EXPORT_STUB(__imp__XamUserGetUserFlagsFromXUID);
 REX_EXPORT_STUB(__imp__XamUserGetUserIndexMask);
 REX_EXPORT_STUB(__imp__XamUserGetUserTenure);
 REX_EXPORT_STUB(__imp__XamUserGetUsersMissingAvatars);
@@ -785,20 +985,13 @@ REX_EXPORT_STUB(__imp__XamUserGetXUIDForTFA);
 REX_EXPORT_STUB(__imp__XamUserInvalidateProfileSetting);
 REX_EXPORT_STUB(__imp__XamUserIsGuest);
 REX_EXPORT_STUB(__imp__XamUserIsLogonPreviewModeEnabled);
-REX_EXPORT_STUB(__imp__XamUserIsParentalControlled);
 REX_EXPORT_STUB(__imp__XamUserIsPartial);
 REX_EXPORT_STUB(__imp__XamUserIsPartialProfile);
-REX_EXPORT_STUB(__imp__XamUserIsUnsafeProgrammingAllowed);
 REX_EXPORT_STUB(__imp__XamUserLockLogonPreviewMode);
 REX_EXPORT_STUB(__imp__XamUserLogon);
-REX_EXPORT_STUB(__imp__XamUserLogonEx);
 REX_EXPORT_STUB(__imp__XamUserLookupDevice);
 REX_EXPORT_STUB(__imp__XamUserNuiBind);
-REX_EXPORT_STUB(__imp__XamUserNuiEnableBiometric);
 REX_EXPORT_STUB(__imp__XamUserNuiGetEnrollmentIndex);
-REX_EXPORT_STUB(__imp__XamUserNuiGetUserIndex);
-REX_EXPORT_STUB(__imp__XamUserNuiGetUserIndexForBind);
-REX_EXPORT_STUB(__imp__XamUserNuiGetUserIndexForSignin);
 REX_EXPORT_STUB(__imp__XamUserNuiIsBiometricEnabled);
 REX_EXPORT_STUB(__imp__XamUserNuiUnbind);
 REX_EXPORT_STUB(__imp__XamUserOverrideBindingCallbacks);

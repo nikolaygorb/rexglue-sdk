@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <exception>
+#include <mutex>
 
 #include <fmt/format.h>
 
@@ -115,6 +117,46 @@ namespace {
 
 XThread* GetBoundCurrentXThread() {
   return current_xthread_tls_;
+}
+
+std::terminate_handler previous_terminate_handler_ = nullptr;
+
+// A host C++ exception (REX_UNIMPLEMENTED, a std::runtime_error from generated
+// or runtime code) that leaves guest execution ends in std::terminate. Before
+// that, log what identifies the guest thread and where it was, metadata only
+// (upstream issue #409). As a terminate handler this runs on top of the
+// throwing frames, so a debugger or crash dump still sees the throw site.
+[[noreturn]] void GuestThreadTerminateHandler() {
+  if (XThread* thread = current_xthread_tls_) {
+    std::string what = "no exception";
+    if (auto exception = std::current_exception()) {
+      try {
+        std::rethrow_exception(exception);
+      } catch (const std::exception& e) {
+        what = e.what();
+      } catch (...) {
+        what = "unknown exception";
+      }
+    }
+    auto* state = thread->thread_state();
+    REXSYS_CRITICAL(
+        "Unhandled host exception in guest thread {} ('{}'): {}. Guest LR {:08X}. "
+        "guest_memory_included=false",
+        thread->thread_id(), thread->thread_name(), what,
+        state ? static_cast<uint32_t>(state->context()->lr) : 0u);
+    rex::FlushLogging();
+  }
+  if (previous_terminate_handler_) {
+    previous_terminate_handler_();
+  }
+  std::abort();
+}
+
+void InstallGuestThreadTerminateHandler() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    previous_terminate_handler_ = std::set_terminate(GuestThreadTerminateHandler);
+  });
 }
 
 }  // namespace
@@ -428,6 +470,8 @@ X_STATUS XThread::Create() {
 
   // Always retain when starting - the thread owns itself until exited.
   RetainHandle();
+
+  InstallGuestThreadTerminateHandler();
 
   rex::thread::Thread::CreationParameters params;
   params.stack_size = 16_MiB;  // Allocate a big host stack.
@@ -1448,6 +1492,10 @@ void XHostThread::Execute() {
 
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
+
+  // As in XThread::Execute: host threads such as the audio worker run guest
+  // callbacks, which write the cached FPSCR state back to the host.
+  thread_state_->context()->fpscr.InitHost();
 
   int ret = host_fn_();
 

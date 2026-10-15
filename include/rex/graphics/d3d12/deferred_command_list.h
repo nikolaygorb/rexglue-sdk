@@ -33,7 +33,8 @@ class DeferredCommandList {
                       size_t initial_size_bytes = 1_MiB);
 
   void Reset();
-  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+  void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1,
+               ID3D12GraphicsCommandList2* command_list_2);
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
@@ -196,6 +197,15 @@ class DeferredCommandList {
     args.aligned_destination_buffer_offset = aligned_destination_buffer_offset;
   }
 
+  void D3DSetPredication(ID3D12Resource* buffer, UINT64 aligned_buffer_offset,
+                         D3D12_PREDICATION_OP operation) {
+    auto& args = *reinterpret_cast<D3DSetPredicationArguments*>(
+        WriteCommand(Command::kD3DSetPredication, sizeof(D3DSetPredicationArguments)));
+    args.buffer = buffer;
+    args.aligned_buffer_offset = aligned_buffer_offset;
+    args.operation = operation;
+  }
+
   void D3DIASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) {
     auto& args = *reinterpret_cast<D3D12_INDEX_BUFFER_VIEW*>(
         WriteCommand(Command::kD3DIASetIndexBuffer, sizeof(D3D12_INDEX_BUFFER_VIEW)));
@@ -268,6 +278,28 @@ class DeferredCommandList {
     arg = stencil_ref;
   }
 
+  void D3DResolveSubresourceRegion(ID3D12Resource* dst_resource, UINT dst_subresource, UINT dst_x,
+                                   UINT dst_y, ID3D12Resource* src_resource, UINT src_subresource,
+                                   const D3D12_RECT* src_rect, DXGI_FORMAT format,
+                                   D3D12_RESOLVE_MODE resolve_mode) {
+    auto& args = *reinterpret_cast<D3DResolveSubresourceRegionArguments*>(WriteCommand(
+        Command::kD3DResolveSubresourceRegion, sizeof(D3DResolveSubresourceRegionArguments)));
+    args.dst_resource = dst_resource;
+    args.dst_subresource = dst_subresource;
+    args.dst_x = dst_x;
+    args.dst_y = dst_y;
+    args.src_resource = src_resource;
+    args.src_subresource = src_subresource;
+    if (src_rect) {
+      args.has_src_rect = true;
+      args.src_rect = *src_rect;
+    } else {
+      args.has_src_rect = false;
+    }
+    args.format = format;
+    args.resolve_mode = resolve_mode;
+  }
+
   void D3DResourceBarrier(UINT num_barriers, const D3D12_RESOURCE_BARRIER* barriers) {
     if (num_barriers == 0) {
       return;
@@ -322,17 +354,16 @@ class DeferredCommandList {
 
   void D3DSetComputeRootConstantBufferView(UINT root_parameter_index,
                                            D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(WriteCommand(
-        Command::kD3DSetComputeRootConstantBufferView, sizeof(SetRootConstantBufferViewArguments)));
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetComputeRootConstantBufferView, sizeof(SetRootDescriptorArguments)));
     args.root_parameter_index = root_parameter_index;
     args.buffer_location = buffer_location;
   }
 
   void D3DSetGraphicsRootConstantBufferView(UINT root_parameter_index,
                                             D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
-        WriteCommand(Command::kD3DSetGraphicsRootConstantBufferView,
-                     sizeof(SetRootConstantBufferViewArguments)));
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetGraphicsRootConstantBufferView, sizeof(SetRootDescriptorArguments)));
     args.root_parameter_index = root_parameter_index;
     args.buffer_location = buffer_location;
   }
@@ -355,35 +386,16 @@ class DeferredCommandList {
 
   void D3DSetComputeRootShaderResourceView(UINT root_parameter_index,
                                            D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(WriteCommand(
-        Command::kD3DSetComputeRootShaderResourceView, sizeof(SetRootConstantBufferViewArguments)));
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetComputeRootShaderResourceView, sizeof(SetRootDescriptorArguments)));
     args.root_parameter_index = root_parameter_index;
     args.buffer_location = buffer_location;
   }
 
   void D3DSetGraphicsRootShaderResourceView(UINT root_parameter_index,
                                             D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
-        WriteCommand(Command::kD3DSetGraphicsRootShaderResourceView,
-                     sizeof(SetRootConstantBufferViewArguments)));
-    args.root_parameter_index = root_parameter_index;
-    args.buffer_location = buffer_location;
-  }
-
-  void D3DSetComputeRootUnorderedAccessView(UINT root_parameter_index,
-                                            D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
-        WriteCommand(Command::kD3DSetComputeRootUnorderedAccessView,
-                     sizeof(SetRootConstantBufferViewArguments)));
-    args.root_parameter_index = root_parameter_index;
-    args.buffer_location = buffer_location;
-  }
-
-  void D3DSetGraphicsRootUnorderedAccessView(UINT root_parameter_index,
-                                             D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
-    auto& args = *reinterpret_cast<SetRootConstantBufferViewArguments*>(
-        WriteCommand(Command::kD3DSetGraphicsRootUnorderedAccessView,
-                     sizeof(SetRootConstantBufferViewArguments)));
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetGraphicsRootShaderResourceView, sizeof(SetRootDescriptorArguments)));
     args.root_parameter_index = root_parameter_index;
     args.buffer_location = buffer_location;
   }
@@ -398,6 +410,22 @@ class DeferredCommandList {
     auto& arg = *reinterpret_cast<ID3D12RootSignature**>(
         WriteCommand(Command::kD3DSetGraphicsRootSignature, sizeof(ID3D12RootSignature*)));
     arg = root_signature;
+  }
+
+  void D3DSetComputeRootUnorderedAccessView(UINT root_parameter_index,
+                                            D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetComputeRootUnorderedAccessView, sizeof(SetRootDescriptorArguments)));
+    args.root_parameter_index = root_parameter_index;
+    args.buffer_location = buffer_location;
+  }
+
+  void D3DSetGraphicsRootUnorderedAccessView(UINT root_parameter_index,
+                                             D3D12_GPU_VIRTUAL_ADDRESS buffer_location) {
+    auto& args = *reinterpret_cast<SetRootDescriptorArguments*>(WriteCommand(
+        Command::kD3DSetGraphicsRootUnorderedAccessView, sizeof(SetRootDescriptorArguments)));
+    args.root_parameter_index = root_parameter_index;
+    args.buffer_location = buffer_location;
   }
 
   void SetDescriptorHeaps(ID3D12DescriptorHeap* cbv_srv_uav_descriptor_heap,
@@ -429,6 +457,13 @@ class DeferredCommandList {
     std::memcpy(
         args.sample_positions, sample_positions,
         std::min(num_samples_per_pixel * num_pixels, UINT(16)) * sizeof(D3D12_SAMPLE_POSITION));
+  }
+
+  void D3DWriteBufferImmediate(D3D12_GPU_VIRTUAL_ADDRESS dest, UINT value) {
+    auto& args = *reinterpret_cast<D3DWriteBufferImmediateArguments*>(
+        WriteCommand(Command::kD3DWriteBufferImmediate, sizeof(D3DWriteBufferImmediateArguments)));
+    args.dest = dest;
+    args.value = value;
   }
 
   void BeginDebugMarker(const char* label_name) {
@@ -466,12 +501,14 @@ class DeferredCommandList {
     kD3DBeginQuery,
     kD3DEndQuery,
     kD3DResolveQueryData,
+    kD3DSetPredication,
     kD3DIASetIndexBuffer,
     kD3DIASetPrimitiveTopology,
     kD3DIASetVertexBuffers,
     kD3DOMSetBlendFactor,
     kD3DOMSetRenderTargets,
     kD3DOMSetStencilRef,
+    kD3DResolveSubresourceRegion,
     kD3DResourceBarrier,
     kRSSetScissorRect,
     kRSSetViewport,
@@ -491,6 +528,7 @@ class DeferredCommandList {
     kD3DSetPipelineState,
     kSetPipelineStateHandle,
     kD3DSetSamplePositions,
+    kD3DWriteBufferImmediate,
     kBeginDebugMarker,
     kEndDebugMarker,
     kInsertDebugMarker,
@@ -592,6 +630,12 @@ class DeferredCommandList {
     UINT64 aligned_destination_buffer_offset;
   };
 
+  struct D3DSetPredicationArguments {
+    ID3D12Resource* buffer;
+    UINT64 aligned_buffer_offset;
+    D3D12_PREDICATION_OP operation;
+  };
+
   struct D3DIASetVertexBuffersHeader {
     UINT start_slot;
     UINT num_views;
@@ -612,7 +656,7 @@ class DeferredCommandList {
     UINT dest_offset_in_32bit_values;
   };
 
-  struct SetRootConstantBufferViewArguments {
+  struct SetRootDescriptorArguments {
     UINT root_parameter_index;
     D3D12_GPU_VIRTUAL_ADDRESS buffer_location;
   };
@@ -627,10 +671,28 @@ class DeferredCommandList {
     ID3D12DescriptorHeap* sampler_descriptor_heap;
   };
 
+  struct D3DResolveSubresourceRegionArguments {
+    ID3D12Resource* dst_resource;
+    UINT dst_subresource;
+    UINT dst_x;
+    UINT dst_y;
+    ID3D12Resource* src_resource;
+    UINT src_subresource;
+    D3D12_RECT src_rect;
+    bool has_src_rect;
+    DXGI_FORMAT format;
+    D3D12_RESOLVE_MODE resolve_mode;
+  };
+
   struct D3DSetSamplePositionsArguments {
     UINT num_samples_per_pixel;
     UINT num_pixels;
     D3D12_SAMPLE_POSITION sample_positions[16];
+  };
+
+  struct D3DWriteBufferImmediateArguments {
+    D3D12_GPU_VIRTUAL_ADDRESS dest;
+    UINT value;
   };
 
   struct DebugMarkerHeader {

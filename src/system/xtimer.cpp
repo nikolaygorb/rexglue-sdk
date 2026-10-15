@@ -41,11 +41,6 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
                           uint32_t routine_arg, bool resume) {
   using rex::chrono::WinSystemClock;
   using rex::chrono::XSystemClock;
-  // Caller is checking for STATUS_TIMER_RESUME_IGNORED.
-  if (resume) {
-    return X_STATUS_TIMER_RESUME_IGNORED;
-  }
-
   period_ms = chrono::Clock::ScaleGuestDurationMillis(period_ms);
   WinSystemClock::time_point due_tp;
   if (due_time < 0) {
@@ -83,6 +78,13 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
   } else {
     result =
         timer_->SetRepeatingAt(due_tp, std::chrono::milliseconds(period_ms), std::move(callback));
+  }
+
+  // The timer is set either way; the caller checks for
+  // STATUS_TIMER_RESUME_IGNORED to learn that resume is not supported.
+  if (resume) {
+    XThread::SetLastError(X_RESULT_FROM_WIN32(0x32));  // ERROR_NOT_SUPPORTED
+    return X_STATUS_TIMER_RESUME_IGNORED;
   }
 
   return result ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;

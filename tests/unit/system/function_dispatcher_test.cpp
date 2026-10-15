@@ -26,6 +26,7 @@ namespace {
 using rex::testing::GetTestMemory;
 
 void DummyFn(PPCContext&, uint8_t*) {}
+void OtherFn(PPCContext&, uint8_t*) {}
 
 }  // namespace
 
@@ -54,6 +55,30 @@ TEST_CASE("FunctionDispatcher: caller_address routes thunk to caller's module po
 
   CHECK(dispatcher.GetFunction(thunk_a) == &DummyFn);
   CHECK(dispatcher.GetFunction(thunk_b) == &DummyFn);
+}
+
+TEST_CASE("FunctionDispatcher: AllocateThunk reuses the thunk of a function",
+          "[runtime][dispatcher]") {
+  auto& memory = GetTestMemory();
+  rex::runtime::ExportResolver resolver;
+  rex::runtime::FunctionDispatcher dispatcher(&memory, &resolver);
+
+  constexpr uint32_t kMod = 0x82000000u;
+  REQUIRE(dispatcher.InitializeFunctionTable(kMod, 0x10000u, kMod, 0x100000u));
+
+  // A title looking the same export up every frame must not run the thunk
+  // reserve out (upstream issue #420).
+  const uint32_t first = dispatcher.AllocateThunk(&DummyFn, kMod + 0x100);
+  REQUIRE(first != 0);
+  constexpr uint32_t kLookups = rex::runtime::FunctionDispatcher::kThunkReserveSize / 4 + 16;
+  for (uint32_t i = 0; i < kLookups; i++) {
+    REQUIRE(dispatcher.AllocateThunk(&DummyFn, kMod + 0x100) == first);
+  }
+
+  const uint32_t other = dispatcher.AllocateThunk(&OtherFn, kMod + 0x100);
+  CHECK(other != 0);
+  CHECK(other != first);
+  CHECK(dispatcher.GetFunction(other) == &OtherFn);
 }
 
 TEST_CASE("FunctionDispatcher: AllocateThunk(0) uses the entrypoint pool only when explicit",

@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/graphics_provider.h>
@@ -81,6 +82,9 @@ class D3D12Provider : public GraphicsProvider {
   // Adapter info.
   GpuVendorID GetAdapterVendorID() const { return adapter_vendor_id_; }
 
+  const std::string& GetAdapterDescription() const;
+  bool IsIntelArcGpu() const;
+
   // Device features.
   D3D12_HEAP_FLAGS GetHeapFlagCreateNotZeroed() const { return heap_flag_create_not_zeroed_; }
   D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER
@@ -89,6 +93,7 @@ class D3D12Provider : public GraphicsProvider {
     return ps_specified_stencil_reference_supported_;
   }
   bool AreRasterizerOrderedViewsSupported() const { return rasterizer_ordered_views_supported_; }
+  bool IsAlphaBlendFactorSupported() const { return alpha_blend_factor_supported_; }
   D3D12_RESOURCE_BINDING_TIER GetResourceBindingTier() const { return resource_binding_tier_; }
   D3D12_TILED_RESOURCES_TIER GetTiledResourcesTier() const { return tiled_resources_tier_; }
   bool AreUnalignedBlockTexturesSupported() const { return unaligned_block_textures_supported_; }
@@ -119,6 +124,10 @@ class D3D12Provider : public GraphicsProvider {
     }
     return pfn_dxcompiler_dxc_create_instance_(rclsid, riid, ppv);
   }
+
+  // Logs all pending D3D12 debug messages to the log.
+  // Call this after operations that fail to get detailed error info.
+  void LogD3D12DebugMessages() const;
 
  private:
   D3D12Provider() = default;
@@ -158,6 +167,8 @@ class D3D12Provider : public GraphicsProvider {
   uint32_t descriptor_sizes_[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES];
 
   GpuVendorID adapter_vendor_id_;
+  uint32_t adapter_device_id_;
+  std::string adapter_description_;
 
   D3D12_HEAP_FLAGS heap_flag_create_not_zeroed_;
   D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER programmable_sample_positions_tier_;
@@ -166,6 +177,7 @@ class D3D12Provider : public GraphicsProvider {
   uint32_t virtual_address_bits_per_resource_;
   bool ps_specified_stencil_reference_supported_;
   bool rasterizer_ordered_views_supported_;
+  bool alpha_blend_factor_supported_;
   bool unaligned_block_textures_supported_;
 };
 

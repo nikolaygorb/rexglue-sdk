@@ -32,6 +32,10 @@ REXCVAR_DEFINE_UINT32(progress_log_frequency, 100, "Codegen",
 // Codegen/Analysis
 //=============================================================================
 
+REXCVAR_DEFINE_STRING(analysis_report, "", "Codegen",
+                      "Write every analyzed function (address, size, source) to this file, so "
+                      "two SDK versions or configs can be compared; empty disables");
+
 REXCVAR_DEFINE_UINT32(max_discovery_iterations, 1000, "Codegen",
                       "Max iterations for function discovery convergence")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)

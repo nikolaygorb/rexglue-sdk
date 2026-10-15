@@ -29,6 +29,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/smaa_textures.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -42,6 +43,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/types.h>
 #include <rex/memory/utils.h>
+#include <rex/thread/mutex.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
@@ -56,8 +58,9 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
-                    "When async shader compilation is enabled, skip presenting frames that "
-                    "used placeholder pipelines to avoid visible flashing")
+                    "When async shader compilation is enabled, skip presenting frames with "
+                    "draws skipped while their pipelines are being created, to avoid visible "
+                    "flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
@@ -558,13 +561,16 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/apply_gamma_table_cs.h"
 #include "../shaders/vulkan_spirv/apply_gamma_table_fxaa_luma_ps.h"
 #include "../shaders/vulkan_spirv/apply_gamma_table_fxaa_luma_cs.h"
+#include "../shaders/vulkan_spirv/smaa_blending_weight_calculation_cs.h"
+#include "../shaders/vulkan_spirv/smaa_edge_detection_cs.h"
+#include "../shaders/vulkan_spirv/smaa_neighborhood_blending_cs.h"
 #include "../shaders/vulkan_spirv/apply_gamma_table_ps.h"
 #include "../shaders/vulkan_spirv/fullscreen_cw_vs.h"
 #include "../shaders/vulkan_spirv/resolve_downscale_cs.h"
 }  // namespace shaders
 
-const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuffer = {
-    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBufferDynamic = {
+    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
     SpirvShaderTranslator::kConstantBufferCount* kLinkedTypeDescriptorPoolSetCount};
 
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
@@ -579,11 +585,14 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeTextures[2
 VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_system,
                                                system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state),
+      completion_timeline_(
+          static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+              ->vulkan_device()),
       deferred_command_buffer_(*this),
       transient_descriptor_allocator_uniform_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
-          &kDescriptorPoolSizeUniformBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
+          &kDescriptorPoolSizeUniformBufferDynamic, 1, kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_storage_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -600,7 +609,6 @@ VulkanCommandProcessor::~VulkanCommandProcessor() = default;
 
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
-  InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
 }
 
@@ -610,106 +618,12 @@ void VulkanCommandProcessor::InvalidateGpuMemory() {
   }
 }
 
-void VulkanCommandProcessor::InvalidateAllVertexBufferResidency() {
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
-  for (VertexBufferState& state : vertex_buffer_states_) {
-    state.address = UINT32_MAX;
-    state.size = UINT32_MAX;
-  }
-}
-
-void VulkanCommandProcessor::InvalidateVertexBufferResidency(uint32_t vfetch_index) {
-  if (vfetch_index >= vertex_buffer_states_.size()) {
-    return;
-  }
-  vertex_buffers_in_sync_[vfetch_index >> 6] &= ~(uint64_t(1) << (vfetch_index & 63));
-}
-
-void VulkanCommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_vfetch,
-                                                                  uint32_t last_vfetch) {
-  if (first_vfetch > last_vfetch) {
-    std::swap(first_vfetch, last_vfetch);
-  }
-  if (first_vfetch >= vertex_buffer_states_.size()) {
-    return;
-  }
-  last_vfetch = std::min(last_vfetch, uint32_t(vertex_buffer_states_.size() - 1));
-  for (uint32_t vfetch_index = first_vfetch; vfetch_index <= last_vfetch; ++vfetch_index) {
-    InvalidateVertexBufferResidency(vfetch_index);
-  }
-}
-
 void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
-                                                     uint32_t title_id, bool blocking) {
-  CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
-  pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
-}
-
-bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
-                                                                uint32_t packet, uint32_t count) {
-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
-    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
-  }
-
-  const uint32_t kQueryFinished = rex::byte_swap(0xFFFFFEED);
-  assert_true(count == 1);
-  uint32_t initiator = reader->ReadAndSwap<uint32_t>();
-  WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
-
-  uint32_t sample_count_addr = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-  auto* sample_counts =
-      memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_addr);
-  if (!sample_counts) {
-    DisableHostOcclusionQueries();
-    return true;
-  }
-
-  auto write_fallback_result = [sample_counts]() -> bool {
-    auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
-    if (fake_sample_count < 0) {
-      return true;
-    }
-    bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
-    bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
-    std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
-    if (is_end_via_z_pass || is_end_via_z_fail) {
-      sample_counts->ZPass_A = fake_sample_count;
-      sample_counts->Total_A = fake_sample_count;
-    }
-    return true;
-  };
-
-  bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
-  bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
-  bool is_end = is_end_via_z_pass || is_end_via_z_fail;
-
-  if (!is_end) {
-    if (active_occlusion_query_.valid &&
-        active_occlusion_query_.sample_count_address != sample_count_addr) {
-      DisableHostOcclusionQueries();
-      return write_fallback_result();
-    }
-    if (!BeginGuestOcclusionQuery(sample_count_addr)) {
-      return write_fallback_result();
-    }
-    return true;
-  }
-
-  if (!active_occlusion_query_.valid ||
-      active_occlusion_query_.sample_count_address != sample_count_addr) {
-    DisableHostOcclusionQueries();
-    return write_fallback_result();
-  }
-
-  if (!EndGuestOcclusionQuery(sample_count_addr)) {
-    return write_fallback_result();
-  }
-  return true;
+                                                     uint32_t title_id, bool blocking,
+                                                     std::function<void()> completion_callback) {
+  CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking, nullptr);
+  pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking,
+                                           std::move(completion_callback));
 }
 
 std::string VulkanCommandProcessor::GetWindowTitleText() const {
@@ -774,7 +688,6 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
   }
-  InvalidateAllVertexBufferResidency();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -828,7 +741,7 @@ bool VulkanCommandProcessor::SetupContext() {
   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
     VkDescriptorSetLayoutBinding& constants_binding = descriptor_set_layout_bindings_constants[i];
     constants_binding.binding = i;
-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     constants_binding.descriptorCount = 1;
     constants_binding.pImmutableSamplers = nullptr;
   }
@@ -912,10 +825,17 @@ bool VulkanCommandProcessor::SetupContext() {
   uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
   bool draw_resolution_scale_not_clamped =
       TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x, draw_resolution_scale_y);
+  // Check if sparse binding is supported for resolution scaling
+  bool has_sparse_binding =
+      device_properties.sparseBinding && device_properties.sparseResidencyBuffer;
+  if (!TextureCache::ClampDrawResolutionScaleToMaxSupported(
+          draw_resolution_scale_x, draw_resolution_scale_y, has_sparse_binding, 0)) {
+    draw_resolution_scale_not_clamped = false;
+  }
   if (!draw_resolution_scale_not_clamped) {
     REXGPU_WARN(
-        "The requested draw resolution scale is not supported by the "
-        "emulator, reducing to {}x{}",
+        "The requested draw resolution scale is not supported by the device or "
+        "the emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
@@ -968,10 +888,15 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  // Shared memory and EDRAM descriptor set layout.
+  // Shared memory, EDRAM, and ZPD counter descriptor set layout.
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[2];
+  zpd_hybrid_supported_ =
+      REXCVAR_GET(occlusion_query_full_counters) && !edram_fragment_shader_interlock &&
+      device_properties.fragmentStoresAndAtomics && device_properties.sampleRateShading &&
+      shared_memory_binding_count < device_properties.maxPerStageDescriptorStorageBuffers;
+  bool zpd_counter_binding_used = edram_fragment_shader_interlock || zpd_hybrid_supported_;
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[3];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -986,19 +911,28 @@ bool VulkanCommandProcessor::SetupContext() {
   shared_memory_and_edram_descriptor_set_layout_create_info.flags = 0;
   shared_memory_and_edram_descriptor_set_layout_create_info.pBindings =
       shared_memory_and_edram_descriptor_set_layout_bindings;
+  if (zpd_counter_binding_used) {
+    // ZPD counter, used by FSI and hybrid queries.
+    VkDescriptorSetLayoutBinding& zpd_counter_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings[1];
+    zpd_counter_binding.binding = 1;
+    zpd_counter_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    zpd_counter_binding.descriptorCount = 1;
+    zpd_counter_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    zpd_counter_binding.pImmutableSamplers = nullptr;
+  }
   if (edram_fragment_shader_interlock) {
     // EDRAM.
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].binding = 1;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].descriptorType =
-        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].descriptorCount = 1;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].stageFlags =
-        VK_SHADER_STAGE_FRAGMENT_BIT;
-    shared_memory_and_edram_descriptor_set_layout_bindings[1].pImmutableSamplers = nullptr;
-    shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 2;
-  } else {
-    shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
+    VkDescriptorSetLayoutBinding& edram_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings[2];
+    edram_binding.binding = 2;
+    edram_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    edram_binding.descriptorCount = 1;
+    edram_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    edram_binding.pImmutableSamplers = nullptr;
   }
+  shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount =
+      1 + uint32_t(zpd_counter_binding_used) + uint32_t(edram_fragment_shader_interlock);
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
@@ -1008,8 +942,9 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  pipeline_cache_ = std::make_unique<VulkanPipelineCache>(
-      *this, *register_file_, *render_target_cache_, guest_shader_vertex_stages_);
+  pipeline_cache_ =
+      std::make_unique<VulkanPipelineCache>(*this, *register_file_, *render_target_cache_,
+                                            guest_shader_vertex_stages_, zpd_hybrid_supported_);
   if (!pipeline_cache_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the graphics pipeline cache");
     return false;
@@ -1024,11 +959,27 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  // Shared memory and EDRAM common bindings.
+  // Fallback for query segment normalization when no draw pinned a scale.
+  zpd_draw_resolution_scale_x_ = draw_resolution_scale_x;
+  zpd_draw_resolution_scale_y_ = draw_resolution_scale_y;
+
+  const VkDeviceSize zpd_counter_sink_range =
+      XenosZPDReport::kCounterSizeBytes * kQueryPoolCapacity;
+  if (zpd_counter_binding_used &&
+      !ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, zpd_counter_sink_range, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, zpd_counter_sink_buffer_,
+          zpd_counter_sink_buffer_memory_)) {
+    REXGPU_ERROR("Failed to create the ZPD counter sink buffer");
+    return false;
+  }
+
+  // Shared memory, EDRAM, and ZPD counter common bindings.
   VkDescriptorPoolSize descriptor_pool_sizes[1];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  descriptor_pool_sizes[0].descriptorCount =
-      shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
+  descriptor_pool_sizes[0].descriptorCount = shared_memory_binding_count +
+                                             uint32_t(edram_fragment_shader_interlock) +
+                                             uint32_t(zpd_counter_binding_used);
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   descriptor_pool_create_info.pNext = nullptr;
@@ -1067,7 +1018,7 @@ bool VulkanCommandProcessor::SetupContext() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[2];
+  VkWriteDescriptorSet write_descriptor_sets[3];
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   write_descriptor_set_shared_memory.pNext = nullptr;
@@ -1079,16 +1030,35 @@ bool VulkanCommandProcessor::SetupContext() {
   write_descriptor_set_shared_memory.pImageInfo = nullptr;
   write_descriptor_set_shared_memory.pBufferInfo = shared_memory_descriptor_buffers_info;
   write_descriptor_set_shared_memory.pTexelBufferView = nullptr;
+  VkDescriptorBufferInfo zpd_counter_descriptor_buffer_info;
+  if (zpd_counter_binding_used) {
+    // ZPD counter.
+    zpd_counter_descriptor_buffer_info.buffer = zpd_counter_sink_buffer_;
+    zpd_counter_descriptor_buffer_info.offset = 0;
+    zpd_counter_descriptor_buffer_info.range = zpd_counter_sink_range;
+    // Keep binding 1 valid until the real counter buffer is ready.
+    VkWriteDescriptorSet& write_descriptor_set_zpd_counter_init = write_descriptor_sets[1];
+    write_descriptor_set_zpd_counter_init.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_zpd_counter_init.pNext = nullptr;
+    write_descriptor_set_zpd_counter_init.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_zpd_counter_init.dstBinding = 1;
+    write_descriptor_set_zpd_counter_init.dstArrayElement = 0;
+    write_descriptor_set_zpd_counter_init.descriptorCount = 1;
+    write_descriptor_set_zpd_counter_init.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write_descriptor_set_zpd_counter_init.pImageInfo = nullptr;
+    write_descriptor_set_zpd_counter_init.pBufferInfo = &zpd_counter_descriptor_buffer_info;
+    write_descriptor_set_zpd_counter_init.pTexelBufferView = nullptr;
+  }
   VkDescriptorBufferInfo edram_descriptor_buffer_info;
   if (edram_fragment_shader_interlock) {
     edram_descriptor_buffer_info.buffer = render_target_cache_->edram_buffer();
     edram_descriptor_buffer_info.offset = 0;
     edram_descriptor_buffer_info.range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet& write_descriptor_set_edram = write_descriptor_sets[1];
+    VkWriteDescriptorSet& write_descriptor_set_edram = write_descriptor_sets[2];
     write_descriptor_set_edram.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write_descriptor_set_edram.pNext = nullptr;
     write_descriptor_set_edram.dstSet = shared_memory_and_edram_descriptor_set_;
-    write_descriptor_set_edram.dstBinding = 1;
+    write_descriptor_set_edram.dstBinding = 2;
     write_descriptor_set_edram.dstArrayElement = 0;
     write_descriptor_set_edram.descriptorCount = 1;
     write_descriptor_set_edram.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1096,8 +1066,13 @@ bool VulkanCommandProcessor::SetupContext() {
     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
     write_descriptor_set_edram.pTexelBufferView = nullptr;
   }
-  dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
-                             write_descriptor_sets, 0, nullptr);
+  dfn.vkUpdateDescriptorSets(
+      device, 1 + uint32_t(zpd_counter_binding_used) + uint32_t(edram_fragment_shader_interlock),
+      write_descriptor_sets, 0, nullptr);
+  if (zpd_counter_binding_used) {
+    zpd_counter_descriptor_buffer_ = zpd_counter_sink_buffer_;
+    zpd_counter_descriptor_range_ = zpd_counter_sink_range;
+  }
 
   // Swap objects.
 
@@ -1288,7 +1263,7 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   // Swap descriptor pool.
-  std::array<VkDescriptorPoolSize, 4> swap_descriptor_pool_sizes;
+  std::array<VkDescriptorPoolSize, 5> swap_descriptor_pool_sizes;
   VkDescriptorPoolCreateInfo swap_descriptor_pool_create_info;
   swap_descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   swap_descriptor_pool_create_info.pNext = nullptr;
@@ -1300,9 +1275,19 @@ bool VulkanCommandProcessor::SetupContext() {
     VkDescriptorPoolSize& swap_descriptor_pool_size_sampled_image =
         swap_descriptor_pool_sizes[swap_descriptor_pool_create_info.poolSizeCount++];
     swap_descriptor_pool_size_sampled_image.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    // Source images.
-    swap_descriptor_pool_size_sampled_image.descriptorCount = kMaxFramesInFlight;
-    swap_descriptor_pool_create_info.maxSets += kMaxFramesInFlight;
+    // Source images, and the sources of the SMAA passes.
+    swap_descriptor_pool_size_sampled_image.descriptorCount =
+        kMaxFramesInFlight + kMaxFramesInFlight * uint32_t(kSwapSmaaPassCount) * kSwapSmaaSourceCount;
+    swap_descriptor_pool_create_info.maxSets +=
+        kMaxFramesInFlight + kMaxFramesInFlight * uint32_t(kSwapSmaaPassCount);
+  }
+  {
+    VkDescriptorPoolSize& swap_descriptor_pool_size_sampler =
+        swap_descriptor_pool_sizes[swap_descriptor_pool_create_info.poolSizeCount++];
+    swap_descriptor_pool_size_sampler.type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    // The SMAA sampler.
+    swap_descriptor_pool_size_sampler.descriptorCount = 1;
+    swap_descriptor_pool_create_info.maxSets += 1;
   }
   {
     VkDescriptorPoolSize& swap_descriptor_pool_size_combined_image_sampler =
@@ -1316,8 +1301,11 @@ bool VulkanCommandProcessor::SetupContext() {
     VkDescriptorPoolSize& swap_descriptor_pool_size_storage_image =
         swap_descriptor_pool_sizes[swap_descriptor_pool_create_info.poolSizeCount++];
     swap_descriptor_pool_size_storage_image.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    swap_descriptor_pool_size_storage_image.descriptorCount = kMaxFramesInFlight * 2;
-    swap_descriptor_pool_create_info.maxSets += kMaxFramesInFlight * 2;
+    // Apply-gamma, FXAA and SMAA pass destinations.
+    swap_descriptor_pool_size_storage_image.descriptorCount =
+        kMaxFramesInFlight * 2 + kMaxFramesInFlight * uint32_t(kSwapSmaaPassCount);
+    swap_descriptor_pool_create_info.maxSets +=
+        kMaxFramesInFlight * 2 + kMaxFramesInFlight * uint32_t(kSwapSmaaPassCount);
   }
   // 256-entry table and PWL gamma ramps. If the gamma ramp buffer is
   // host-visible, for multiple frames.
@@ -1429,6 +1417,99 @@ bool VulkanCommandProcessor::SetupContext() {
                           &swap_sampler_linear_clamp_) != VK_SUCCESS) {
     REXGPU_ERROR("Failed to create the presentation FXAA sampler");
     return false;
+  }
+
+  // SMAA descriptor set layouts and sets.
+  {
+    VkDescriptorSetLayoutBinding swap_smaa_sampler_binding;
+    swap_smaa_sampler_binding.binding = 0;
+    swap_smaa_sampler_binding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    swap_smaa_sampler_binding.descriptorCount = 1;
+    swap_smaa_sampler_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    swap_smaa_sampler_binding.pImmutableSamplers = &swap_sampler_linear_clamp_;
+    VkDescriptorSetLayoutCreateInfo swap_smaa_set_layout_create_info;
+    swap_smaa_set_layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    swap_smaa_set_layout_create_info.pNext = nullptr;
+    swap_smaa_set_layout_create_info.flags = 0;
+    swap_smaa_set_layout_create_info.bindingCount = 1;
+    swap_smaa_set_layout_create_info.pBindings = &swap_smaa_sampler_binding;
+    if (dfn.vkCreateDescriptorSetLayout(device, &swap_smaa_set_layout_create_info, nullptr,
+                                        &swap_smaa_descriptor_set_layout_sampler_) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to create the SMAA sampler descriptor set layout");
+      return false;
+    }
+    std::array<VkDescriptorSetLayoutBinding, kSwapSmaaSourceCount> swap_smaa_source_bindings;
+    for (uint32_t i = 0; i < kSwapSmaaSourceCount; ++i) {
+      VkDescriptorSetLayoutBinding& binding = swap_smaa_source_bindings[i];
+      binding.binding = i;
+      binding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      binding.descriptorCount = 1;
+      binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      binding.pImmutableSamplers = nullptr;
+    }
+    swap_smaa_set_layout_create_info.bindingCount = uint32_t(swap_smaa_source_bindings.size());
+    swap_smaa_set_layout_create_info.pBindings = swap_smaa_source_bindings.data();
+    if (dfn.vkCreateDescriptorSetLayout(device, &swap_smaa_set_layout_create_info, nullptr,
+                                        &swap_smaa_descriptor_set_layout_sources_) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to create the SMAA source descriptor set layout");
+      return false;
+    }
+
+    VkDescriptorSetAllocateInfo swap_smaa_set_allocate_info;
+    swap_smaa_set_allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    swap_smaa_set_allocate_info.pNext = nullptr;
+    swap_smaa_set_allocate_info.descriptorPool = swap_descriptor_pool_;
+    swap_smaa_set_allocate_info.descriptorSetCount = 1;
+    swap_smaa_set_allocate_info.pSetLayouts = &swap_smaa_descriptor_set_layout_sampler_;
+    if (dfn.vkAllocateDescriptorSets(device, &swap_smaa_set_allocate_info,
+                                     &swap_smaa_descriptor_sampler_) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to allocate the SMAA sampler descriptor set");
+      return false;
+    }
+    for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+      for (size_t j = 0; j < kSwapSmaaPassCount; ++j) {
+        swap_smaa_set_allocate_info.pSetLayouts = &swap_smaa_descriptor_set_layout_sources_;
+        if (dfn.vkAllocateDescriptorSets(device, &swap_smaa_set_allocate_info,
+                                         &swap_smaa_descriptors_sources_[i][j]) != VK_SUCCESS) {
+          REXGPU_ERROR("Failed to allocate the SMAA source descriptor sets");
+          return false;
+        }
+        swap_smaa_set_allocate_info.pSetLayouts = &swap_descriptor_set_layout_storage_image_;
+        if (dfn.vkAllocateDescriptorSets(device, &swap_smaa_set_allocate_info,
+                                         &swap_smaa_descriptors_destination_[i][j]) !=
+            VK_SUCCESS) {
+          REXGPU_ERROR("Failed to allocate the SMAA destination descriptor sets");
+          return false;
+        }
+      }
+    }
+
+    std::array<VkDescriptorSetLayout, kSwapSmaaDescriptorSetCount>
+        swap_smaa_descriptor_set_layouts{};
+    swap_smaa_descriptor_set_layouts[kSwapSmaaDescriptorSetSampler] =
+        swap_smaa_descriptor_set_layout_sampler_;
+    swap_smaa_descriptor_set_layouts[kSwapSmaaDescriptorSetSources] =
+        swap_smaa_descriptor_set_layout_sources_;
+    swap_smaa_descriptor_set_layouts[kSwapSmaaDescriptorSetDestination] =
+        swap_descriptor_set_layout_storage_image_;
+    VkPushConstantRange swap_smaa_push_constant_range;
+    swap_smaa_push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    swap_smaa_push_constant_range.offset = 0;
+    swap_smaa_push_constant_range.size = sizeof(SwapSmaaConstants);
+    VkPipelineLayoutCreateInfo swap_smaa_pipeline_layout_create_info;
+    swap_smaa_pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    swap_smaa_pipeline_layout_create_info.pNext = nullptr;
+    swap_smaa_pipeline_layout_create_info.flags = 0;
+    swap_smaa_pipeline_layout_create_info.setLayoutCount =
+        uint32_t(swap_smaa_descriptor_set_layouts.size());
+    swap_smaa_pipeline_layout_create_info.pSetLayouts = swap_smaa_descriptor_set_layouts.data();
+    swap_smaa_pipeline_layout_create_info.pushConstantRangeCount = 1;
+    swap_smaa_pipeline_layout_create_info.pPushConstantRanges = &swap_smaa_push_constant_range;
+    if (dfn.vkCreatePipelineLayout(device, &swap_smaa_pipeline_layout_create_info, nullptr,
+                                   &swap_smaa_pipeline_layout_) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to create the SMAA compute pipeline layout");
+      return false;
+    }
   }
 
   // Gamma ramp application pipeline layout.
@@ -1861,45 +1942,84 @@ bool VulkanCommandProcessor::SetupContext() {
     }
   }
 
-  VkPipelineLayoutCreateInfo resolve_downscale_layout_create_info = {};
-  resolve_downscale_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  VkDescriptorSetLayout resolve_downscale_set_layout =
-      descriptor_set_layouts_single_transient_[size_t(
-          SingleTransientDescriptorLayout::kStorageBufferPairCompute)];
-  resolve_downscale_layout_create_info.setLayoutCount = 1;
-  resolve_downscale_layout_create_info.pSetLayouts = &resolve_downscale_set_layout;
-  VkPushConstantRange resolve_downscale_push_constant_range = {};
-  resolve_downscale_push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-  resolve_downscale_push_constant_range.offset = 0;
-  resolve_downscale_push_constant_range.size = sizeof(ResolveDownscaleConstants);
-  resolve_downscale_layout_create_info.pushConstantRangeCount = 1;
-  resolve_downscale_layout_create_info.pPushConstantRanges = &resolve_downscale_push_constant_range;
-  if (dfn.vkCreatePipelineLayout(device, &resolve_downscale_layout_create_info, nullptr,
-                                 &resolve_downscale_pipeline_layout_) == VK_SUCCESS) {
+  // SMAA compute pipelines. Like FXAA, optional - without them, the swap falls
+  // back to the gamma ramp only.
+  {
+    const std::pair<const uint32_t*, size_t> swap_smaa_shaders[kSwapSmaaPassCount] = {
+        {shaders::smaa_edge_detection_cs, sizeof(shaders::smaa_edge_detection_cs)},
+        {shaders::smaa_blending_weight_calculation_cs,
+         sizeof(shaders::smaa_blending_weight_calculation_cs)},
+        {shaders::smaa_neighborhood_blending_cs, sizeof(shaders::smaa_neighborhood_blending_cs)},
+    };
+    for (size_t i = 0; i < kSwapSmaaPassCount; ++i) {
+      swap_smaa_pipelines_[i] = ui::vulkan::util::CreateComputePipeline(
+          vulkan_device, swap_smaa_pipeline_layout_, swap_smaa_shaders[i].first,
+          swap_smaa_shaders[i].second);
+      if (swap_smaa_pipelines_[i] == VK_NULL_HANDLE) {
+        REXGPU_WARN("Failed to create the SMAA compute pipeline for pass {}", i);
+      }
+    }
+  }
+
+  // Initialize the resolve downscale compute pipeline for scaled resolution
+  // readback.
+  {
+    VkDescriptorSetLayout resolve_downscale_descriptor_set_layouts[] = {
+        // Source.
+        GetSingleTransientDescriptorLayout(SingleTransientDescriptorLayout::kStorageBufferCompute),
+        // Destination.
+        GetSingleTransientDescriptorLayout(SingleTransientDescriptorLayout::kStorageBufferCompute),
+    };
+    VkPushConstantRange resolve_downscale_push_constant_range;
+    resolve_downscale_push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    resolve_downscale_push_constant_range.offset = 0;
+    resolve_downscale_push_constant_range.size = sizeof(ResolveDownscaleConstants);
+    VkPipelineLayoutCreateInfo resolve_downscale_pipeline_layout_create_info;
+    resolve_downscale_pipeline_layout_create_info.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    resolve_downscale_pipeline_layout_create_info.pNext = nullptr;
+    resolve_downscale_pipeline_layout_create_info.flags = 0;
+    resolve_downscale_pipeline_layout_create_info.setLayoutCount =
+        uint32_t(rex::countof(resolve_downscale_descriptor_set_layouts));
+    resolve_downscale_pipeline_layout_create_info.pSetLayouts =
+        resolve_downscale_descriptor_set_layouts;
+    resolve_downscale_pipeline_layout_create_info.pushConstantRangeCount = 1;
+    resolve_downscale_pipeline_layout_create_info.pPushConstantRanges =
+        &resolve_downscale_push_constant_range;
+    if (dfn.vkCreatePipelineLayout(device, &resolve_downscale_pipeline_layout_create_info, nullptr,
+                                   &resolve_downscale_pipeline_layout_) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to create the resolve downscale pipeline layout");
+      return false;
+    }
     resolve_downscale_pipeline_ = ui::vulkan::util::CreateComputePipeline(
         vulkan_device, resolve_downscale_pipeline_layout_, shaders::resolve_downscale_cs,
         sizeof(shaders::resolve_downscale_cs));
     if (resolve_downscale_pipeline_ == VK_NULL_HANDLE) {
-      REXGPU_WARN("Failed to create Vulkan resolve-downscale readback pipeline");
-      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
-                                             resolve_downscale_pipeline_layout_);
+      REXGPU_ERROR("Failed to create the resolve downscale compute pipeline");
+      return false;
     }
-  } else {
-    REXGPU_WARN("Failed to create Vulkan resolve-downscale pipeline layout");
   }
 
-  occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
+  // Initialize the occlusion query pool and resources.
+  host_query_pool_ = std::make_unique<VulkanQueryPool>();
+  EnsureQueryResources();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
+  // ZPD counter uses UINT32_MAX as its skip sentinel outside query draws.
+  system_constants_.zpd_counter_index = UINT32_MAX;
+  zpd_counter_index_force_update_ = true;
 
   return true;
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
-  InvalidateAllVertexBufferResidency();
-  ShutdownOcclusionQueryResources();
+
+  ShutdownQueryResources();
+  host_query_pool_.reset();
+
+  ShutdownVIZQueryResources();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1937,6 +2057,15 @@ void VulkanCommandProcessor::ShutdownContext() {
     }
   }
   memexport_readback_buffers_.clear();
+  if (memexport_full_readback_memory_ != VK_NULL_HANDLE) {
+    dfn.vkUnmapMemory(device, memexport_full_readback_memory_);
+  }
+  memexport_full_readback_mapping_ = nullptr;
+  memexport_full_readback_size_ = 0;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         memexport_full_readback_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         memexport_full_readback_memory_);
 
   resolve_downscale_buffer_size_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, resolve_downscale_buffer_);
@@ -1952,6 +2081,12 @@ void VulkanCommandProcessor::ShutdownContext() {
                                            swap_framebuffer.framebuffer);
   }
   DestroySwapFxaaSourceImage();
+  DestroySwapSmaaImages(0, kSwapSmaaImageCount, true);
+  for (VkPipeline& swap_smaa_pipeline : swap_smaa_pipelines_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_smaa_pipeline);
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         swap_smaa_pipeline_layout_);
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_fxaa_extreme_pipeline_);
@@ -1999,6 +2134,10 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          swap_descriptor_pool_);
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         swap_smaa_descriptor_set_layout_sources_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         swap_smaa_descriptor_set_layout_sampler_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                          swap_descriptor_set_layout_uniform_texel_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                          swap_descriptor_set_layout_storage_image_);
@@ -2017,6 +2156,10 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          shared_memory_and_edram_descriptor_pool_);
+  zpd_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  zpd_counter_descriptor_range_ = 0;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, zpd_counter_sink_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, zpd_counter_sink_buffer_memory_);
 
   texture_cache_.reset();
 
@@ -2097,26 +2240,17 @@ void VulkanCommandProcessor::ShutdownContext() {
     dfn.vkDestroySemaphore(device, semaphore.second, nullptr);
   }
   submissions_in_flight_semaphores_.clear();
-  for (VkFence& fence : submissions_in_flight_fences_) {
-    dfn.vkDestroyFence(device, fence, nullptr);
-  }
-  submissions_in_flight_fences_.clear();
   current_submission_wait_stage_masks_.clear();
   for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
     dfn.vkDestroySemaphore(device, semaphore, nullptr);
   }
   current_submission_wait_semaphores_.clear();
-  submission_completed_ = 0;
   submission_open_ = false;
 
   for (VkSemaphore semaphore : semaphores_free_) {
     dfn.vkDestroySemaphore(device, semaphore, nullptr);
   }
   semaphores_free_.clear();
-  for (VkFence fence : fences_free_) {
-    dfn.vkDestroyFence(device, fence, nullptr);
-  }
-  fences_free_.clear();
 
   device_lost_ = false;
 
@@ -2156,7 +2290,6 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
     }
-    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
 }
 
@@ -2239,7 +2372,6 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
   }
 
@@ -2272,8 +2404,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
-  vertex_buffers_in_sync_[0] = 0;
-  vertex_buffers_in_sync_[1] = 0;
+  EndZPDFrame();
 
   if (!graphics_system_)
     return;
@@ -2289,16 +2420,16 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
-  bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
-                                            REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
-                                            frame_used_async_placeholder_pipeline_;
-  if (skip_present_due_async_placeholder) {
+  bool skip_present_due_pending_pipeline = REXCVAR_GET(async_shader_compilation) &&
+                                           REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                           frame_used_pending_pipeline_;
+  if (skip_present_due_pending_pipeline) {
     static bool skipped_incomplete_frame_logged = false;
     if (!skipped_incomplete_frame_logged) {
       skipped_incomplete_frame_logged = true;
       REXGPU_WARN(
-          "Skipping Vulkan frame presentation due to async placeholder draw "
-          "usage in this frame");
+          "Skipping Vulkan frame presentation due to draws skipped while their "
+          "pipelines are being created");
     }
     EndSubmission(true);
     return;
@@ -2513,8 +2644,36 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         }
         bool use_compute_gamma = swap_apply_gamma_compute_pipeline != VK_NULL_HANDLE;
 
+        // SMAA runs after the compute gamma ramp (without FXAA luma).
+        bool use_smaa = swap_post_effect == SwapPostEffect::kSmaa;
+        if (use_smaa) {
+          bool smaa_pipelines_available = use_compute_gamma;
+          for (VkPipeline swap_smaa_pipeline : swap_smaa_pipelines_) {
+            smaa_pipelines_available &= swap_smaa_pipeline != VK_NULL_HANDLE;
+          }
+          if (!smaa_pipelines_available) {
+            static bool smaa_pipelines_unavailable_logged = false;
+            if (!smaa_pipelines_unavailable_logged) {
+              REXGPU_WARN(
+                  "Vulkan SMAA swap effect requested but the SMAA or compute "
+                  "gamma pipelines are unavailable, falling back to gamma only");
+              smaa_pipelines_unavailable_logged = true;
+            }
+            use_smaa = false;
+          } else if (!EnsureSwapSmaaResources(guest_output_width, guest_output_height)) {
+            static bool smaa_resources_failed_logged = false;
+            if (!smaa_resources_failed_logged) {
+              REXGPU_WARN(
+                  "Failed to create the Vulkan SMAA images, falling back to "
+                  "gamma-only presentation");
+              smaa_resources_failed_logged = true;
+            }
+            use_smaa = false;
+          }
+        }
+
         // TODO(Triang3l): FXAA can result in more than 8 bits of precision.
-        context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+        context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa && !use_smaa);
 
         // Update the gamma ramp if it's out of date.
         uint32_t& gamma_ramp_frame_index_ref = use_pwl_gamma_ramp
@@ -2625,6 +2784,18 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                    swap_fxaa_source_access_mask_, VK_ACCESS_SHADER_WRITE_BIT,
                                    swap_fxaa_source_layout_, VK_IMAGE_LAYOUT_GENERAL);
           }
+          if (use_smaa) {
+            // The intermediate images are fully rewritten every frame, and were
+            // only read by compute shaders before, so they can be discarded.
+            for (size_t i = 0; i < kSwapSmaaImageIntermediateCount; ++i) {
+              PushImageMemoryBarrier(swap_smaa_images_[i], guest_output_subresource_range,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                     VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                     VK_IMAGE_LAYOUT_GENERAL);
+            }
+            swap_smaa_images_submission_ = GetCurrentSubmission();
+          }
           SubmitBarriers(true);
 
           if (use_fxaa) {
@@ -2639,7 +2810,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           VkDescriptorImageInfo swap_descriptor_destination_storage_image_info;
           swap_descriptor_destination_storage_image_info.sampler = VK_NULL_HANDLE;
           swap_descriptor_destination_storage_image_info.imageView =
-              use_fxaa ? swap_fxaa_source_image_view_ : vulkan_context.image_view();
+              use_fxaa   ? swap_fxaa_source_image_view_
+              : use_smaa ? swap_smaa_image_views_[kSwapSmaaImageColor]
+                         : vulkan_context.image_view();
           swap_descriptor_destination_storage_image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
           VkWriteDescriptorSet swap_descriptor_destination_storage_write;
           swap_descriptor_destination_storage_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2750,6 +2923,89 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                             ? swap_fxaa_extreme_pipeline_
                                             : swap_fxaa_pipeline_);
             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          } else if (use_smaa) {
+            VkImageView smaa_color = swap_smaa_image_views_[kSwapSmaaImageColor];
+            VkImageView smaa_edges = swap_smaa_image_views_[kSwapSmaaImageEdges];
+            VkImageView smaa_weights = swap_smaa_image_views_[kSwapSmaaImageWeights];
+            // Unused sources are bound to a valid image too.
+            const VkImageView smaa_pass_sources[kSwapSmaaPassCount][kSwapSmaaSourceCount] = {
+                {smaa_color, smaa_color, smaa_color},
+                {smaa_edges, swap_smaa_image_views_[kSwapSmaaImageArea],
+                 swap_smaa_image_views_[kSwapSmaaImageSearch]},
+                {smaa_color, smaa_weights, smaa_weights},
+            };
+            const VkImageView smaa_pass_destinations[kSwapSmaaPassCount] = {
+                smaa_edges, smaa_weights, vulkan_context.image_view()};
+            // The image written by the previous pass (or the gamma ramp) to make
+            // readable before each pass.
+            const VkImage smaa_pass_inputs[kSwapSmaaPassCount] = {
+                swap_smaa_images_[kSwapSmaaImageColor], swap_smaa_images_[kSwapSmaaImageEdges],
+                swap_smaa_images_[kSwapSmaaImageWeights]};
+
+            std::array<VkDescriptorImageInfo,
+                       kSwapSmaaPassCount * kSwapSmaaSourceCount + kSwapSmaaPassCount>
+                smaa_image_infos;
+            std::array<VkWriteDescriptorSet, kSwapSmaaPassCount * 2> smaa_writes;
+            for (size_t i = 0; i < kSwapSmaaPassCount; ++i) {
+              VkDescriptorImageInfo* source_infos = &smaa_image_infos[i * kSwapSmaaSourceCount];
+              for (uint32_t j = 0; j < kSwapSmaaSourceCount; ++j) {
+                source_infos[j].sampler = VK_NULL_HANDLE;
+                source_infos[j].imageView = smaa_pass_sources[i][j];
+                source_infos[j].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              }
+              VkWriteDescriptorSet& source_write = smaa_writes[i * 2];
+              source_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              source_write.pNext = nullptr;
+              source_write.dstSet = swap_smaa_descriptors_sources_[swap_frame_index][i];
+              source_write.dstBinding = 0;
+              source_write.dstArrayElement = 0;
+              source_write.descriptorCount = kSwapSmaaSourceCount;
+              source_write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              source_write.pImageInfo = source_infos;
+              source_write.pBufferInfo = nullptr;
+              source_write.pTexelBufferView = nullptr;
+              VkDescriptorImageInfo& dest_info =
+                  smaa_image_infos[kSwapSmaaPassCount * kSwapSmaaSourceCount + i];
+              dest_info.sampler = VK_NULL_HANDLE;
+              dest_info.imageView = smaa_pass_destinations[i];
+              dest_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+              VkWriteDescriptorSet& dest_write = smaa_writes[i * 2 + 1];
+              dest_write = source_write;
+              dest_write.dstSet = swap_smaa_descriptors_destination_[swap_frame_index][i];
+              dest_write.descriptorCount = 1;
+              dest_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+              dest_write.pImageInfo = &dest_info;
+            }
+            dfn.vkUpdateDescriptorSets(device, uint32_t(smaa_writes.size()), smaa_writes.data(),
+                                       0, nullptr);
+
+            deferred_command_buffer_.CmdVkBindDescriptorSets(
+                VK_PIPELINE_BIND_POINT_COMPUTE, swap_smaa_pipeline_layout_,
+                kSwapSmaaDescriptorSetSampler, 1, &swap_smaa_descriptor_sampler_, 0, nullptr);
+            SwapSmaaConstants swap_smaa_constants = {
+                {guest_output_width, guest_output_height},
+                {1.0f / float(guest_output_width), 1.0f / float(guest_output_height)}};
+            deferred_command_buffer_.CmdVkPushConstants(
+                swap_smaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                sizeof(swap_smaa_constants), &swap_smaa_constants);
+            for (size_t i = 0; i < kSwapSmaaPassCount; ++i) {
+              PushImageMemoryBarrier(smaa_pass_inputs[i], guest_output_subresource_range,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                     VK_IMAGE_LAYOUT_GENERAL,
+                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+              SubmitBarriers(true);
+              VkDescriptorSet pass_descriptor_sets[] = {
+                  swap_smaa_descriptors_sources_[swap_frame_index][i],
+                  swap_smaa_descriptors_destination_[swap_frame_index][i]};
+              deferred_command_buffer_.CmdVkBindDescriptorSets(
+                  VK_PIPELINE_BIND_POINT_COMPUTE, swap_smaa_pipeline_layout_,
+                  kSwapSmaaDescriptorSetSources, uint32_t(rex::countof(pass_descriptor_sets)),
+                  pass_descriptor_sets, 0, nullptr);
+              BindExternalComputePipeline(swap_smaa_pipelines_[i]);
+              deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            }
           }
 
           // Insert the release barrier.
@@ -2794,7 +3050,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             swap_framebuffer_index = swap_framebuffer_new_index;
             SwapFramebuffer& new_swap_framebuffer = swap_framebuffers_[swap_framebuffer_new_index];
             if (new_swap_framebuffer.framebuffer != VK_NULL_HANDLE) {
-              if (submission_completed_ >= new_swap_framebuffer.last_submission) {
+              if (GetCompletedSubmission() >= new_swap_framebuffer.last_submission) {
                 dfn.vkDestroyFramebuffer(device, new_swap_framebuffer.framebuffer, nullptr);
               } else {
                 destroy_framebuffers_.emplace_back(new_swap_framebuffer.last_submission,
@@ -2984,7 +3240,7 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
     VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
     VkAccessFlags src_access_mask, VkAccessFlags dst_access_mask, VkImageLayout old_layout,
     VkImageLayout new_layout, uint32_t src_queue_family_index, uint32_t dst_queue_family_index,
-    bool skip_if_equal) {
+    bool skip_if_equal, const VkSampleLocationsInfoEXT* sample_locations) {
   if (skip_if_equal && src_stage_mask == dst_stage_mask && src_access_mask == dst_access_mask &&
       old_layout == new_layout && src_queue_family_index == dst_queue_family_index) {
     return false;
@@ -3012,7 +3268,8 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
              subresource_range.baseArrayLayer)) {
       continue;
     }
-    if (other_image_memory_barrier.subresourceRange.aspectMask == subresource_range.aspectMask &&
+    if (other_image_memory_barrier.pNext == sample_locations &&
+        other_image_memory_barrier.subresourceRange.aspectMask == subresource_range.aspectMask &&
         other_image_memory_barrier.subresourceRange.baseMipLevel ==
             subresource_range.baseMipLevel &&
         other_image_memory_barrier.subresourceRange.levelCount == subresource_range.levelCount &&
@@ -3039,7 +3296,7 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
   VkImageMemoryBarrier& image_memory_barrier =
       pending_barriers_image_memory_barriers_.emplace_back();
   image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  image_memory_barrier.pNext = nullptr;
+  image_memory_barrier.pNext = sample_locations;
   image_memory_barrier.srcAccessMask = src_access_mask;
   image_memory_barrier.dstAccessMask = dst_access_mask;
   image_memory_barrier.oldLayout = old_layout;
@@ -3107,26 +3364,33 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
 
   if (in_render_pass_) {
-    if (use_dynamic_rendering) {
-      deferred_command_buffer_.CmdVkEndRendering();
-    } else {
-      deferred_command_buffer_.CmdVkEndRenderPass();
-    }
-    in_render_pass_ = false;
+    // Close VIZ and ZPD queries along with the pass.
+    EndRenderPass();
+  }
+  // Clear released ZPD counter slots while no pass is open, so a hybrid query
+  // opening inside this pass finds a clean slot without breaking it.
+  if (host_query_pool_ && host_query_pool_->has_dirty_counters()) {
+    host_query_pool_->FlushCounterClears(deferred_command_buffer_);
   }
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
 
   if (use_dynamic_rendering) {
+    // The fragment shader interlock path emulates EDRAM via storage buffers and
+    // uses no real attachments (like the zero-attachment FSI render pass).
     VkRenderingAttachmentInfo color_attachments[xenos::kMaxColorRenderTargets];
-    VkRenderingAttachmentInfo depth_attachment;
-    VkRenderingAttachmentInfo stencil_attachment;
+    VkRenderingAttachmentInfo depth_attachment = {};
+    VkRenderingAttachmentInfo stencil_attachment = {};
     uint32_t color_attachment_count = 0;
-    render_target_cache_->GetLastUpdateRenderingAttachments(
-        color_attachments, &color_attachment_count, &depth_attachment, &stencil_attachment);
-    bool has_depth = depth_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    bool has_stencil = stencil_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    bool has_depth = false;
+    bool has_stencil = false;
+    if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+      render_target_cache_->GetLastUpdateRenderingAttachments(
+          color_attachments, &color_attachment_count, &depth_attachment, &stencil_attachment);
+      has_depth = depth_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+      has_stencil = stencil_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    }
 
     VkRenderingInfo rendering_info = {};
     rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -3155,10 +3419,20 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
-    deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
-                                                  VK_SUBPASS_CONTENTS_INLINE);
+    // The sample locations for automatic depth layout transitions and for the
+    // subpass rasterization state when variableSampleLocations is false.
+    deferred_command_buffer_.CmdVkBeginRenderPass(
+        &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE,
+        framebuffer->render_pass_key.depth_and_color_used
+            ? render_target_cache_->GetSampleLocationsInfo(
+                  framebuffer->render_pass_key.msaa_samples, true)
+            : nullptr,
+        (framebuffer->render_pass_key.depth_and_color_used & 1) != 0);
   }
   in_render_pass_ = true;
+
+  // Resume any pending ZPD segment now that the pass is open.
+  OpenQuerySegment(false);
 }
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -3181,12 +3455,13 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
 
   if (in_render_pass_) {
-    if (use_dynamic_rendering) {
-      deferred_command_buffer_.CmdVkEndRendering();
-    } else {
-      deferred_command_buffer_.CmdVkEndRenderPass();
-    }
-    in_render_pass_ = false;
+    // Close VIZ and ZPD queries along with the pass.
+    EndRenderPass();
+  }
+  // Clear released ZPD counter slots while no pass is open, so a hybrid query
+  // opening inside this pass finds a clean slot without breaking it.
+  if (host_query_pool_ && host_query_pool_->has_dirty_counters()) {
+    host_query_pool_->FlushCounterClears(deferred_command_buffer_);
   }
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
@@ -3247,14 +3522,32 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
-    deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
-                                                  VK_SUBPASS_CONTENTS_INLINE);
+    // The sample locations for automatic depth layout transitions and for the
+    // subpass rasterization state when variableSampleLocations is false.
+    deferred_command_buffer_.CmdVkBeginRenderPass(
+        &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE,
+        framebuffer->render_pass_key.depth_and_color_used
+            ? render_target_cache_->GetSampleLocationsInfo(
+                  framebuffer->render_pass_key.msaa_samples, true)
+            : nullptr,
+        (framebuffer->render_pass_key.depth_and_color_used & 1) != 0);
   }
   in_render_pass_ = true;
+
+  // Resume any pending ZPD segment now that the pass is open.
+  OpenQuerySegment(false);
 }
 
 void VulkanCommandProcessor::EndRenderPass() {
   assert_true(submission_open_);
+
+  // Close native Vulkan occlusion queries before ending the pass. FSI counter
+  // segments don't use vkCmdBeginQuery / vkCmdEndQuery and can stay logically
+  // open across render passes.
+  if (active_segment_.segment_active && !active_query_is_fsi_) {
+    CloseQuerySegment();
+  }
+
   if (!in_render_pass_) {
     return;
   }
@@ -3266,6 +3559,8 @@ void VulkanCommandProcessor::EndRenderPass() {
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
+
+  RecordVIZPredicateCopies();
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -3480,7 +3775,7 @@ VulkanCommandProcessor::ScratchBufferAcquisition VulkanCommandProcessor::Acquire
     return ScratchBufferAcquisition();
   }
 
-  if (submission_completed_ >= scratch_buffer_last_usage_submission_) {
+  if (GetCompletedSubmission() >= scratch_buffer_last_usage_submission_) {
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
     const VkDevice device = vulkan_device->device();
     if (scratch_buffer_ != VK_NULL_HANDLE) {
@@ -3610,9 +3905,17 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return false;
   };
 
+  // VIZ survey geometry associated with a specific 0:63 ID.
+  // draw_util keeps it normalized, so it only counts coverage here.
+  const bool viz_survey = draw_util::IsVIZSurveyDraw(regs);
+
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
+    if (viz_survey) {
+      OnVIZSurveyDraw(false);
+      return true;
+    }
     return IssueCopy();
   }
 
@@ -3679,7 +3982,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
+
+  // A draw contributing to its VIZ ID without the kill bit counts
+  // at hi-Z before the pixel shader can reject anything.
+  if (!viz_survey && pixel_shader &&
+      (pixel_shader->kills_pixels() ||
+       (pixel_shader->writes_color_target(0) &&
+        draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>())))) {
+    OnVIZSurveyDraw(false);
+  }
+
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+  uint32_t normalized_color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                   : 0;
+  draw_util::HostDepthPolygonOffset host_depth_polygon_offset;
+  bool apply_host_depth_polygon_offset =
+      pixel_shader && !pixel_shader->writes_depth() &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+      draw_util::GetHostDepthPolygonOffsetIfNeeded(regs, primitive_polygonal,
+                                                   normalized_depth_control, normalized_color_mask,
+                                                   host_depth_polygon_offset);
 
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
@@ -3695,6 +4018,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+  bool zpd_hybrid = false;
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -3741,10 +4065,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
         *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
         ps_param_gen_pos != UINT32_MAX);
-    pixel_shader_modification = pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
-                                                   *pixel_shader, interpolator_mask,
-                                                   ps_param_gen_pos, normalized_depth_control)
-                                             : SpirvShaderTranslator::Modification(0);
+    pixel_shader_modification = pixel_shader
+                                    ? pipeline_cache_->GetCurrentPixelShaderModification(
+                                          *pixel_shader, interpolator_mask, ps_param_gen_pos,
+                                          normalized_depth_control, apply_host_depth_polygon_offset)
+                                    : SpirvShaderTranslator::Modification(0);
+    // Hybrid occlusion query draw, counting coverage into the Total counter.
+    // Only depth or stencil tested draws w/o depth writes, so scene geometry
+    // keeps early depth rejection, and nothing can fail without a test anyway.
+    // Surveys never count for a report.
+    zpd_hybrid = zpd_hybrid_supported_ && active_segment_.report_measuring() && !viz_survey &&
+                 !normalized_depth_control.z_write_enable &&
+                 (normalized_depth_control.z_enable || normalized_depth_control.stencil_enable);
+    if (zpd_hybrid && pixel_shader) {
+      pixel_shader_modification.pixel.zpd_total = 1;
+      // The counter buffer write disables early depth/stencil anyway.
+      if (pixel_shader_modification.pixel.depth_stencil_mode ==
+          SpirvShaderTranslator::Modification::DepthStencilMode::kEarlyHint) {
+        pixel_shader_modification.pixel.depth_stencil_mode =
+            SpirvShaderTranslator::Modification::DepthStencilMode::kNoModifiers;
+      }
+    }
 
     // Translate the shaders now to obtain the sampler bindings.
     vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
@@ -3822,12 +4163,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     uint64_t sampler_overflow_await_submission =
         texture_cache_->GetSubmissionToAwaitOnSamplerOverflow(samplers_overflowed_count);
     assert_true(sampler_overflow_await_submission <= GetCurrentSubmission());
-    CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission);
+    CheckSubmissionCompletionAndDeviceLoss(sampler_overflow_await_submission);
   }
-
-  uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
-                   : 0;
 
   // Update the textures before most other work in the submission because
   // samplers depend on this (and in case of sampler overflow in a submission,
@@ -3838,34 +4175,47 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   texture_cache_->RequestTextures(used_texture_mask);
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+  // Put the window offset into the EDRAM bases when possible.
+  int32_t window_offset_tiles = render_target_cache_->GetWindowOffsetTiles(
+      regs, normalized_depth_control, normalized_color_mask, frame_current_);
+
   // Set up the render targets - this may perform dispatches and draws.
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
+                                    normalized_color_mask, *vertex_shader, window_offset_tiles)) {
     return draw_fail("render_target_update");
   }
 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
-  VkPipeline pipeline;
-  void* pipeline_handle = nullptr;
+  VulkanRenderTargetCache::RenderPassKey render_pass_key =
+      render_target_cache_->last_update_render_pass_key();
+  VulkanPipelineCache::Pipeline* pipeline_state;
   if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
                                           primitive_processing_result, normalized_depth_control,
-                                          normalized_color_mask,
-                                          render_target_cache_->last_update_render_pass_key(),
-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
+                                          normalized_color_mask, render_pass_key, zpd_hybrid,
+                                          viz_survey, &pipeline_state)) {
     return draw_fail("configure_pipeline");
   }
-  bool pipeline_is_placeholder = false;
-  // Reload the current handle state to observe async hot-swap completions that
-  // may happen between pipeline configuration and binding.
-  pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
-                                                &pipeline_is_placeholder);
-  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
-    frame_used_async_placeholder_pipeline_ = true;
-    return true;
+  VkPipeline pipeline = pipeline_state->pipeline.load(std::memory_order_acquire);
+  if (pipeline == VK_NULL_HANDLE) {
+    bool creation_pending = pipeline_state->creation_pending.load(std::memory_order_acquire);
+    // May have been created between the two loads.
+    pipeline = pipeline_state->pipeline.load(std::memory_order_acquire);
+    if (pipeline == VK_NULL_HANDLE) {
+      if (creation_pending) {
+        // Pipeline not ready (still being created asynchronously) - skip the
+        // draw.
+        frame_used_pending_pipeline_ = true;
+        OnVIZSurveyDraw(false);
+        return true;
+      }
+      return draw_fail("pipeline_creation_failed");
+    }
   }
-  if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+  // Published before the pipeline.
+  pipeline_layout_provider = pipeline_state->pipeline_layout.load(std::memory_order_acquire);
+  if (pipeline_layout_provider == nullptr) {
     return draw_fail("pipeline_lookup");
   }
   if (current_guest_graphics_pipeline_ != pipeline) {
@@ -3904,8 +4254,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   bool host_render_targets_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // Resolution scale of this draw, which may be 1x1 because of
+  // draw_resolution_scale_threshold.
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
+  // Consumer VIZ draws run under conditional rendering instead of blocking.
+  // The predicate value may still need copying outside a pass, so bind it
+  // before the segment opens: the pass ending would close it.
+  VkDeviceSize predicate_offset = 0;
+  const VkBuffer predicate_buffer = BindVIZPredicate(predicate_offset);
+  // Segments can't mix scales, hybrid query Total counting, or VIZ IDs.
+  // The resolved sample count is divided by one scale area per segment.
+  // Needs to be split before the counter index goes into system constants.
+  UpdateQuerySegment(draw_resolution_scale_x * draw_resolution_scale_y, zpd_hybrid, viz_survey);
 
   // Get dynamic rasterizer state.
   draw_util::ViewportInfo viewport_info;
@@ -3930,10 +4291,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
       normalized_depth_control,
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
-      host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
+      host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info,
+      window_offset_tiles != 0,
+      !host_render_targets_used ||
+          render_target_cache_->GetSampleLocationsInfo(
+              render_pass_key.msaa_samples, render_pass_key.depth_and_color_used != 0) != nullptr);
 
   // Update dynamic graphics pipeline state.
-  UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
+  UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control,
+                     apply_host_depth_polygon_offset, window_offset_tiles != 0);
 
   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
 
@@ -3967,9 +4333,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   // Update system constants before uploading them.
-  UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
-                             shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
-                             normalized_depth_control, normalized_color_mask);
+  UpdateSystemConstantValues(
+      primitive_polygonal, primitive_processing_result, shader_32bit_index_dma, 0, viewport_info,
+      used_texture_mask, normalized_depth_control, normalized_color_mask,
+      apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr, window_offset_tiles);
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
@@ -3979,51 +4346,73 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Ensure vertex buffers are resident.
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
-  for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
-    uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
-    uint32_t j;
-    while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
-      vfetch_bits_remaining &= ~(uint32_t(1) << j);
-      uint32_t vfetch_index = i * 32 + j;
-      uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
-      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
-        continue;
-      }
-      xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
-      switch (vfetch_constant.type) {
-        case xenos::FetchConstantType::kVertex:
-          break;
-        case xenos::FetchConstantType::kInvalidVertex:
-          if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+  {
+    uint32_t vfetch_addresses[96];
+    uint32_t vfetch_sizes[96];
+    uint32_t vfetch_current_queued = 0;
+    for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
+      uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
+      uint32_t j;
+      while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+        vfetch_bits_remaining &= ~(uint32_t(1) << j);
+        uint32_t vfetch_index = i * 32 + j;
+        xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
+        switch (vfetch_constant.type) {
+          case xenos::FetchConstantType::kVertex:
             break;
-          }
-          REXGPU_WARN(
-              "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type! "
-              "This "
-              "is incorrect behavior, but you can try bypassing this by "
-              "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
-              vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+          case xenos::FetchConstantType::kInvalidVertex:
+            if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+              break;
+            }
+            REXGPU_WARN(
+                "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type! "
+                "This "
+                "is incorrect behavior, but you can try bypassing this by "
+                "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
+                vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+            return false;
+          default:
+            // Type is kTexture (2) or kInvalidTexture (3) - completely wrong for vertex data.
+            if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+              REXGPU_WARN(
+                  "Vertex fetch constant {} ({:08X} {:08X}) has wrong type {} (texture fetch "
+                  "constant in vertex slot) - allowing due to "
+                  "--gpu_allow_invalid_fetch_constants=true. This will likely crash or produce "
+                  "garbage!",
+                  vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1,
+                  static_cast<uint32_t>(vfetch_constant.type));
+              break;
+            }
+            REXGPU_WARN(
+                "Vertex fetch constant {} ({:08X} {:08X}) is completely invalid! Type={} - this "
+                "slot contains a texture fetch constant (type 2), not a vertex fetch constant "
+                "(type 0). This may indicate the shader is reading from the wrong fetch constant "
+                "index, or the game has a bug.",
+                vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1,
+                static_cast<uint32_t>(vfetch_constant.type));
+            return false;
+        }
+        vfetch_addresses[vfetch_current_queued] = vfetch_constant.address;
+        vfetch_sizes[vfetch_current_queued++] = vfetch_constant.size;
+      }
+    }
+
+    if (vfetch_current_queued) {
+      // Pre-acquire the critical region so we're not repeatedly re-acquiring it in RequestRange -
+      // SharedMemory tracks dirty pages and only uploads what actually changed, making redundant
+      // calls cheap under a hoisted lock.
+      auto shared_memory_request_range_hoisted =
+          rex::thread::global_critical_region::AcquireDirect();
+
+      for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
+        if (!shared_memory_->RequestRange(vfetch_addresses[i] << 2, vfetch_sizes[i] << 2)) {
+          REXGPU_ERROR(
+              "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
+              "memory",
+              vfetch_addresses[i] << 2, vfetch_sizes[i] << 2);
           return false;
-        default:
-          REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
-                      vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return false;
+        }
       }
-      VertexBufferState& state = vertex_buffer_states_[vfetch_index];
-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
-        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
-        continue;
-      }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
-        REXGPU_ERROR(
-            "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
-            "memory",
-            vfetch_constant.address << 2, vfetch_constant.size << 2);
-        return false;
-      }
-      state.address = vfetch_constant.address;
-      state.size = vfetch_constant.size;
-      vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
   }
 
@@ -4111,15 +4500,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
+  uint32_t zpd_hybrid_index_before_render_pass =
+      active_segment_.hybrid ? active_query_index_ : UINT32_MAX;
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+  uint32_t zpd_hybrid_index_after_render_pass =
+      active_segment_.hybrid ? active_query_index_ : UINT32_MAX;
+  if (zpd_hybrid && zpd_hybrid_index_after_render_pass != zpd_hybrid_index_before_render_pass) {
+    UpdateSystemConstantValues(
+        primitive_polygonal, primitive_processing_result, shader_32bit_index_dma, 0, viewport_info,
+        used_texture_mask, normalized_depth_control, normalized_color_mask,
+        apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr,
+        window_offset_tiles);
+    if (!UpdateBindings(vertex_shader, pixel_shader)) {
+      return draw_fail("update_bindings");
+    }
+  }
 
   // Draw.
+  OnVIZSurveyDraw(true);
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
+    if (predicate_buffer != VK_NULL_HANDLE) {
+      deferred_command_buffer_.CmdVkBeginConditionalRenderingEXT(predicate_buffer, predicate_offset,
+                                                                 0);
+    }
     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+    if (predicate_buffer != VK_NULL_HANDLE) {
+      deferred_command_buffer_.CmdVkEndConditionalRenderingEXT();
+    }
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
     switch (primitive_processing_result.index_buffer_type) {
@@ -4150,8 +4561,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
+    if (predicate_buffer != VK_NULL_HANDLE) {
+      deferred_command_buffer_.CmdVkBeginConditionalRenderingEXT(predicate_buffer, predicate_offset,
+                                                                 0);
+    }
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
+    if (predicate_buffer != VK_NULL_HANDLE) {
+      deferred_command_buffer_.CmdVkEndConditionalRenderingEXT();
+    }
   }
 
   // Invalidate textures in memexported memory and watch for changes.
@@ -4184,8 +4602,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   return true;
 }
 
-bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
-  if (!total_size || memexport_ranges_.empty()) {
+bool VulkanCommandProcessor::RequestMemexportFullReadbackBuffer(uint32_t size) {
+  size = AlignReadbackBufferSize(size);
+  if (memexport_full_readback_buffer_ != VK_NULL_HANDLE && size <= memexport_full_readback_size_) {
     return true;
   }
 
@@ -4193,17 +4612,55 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  VkBuffer readback_buffer = VK_NULL_HANDLE;
-  VkDeviceMemory readback_memory = VK_NULL_HANDLE;
-  uint32_t readback_memory_type = UINT32_MAX;
-  VkDeviceSize readback_memory_size = 0;
+  VkBuffer new_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory new_memory = VK_NULL_HANDLE;
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          vulkan_device, total_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-          ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer, readback_memory,
-          &readback_memory_type, &readback_memory_size)) {
-    REXGPU_ERROR("Failed to create a Vulkan memexport readback buffer");
+          vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, new_buffer, new_memory)) {
+    REXGPU_ERROR("Failed to create a {} MB Vulkan memexport readback buffer", size >> 20);
+    return false;
+  }
+  void* new_mapping = nullptr;
+  if (dfn.vkMapMemory(device, new_memory, 0, VK_WHOLE_SIZE, 0, &new_mapping) != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to map a Vulkan memexport readback buffer");
+    dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+    dfn.vkFreeMemory(device, new_memory, nullptr);
+    return false;
+  }
+
+  // Every full readback awaits its copy, so the old buffer is not in use.
+  if (memexport_full_readback_memory_ != VK_NULL_HANDLE) {
+    dfn.vkUnmapMemory(device, memexport_full_readback_memory_);
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         memexport_full_readback_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         memexport_full_readback_memory_);
+  memexport_full_readback_buffer_ = new_buffer;
+  memexport_full_readback_memory_ = new_memory;
+  memexport_full_readback_mapping_ = new_mapping;
+  memexport_full_readback_size_ = size;
+  return true;
+}
+
+void VulkanCommandProcessor::ReadMemexportRanges(const void* readback_mapping) {
+  const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback_mapping);
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
+                readback_bytes, memexport_range.size_bytes);
+    readback_bytes += memexport_range.size_bytes;
+  }
+}
+
+bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
+  if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
+
+  if (!RequestMemexportFullReadbackBuffer(total_size)) {
+    return true;
+  }
+  const VkBuffer readback_buffer = memexport_full_readback_buffer_;
 
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   SubmitBarriers(true);
@@ -4224,40 +4681,19 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
 
   if (!AwaitAllQueueOperationsCompletion()) {
     REXGPU_ERROR("Failed to await completion of Vulkan memexport readback");
-    dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
-    dfn.vkFreeMemory(device, readback_memory, nullptr);
     return true;
   }
 
-  void* readback_mapping = nullptr;
-  if (dfn.vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &readback_mapping) !=
-      VK_SUCCESS) {
-    REXGPU_ERROR("Failed to map a Vulkan memexport readback buffer");
-    dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
-    dfn.vkFreeMemory(device, readback_memory, nullptr);
-    return true;
-  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  VkMappedMemoryRange readback_memory_range = {};
+  readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  readback_memory_range.memory = memexport_full_readback_memory_;
+  readback_memory_range.offset = 0;
+  readback_memory_range.size = VK_WHOLE_SIZE;
+  vulkan_device->functions().vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1,
+                                                            &readback_memory_range);
 
-  if (!(vulkan_device->memory_types().host_coherent & (uint32_t(1) << readback_memory_type))) {
-    VkMappedMemoryRange readback_memory_range = {};
-    readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    readback_memory_range.memory = readback_memory;
-    readback_memory_range.offset = 0;
-    readback_memory_range.size = std::min(
-        rex::round_up(VkDeviceSize(total_size), vulkan_device->properties().nonCoherentAtomSize),
-        readback_memory_size);
-    dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
-  }
-
-  const uint8_t* readback_bytes = reinterpret_cast<const uint8_t*>(readback_mapping);
-  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-    std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
-                readback_bytes, memexport_range.size_bytes);
-    readback_bytes += memexport_range.size_bytes;
-  }
-  dfn.vkUnmapMemory(device, readback_memory);
-  dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
-  dfn.vkFreeMemory(device, readback_memory, nullptr);
+  ReadMemexportRanges(memexport_full_readback_mapping_);
   return true;
 }
 
@@ -4349,33 +4785,33 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   readback.submission_written[write_index] = GetCurrentSubmission();
   readback.written_size[write_index] = total_size;
 
-  CheckSubmissionFenceAndDeviceLoss(0);
+  CheckSubmissionCompletionAndDeviceLoss(0);
   bool previous_slot_ready =
       readback.buffers[read_index] != VK_NULL_HANDLE &&
       readback.memories[read_index] != VK_NULL_HANDLE &&
       readback.mapped_data[read_index] != nullptr && total_size <= readback.sizes[read_index] &&
       total_size <= readback.written_size[read_index] && readback.submission_written[read_index] &&
-      readback.submission_written[read_index] <= submission_completed_;
+      readback.submission_written[read_index] <= GetCompletedSubmission();
+  uint32_t source_index = read_index;
   if (!previous_slot_ready) {
-    IssueDraw_MemexportReadbackFullPath(total_size);
-    readback.current_index = read_index;
-    return true;
+    // The copy into the write slot is already recorded: wait for it rather than
+    // copying the same ranges again through the full path.
+    if (!AwaitAllQueueOperationsCompletion()) {
+      REXGPU_ERROR("Failed to await completion of Vulkan memexport readback");
+      readback.current_index = read_index;
+      return true;
+    }
+    source_index = write_index;
   }
 
   VkMappedMemoryRange readback_memory_range = {};
   readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-  readback_memory_range.memory = readback.memories[read_index];
+  readback_memory_range.memory = readback.memories[source_index];
   readback_memory_range.offset = 0;
   readback_memory_range.size = VK_WHOLE_SIZE;
   dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
 
-  const uint8_t* readback_bytes =
-      reinterpret_cast<const uint8_t*>(readback.mapped_data[read_index]);
-  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-    std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
-                readback_bytes, memexport_range.size_bytes);
-    readback_bytes += memexport_range.size_bytes;
-  }
+  ReadMemexportRanges(readback.mapped_data[source_index]);
 
   readback.current_index = read_index;
   return true;
@@ -4406,8 +4842,10 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   const VkDevice device = vulkan_device->device();
 
   uint32_t written_address, written_length;
+  reg::RB_COPY_DEST_INFO copy_dest_info;
+  bool is_scaled;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
-                                     written_length)) {
+                                     written_length, &copy_dest_info, &is_scaled)) {
     return false;
   }
 
@@ -4422,6 +4860,94 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
+  }
+
+  // With resolution scaling, the resolve went to the scaled resolve buffer,
+  // and a compute downscale back to 1x is needed before readback. If any
+  // prerequisite fails, skip the readback. When applicable, native resolves
+  // went to shared memory and are read back directly.
+  uint32_t readback_length = written_length;
+  uint32_t downscale_pixel_size_log2 = 0;
+  uint32_t downscale_tile_count = 0;
+  uint32_t downscale_tile_size_1x = 0;
+  VkDeviceSize downscale_tile_size_scaled = 0;
+  VkBuffer downscale_source_buffer = VK_NULL_HANDLE;
+  VkDeviceSize downscale_source_bind_offset = 0;
+  uint32_t downscale_source_offset_remainder = 0;
+  if (is_scaled) {
+    if (!resolve_downscale_pipeline_ || !resolve_downscale_pipeline_layout_) {
+      return true;
+    }
+    // The same destination format and texel size derivation that
+    // GetResolveInfo calculated the written extent with.
+    downscale_pixel_size_log2 = draw_util::GetResolveDownscalePixelSizeLog2(copy_dest_info);
+    if (downscale_pixel_size_log2 > 3) {
+      // 128bpp - not supported by the tiled scaled addressing reversal in the
+      // downscale shader.
+      REXGPU_DEBUG(
+          "Skipping readback of a resolution-scaled resolve to a 128bpp "
+          "destination - not supported by the downscale shader");
+      return true;
+    }
+    // The scaled addressing is periodic per guest group - the written extent
+    // must be group-aligned for the reversal to be valid (tiled destinations
+    // are 32x32-tile-aligned, so this normally holds).
+    uint32_t group_bytes_log2 = downscale_pixel_size_log2 <= 2 ? 7 : 6;
+    if (written_address & ((UINT32_C(1) << group_bytes_log2) - 1)) {
+      REXGPU_DEBUG(
+          "Skipping readback of a resolution-scaled resolve to 0x{:08X} - the "
+          "destination is not aligned to the scaled addressing group size",
+          written_address);
+      return true;
+    }
+    downscale_tile_size_1x = (32 * 32) << downscale_pixel_size_log2;
+    downscale_tile_count = written_length / downscale_tile_size_1x;
+    if (!downscale_tile_count) {
+      return true;
+    }
+    if (written_length % downscale_tile_size_1x) {
+      // Only whole 32x32-texel tiles are downscaled - don't copy a garbage
+      // tail to the guest.
+      readback_length = downscale_tile_count * downscale_tile_size_1x;
+      REXGPU_DEBUG(
+          "Readback of a resolution-scaled resolve to 0x{:08X}: length {} is "
+          "not a multiple of the {}-byte tile, truncating to {}",
+          written_address, written_length, downscale_tile_size_1x, readback_length);
+    }
+    // The scaled resolve range made current by the render target cache during
+    // the resolve must contain the written extent.
+    uint32_t scale_area =
+        texture_cache_->draw_resolution_scale_x() * texture_cache_->draw_resolution_scale_y();
+    uint64_t scaled_start = uint64_t(written_address) * scale_area;
+    uint64_t scaled_length = uint64_t(readback_length) * scale_area;
+    downscale_tile_size_scaled = VkDeviceSize(downscale_tile_size_1x) * scale_area;
+    if (!texture_cache_->MakeScaledResolveRangeCurrent(written_address, readback_length)) {
+      REXGPU_DEBUG(
+          "Skipping readback of a resolution-scaled resolve to 0x{:08X} - the "
+          "written extent is not within a scaled resolve buffer",
+          written_address);
+      return true;
+    }
+    downscale_source_buffer = texture_cache_->GetCurrentScaledResolveBuffer();
+    if (downscale_source_buffer == VK_NULL_HANDLE) {
+      return true;
+    }
+    uint64_t buffer_base = texture_cache_->GetCurrentScaledResolveBufferBaseOffset();
+    if (scaled_start < buffer_base || scaled_start - buffer_base + scaled_length >
+                                          texture_cache_->GetCurrentScaledResolveBufferSize()) {
+      REXGPU_DEBUG(
+          "Skipping readback of a resolution-scaled resolve to 0x{:08X} - the "
+          "written extent is not within the current scaled resolve buffer",
+          written_address);
+      return true;
+    }
+    uint64_t source_offset = scaled_start - buffer_base;
+    // Storage buffer descriptor offsets must be aligned - pass the remainder
+    // to the shader.
+    VkDeviceSize storage_buffer_offset_alignment =
+        vulkan_device->properties().minStorageBufferOffsetAlignment;
+    downscale_source_bind_offset = source_offset & ~uint64_t(storage_buffer_offset_alignment - 1);
+    downscale_source_offset_remainder = uint32_t(source_offset - downscale_source_bind_offset);
   }
 
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
@@ -4472,63 +4998,25 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   };
 
-  bool is_scaled = texture_cache_->IsDrawResolutionScaled();
   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& readback = readback_buffers_[resolve_key];
   readback.last_used_frame = frame_current_;
   uint32_t write_index = readback.current_index;
-  uint32_t readback_size = AlignReadbackBufferSize(written_length);
+  uint32_t readback_size = AlignReadbackBufferSize(readback_length);
   if (!ensure_readback_slot(readback, write_index, readback_size)) {
     return true;
   }
 
   if (is_scaled) {
-    if (!resolve_downscale_pipeline_ || !resolve_downscale_pipeline_layout_) {
-      return true;
-    }
-
-    reg::RB_COPY_DEST_INFO copy_dest_info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
-    const FormatInfo* format_info = FormatInfo::Get(uint32_t(copy_dest_info.copy_dest_format));
-    uint32_t bits_per_pixel = format_info->bits_per_pixel;
-    if (bits_per_pixel != 8 && bits_per_pixel != 16 && bits_per_pixel != 32 &&
-        bits_per_pixel != 64) {
-      return true;
-    }
-
-    uint32_t pixel_size_log2;
-    if (!rex::bit_scan_forward(bits_per_pixel >> 3, &pixel_size_log2)) {
-      return true;
-    }
-    uint32_t tile_size_1x = 32 * 32 * (uint32_t(1) << pixel_size_log2);
-    uint32_t tile_count = written_length / tile_size_1x;
-    if (!tile_count) {
-      return true;
-    }
-
-    uint64_t scaled_start = 0, scaled_length = 0;
-    if (!texture_cache_->GetScaledResolveRange(written_address, written_length, 0, scaled_start,
-                                               scaled_length)) {
-      return true;
-    }
-    if (!scaled_length) {
-      return true;
-    }
-
-    VkBuffer scaled_resolve_buffer = texture_cache_->scaled_resolve_buffer();
-    if (scaled_resolve_buffer == VK_NULL_HANDLE || scaled_start > uint64_t(UINT32_MAX)) {
-      return true;
-    }
-
-    uint32_t downscale_buffer_size = AlignReadbackBufferSize(written_length);
-    if (downscale_buffer_size > resolve_downscale_buffer_size_) {
+    if (readback_size > resolve_downscale_buffer_size_) {
       VkBuffer new_buffer = VK_NULL_HANDLE;
       VkDeviceMemory new_memory = VK_NULL_HANDLE;
       if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-              vulkan_device, downscale_buffer_size,
+              vulkan_device, readback_size,
               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
               ui::vulkan::util::MemoryPurpose::kDeviceLocal, new_buffer, new_memory)) {
         REXGPU_ERROR("Failed to create a {} MB Vulkan resolve downscale buffer",
-                     downscale_buffer_size >> 20);
+                     readback_size >> 20);
         return true;
       }
       if (resolve_downscale_buffer_ != VK_NULL_HANDLE ||
@@ -4547,90 +5035,109 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       }
       resolve_downscale_buffer_ = new_buffer;
       resolve_downscale_buffer_memory_ = new_memory;
-      resolve_downscale_buffer_size_ = downscale_buffer_size;
+      resolve_downscale_buffer_size_ = readback_size;
     }
     if (resolve_downscale_buffer_ == VK_NULL_HANDLE) {
       return true;
     }
 
-    VkDescriptorSet descriptor_set = AllocateSingleTransientDescriptor(
-        SingleTransientDescriptorLayout::kStorageBufferPairCompute);
-    if (descriptor_set == VK_NULL_HANDLE) {
-      return true;
-    }
-
-    VkDescriptorBufferInfo buffer_infos[2] = {};
-    buffer_infos[0].buffer = scaled_resolve_buffer;
-    buffer_infos[0].offset = 0;
-    buffer_infos[0].range = VK_WHOLE_SIZE;
-    buffer_infos[1].buffer = resolve_downscale_buffer_;
-    buffer_infos[1].offset = 0;
-    buffer_infos[1].range = written_length;
-
-    VkWriteDescriptorSet descriptor_writes[2] = {};
-    for (uint32_t i = 0; i < 2; ++i) {
-      descriptor_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      descriptor_writes[i].dstSet = descriptor_set;
-      descriptor_writes[i].dstBinding = i;
-      descriptor_writes[i].descriptorCount = 1;
-      descriptor_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-      descriptor_writes[i].pBufferInfo = &buffer_infos[i];
-    }
-    dfn.vkUpdateDescriptorSets(device, 2, descriptor_writes, 0, nullptr);
-
-    texture_cache_->UseScaledResolveBufferForRead();
+    // The resolve wrote the scaled resolve buffer from a compute shader and
+    // made it visible to compute shader reads. The downscale buffer was last
+    // read by a transfer to the readback buffer.
+    PushBufferMemoryBarrier(resolve_downscale_buffer_, 0, VK_WHOLE_SIZE,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     SubmitBarriers(true);
 
-    VkBufferMemoryBarrier pre_barrier = {};
-    pre_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    pre_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    pre_barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    pre_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    pre_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    pre_barrier.buffer = resolve_downscale_buffer_;
-    pre_barrier.offset = 0;
-    pre_barrier.size = written_length;
-    deferred_command_buffer_.CmdVkPipelineBarrier(
-        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &pre_barrier, 0, nullptr);
-
     BindExternalComputePipeline(resolve_downscale_pipeline_);
+    ResolveDownscaleConstants downscale_constants;
+    downscale_constants.scale_x = texture_cache_->draw_resolution_scale_x();
+    downscale_constants.scale_y = texture_cache_->draw_resolution_scale_y();
+    downscale_constants.pixel_size_log2 = downscale_pixel_size_log2;
+    downscale_constants.source_offset_bytes = downscale_source_offset_remainder;
+    downscale_constants.half_pixel_offset =
+        uint32_t(REXCVAR_GET(readback_resolve_half_pixel_offset));
+    // Dispatch in chunks of tiles so one bound source range never exceeds
+    // maxStorageBufferRange (at least 128 MB, always far above the offset
+    // alignment remainder).
+    VkDeviceSize max_chunk_source_size =
+        vulkan_device->properties().maxStorageBufferRange - downscale_source_offset_remainder;
+    uint32_t done_tiles = 0;
+    while (done_tiles < downscale_tile_count) {
+      uint32_t chunk_tiles = uint32_t(std::min<uint64_t>(
+          downscale_tile_count - done_tiles, max_chunk_source_size / downscale_tile_size_scaled));
+      if (!chunk_tiles) {
+        REXGPU_DEBUG(
+            "Skipping readback of a resolution-scaled resolve to 0x{:08X} - one "
+            "32x32 tile exceeds maxStorageBufferRange",
+            written_address);
+        return true;
+      }
 
-    ResolveDownscaleConstants constants;
-    constants.scale_x = texture_cache_->draw_resolution_scale_x();
-    constants.scale_y = texture_cache_->draw_resolution_scale_y();
-    constants.pixel_size_log2 = pixel_size_log2;
-    constants.tile_count = tile_count;
-    constants.source_offset_bytes = uint32_t(scaled_start);
-    constants.half_pixel_offset = (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
-                                   (constants.scale_x > 1 || constants.scale_y > 1))
-                                      ? 1u
-                                      : 0u;
-    deferred_command_buffer_.CmdVkPushConstants(resolve_downscale_pipeline_layout_,
-                                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
-                                                &constants);
-    deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                     resolve_downscale_pipeline_layout_, 0, 1,
-                                                     &descriptor_set, 0, nullptr);
-    deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1);
+      VkDescriptorSet downscale_descriptor_source =
+          AllocateSingleTransientDescriptor(SingleTransientDescriptorLayout::kStorageBufferCompute);
+      VkDescriptorSet downscale_descriptor_dest =
+          AllocateSingleTransientDescriptor(SingleTransientDescriptorLayout::kStorageBufferCompute);
+      if (downscale_descriptor_source == VK_NULL_HANDLE ||
+          downscale_descriptor_dest == VK_NULL_HANDLE) {
+        REXGPU_ERROR("Failed to allocate descriptors for the resolve downscale");
+        return true;
+      }
+      VkDescriptorBufferInfo downscale_descriptor_buffer_info[2];
+      downscale_descriptor_buffer_info[0].buffer = downscale_source_buffer;
+      downscale_descriptor_buffer_info[0].offset =
+          downscale_source_bind_offset + VkDeviceSize(done_tiles) * downscale_tile_size_scaled;
+      downscale_descriptor_buffer_info[0].range =
+          VkDeviceSize(chunk_tiles) * downscale_tile_size_scaled +
+          downscale_source_offset_remainder;
+      downscale_descriptor_buffer_info[1].buffer = resolve_downscale_buffer_;
+      downscale_descriptor_buffer_info[1].offset =
+          VkDeviceSize(done_tiles) * downscale_tile_size_1x;
+      downscale_descriptor_buffer_info[1].range =
+          VkDeviceSize(chunk_tiles) * downscale_tile_size_1x;
+      VkWriteDescriptorSet downscale_descriptor_writes[2];
+      for (uint32_t i = 0; i < 2; ++i) {
+        VkWriteDescriptorSet& downscale_descriptor_write = downscale_descriptor_writes[i];
+        downscale_descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        downscale_descriptor_write.pNext = nullptr;
+        downscale_descriptor_write.dstSet =
+            i ? downscale_descriptor_dest : downscale_descriptor_source;
+        downscale_descriptor_write.dstBinding = 0;
+        downscale_descriptor_write.dstArrayElement = 0;
+        downscale_descriptor_write.descriptorCount = 1;
+        downscale_descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        downscale_descriptor_write.pImageInfo = nullptr;
+        downscale_descriptor_write.pBufferInfo = &downscale_descriptor_buffer_info[i];
+        downscale_descriptor_write.pTexelBufferView = nullptr;
+      }
+      dfn.vkUpdateDescriptorSets(device, 2, downscale_descriptor_writes, 0, nullptr);
 
-    VkBufferMemoryBarrier downscale_barrier = {};
-    downscale_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    downscale_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    downscale_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    downscale_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    downscale_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    downscale_barrier.buffer = resolve_downscale_buffer_;
-    downscale_barrier.offset = 0;
-    downscale_barrier.size = written_length;
-    deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1,
-                                                  &downscale_barrier, 0, nullptr);
+      VkDescriptorSet downscale_descriptor_sets[] = {
+          downscale_descriptor_source,
+          downscale_descriptor_dest,
+      };
+      deferred_command_buffer_.CmdVkBindDescriptorSets(
+          VK_PIPELINE_BIND_POINT_COMPUTE, resolve_downscale_pipeline_layout_, 0,
+          uint32_t(rex::countof(downscale_descriptor_sets)), downscale_descriptor_sets, 0, nullptr);
+      downscale_constants.tile_count = chunk_tiles;
+      deferred_command_buffer_.CmdVkPushConstants(
+          resolve_downscale_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+          sizeof(downscale_constants), &downscale_constants);
+      // One thread group per 32x32 tile.
+      deferred_command_buffer_.CmdVkDispatch(chunk_tiles, 1, 1);
 
+      done_tiles += chunk_tiles;
+    }
+
+    // Copy the downscaled data to the readback buffer.
+    PushBufferMemoryBarrier(resolve_downscale_buffer_, 0, VK_WHOLE_SIZE,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    SubmitBarriers(true);
     VkBufferCopy readback_region = {};
     readback_region.srcOffset = 0;
     readback_region.dstOffset = 0;
-    readback_region.size = written_length;
+    readback_region.size = readback_length;
     deferred_command_buffer_.CmdVkCopyBuffer(resolve_downscale_buffer_,
                                              readback.buffers[write_index], 1, &readback_region);
   } else {
@@ -4640,12 +5147,12 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     VkBufferCopy readback_region = {};
     readback_region.srcOffset = written_address;
     readback_region.dstOffset = 0;
-    readback_region.size = written_length;
+    readback_region.size = readback_length;
     deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(),
                                              readback.buffers[write_index], 1, &readback_region);
   }
 
-  PushBufferMemoryBarrier(readback.buffers[write_index], 0, written_length,
+  PushBufferMemoryBarrier(readback.buffers[write_index], 0, readback_length,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
 
@@ -4660,8 +5167,10 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   bool is_cache_miss = false;
   if (use_delayed_sync && (readback.buffers[read_index] == VK_NULL_HANDLE ||
-                           written_length > readback.sizes[read_index] ||
+                           readback_length > readback.sizes[read_index] ||
                            readback.mapped_data[read_index] == nullptr)) {
+    // Delayed sync, but the previous buffer doesn't exist - use the current
+    // buffer with a sync as a fallback.
     is_cache_miss = true;
     read_index = write_index;
     if (!AwaitAllQueueOperationsCompletion()) {
@@ -4671,7 +5180,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
   if (should_copy && readback.buffers[read_index] != VK_NULL_HANDLE &&
-      written_length <= readback.sizes[read_index] && readback.mapped_data[read_index] != nullptr) {
+      readback_length <= readback.sizes[read_index] &&
+      readback.mapped_data[read_index] != nullptr) {
     VkMappedMemoryRange readback_memory_range = {};
     readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
     readback_memory_range.memory = readback.memories[read_index];
@@ -4681,7 +5191,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
 
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
-      std::memcpy(destination, readback.mapped_data[read_index], written_length);
+      std::memcpy(destination, readback.mapped_data[read_index], readback_length);
     }
   }
 
@@ -4730,220 +5240,489 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
   }
 }
 
-bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
-  active_occlusion_query_ = {};
-  occlusion_query_cursor_ = 0;
-  occlusion_query_resources_available_ = false;
-  occlusion_query_pool_ = VK_NULL_HANDLE;
-  occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-  occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-  occlusion_query_readback_memory_type_ = UINT32_MAX;
-  occlusion_query_readback_memory_size_ = 0;
-  occlusion_query_readback_mapping_ = nullptr;
+void VulkanCommandProcessor::EnsureQueryResources() {
+  // VIZ surveys need the pool even when ZPD reports are faked.
+  if ((zpd_mode_ == ZPDMode::kFake && !REXCVAR_GET(occlusion_query_viz)) || !host_query_pool_) {
+    return;
+  }
+
+  bool can_recreate = zpd_current_report_.handle == kInvalidReportHandle &&
+                      !active_segment_.segment_active && active_query_index_ == UINT32_MAX &&
+                      !active_query_is_fsi_ && !host_query_pool_->has_pending_resolve_batch() &&
+                      query_resolves_in_flight_.empty();
+
+  bool fsi_path = render_target_cache_ &&
+                  render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  zpd_fsi_path_ = fsi_path;
+
+  // Hybrid queries need the counter too.
+  if (host_query_pool_->EnsureInitialized(GetVulkanDevice(), kQueryPoolCapacity, can_recreate,
+                                          fsi_path || zpd_hybrid_supported_) &&
+      host_query_pool_->counter_initialized()) {
+    VkBuffer counter_buffer = host_query_pool_->counter_buffer();
+    VkDeviceSize counter_range = XenosZPDReport::kCounterSizeBytes * host_query_pool_->capacity();
+    if (zpd_counter_descriptor_buffer_ != counter_buffer ||
+        zpd_counter_descriptor_range_ != counter_range) {
+      VkDescriptorBufferInfo counter_descriptor_buffer_info;
+      counter_descriptor_buffer_info.buffer = counter_buffer;
+      counter_descriptor_buffer_info.offset = 0;
+      counter_descriptor_buffer_info.range = counter_range;
+
+      VkWriteDescriptorSet counter_descriptor_write;
+      counter_descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      counter_descriptor_write.pNext = nullptr;
+      counter_descriptor_write.dstSet = shared_memory_and_edram_descriptor_set_;
+      counter_descriptor_write.dstBinding = 1;
+      counter_descriptor_write.dstArrayElement = 0;
+      counter_descriptor_write.descriptorCount = 1;
+      counter_descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      counter_descriptor_write.pImageInfo = nullptr;
+      counter_descriptor_write.pBufferInfo = &counter_descriptor_buffer_info;
+      counter_descriptor_write.pTexelBufferView = nullptr;
+
+      const ui::vulkan::VulkanDevice::Functions& dfn = GetVulkanDevice()->functions();
+      dfn.vkUpdateDescriptorSets(GetVulkanDevice()->device(), 1, &counter_descriptor_write, 0,
+                                 nullptr);
+
+      zpd_counter_descriptor_buffer_ = counter_buffer;
+      zpd_counter_descriptor_range_ = counter_range;
+    }
+  } else if (fsi_path && !IsQueryPoolReady()) {
+    REXGPU_WARN(
+        "ZPD/Vulkan: Counter resources unavailable; keeping counter "
+        "index sentinel active");
+  }
+  zpd_counter_index_force_update_ = true;
+}
+
+bool VulkanCommandProcessor::IsQueryPoolReady() const {
+  if (!host_query_pool_ || !host_query_pool_->fbo_initialized()) {
+    return false;
+  }
+  if (!zpd_fsi_path_) {
+    return true;
+  }
+  VkDeviceSize counter_range = XenosZPDReport::kCounterSizeBytes * host_query_pool_->capacity();
+  return host_query_pool_->counter_initialized() &&
+         zpd_counter_descriptor_buffer_ == host_query_pool_->counter_buffer() &&
+         zpd_counter_descriptor_range_ == counter_range;
+}
+
+bool VulkanCommandProcessor::CanOpenQuery() const {
+  if (!submission_open_) {
+    return false;
+  }
+  return (render_target_cache_ &&
+          render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock) ||
+         in_render_pass_;
+}
+
+CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenQuery(bool can_close_submission) {
+  bool use_fsi_path = zpd_fsi_path_ && host_query_pool_->counter_initialized();
+
+  if (!BeginSubmission(true)) {
+    return QueryOpenResult::kFailed;
+  }
+
+  if (!use_fsi_path && !in_render_pass_) {
+    return QueryOpenResult::kDeferred;
+  }
+
+  // Strict mode can't guess, so wait for the oldest in-flight resolve to hand
+  // a slot back. If it's still in the open submission, flip submissions once,
+  // reentering the render pass, and try again.
+  bool retried_after_submission_flip = false;
+  while (true) {
+    bool is_pool_exhausted = !host_query_pool_->has_free_indices();
+
+    if (is_pool_exhausted) {
+      PumpQueryResolves();
+      is_pool_exhausted = !host_query_pool_->has_free_indices();
+    }
+
+    if (is_pool_exhausted && zpd_mode_ != ZPDMode::kStrict) {
+      return QueryOpenResult::kPoolExhausted;
+    }
+
+    uint64_t wait_for = 0;
+    if (is_pool_exhausted && !query_resolves_in_flight_.empty()) {
+      wait_for = query_resolves_in_flight_.front().submission;
+    }
+
+    if (wait_for == 0) {
+      break;
+    }
+
+    if (submission_open_ && wait_for == GetCurrentSubmission()) {
+      if (retried_after_submission_flip || !can_close_submission ||
+          !CanEndSubmissionImmediately()) {
+        return QueryOpenResult::kDeferred;
+      }
+
+      // Only the guest draw pass can be reentered from here.
+      const VulkanRenderTargetCache::Framebuffer* saved_framebuffer =
+          in_render_pass_ && current_framebuffer_ == render_target_cache_->last_update_framebuffer()
+              ? current_framebuffer_
+              : nullptr;
+
+      if (in_render_pass_) {
+        EndRenderPass();
+      }
+      if (!EndSubmission(false)) {
+        return QueryOpenResult::kFailed;
+      }
+      if (!BeginSubmission(true)) {
+        return QueryOpenResult::kFailed;
+      }
+
+      if (saved_framebuffer) {
+        // The pass entry won't try to open a segment while this is opening.
+        SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+            render_target_cache_->last_update_render_pass(), saved_framebuffer);
+        if (!in_render_pass_) {
+          return QueryOpenResult::kDeferred;
+        }
+      }
+
+      retried_after_submission_flip = true;
+      continue;
+    }
+
+    if (wait_for > GetCompletedSubmission()) {
+      CheckSubmissionCompletionAndDeviceLoss(wait_for);
+      PumpQueryResolves();
+    }
+
+    break;
+  }
+
+  if (!use_fsi_path && !in_render_pass_) {
+    return QueryOpenResult::kDeferred;
+  }
+
+  if (!host_query_pool_->AcquireQueryIndex(active_query_index_, active_query_generation_)) {
+    return QueryOpenResult::kFailed;
+  }
+
+  active_query_is_fsi_ = use_fsi_path;
+  active_segment_.hybrid = !use_fsi_path && zpd_hybrid_supported_ && active_segment_.count_total &&
+                           host_query_pool_->counter_initialized();
+
+  // FSI queries don't use Vulkan occlusion queries at all.
+  // While the segment is open, the translated pixel shader accumulates depth/
+  // stencil outcomes into one counter slot selected via zpd_counter_index.
+  // Clear the slot here if it's still dirty so a recycled index never inherits
+  // old counts.
+  if (active_query_is_fsi_) {
+    if (host_query_pool_->IsCounterDirty(active_query_index_)) {
+      if (in_render_pass_) {
+        // Only the guest draw pass can be reentered from here.
+        const VulkanRenderTargetCache::Framebuffer* saved_framebuffer =
+            current_framebuffer_ == render_target_cache_->last_update_framebuffer()
+                ? current_framebuffer_
+                : nullptr;
+        EndRenderPass();
+        host_query_pool_->ClearCounter(deferred_command_buffer_, active_query_index_);
+        if (saved_framebuffer) {
+          SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+              render_target_cache_->last_update_render_pass(), saved_framebuffer);
+        }
+      } else {
+        host_query_pool_->ClearCounter(deferred_command_buffer_, active_query_index_);
+      }
+    }
+    zpd_counter_index_force_update_ = true;
+    return QueryOpenResult::kOpened;
+  }
+
+  if (active_segment_.hybrid) {
+    // Dirty slots are cleared in bulk before the next render pass begins, so
+    // wait for that rather than splitting this one.
+    if (host_query_pool_->IsCounterDirty(active_query_index_)) {
+      host_query_pool_->ReleaseQueryIndex(active_query_index_, active_query_generation_);
+      active_query_index_ = UINT32_MAX;
+      active_query_generation_ = 0;
+      active_segment_.hybrid = false;
+      return QueryOpenResult::kDeferred;
+    }
+    zpd_counter_index_force_update_ = true;
+  }
+
+  host_query_pool_->BeginQuery(deferred_command_buffer_, active_query_index_,
+                               /*precise=*/active_segment_.report);
+  return QueryOpenResult::kOpened;
+}
+
+bool VulkanCommandProcessor::CloseQuery(ReportHandle report_handle, const VIZQueryHandle& viz,
+                                        uint64_t& out_submission) {
+  if (!active_query_is_fsi_ && !in_render_pass_) {
+    return false;
+  }
+
+  if (active_query_is_fsi_) {
+    host_query_pool_->QueueQueryResolve(active_query_index_, true);
+  } else {
+    host_query_pool_->EndQuery(deferred_command_buffer_, active_query_index_);
+    host_query_pool_->QueueQueryResolve(active_query_index_, false);
+    if (active_segment_.hybrid) {
+      host_query_pool_->QueueQueryResolve(active_query_index_, true);
+    }
+  }
+
+  if (viz.generation != kInvalidVIZGeneration) {
+    if (CanArmVIZPredicate(viz.id, viz.generation) && EnsureVIZPredicateBuffer()) {
+      // The copy into the ID's predicate waits for a pass boundary, or for a
+      // consumer draw that can't. A newer survey on the same ID replaces the
+      // queued copy, so the older generation can't be consumed.
+      PendingVIZCopy* queued = nullptr;
+      for (PendingVIZCopy& copy : viz_pending_copies_) {
+        if (copy.id == viz.id) {
+          queued = &copy;
+          break;
+        }
+      }
+      if (!queued) {
+        queued = &viz_pending_copies_.emplace_back();
+        queued->id = viz.id;
+      }
+      queued->query_index = active_query_index_;
+      queued->fsi = active_query_is_fsi_;
+      ArmVIZPredicate(viz.id, viz.generation);
+    } else {
+      BlockVIZPredicate(viz.id, viz.generation);
+    }
+  }
+
+  PendingQueryResolve resolve;
+  resolve.submission = GetCurrentSubmission();
+  resolve.query_index = active_query_index_;
+  resolve.query_generation = active_query_generation_;
+  resolve.scale_area = GetZPDScaleArea();
+  resolve.fsi = active_query_is_fsi_;
+  resolve.hybrid = active_segment_.hybrid;
+  resolve.report_handle = report_handle;
+  resolve.viz = viz;
+  query_resolves_in_flight_.push_back(resolve);
+
+  out_submission = resolve.submission;
+
+  active_query_index_ = UINT32_MAX;
+  active_query_generation_ = 0;
+  if (active_query_is_fsi_ || active_segment_.hybrid) {
+    zpd_counter_index_force_update_ = true;
+  }
+  active_query_is_fsi_ = false;
+  return true;
+}
+
+void VulkanCommandProcessor::PumpQueryResolves() {
+  if (!host_query_pool_ || query_resolves_in_flight_.empty()) {
+    return;
+  }
+
+  uint64_t completed = GetCompletedSubmission();
+  if (query_resolves_in_flight_.front().submission > completed) {
+    return;
+  }
+
+  // Invalidate CPU cache before reading results on non-coherent memory.
+  host_query_pool_->InvalidateReadback();
+
+  while (!query_resolves_in_flight_.empty() &&
+         query_resolves_in_flight_.front().submission <= completed) {
+    PendingQueryResolve resolve = query_resolves_in_flight_.front();
+    query_resolves_in_flight_.pop_front();
+
+    if (!host_query_pool_->GenerationMatches(resolve.query_index, resolve.query_generation)) {
+      continue;
+    }
+    XenosZPDReport raw_counts =
+        host_query_pool_->GetQueryReadbackValue(resolve.query_index, resolve.fsi, resolve.hybrid);
+    host_query_pool_->ReleaseQueryIndex(resolve.query_index, resolve.query_generation);
+    if (resolve.report_handle != kInvalidReportHandle) {
+      OnZPDQueryResolved(resolve.report_handle, raw_counts, resolve.scale_area);
+    }
+    if (resolve.viz.generation != kInvalidVIZGeneration) {
+      OnVIZQueryResolved(resolve.viz.id, resolve.viz.generation, raw_counts.z_pass != 0);
+    }
+  }
+}
+
+bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
+                                               uint64_t wait_for_submission) {
+  assert_not_zero(wait_for_submission);
+
+  // The resolve is still in the open submission. Pipelines being created
+  // asynchronously have to finish before it can be executed.
+  if (wait_for_submission >= GetCurrentSubmission()) {
+    if (!submission_open_) {
+      return false;
+    }
+    if (!CanEndSubmissionImmediately()) {
+      pipeline_cache_->AwaitPipelineCompletion();
+    }
+    EndRenderPass();
+    if (!EndSubmission(false)) {
+      return false;
+    }
+  }
+
+  if (wait_for_submission > GetCompletedSubmission()) {
+    CheckSubmissionCompletionAndDeviceLoss(wait_for_submission);
+  }
+
+  PumpQueryResolves();
+
+  const ZPDReport* report = FindZPDReport(report_handle);
+  return !report || !report->pending_segments;
+}
+
+bool VulkanCommandProcessor::EnsureVIZPredicateBuffer() {
+  if (viz_predicate_buffer_ != VK_NULL_HANDLE) {
+    return true;
+  }
+  if (viz_predicate_buffer_failed_) {
+    // Don't retry and relog on every close.
+    return false;
+  }
 
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  VkDevice device = vulkan_device->device();
-
-  VkQueryPoolCreateInfo pool_info = {};
-  pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-  pool_info.queryType = VK_QUERY_TYPE_OCCLUSION;
-  pool_info.queryCount = kMaxOcclusionQueries;
-  if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &occlusion_query_pool_) != VK_SUCCESS) {
-    REXGPU_WARN(
-        "VulkanCommandProcessor: Failed to create occlusion query pool, using fake sample counts");
+  if (!vulkan_device->properties().conditionalRendering) {
     return false;
   }
 
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          vulkan_device, sizeof(uint64_t) * kMaxOcclusionQueries, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-          ui::vulkan::util::MemoryPurpose::kReadback, occlusion_query_readback_buffer_,
-          occlusion_query_readback_memory_, &occlusion_query_readback_memory_type_,
-          &occlusion_query_readback_memory_size_)) {
-    REXGPU_WARN(
-        "VulkanCommandProcessor: Failed to create occlusion query readback buffer, using fake "
-        "sample counts");
-    ShutdownOcclusionQueryResources();
+          vulkan_device, sizeof(uint32_t) * uint32_t(viz_queries_.size()),
+          VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT,
+          ui::vulkan::util::MemoryPurpose::kDeviceLocal, viz_predicate_buffer_,
+          viz_predicate_buffer_memory_)) {
+    REXGPU_ERROR("VIZ/Vulkan: Failed to create the predicate buffer");
+    viz_predicate_buffer_ = VK_NULL_HANDLE;
+    viz_predicate_buffer_memory_ = VK_NULL_HANDLE;
+    viz_predicate_buffer_failed_ = true;
     return false;
   }
 
-  if (dfn.vkMapMemory(device, occlusion_query_readback_memory_, 0, VK_WHOLE_SIZE, 0,
-                      reinterpret_cast<void**>(&occlusion_query_readback_mapping_)) != VK_SUCCESS) {
-    REXGPU_WARN(
-        "VulkanCommandProcessor: Failed to map occlusion query readback buffer, using fake sample "
-        "counts");
-    ShutdownOcclusionQueryResources();
-    return false;
-  }
-
-  occlusion_query_resources_available_ = true;
   return true;
 }
 
-void VulkanCommandProcessor::ShutdownOcclusionQueryResources() {
-  DisableHostOcclusionQueries();
-
-  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  VkDevice device = vulkan_device->device();
-
-  if (occlusion_query_readback_mapping_ && occlusion_query_readback_memory_ != VK_NULL_HANDLE) {
-    dfn.vkUnmapMemory(device, occlusion_query_readback_memory_);
-  }
-  occlusion_query_readback_mapping_ = nullptr;
-  if (occlusion_query_readback_buffer_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyBuffer(device, occlusion_query_readback_buffer_, nullptr);
-  }
-  if (occlusion_query_readback_memory_ != VK_NULL_HANDLE) {
-    dfn.vkFreeMemory(device, occlusion_query_readback_memory_, nullptr);
-  }
-  if (occlusion_query_pool_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
-  }
-
-  occlusion_query_pool_ = VK_NULL_HANDLE;
-  occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-  occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-  occlusion_query_readback_memory_type_ = UINT32_MAX;
-  occlusion_query_readback_memory_size_ = 0;
-}
-
-bool VulkanCommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out) {
-  if (occlusion_query_cursor_ >= kMaxOcclusionQueries) {
-    occlusion_query_cursor_ = 0;
-  }
-  host_index_out = occlusion_query_cursor_++;
-  return true;
-}
-
-void VulkanCommandProcessor::DisableHostOcclusionQueries() {
-  if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
-    if (BeginSubmission(true)) {
-      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
-                                             active_occlusion_query_.host_index);
-      EndSubmission(false);
-    }
-  }
-  active_occlusion_query_ = {};
-  occlusion_query_cursor_ = 0;
-  occlusion_query_resources_available_ = false;
-}
-
-bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_address) {
-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
-      occlusion_query_pool_ == VK_NULL_HANDLE || occlusion_query_readback_mapping_ == nullptr) {
-    return false;
-  }
-  if (active_occlusion_query_.valid) {
-    REXGPU_WARN(
-        "VulkanCommandProcessor: Occlusion query begin issued while another query is active");
-    DisableHostOcclusionQueries();
-    return false;
-  }
-
-  uint32_t host_index = 0;
-  if (!AcquireOcclusionQueryIndex(host_index)) {
-    return false;
-  }
-  if (!BeginSubmission(true)) {
-    return false;
-  }
-
-  EndRenderPass();
-
-  DeferredCommandBuffer& command_buffer = deferred_command_buffer();
-  command_buffer.CmdVkResetQueryPool(occlusion_query_pool_, host_index, 1);
-  command_buffer.CmdVkBeginQuery(occlusion_query_pool_, host_index, 0);
-  active_occlusion_query_.sample_count_address = sample_count_address;
-  active_occlusion_query_.host_index = host_index;
-  active_occlusion_query_.valid = true;
-  return true;
-}
-
-bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_address) {
-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
-      !active_occlusion_query_.valid || occlusion_query_pool_ == VK_NULL_HANDLE ||
-      occlusion_query_readback_mapping_ == nullptr) {
-    return false;
-  }
-
-  uint32_t host_index = active_occlusion_query_.host_index;
-  active_occlusion_query_ = {};
-
-  if (!BeginSubmission(true)) {
-    return false;
-  }
-
-  EndRenderPass();
-
-  DeferredCommandBuffer& command_buffer = deferred_command_buffer();
-  command_buffer.CmdVkEndQuery(occlusion_query_pool_, host_index);
-  command_buffer.CmdVkCopyQueryPoolResults(occlusion_query_pool_, host_index, 1,
-                                           occlusion_query_readback_buffer_,
-                                           sizeof(uint64_t) * host_index, sizeof(uint64_t),
-                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-
-  if (!EndSubmission(false)) {
-    return false;
-  }
-  if (!AwaitAllQueueOperationsCompletion()) {
-    return false;
-  }
-
-  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-  if (!(vulkan_device->memory_types().host_coherent &
-        (uint32_t(1) << occlusion_query_readback_memory_type_))) {
-    VkMappedMemoryRange memory_range = {};
-    memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    memory_range.memory = occlusion_query_readback_memory_;
-    memory_range.offset = 0;
-    memory_range.size =
-        std::min(rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxOcclusionQueries),
-                               vulkan_device->properties().nonCoherentAtomSize),
-                 occlusion_query_readback_memory_size_);
-    dfn.vkInvalidateMappedMemoryRanges(device, 1, &memory_range);
-  }
-
-  const uint64_t* results = reinterpret_cast<const uint64_t*>(occlusion_query_readback_mapping_);
-  uint64_t samples = NormalizeOcclusionSamples(results[host_index]);
-  WriteGuestOcclusionResult(sample_count_address, samples);
-  return true;
-}
-
-uint64_t VulkanCommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {
-  if (samples == 0 || !texture_cache_) {
-    return samples;
-  }
-  uint64_t scale_x = texture_cache_->draw_resolution_scale_x();
-  uint64_t scale_y = texture_cache_->draw_resolution_scale_y();
-  uint64_t scale = scale_x * scale_y;
-  if (scale <= 1) {
-    return samples;
-  }
-  return (samples + (scale >> 1)) / scale;
-}
-
-void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_address,
-                                                       uint64_t samples) {
-  auto* sample_counts =
-      memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(sample_count_address);
-  if (!sample_counts) {
+void VulkanCommandProcessor::RecordVIZPredicateCopies() {
+  if (viz_pending_copies_.empty()) {
     return;
   }
-  uint32_t clamped = samples > uint64_t(UINT32_MAX) ? UINT32_MAX : uint32_t(samples);
-  sample_counts->Total_A = clamped;
-  sample_counts->Total_B = 0;
-  sample_counts->ZPass_A = clamped;
-  sample_counts->ZPass_B = 0;
-  sample_counts->ZFail_A = 0;
-  sample_counts->ZFail_B = 0;
-  sample_counts->StencilFail_A = 0;
-  sample_counts->StencilFail_B = 0;
+
+  if (in_render_pass_) {
+    // Copies aren't valid inside a render pass, so end it. The draw that
+    // needed the predicate value enters its own pass afterwards. Ending the
+    // pass records the copies.
+    EndRenderPass();
+    return;
+  }
+
+  bool counter_copies = false;
+  for (const PendingVIZCopy& copy : viz_pending_copies_) {
+    counter_copies |= copy.fsi;
+  }
+
+  const VkBuffer counter_buffer =
+      counter_copies ? host_query_pool_->counter_buffer() : VK_NULL_HANDLE;
+  // We might still be reading predicates, and earlier copies might still be
+  // writing them. Both have to settle first.
+  VkBufferMemoryBarrier barriers[2];
+  barriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  barriers[0].pNext = nullptr;
+  barriers[0].srcAccessMask =
+      VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[0].buffer = viz_predicate_buffer_;
+  barriers[0].offset = 0;
+  barriers[0].size = VK_WHOLE_SIZE;
+  barriers[1] = barriers[0];
+  barriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barriers[1].buffer = counter_buffer;
+  const VkPipelineStageFlags counter_stage_mask =
+      counter_copies ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : 0;
+  const uint32_t barrier_count = counter_copies ? 2 : 1;
+  deferred_command_buffer_.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+          counter_stage_mask,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, barrier_count, barriers, 0, nullptr);
+
+  // 32 bit results with the query wait folded into the copy. Non-zero draws.
+  for (const PendingVIZCopy& copy : viz_pending_copies_) {
+    const VkDeviceSize predicate_offset = VkDeviceSize(copy.id) * sizeof(uint32_t);
+    if (copy.fsi) {
+      VkBufferCopy region;
+      region.srcOffset = VkDeviceSize(copy.query_index) * XenosZPDReport::kCounterSizeBytes +
+                         XenosZPDReport::kZPass * sizeof(uint32_t);
+      region.dstOffset = predicate_offset;
+      region.size = sizeof(uint32_t);
+      deferred_command_buffer_.CmdVkCopyBuffer(counter_buffer, viz_predicate_buffer_, 1, &region);
+      continue;
+    }
+    deferred_command_buffer_.CmdVkCopyQueryPoolResults(
+        host_query_pool_->query_pool(), copy.query_index, 1, viz_predicate_buffer_,
+        predicate_offset, sizeof(uint32_t), VK_QUERY_RESULT_WAIT_BIT);
+  }
+
+  viz_pending_copies_.clear();
+
+  // Make the values visible to conditional rendering.
+  // Hand the counter back to the fragment shaders.
+  barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barriers[0].dstAccessMask = VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT;
+  barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  deferred_command_buffer_.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT | counter_stage_mask, 0, 0, nullptr,
+      barrier_count, barriers, 0, nullptr);
 }
 
-void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
+VkBuffer VulkanCommandProcessor::BindVIZPredicate(VkDeviceSize& offset_out) {
+  if (viz_predicate_buffer_ == VK_NULL_HANDLE || !IsVIZPredicateArmed()) {
+    return VK_NULL_HANDLE;
+  }
+
+  for (const PendingVIZCopy& copy : viz_pending_copies_) {
+    if (copy.id == viz_draw_predicate_.id) {
+      // The value is still queued and this draw needs it, even at the cost of
+      // splitting the pass. Everything queued rides the same split.
+      RecordVIZPredicateCopies();
+      break;
+    }
+  }
+
+  offset_out = VkDeviceSize(viz_draw_predicate_.id) * sizeof(uint32_t);
+  return viz_predicate_buffer_;
+}
+
+void VulkanCommandProcessor::AwaitVIZQueryResolve(uint64_t wait_for_submission) {
+  if (wait_for_submission >= GetCurrentSubmission()) {
+    return;
+  }
+
+  if (wait_for_submission > GetCompletedSubmission()) {
+    CheckSubmissionCompletionAndDeviceLoss(wait_for_submission);
+  }
+
+  PumpQueryResolves();
+}
+
+void VulkanCommandProcessor::PollCompletedSubmission() {
+  // Strict ZPD can skip unnecessary work here that can wait for the next full
+  // CheckSubmissionCompletionAndDeviceLoss and it's not needed for retirement.
+  if (device_lost_) {
+    return;
+  }
+  CheckSubmissionCompletionAndDeviceLoss(0);
+  PumpQueryResolves();
+}
+
+void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(uint64_t await_submission) {
   // Only report once, no need to retry a wait that won't succeed anyway.
   if (device_lost_) {
     return;
@@ -4958,68 +5737,24 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     await_submission = GetCurrentSubmission() - 1;
   }
 
-  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
+  completion_timeline_.AwaitSubmissionAndUpdateCompleted(await_submission);
 
-  size_t fences_total = submissions_in_flight_fences_.size();
-  size_t fences_awaited = 0;
-  if (await_submission > submission_completed_) {
-    // Await in a blocking way if requested.
-    // TODO(Triang3l): Await only one fence. "Fence signal operations that are
-    // defined by vkQueueSubmit additionally include in the first
-    // synchronization scope all commands that occur earlier in submission
-    // order."
-    VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
-    if (wait_result == VK_SUCCESS) {
-      fences_awaited += await_submission - submission_completed_;
-    } else {
-      REXGPU_ERROR("Failed to await submission completion Vulkan fences");
-      if (wait_result == VK_ERROR_DEVICE_LOST) {
-        device_lost_ = true;
-      }
-    }
-  }
-  // Check how far into the submissions the GPU currently is, in order because
-  // submission themselves can be executed out of order, but Xenia serializes
-  // that for simplicity.
-  while (fences_awaited < fences_total) {
-    VkResult fence_status =
-        dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
-    if (fence_status != VK_SUCCESS) {
-      if (fence_status == VK_ERROR_DEVICE_LOST) {
-        device_lost_ = true;
-      }
-      break;
-    }
-    ++fences_awaited;
-  }
-  if (device_lost_) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+
+  if (vulkan_device->IsLost()) {
+    device_lost_ = true;
     if (graphics_system_) {
       graphics_system_->OnHostGpuLossFromAnyThread(true);
     }
     return;
   }
-  if (!fences_awaited) {
-    // Not updated - no need to reclaim or download things.
-    return;
-  }
-  // Reclaim fences.
-  fences_free_.reserve(fences_free_.size() + fences_awaited);
-  auto submissions_in_flight_fences_awaited_end = submissions_in_flight_fences_.cbegin();
-  std::advance(submissions_in_flight_fences_awaited_end, fences_awaited);
-  fences_free_.insert(fences_free_.cend(), submissions_in_flight_fences_.cbegin(),
-                      submissions_in_flight_fences_awaited_end);
-  submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
-                                      submissions_in_flight_fences_awaited_end);
-  submission_completed_ += fences_awaited;
+
+  const uint64_t completed_submission = GetCompletedSubmission();
 
   // Reclaim semaphores.
   while (!submissions_in_flight_semaphores_.empty()) {
     const auto& semaphore_submission = submissions_in_flight_semaphores_.front();
-    if (semaphore_submission.first > submission_completed_) {
+    if (semaphore_submission.first > completed_submission) {
       break;
     }
     semaphores_free_.push_back(semaphore_submission.second);
@@ -5029,7 +5764,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   // Reclaim command pools.
   while (!command_buffers_submitted_.empty()) {
     const auto& command_buffer_pair = command_buffers_submitted_.front();
-    if (command_buffer_pair.first > submission_completed_) {
+    if (command_buffer_pair.first > completed_submission) {
       break;
     }
     command_buffers_writable_.push_back(command_buffer_pair.second);
@@ -5042,12 +5777,17 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
 
   render_target_cache_->CompletedSubmissionUpdated();
 
-  texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+  texture_cache_->CompletedSubmissionUpdated(completed_submission);
+
+  PumpQueryResolves();
+  PumpPendingRetire();
 
   // Destroy objects scheduled for destruction.
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   while (!destroy_framebuffers_.empty()) {
     const auto& destroy_pair = destroy_framebuffers_.front();
-    if (destroy_pair.first > submission_completed_) {
+    if (destroy_pair.first > completed_submission) {
       break;
     }
     dfn.vkDestroyFramebuffer(device, destroy_pair.second, nullptr);
@@ -5055,7 +5795,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   }
   while (!destroy_image_views_.empty()) {
     const auto& destroy_pair = destroy_image_views_.front();
-    if (destroy_pair.first > submission_completed_) {
+    if (destroy_pair.first > completed_submission) {
       break;
     }
     dfn.vkDestroyImageView(device, destroy_pair.second, nullptr);
@@ -5063,7 +5803,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   }
   while (!destroy_buffers_.empty()) {
     const auto& destroy_pair = destroy_buffers_.front();
-    if (destroy_pair.first > submission_completed_) {
+    if (destroy_pair.first > completed_submission) {
       break;
     }
     dfn.vkDestroyBuffer(device, destroy_pair.second, nullptr);
@@ -5071,7 +5811,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   }
   while (!destroy_images_.empty()) {
     const auto& destroy_pair = destroy_images_.front();
-    if (destroy_pair.first > submission_completed_) {
+    if (destroy_pair.first > completed_submission) {
       break;
     }
     dfn.vkDestroyImage(device, destroy_pair.second, nullptr);
@@ -5079,7 +5819,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   }
   while (!destroy_memory_.empty()) {
     const auto& destroy_pair = destroy_memory_.front();
-    if (destroy_pair.first > submission_completed_) {
+    if (destroy_pair.first > completed_submission) {
       break;
     }
     dfn.vkFreeMemory(device, destroy_pair.second, nullptr);
@@ -5111,8 +5851,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // is still available, and whether the await was successful.
   uint64_t await_submission =
       is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
-  CheckSubmissionFenceAndDeviceLoss(await_submission);
-  if (device_lost_ || submission_completed_ < await_submission) {
+  CheckSubmissionCompletionAndDeviceLoss(await_submission);
+  const uint64_t completed_submission = GetCompletedSubmission();
+  if (device_lost_ || completed_submission < await_submission) {
     return false;
   }
 
@@ -5122,7 +5863,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // before reclaiming resources tracked with the frame number.
     frame_completed_ = std::max(frame_current_, uint64_t(kMaxFramesInFlight)) - kMaxFramesInFlight;
     for (uint64_t frame = frame_completed_ + 1; frame < frame_current_; ++frame) {
-      if (closed_frame_submissions_[frame % kMaxFramesInFlight] > submission_completed_) {
+      if (closed_frame_submissions_[frame % kMaxFramesInFlight] > completed_submission) {
         break;
       }
       frame_completed_ = frame;
@@ -5164,7 +5905,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
-    frame_used_async_placeholder_pipeline_ = false;
+    frame_used_pending_pipeline_ = false;
 
     // Reset bindings that depend on transient data.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
@@ -5236,20 +5977,6 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
   // Make sure everything needed for submitting exist.
   if (submission_open_) {
-    if (fences_free_.empty()) {
-      VkFenceCreateInfo fence_create_info;
-      fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-      fence_create_info.pNext = nullptr;
-      fence_create_info.flags = 0;
-      VkFence fence;
-      if (dfn.vkCreateFence(device, &fence_create_info, nullptr, &fence) != VK_SUCCESS) {
-        REXGPU_ERROR("Failed to create a Vulkan fence");
-        // Try to submit later. Completely dropping the submission is not
-        // permitted because resources would be left in an undefined state.
-        return false;
-      }
-      fences_free_.push_back(fence);
-    }
     if (!sparse_memory_binds_.empty() && semaphores_free_.empty()) {
       VkSemaphoreCreateInfo semaphore_create_info;
       semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -5301,12 +6028,6 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
-
-    if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
-      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
-                                             active_occlusion_query_.host_index);
-      active_occlusion_query_ = {};
-    }
 
     EndRenderPass();
 
@@ -5368,6 +6089,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       sparse_memory_binds_.clear();
     }
 
+    // Can't cross command buffer boundaries. Close the active segment first.
+    CloseQuerySegment();
+    RecordVIZPredicateCopies();
+
     SubmitBarriers(true);
 
     assert_false(command_buffers_writable_.empty());
@@ -5386,42 +6111,33 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       return false;
     }
     deferred_command_buffer_.Execute(command_buffer.buffer);
+
+    // Record query resolves before submitting.
+    if (host_query_pool_) {
+      host_query_pool_->RecordResolveBatch(command_buffer.buffer);
+    }
+
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");
       return false;
     }
 
-    VkSubmitInfo submit_info;
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.pNext = nullptr;
+    const uint64_t submission_index = GetCurrentSubmission();
+
+    VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     if (!current_submission_wait_semaphores_.empty()) {
       submit_info.waitSemaphoreCount = uint32_t(current_submission_wait_semaphores_.size());
       submit_info.pWaitSemaphores = current_submission_wait_semaphores_.data();
       submit_info.pWaitDstStageMask = current_submission_wait_stage_masks_.data();
-    } else {
-      submit_info.waitSemaphoreCount = 0;
-      submit_info.pWaitSemaphores = nullptr;
-      submit_info.pWaitDstStageMask = nullptr;
     }
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &command_buffer.buffer;
-    submit_info.signalSemaphoreCount = 0;
-    submit_info.pSignalSemaphores = nullptr;
-    assert_false(fences_free_.empty());
-    VkFence fence = fences_free_.back();
-    if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to reset a Vulkan submission fence");
-      return false;
-    }
-    VkResult submit_result;
-    {
-      ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
-          vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
-      submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
-    }
+    const VkResult submit_result = completion_timeline_.AcquireFenceAndSubmit(
+        vulkan_device->queue_family_graphics_compute(), 0, 1, &submit_info);
     if (submit_result != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to submit a Vulkan command buffer");
-      if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
+      REXGPU_ERROR("Failed to submit a GPU emulation Vulkan command buffer: {}",
+                   vk::to_string(vk::Result(submit_result)));
+      if (vulkan_device->IsLost() && !device_lost_) {
         device_lost_ = true;
         if (graphics_system_) {
           graphics_system_->OnHostGpuLossFromAnyThread(true);
@@ -5429,19 +6145,19 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       }
       return false;
     }
-    uint64_t submission_current = GetCurrentSubmission();
     current_submission_wait_stage_masks_.clear();
     for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
-      submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
+      submissions_in_flight_semaphores_.emplace_back(submission_index, semaphore);
     }
     current_submission_wait_semaphores_.clear();
-    command_buffers_submitted_.emplace_back(submission_current, command_buffer);
+    command_buffers_submitted_.emplace_back(submission_index, command_buffer);
     command_buffers_writable_.pop_back();
-    // Increments the current submission number, going to the next submission.
-    submissions_in_flight_fences_.push_back(fence);
-    fences_free_.pop_back();
 
     submission_open_ = false;
+
+    // Process any query resolves that completed with this submission.
+    PumpQueryResolves();
+    PumpPendingRetire();
   }
 
   if (is_closing_frame) {
@@ -5552,7 +6268,7 @@ bool VulkanCommandProcessor::EnsureSwapFxaaSourceImage(uint32_t width, uint32_t 
   if (swap_fxaa_source_image_ != VK_NULL_HANDLE) {
     const uint64_t destroy_submission = swap_fxaa_source_image_submission_;
     const uint64_t deferred_destroy_submission = GetCurrentSubmission();
-    if (submission_completed_ >= destroy_submission) {
+    if (GetCompletedSubmission() >= destroy_submission) {
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
                                              swap_fxaa_source_image_view_);
       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, swap_fxaa_source_image_);
@@ -5652,16 +6368,230 @@ void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
   swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
+bool VulkanCommandProcessor::EnsureSwapSmaaResources(uint32_t width, uint32_t height) {
+  assert_true(submission_open_);
+  if (!width || !height) {
+    return false;
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  auto create_image = [&](size_t index, VkFormat format, uint32_t image_width,
+                          uint32_t image_height, VkImageUsageFlags usage) -> bool {
+    VkImageCreateInfo image_create_info;
+    image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_create_info.pNext = nullptr;
+    image_create_info.flags = 0;
+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    image_create_info.format = format;
+    image_create_info.extent.width = image_width;
+    image_create_info.extent.height = image_height;
+    image_create_info.extent.depth = 1;
+    image_create_info.mipLevels = 1;
+    image_create_info.arrayLayers = 1;
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_create_info.usage = usage;
+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.queueFamilyIndexCount = 0;
+    image_create_info.pQueueFamilyIndices = nullptr;
+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            swap_smaa_images_[index], swap_smaa_image_memory_[index])) {
+      REXGPU_ERROR("Failed to create the SMAA image {}", index);
+      return false;
+    }
+    VkImageViewCreateInfo image_view_create_info;
+    image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    image_view_create_info.pNext = nullptr;
+    image_view_create_info.flags = 0;
+    image_view_create_info.image = swap_smaa_images_[index];
+    image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    image_view_create_info.format = format;
+    image_view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+    image_view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+    image_view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+    image_view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+    image_view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
+    if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr,
+                              &swap_smaa_image_views_[index]) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to create the SMAA image view {}", index);
+      return false;
+    }
+    return true;
+  };
+
+  // Intermediate images of the guest output size.
+  if (swap_smaa_images_[0] == VK_NULL_HANDLE || swap_smaa_image_width_ != width ||
+      swap_smaa_image_height_ != height) {
+    DestroySwapSmaaImages(0, kSwapSmaaImageIntermediateCount, false);
+    // The formats must match the image format qualifiers in the shaders.
+    static constexpr VkFormat kIntermediateFormats[kSwapSmaaImageIntermediateCount] = {
+        VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+    };
+    for (size_t i = 0; i < kSwapSmaaImageIntermediateCount; ++i) {
+      if (!create_image(i, kIntermediateFormats[i], width, height,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)) {
+        DestroySwapSmaaImages(0, kSwapSmaaImageIntermediateCount, true);
+        return false;
+      }
+    }
+    swap_smaa_image_width_ = width;
+    swap_smaa_image_height_ = height;
+  }
+
+  // The lookup textures, uploaded once.
+  if (swap_smaa_images_[kSwapSmaaImageArea] == VK_NULL_HANDLE) {
+    struct LookupTexture {
+      size_t index;
+      VkFormat format;
+      uint32_t width;
+      uint32_t height;
+      uint32_t pitch;
+      const uint8_t* data;
+    };
+    const LookupTexture lookup_textures[] = {
+        {kSwapSmaaImageArea, VK_FORMAT_R8G8_UNORM, smaa::kAreaTextureWidth,
+         smaa::kAreaTextureHeight, smaa::kAreaTexturePitch, smaa::GetAreaTextureData()},
+        {kSwapSmaaImageSearch, VK_FORMAT_R8_UNORM, smaa::kSearchTextureWidth,
+         smaa::kSearchTextureHeight, smaa::kSearchTexturePitch, smaa::GetSearchTextureData()},
+    };
+    VkDeviceSize area_size = VkDeviceSize(smaa::kAreaTexturePitch) * smaa::kAreaTextureHeight;
+    VkDeviceSize search_size =
+        VkDeviceSize(smaa::kSearchTexturePitch) * smaa::kSearchTextureHeight;
+    // Buffer offsets of copies to images must be multiples of the texel size
+    // and of 4.
+    const VkDeviceSize lookup_texture_offsets[] = {0, rex::round_up(area_size, 4, false)};
+    VkDeviceSize upload_size = lookup_texture_offsets[1] + search_size;
+    VkBuffer upload_buffer;
+    VkDeviceMemory upload_memory;
+    uint32_t upload_memory_type;
+    VkDeviceSize upload_memory_size;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, upload_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            ui::vulkan::util::MemoryPurpose::kUpload, upload_buffer, upload_memory,
+            &upload_memory_type, &upload_memory_size)) {
+      REXGPU_ERROR("Failed to create the SMAA lookup texture upload buffer");
+      return false;
+    }
+    void* upload_mapping;
+    if (dfn.vkMapMemory(device, upload_memory, 0, VK_WHOLE_SIZE, 0, &upload_mapping) !=
+        VK_SUCCESS) {
+      REXGPU_ERROR("Failed to map the SMAA lookup texture upload buffer");
+      dfn.vkDestroyBuffer(device, upload_buffer, nullptr);
+      dfn.vkFreeMemory(device, upload_memory, nullptr);
+      return false;
+    }
+    for (size_t i = 0; i < 2; ++i) {
+      const LookupTexture& lookup_texture = lookup_textures[i];
+      std::memcpy(static_cast<uint8_t*>(upload_mapping) + lookup_texture_offsets[i],
+                  lookup_texture.data, size_t(lookup_texture.pitch) * lookup_texture.height);
+    }
+    ui::vulkan::util::FlushMappedMemoryRange(vulkan_device, upload_memory, upload_memory_type, 0,
+                                             upload_memory_size);
+    dfn.vkUnmapMemory(device, upload_memory);
+    // Destroyed after this submission whether the upload is done or not.
+    destroy_buffers_.emplace_back(GetCurrentSubmission(), upload_buffer);
+    destroy_memory_.emplace_back(GetCurrentSubmission(), upload_memory);
+
+    VkImageSubresourceRange subresource_range = ui::vulkan::util::InitializeSubresourceRange();
+    for (size_t i = 0; i < 2; ++i) {
+      const LookupTexture& lookup_texture = lookup_textures[i];
+      if (!create_image(lookup_texture.index, lookup_texture.format, lookup_texture.width,
+                        lookup_texture.height,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        DestroySwapSmaaImages(kSwapSmaaImageIntermediateCount,
+                              kSwapSmaaImageCount - kSwapSmaaImageIntermediateCount, true);
+        return false;
+      }
+    }
+    for (size_t i = 0; i < 2; ++i) {
+      PushImageMemoryBarrier(swap_smaa_images_[lookup_textures[i].index], subresource_range,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
+    SubmitBarriers(true);
+    for (size_t i = 0; i < 2; ++i) {
+      const LookupTexture& lookup_texture = lookup_textures[i];
+      VkBufferImageCopy copy_region;
+      copy_region.bufferOffset = lookup_texture_offsets[i];
+      copy_region.bufferRowLength = 0;
+      copy_region.bufferImageHeight = 0;
+      copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      copy_region.imageSubresource.mipLevel = 0;
+      copy_region.imageSubresource.baseArrayLayer = 0;
+      copy_region.imageSubresource.layerCount = 1;
+      copy_region.imageOffset = {0, 0, 0};
+      copy_region.imageExtent = {lookup_texture.width, lookup_texture.height, 1};
+      deferred_command_buffer_.CmdVkCopyBufferToImage(
+          upload_buffer, swap_smaa_images_[lookup_texture.index],
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+      PushImageMemoryBarrier(swap_smaa_images_[lookup_texture.index], subresource_range,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+  }
+
+  return true;
+}
+
+void VulkanCommandProcessor::DestroySwapSmaaImages(size_t first, size_t count, bool immediately) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  bool destroy_now = immediately || GetCompletedSubmission() >= swap_smaa_images_submission_;
+  uint64_t destroy_submission = GetCurrentSubmission();
+  for (size_t i = first; i < first + count; ++i) {
+    if (destroy_now) {
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device,
+                                             swap_smaa_image_views_[i]);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, swap_smaa_images_[i]);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                             swap_smaa_image_memory_[i]);
+      continue;
+    }
+    if (swap_smaa_image_views_[i] != VK_NULL_HANDLE) {
+      destroy_image_views_.emplace_back(destroy_submission, swap_smaa_image_views_[i]);
+      swap_smaa_image_views_[i] = VK_NULL_HANDLE;
+    }
+    if (swap_smaa_images_[i] != VK_NULL_HANDLE) {
+      destroy_images_.emplace_back(destroy_submission, swap_smaa_images_[i]);
+      swap_smaa_images_[i] = VK_NULL_HANDLE;
+    }
+    if (swap_smaa_image_memory_[i] != VK_NULL_HANDLE) {
+      destroy_memory_.emplace_back(destroy_submission, swap_smaa_image_memory_[i]);
+      swap_smaa_image_memory_[i] = VK_NULL_HANDLE;
+    }
+  }
+  if (first < kSwapSmaaImageIntermediateCount) {
+    swap_smaa_image_width_ = 0;
+    swap_smaa_image_height_ = 0;
+  }
+}
+
 void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                                                 bool primitive_polygonal,
-                                                reg::RB_DEPTHCONTROL normalized_depth_control) {
+                                                reg::RB_DEPTHCONTROL normalized_depth_control,
+                                                bool depth_bias_in_pixel_shader,
+                                                bool window_offset_in_edram) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   const RegisterFile& regs = *register_file_;
-  uint32_t draw_resolution_scale_x = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
-  uint32_t draw_resolution_scale_y = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+  // Resolution scale of this draw (1x1 with draw_resolution_scale_threshold).
+  uint32_t draw_resolution_scale_x =
+      render_target_cache_ ? render_target_cache_->GetDrawScaleX() : 1;
+  uint32_t draw_resolution_scale_y =
+      render_target_cache_ ? render_target_cache_->GetDrawScaleY() : 1;
 
   // Window parameters.
   // http://ftp.tku.edu.tw/NetBSD/NetBSD-current/xsrc/external/mit/xf86-video-ati/dist/src/r600_reg_auto_r6xx.h
@@ -5691,7 +6621,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
 
   // Scissor.
   draw_util::Scissor scissor;
-  draw_util::GetScissor(regs, scissor);
+  draw_util::GetScissor(regs, scissor, true, window_offset_in_edram);
   scissor.offset[0] *= draw_resolution_scale_x;
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
@@ -5706,18 +6636,24 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     // Depth bias.
     float depth_bias_constant_factor, depth_bias_slope_factor;
-    draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, depth_bias_slope_factor,
-                                             depth_bias_constant_factor);
-    depth_bias_constant_factor *=
-        regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
-            ? draw_util::kD3D10PolygonOffsetFactorUnorm24
-            : draw_util::kD3D10PolygonOffsetFactorFloat24;
-    // With non-square resolution scaling, make sure the worst-case impact is
-    // reverted (slope only along the scaled axis), thus max. More bias is
-    // better than less bias, because less bias means Z fighting with the
-    // background is more likely.
-    depth_bias_slope_factor *= xenos::kPolygonOffsetScaleSubpixelUnit *
-                               float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
+    if (depth_bias_in_pixel_shader) {
+      // Applied by the pixel shader instead.
+      depth_bias_constant_factor = 0.0f;
+      depth_bias_slope_factor = 0.0f;
+    } else {
+      draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, depth_bias_slope_factor,
+                                               depth_bias_constant_factor);
+      depth_bias_constant_factor *=
+          regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
+              ? draw_util::kD3D10PolygonOffsetFactorUnorm24
+              : draw_util::kD3D10PolygonOffsetFactorFloat24;
+      // With non-square resolution scaling, make sure the worst-case impact is
+      // reverted (slope only along the scaled axis), thus max. Per-draw scale
+      // so native draws get the guest bias as is. More bias is better than less
+      // bias; less bias means Z fighting with the background is more likely.
+      depth_bias_slope_factor *= xenos::kPolygonOffsetScaleSubpixelUnit *
+                                 float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
+    }
     // std::memcmp instead of != so in case of NaN, every draw won't be
     // invalidating it.
     dynamic_depth_bias_update_needed_ |=
@@ -5764,9 +6700,11 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
           stencil_ref_mask_back_reg = XE_GPU_REG_RB_STENCILREFMASK_BF;
         } else {
           // Choose the back face values only if drawing only back faces.
-          stencil_ref_mask_front_reg = regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_front
-                                           ? XE_GPU_REG_RB_STENCILREFMASK_BF
-                                           : XE_GPU_REG_RB_STENCILREFMASK;
+          auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+          stencil_ref_mask_front_reg =
+              (pa_su_sc_mode_cntl.cull_front && !pa_su_sc_mode_cntl.cull_back)
+                  ? XE_GPU_REG_RB_STENCILREFMASK_BF
+                  : XE_GPU_REG_RB_STENCILREFMASK;
           stencil_ref_mask_back_reg = stencil_ref_mask_front_reg;
         }
       } else {
@@ -5864,7 +6802,9 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
     const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
-    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask) {
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
+    int32_t window_offset_tiles) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -5887,8 +6827,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+  // Resolution scale of this draw.
+  // 1x1 with draw_resolution_scale_threshold (FSI only).
+  uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
+  uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
 
   // Get the color info register values for each render target. Also, for FSI,
   // exclude components that don't exist in the format from the write mask.
@@ -5910,15 +6852,16 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     }
   }
 
-  // Disable depth and stencil if it aliases a color render target (for
-  // instance, during the XBLA logo in 58410954, though depth writing is already
-  // disabled there).
+  // Disable depth and stencil only if an aliased color target writes bits used
+  // by either test. Otherwise its keep-masked store preserves them.
   bool depth_stencil_enabled =
       normalized_depth_control.stencil_enable || normalized_depth_control.z_enable;
   if (edram_fragment_shader_interlock && depth_stencil_enabled) {
     for (uint32_t i = 0; i < 4; ++i) {
       if (rb_depth_info.depth_base == color_infos[i].color_base &&
-          (rt_keep_masks[i][0] != UINT32_MAX || rt_keep_masks[i][1] != UINT32_MAX)) {
+          RenderTargetCache::ColorOverlapsDepthStencil(color_infos[i].color_format,
+                                                       rt_keep_masks[i][0], rt_keep_masks[i][1],
+                                                       normalized_depth_control)) {
         depth_stencil_enabled = false;
         break;
       }
@@ -6130,6 +7073,18 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
   }
 
+  // Window offset carried in the EDRAM bases.
+  float param_gen_window_offset[2] = {0.0f, 0.0f};
+  if (window_offset_tiles) {
+    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    param_gen_window_offset[0] = float(pa_sc_window_offset.window_x_offset);
+    param_gen_window_offset[1] = float(pa_sc_window_offset.window_y_offset);
+  }
+  for (uint32_t i = 0; i < 2; ++i) {
+    dirty |= system_constants_.param_gen_window_offset[i] != param_gen_window_offset[i];
+    system_constants_.param_gen_window_offset[i] = param_gen_window_offset[i];
+  }
+
   // Point size.
   if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {
     auto pa_su_point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
@@ -6179,6 +7134,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       uint32_t texture_signs_mask = ((UINT32_C(1) << 8) - 1) << texture_signs_shift;
       dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
       texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
+      uint32_t texture_integer_scale_bits =
+          texture_cache_->GetActiveIntegerScaleBits(texture_index);
+      dirty |=
+          system_constants_.texture_integer_scale_bits[texture_index] != texture_integer_scale_bits;
+      system_constants_.texture_integer_scale_bits[texture_index] = texture_integer_scale_bits;
       textures_resolution_scaled |=
           uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
     }
@@ -6210,6 +7170,17 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       rb_colorcontrol.alpha_to_mask_enable ? (rb_colorcontrol.value >> 24) | (UINT32_C(1) << 8) : 0;
   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
   system_constants_.alpha_to_mask = alpha_to_mask;
+
+  // ZPD counter.
+  uint32_t zpd_counter_index = UINT32_MAX;
+  if (active_query_index_ != UINT32_MAX &&
+      (edram_fragment_shader_interlock ? active_query_is_fsi_ : active_segment_.hybrid)) {
+    zpd_counter_index = active_query_index_;
+  }
+  dirty |=
+      zpd_counter_index_force_update_ || system_constants_.zpd_counter_index != zpd_counter_index;
+  system_constants_.zpd_counter_index = zpd_counter_index;
+  zpd_counter_index_force_update_ = false;
 
   uint32_t edram_tile_dwords_scaled = xenos::kEdramTileWidthSamples *
                                       xenos::kEdramTileHeightSamples *
@@ -6253,7 +7224,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       dirty |= system_constants_.edram_rt_keep_mask[i][1] != rt_keep_masks[i][1];
       system_constants_.edram_rt_keep_mask[i][1] = rt_keep_masks[i][1];
       if (rt_keep_masks[i][0] != UINT32_MAX || rt_keep_masks[i][1] != UINT32_MAX) {
-        uint32_t rt_base_dwords_scaled = color_info.color_base * edram_tile_dwords_scaled;
+        uint32_t rt_base_dwords_scaled =
+            draw_util::AddWindowOffsetToEdramBase(
+                color_info.color_base, window_offset_tiles,
+                xenos::IsColorRenderTargetFormat64bpp(color_info.color_format)) *
+            edram_tile_dwords_scaled;
         dirty |= system_constants_.edram_rt_base_dwords_scaled[i] != rt_base_dwords_scaled;
         system_constants_.edram_rt_base_dwords_scaled[i] = rt_base_dwords_scaled;
         uint32_t format_flags = RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
@@ -6272,8 +7247,26 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     }
   }
 
+  if (!edram_fragment_shader_interlock && host_depth_polygon_offset) {
+    // Polygon offset applied in the pixel shader for host render target decals.
+    draw_util::HostDepthPolygonOffset polygon_offset = *host_depth_polygon_offset;
+    float scale_factor = float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
+    polygon_offset.front_scale *= scale_factor;
+    polygon_offset.back_scale *= scale_factor;
+    dirty |= system_constants_.edram_poly_offset_front_scale != polygon_offset.front_scale;
+    system_constants_.edram_poly_offset_front_scale = polygon_offset.front_scale;
+    dirty |= system_constants_.edram_poly_offset_front_offset != polygon_offset.front_offset;
+    system_constants_.edram_poly_offset_front_offset = polygon_offset.front_offset;
+    dirty |= system_constants_.edram_poly_offset_back_scale != polygon_offset.back_scale;
+    system_constants_.edram_poly_offset_back_scale = polygon_offset.back_scale;
+    dirty |= system_constants_.edram_poly_offset_back_offset != polygon_offset.back_offset;
+    system_constants_.edram_poly_offset_back_offset = polygon_offset.back_offset;
+  }
+
   if (edram_fragment_shader_interlock) {
-    uint32_t depth_base_dwords_scaled = rb_depth_info.depth_base * edram_tile_dwords_scaled;
+    uint32_t depth_base_dwords_scaled = draw_util::AddWindowOffsetToEdramBase(
+                                            rb_depth_info.depth_base, window_offset_tiles, false) *
+                                        edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled != depth_base_dwords_scaled;
     system_constants_.edram_depth_base_dwords_scaled = depth_base_dwords_scaled;
 
@@ -6418,32 +7411,47 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   constexpr uint32_t kAllConstantBuffersMask =
       (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
   assert_zero(current_constant_buffers_up_to_date_ & ~kAllConstantBuffersMask);
+  // The bindings are dynamic, so a new suballocation only changes the offsets
+  // passed when binding the set. The set itself has to be rewritten only when a
+  // pool page or a size changes.
+  bool constant_buffer_offsets_changed = false;
   if ((current_constant_buffers_up_to_date_ & kAllConstantBuffersMask) != kAllConstantBuffersMask) {
-    current_graphics_descriptor_set_values_up_to_date_ &=
-        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+    constant_buffer_offsets_changed = true;
     size_t uniform_buffer_alignment =
         size_t(vulkan_device->properties().minUniformBufferOffsetAlignment);
+    auto request_constant_buffer = [&](uint32_t index, size_t size) -> uint8_t* {
+      VkBuffer buffer = VK_NULL_HANDLE;
+      VkDeviceSize offset = 0;
+      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, size,
+                                                       uniform_buffer_alignment, buffer, offset);
+      if (!mapping) {
+        return nullptr;
+      }
+      VkDescriptorBufferInfo& constant_buffer_info = current_constant_buffer_infos_[index];
+      if (constant_buffer_info.buffer != buffer ||
+          constant_buffer_info.range != VkDeviceSize(size)) {
+        constant_buffer_info.buffer = buffer;
+        constant_buffer_info.range = VkDeviceSize(size);
+        current_graphics_descriptor_set_values_up_to_date_ &=
+            ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+      }
+      current_constant_buffer_dynamic_offsets_[index] = uint32_t(offset);
+      current_constant_buffers_up_to_date_ |= UINT32_C(1) << index;
+      return mapping;
+    };
     // System constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem))) {
-      VkDescriptorBufferInfo& buffer_info =
-          current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferSystem];
-      uint8_t* mapping = uniform_buffer_pool_->Request(
-          frame_current_, sizeof(SpirvShaderTranslator::SystemConstants), uniform_buffer_alignment,
-          buffer_info.buffer, buffer_info.offset);
+      uint8_t* mapping = request_constant_buffer(SpirvShaderTranslator::kConstantBufferSystem,
+                                                 sizeof(SpirvShaderTranslator::SystemConstants));
       if (!mapping) {
         return false;
       }
-      buffer_info.range = sizeof(SpirvShaderTranslator::SystemConstants);
       std::memcpy(mapping, &system_constants_, sizeof(SpirvShaderTranslator::SystemConstants));
-      current_constant_buffers_up_to_date_ |= UINT32_C(1)
-                                              << SpirvShaderTranslator::kConstantBufferSystem;
     }
     // Vertex shader float constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex))) {
-      VkDescriptorBufferInfo& buffer_info =
-          current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferFloatVertex];
       // Even if the shader doesn't need any float constants, a valid binding
       // must still be provided (the pipeline layout always has float constants,
       // for both the vertex shader and the pixel shader), so if the first draw
@@ -6451,13 +7459,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       // dummy buffer.
       size_t float_constants_size =
           sizeof(float) * 4 * std::max(float_constant_count_vertex, UINT32_C(1));
-      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, float_constants_size,
-                                                       uniform_buffer_alignment, buffer_info.buffer,
-                                                       buffer_info.offset);
+      uint8_t* mapping = request_constant_buffer(SpirvShaderTranslator::kConstantBufferFloatVertex,
+                                                 float_constants_size);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(float_constants_size);
       for (uint32_t i = 0; i < 4; ++i) {
         uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
         uint32_t float_constant_index;
@@ -6470,23 +7476,17 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           mapping += sizeof(float) * 4;
         }
       }
-      current_constant_buffers_up_to_date_ |= UINT32_C(1)
-                                              << SpirvShaderTranslator::kConstantBufferFloatVertex;
     }
     // Pixel shader float constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel))) {
-      VkDescriptorBufferInfo& buffer_info =
-          current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferFloatPixel];
       size_t float_constants_size =
           sizeof(float) * 4 * std::max(float_constant_count_pixel, UINT32_C(1));
-      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, float_constants_size,
-                                                       uniform_buffer_alignment, buffer_info.buffer,
-                                                       buffer_info.offset);
+      uint8_t* mapping = request_constant_buffer(SpirvShaderTranslator::kConstantBufferFloatPixel,
+                                                 float_constants_size);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(float_constants_size);
       for (uint32_t i = 0; i < 4; ++i) {
         uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
         uint32_t float_constant_index;
@@ -6499,42 +7499,28 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           mapping += sizeof(float) * 4;
         }
       }
-      current_constant_buffers_up_to_date_ |= UINT32_C(1)
-                                              << SpirvShaderTranslator::kConstantBufferFloatPixel;
     }
     // Bool and loop constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop))) {
-      VkDescriptorBufferInfo& buffer_info =
-          current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferBoolLoop];
       constexpr size_t kBoolLoopConstantsSize = sizeof(uint32_t) * (8 + 32);
-      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, kBoolLoopConstantsSize,
-                                                       uniform_buffer_alignment, buffer_info.buffer,
-                                                       buffer_info.offset);
+      uint8_t* mapping = request_constant_buffer(SpirvShaderTranslator::kConstantBufferBoolLoop,
+                                                 kBoolLoopConstantsSize);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(kBoolLoopConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], kBoolLoopConstantsSize);
-      current_constant_buffers_up_to_date_ |= UINT32_C(1)
-                                              << SpirvShaderTranslator::kConstantBufferBoolLoop;
     }
     // Fetch constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch))) {
-      VkDescriptorBufferInfo& buffer_info =
-          current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferFetch];
       constexpr size_t kFetchConstantsSize = sizeof(uint32_t) * 6 * 32;
-      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, kFetchConstantsSize,
-                                                       uniform_buffer_alignment, buffer_info.buffer,
-                                                       buffer_info.offset);
+      uint8_t* mapping =
+          request_constant_buffer(SpirvShaderTranslator::kConstantBufferFetch, kFetchConstantsSize);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(kFetchConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
-      current_constant_buffers_up_to_date_ |= UINT32_C(1)
-                                              << SpirvShaderTranslator::kConstantBufferFetch;
     }
   }
 
@@ -6559,10 +7545,33 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  // Reuse the texture and sampler descriptor sets across draws while their
+  // contents stay valid. A set becomes stale when the shader (and thus its
+  // binding list) changes, when a used texture's host image view changes, or
+  // when a sampler changes. The validity bits are cleared at the start of every
+  // frame, and the transient sets aren't recycled until the frame completes, so
+  // a kept set's handle is always still alive.
+  uint32_t textures_changed = texture_cache_->texture_bindings_changed();
+  uint32_t used_texture_mask_vertex = vertex_shader->GetUsedTextureMaskAfterTranslation();
+  uint32_t used_texture_mask_pixel =
+      pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0;
+  if ((current_graphics_descriptor_set_values_up_to_date_ &
+       (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex)) &&
+      (current_textures_vertex_shader_ != vertex_shader ||
+       (textures_changed & used_texture_mask_vertex) ||
+       current_written_samplers_vertex_ != current_samplers_vertex_)) {
+    current_graphics_descriptor_set_values_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
+  }
+  if ((current_graphics_descriptor_set_values_up_to_date_ &
+       (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel)) &&
+      (current_textures_pixel_shader_ != pixel_shader ||
+       (textures_changed & used_texture_mask_pixel) ||
+       current_written_samplers_pixel_ != current_samplers_pixel_)) {
+    current_graphics_descriptor_set_values_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+  }
+  texture_cache_->ResetTextureBindingsChanged(used_texture_mask_vertex | used_texture_mask_pixel);
 
   // Make sure new descriptor sets are bound to the command buffer.
 
@@ -6644,7 +7653,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       constants_transient_descriptors_free_.pop_back();
     } else {
       VkDescriptorPoolSize constants_descriptor_count;
-      constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
       constants_descriptor_count.descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
       constants_descriptor_set = transient_descriptor_allocator_uniform_buffer_.Allocate(
           descriptor_set_layout_constants_, &constants_descriptor_count, 1);
@@ -6663,7 +7672,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       write_constants.dstBinding = i;
       write_constants.dstArrayElement = 0;
       write_constants.descriptorCount = 1;
-      write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
       write_constants.pImageInfo = nullptr;
       write_constants.pBufferInfo = &current_constant_buffer_infos_[i];
       write_constants.pTexelBufferView = nullptr;
@@ -6688,6 +7697,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
         write_textures[0].dstSet;
+    // Remember what this set was written for, to reuse it in later draws.
+    current_textures_vertex_shader_ = vertex_shader;
+    current_written_samplers_vertex_ = current_samplers_vertex_;
   }
   // Pixel shader textures and samplers.
   if (write_pixel_textures) {
@@ -6705,6 +7717,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
         write_textures[0].dstSet;
+    // Remember what this set was written for, to reuse it in later draws.
+    current_textures_pixel_shader_ = pixel_shader;
+    current_written_samplers_pixel_ = current_samplers_pixel_;
   }
   // Write.
   if (write_descriptor_set_count) {
@@ -6714,6 +7729,13 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // Only make valid if all descriptor sets have been allocated and written
   // successfully.
   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
+
+  // Dynamic offsets are supplied when binding, so a moved suballocation needs a
+  // rebind even though the set itself is unchanged.
+  if (constant_buffer_offsets_changed) {
+    current_graphics_descriptor_sets_bound_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+  }
 
   // Bind the new descriptor sets.
   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
@@ -6729,11 +7751,18 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   while (rex::bit_scan_forward(descriptor_sets_remaining, &descriptor_set_index)) {
     uint32_t descriptor_set_mask_tzcnt =
         rex::tzcnt(~(descriptor_sets_remaining | ((UINT32_C(1) << descriptor_set_index) - 1)));
+    // The constants are the only dynamic bindings, so their offsets are passed
+    // only by the command covering that set.
+    bool binds_constants =
+        descriptor_set_index <= uint32_t(SpirvShaderTranslator::kDescriptorSetConstants) &&
+        uint32_t(SpirvShaderTranslator::kDescriptorSetConstants) < descriptor_set_mask_tzcnt;
     deferred_command_buffer_.CmdVkBindDescriptorSets(
         VK_PIPELINE_BIND_POINT_GRAPHICS,
         current_guest_graphics_pipeline_layout_->GetPipelineLayout(), descriptor_set_index,
         descriptor_set_mask_tzcnt - descriptor_set_index,
-        current_graphics_descriptor_sets_ + descriptor_set_index, 0, nullptr);
+        current_graphics_descriptor_sets_ + descriptor_set_index,
+        binds_constants ? uint32_t(SpirvShaderTranslator::kConstantBufferCount) : 0,
+        binds_constants ? current_constant_buffer_dynamic_offsets_ : nullptr);
     if (descriptor_set_mask_tzcnt >= 32) {
       break;
     }

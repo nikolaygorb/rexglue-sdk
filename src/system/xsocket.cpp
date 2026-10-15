@@ -9,9 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstring>
 
 #include <rex/kernel/xam/module.h>
+#include <rex/memory/utils.h>
 #include <rex/platform.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xsocket.h>
@@ -74,6 +76,25 @@ X_STATUS XSocket::Close() {
   return X_STATUS_SUCCESS;
 }
 
+// The guest reads and writes socket option values and the ioctlsocket argument
+// big-endian; the 4-byte ones (integers and BOOLs) are swapped for the host.
+// Gears of War 2 asked for 128 KiB buffers with SO_SNDBUF/SO_RCVBUF and got
+// 512 bytes (upstream issue #512).
+X_STATUS XSocket::GetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t* optlen) {
+  socklen_t native_len = static_cast<socklen_t>(*optlen);
+  int ret = getsockopt(native_handle_, level, optname, static_cast<char*>(optval_ptr), &native_len);
+  if (ret < 0) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  if (native_len == sizeof(uint32_t)) {
+    uint32_t host_value;
+    std::memcpy(&host_value, optval_ptr, sizeof(host_value));
+    rex::memory::store_and_swap<uint32_t>(optval_ptr, host_value);
+  }
+  *optlen = static_cast<uint32_t>(native_len);
+  return X_STATUS_SUCCESS;
+}
+
 X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen) {
   if (level == 0xFFFF && (optname == 0x5801 || optname == 0x5802)) {
     // Disable socket encryption
@@ -81,7 +102,13 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
     return X_STATUS_SUCCESS;
   }
 
-  int ret = setsockopt(native_handle_, level, optname, (char*)optval_ptr, optlen);
+  char* value = static_cast<char*>(optval_ptr);
+  uint32_t host_value;
+  if (optlen == sizeof(host_value)) {
+    host_value = rex::memory::load_and_swap<uint32_t>(optval_ptr);
+    value = reinterpret_cast<char*>(&host_value);
+  }
+  int ret = setsockopt(native_handle_, level, optname, value, optlen);
   if (ret < 0) {
     // TODO: WSAGetLastError()
     return X_STATUS_UNSUCCESSFUL;
@@ -96,10 +123,15 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr, 
 }
 
 X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
-  int ret = rex::net::socket_ioctl(native_handle_, cmd, arg_ptr);
+  // The argument is one u_long, read (FIONBIO) or written (FIONREAD).
+  uint32_t host_arg = arg_ptr ? rex::memory::load_and_swap<uint32_t>(arg_ptr) : 0;
+  int ret = rex::net::socket_ioctl(native_handle_, cmd, reinterpret_cast<uint8_t*>(&host_arg));
   if (ret < 0) {
     // TODO: Get last error
     return X_STATUS_UNSUCCESSFUL;
+  }
+  if (arg_ptr) {
+    rex::memory::store_and_swap<uint32_t>(arg_ptr, host_arg);
   }
 
   return X_STATUS_SUCCESS;
@@ -156,6 +188,19 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
   socket->proto_ = proto_;
 
   return socket;
+}
+
+X_STATUS XSocket::GetSockName(N_XSOCKADDR* name, int* name_len) {
+  sockaddr n_sockaddr = {};
+  socklen_t n_name_len = sizeof(sockaddr);
+  if (getsockname(native_handle_, &n_sockaddr, &n_name_len) < 0) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  const int count =
+      std::min({*name_len, static_cast<int>(n_name_len), static_cast<int>(sizeof(N_XSOCKADDR))});
+  std::memcpy(name, &n_sockaddr, count);
+  *name_len = static_cast<int>(n_name_len);
+  return X_STATUS_SUCCESS;
 }
 
 int XSocket::Shutdown(int how) {

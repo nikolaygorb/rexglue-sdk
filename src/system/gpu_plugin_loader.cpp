@@ -66,7 +66,8 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
 
   platform::DynamicLibrary library;
   if (!library.Load(path, platform::SymbolResolution::kImmediate)) {
-    REXSYS_ERROR("GPU plugin '{}' failed to load: {}", name, path.string());
+    REXSYS_ERROR("GPU plugin '{}' failed to load: {}: {}", name, path.string(),
+                 library.last_error());
     return nullptr;
   }
 

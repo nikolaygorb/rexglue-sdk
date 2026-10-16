@@ -15,10 +15,13 @@ add_executable(unit_tests
     core/stream_test.cpp
     core/chrono_test.cpp
     core/socket_test.cpp
+    core/gpu_vendor_test.cpp
+    core/utf8_case_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
     ppc/fpscr_test.cpp
     system/guest_path_test.cpp
+    system/xsocket_accept_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
     audio/conversion_test.cpp

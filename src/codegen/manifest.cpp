@@ -20,6 +20,7 @@
 
 #include <toml++/toml.hpp>
 
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/system/guest_path.h>
 
@@ -54,6 +55,33 @@ bool IsValidProjectName(std::string_view name) {
 }
 
 /**
+ * Rewrite a manifest path to its on-disk spelling when it only matches by
+ * case. Windows finds `assets/default.xex` for `assets/Default.xex`, Linux and
+ * macOS do not, so a manifest written on Windows would fail there. Every later
+ * `manifestDir / path` join then sees the real name. Paths that match nothing
+ * are left alone for the caller's "not found" error.
+ */
+void FixPathCase(std::string& rel, const std::filesystem::path& base_dir, std::string_view field) {
+  if (rel.empty()) {
+    return;
+  }
+  std::error_code ec;
+  const auto given = rex::to_path(rel);
+  if (std::filesystem::exists(base_dir / given, ec)) {
+    return;
+  }
+  const auto resolved = rex::filesystem::ResolvePathCaseInsensitive(base_dir, given);
+  if (!std::filesystem::exists(resolved, ec)) {
+    return;
+  }
+  auto fixed = rex::path_to_utf8(given.is_absolute() ? resolved
+                                                     : resolved.lexically_relative(base_dir));
+  REXLOG_WARN("Manifest {} '{}' differs from the file on disk only in case; using '{}'", field,
+              rel, fixed);
+  rel = std::move(fixed);
+}
+
+/**
  * Pull file_path / out_directory_path / project_name onto the recompiler
  * config so downstream consumers can rely on them. Other fields (codegen
  * flags, sub-tables, includes) come from RecompilerConfig::LoadFromTable.
@@ -65,6 +93,8 @@ bool LoadBinaryConfig(const toml::table& tbl, const std::filesystem::path& base_
   if (!out.recompiler.LoadFromTable(tbl, base_dir)) {
     return false;
   }
+  FixPathCase(out.recompiler.filePath, base_dir, "file_path");
+  FixPathCase(out.recompiler.templateDir, base_dir, "template_dir");
   return true;
 }
 
@@ -105,6 +135,7 @@ std::optional<ManifestConfig> ManifestConfig::Load(const std::filesystem::path& 
   }
   if (auto root = (*project)["game_root"].value<std::string>(); root && !root->empty()) {
     manifest.gameRoot = *root;
+    FixPathCase(*manifest.gameRoot, manifest.manifestDir, "[project].game_root");
   }
 
   auto* entrypoint = tbl["entrypoint"].as_table();

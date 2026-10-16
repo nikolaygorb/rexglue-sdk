@@ -28,7 +28,12 @@ bool DynamicLibrary::Load(const std::filesystem::path& path, SymbolResolution /*
   // Windows resolves all imports at load time; mode is informational only.
   Close();
   handle_ = static_cast<void*>(LoadLibraryW(path.c_str()));
-  return handle_ != nullptr;
+  if (!handle_) {
+    last_error_ = "LoadLibraryW error " + std::to_string(GetLastError());
+    return false;
+  }
+  last_error_.clear();
+  return true;
 }
 
 void DynamicLibrary::Close() {

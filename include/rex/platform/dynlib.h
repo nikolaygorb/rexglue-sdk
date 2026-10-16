@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string>
 
 #include <rex/platform.h>
 
@@ -36,6 +37,10 @@ class DynamicLibrary {
 
   void* GetRawSymbol(const char* name) const;
 
+  // Loader message for the last failed Load() (dlerror() on POSIX, the
+  // GetLastError() code on Windows); empty after a successful Load().
+  const std::string& last_error() const { return last_error_; }
+
   template <typename T>
   T GetSymbol(const char* name) const {
     return reinterpret_cast<T>(GetRawSymbol(name));
@@ -43,6 +48,7 @@ class DynamicLibrary {
 
  private:
   void* handle_ = nullptr;
+  std::string last_error_;
 };
 
 namespace lib_names {

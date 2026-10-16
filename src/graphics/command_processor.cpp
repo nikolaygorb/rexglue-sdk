@@ -160,8 +160,10 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       register_file_(graphics_system_->register_file()),
       worker_running_(true),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
+      vblank_event_(rex::thread::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0) {
   assert_not_null(write_ptr_index_event_);
+  assert_not_null(vblank_event_);
 }
 
 CommandProcessor::~CommandProcessor() = default;
@@ -235,6 +237,26 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
   }
   return legacy_readback_resolve_enabled ? ReadbackResolveMode::kFast
                                          : ReadbackResolveMode::kDisabled;
+}
+
+uint64_t CommandProcessor::GetReadbackResolveKey(uint32_t written_address,
+                                                 uint32_t written_length) const {
+  const RegisterFile& regs = *register_file_;
+  reg::RB_COPY_CONTROL copy_control = regs.Get<reg::RB_COPY_CONTROL>();
+  reg::RB_COPY_DEST_INFO dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
+  // Not the exponent bias, the EDRAM base or the size: they may change from frame to frame
+  // in the same pass, and each change would be a GPU wait.
+  uint64_t signature = uint64_t(copy_control.copy_src_select >= 4) |
+                       (uint64_t(dest_info.copy_dest_format) << 1) |
+                       (uint64_t(dest_info.copy_dest_number) << 7) |
+                       (uint64_t(dest_info.copy_dest_endian) << 10) |
+                       (uint64_t(dest_info.copy_dest_swap) << 13) |
+                       (uint64_t(dest_info.copy_dest_array) << 14) |
+                       (uint64_t(dest_info.copy_dest_slice) << 15);
+  // Distinct keys for distinct signatures; signature 0 (a color copy to k_1_REVERSE) keeps
+  // the plain (address, length) key.
+  return ((uint64_t(written_address) << 32) | uint64_t(written_length)) ^
+         (signature * UINT64_C(0x9E3779B97F4A7C15));
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
@@ -407,6 +429,27 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
   return it != extended_register_values_.end() ? it->second : 0;
 }
 
+namespace {
+// RegisterFile::GetRegisterInfo is a switch over every known register. Calling it
+// on each register write, only to log writes to unknown registers, cost more than
+// the rest of the write; look the registers up once instead.
+class KnownRegisters {
+ public:
+  KnownRegisters() {
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+      if (RegisterFile::GetRegisterInfo(i)) {
+        bits_[i >> 6] |= uint64_t(1) << (i & 63);
+      }
+    }
+  }
+  bool IsKnown(uint32_t index) const { return (bits_[index >> 6] >> (index & 63)) & 1; }
+
+ private:
+  uint64_t bits_[(RegisterFile::kRegisterCount + 63) / 64] = {};
+};
+const KnownRegisters known_registers;
+}  // namespace
+
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
   if (index >= RegisterFile::kRegisterCount) {
@@ -422,7 +465,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!known_registers.IsKnown(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -802,10 +845,16 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg) {
+    // Consecutive registers: as a range, so the backend can take the constant
+    // blocks (most of these packets) in one go rather than one virtual
+    // WriteRegister call per register.
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+    WriteRegister(base_index, reg_data);
   }
 
   return true;
@@ -1146,7 +1195,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // Sleep, but wake up after a guest vblank interrupt: games wait here
+          // for values their interrupt handler changes (the frame flip), and a
+          // full sleep added up to a millisecond to every such wait.
+          rex::thread::Wait(vblank_event_.get(), false, std::chrono::milliseconds(wait / 0x100));
         }
         rex::thread::SyncMemory();
         ReturnFromWait();

@@ -268,6 +268,9 @@ class ShaderStorageWriter {
           pipeline_storage_file_,
           uint64_t(sizeof(pipeline_header) +
                    sizeof(TPipelineStoredDescription) * pipeline_descriptions_out.size()));
+      // The stream was last read from; ISO C requires a positioning call
+      // before it is written to (the storage writer appends from now on).
+      rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
     } else {
       // Write new header.
       rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
@@ -309,6 +312,9 @@ class ShaderStorageWriter {
             return false;
           });
       rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
+      // Same as for the pipeline storage: switch the stream from reading to
+      // writing with a positioning call.
+      rex::filesystem::Seek(shader_storage_file_, 0, SEEK_END);
     } else {
       // Write new header.
       rex::filesystem::TruncateStdioFile(shader_storage_file_, 0);

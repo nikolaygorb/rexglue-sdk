@@ -18,6 +18,10 @@ REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_upload_range, false, "GPU",
                     "Allows games to read data from pages that are marked as no access.");
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
+// Used by both the DXBC and the SPIR-V translators; the DXBC sources are built
+// only with D3D12, so the definition must not live there.
+REXCVAR_DEFINE_BOOL(draw_resolution_scaled_texture_offsets, true, "GPU/Shader",
+                    "Scale texture offsets with draw resolution");
 REXCVAR_DEFINE_BOOL(precise_interpolation, true, "GPU",
                     "Interpolate pixel shader inputs manually from the per-vertex values (Vulkan "
                     "with VK_KHR_fragment_shader_barycentric) to avoid host interpolation "

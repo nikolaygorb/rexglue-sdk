@@ -752,3 +752,24 @@ TEST_CASE("LookupHeapByType selects correct heap", "[memory][heap]") {
     // Should be vC0000000 heap
   }
 }
+
+TEST_CASE("AllocRange keeps the allocation within an unaligned high bound", "[memory][heap]") {
+  auto& memory = GetTestMemory();
+  auto* heap = MutableHeap(memory.LookupHeap(0x38000000));  // v00000000, 4KB pages
+  REQUIRE(heap != nullptr);
+
+  // The bound is not 64 KB aligned. Rounding it up let a top-down search
+  // return 0x38010000, past the requested range.
+  const uint32_t low = 0x38000000;
+  const uint32_t high = 0x38008FFF;
+  uint32_t addr = 0;
+  bool result = heap->AllocRange(low, high, 0x1000, 0x10000,
+                                 rex::memory::kMemoryAllocationReserve,
+                                 rex::memory::kMemoryProtectRead, true, &addr);
+  REQUIRE(result);
+  CHECK(addr >= low);
+  CHECK(addr + 0x1000 - 1 <= high);
+  CHECK(addr % 0x10000 == 0);
+
+  heap->Release(addr, nullptr);
+}

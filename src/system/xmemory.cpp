@@ -1393,7 +1393,9 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   alignment = rex::round_up(alignment, page_size_);
   uint32_t page_count = get_page_count(size, page_size_, page_size_shift_);
   low_address = std::max(heap_base_, rex::align(low_address, alignment));
-  high_address = std::min(heap_base_ + (heap_size_ - 1), rex::align(high_address, alignment));
+  // high_address is inclusive: rounding it up would let the allocation end up to one
+  // alignment stride past the caller's bound.
+  high_address = std::min(heap_base_ + (heap_size_ - 1), high_address);
   if (high_address < low_address) {
     REXSYS_ERROR("BaseHeap::Alloc invalid requested range");
     return false;

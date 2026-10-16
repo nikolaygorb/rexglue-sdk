@@ -279,7 +279,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     }
     std::string host_tail{tail};
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
-    auto xex_host = paths.game_data_root / host_tail;
+    // The guest path is case-insensitive and so is the VFS host device; a
+    // Default.xex on a case-sensitive host must not fail this check.
+    auto xex_host =
+        rex::filesystem::ResolvePathCaseInsensitive(paths.game_data_root, rex::to_path(host_tail));
     if (!std::filesystem::is_regular_file(xex_host)) {
       auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
       REXLOG_ERROR("{}", msg);

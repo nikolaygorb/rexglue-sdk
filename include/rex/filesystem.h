@@ -126,6 +126,14 @@ struct FileInfo {
 bool GetInfo(const std::filesystem::path& path, FileInfo* out_info);
 std::vector<FileInfo> ListFiles(const std::filesystem::path& path);
 
+// Joins `base` and `relative` the way a case-insensitive host (Windows, the
+// guest) would: a component of `relative` that does not exist as spelled is
+// matched against its directory ignoring case. The exact spelling wins when
+// both exist. From the first component that matches nothing on, the rest is
+// appended as given, so the result simply does not exist.
+std::filesystem::path ResolvePathCaseInsensitive(const std::filesystem::path& base,
+                                                 const std::filesystem::path& relative);
+
 #if REX_PLATFORM_ANDROID
 void AndroidInitialize();
 void AndroidShutdown();

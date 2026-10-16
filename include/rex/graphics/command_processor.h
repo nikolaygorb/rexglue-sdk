@@ -121,6 +121,8 @@ class CommandProcessor {
 
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
+  // Called after the guest's vblank interrupt handler has run.
+  void OnVblankDispatched() { vblank_event_->Set(); }
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
@@ -471,6 +473,12 @@ class CommandProcessor {
 
   // Shared readback resolve mode with backend legacy-flag alias support.
   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
+  // Key of the resolve readback buffers of the current copy: the written range, plus whether
+  // the copy is from depth or color and its destination format. A range that one pass resolves
+  // every frame (a depth buffer) and another pass resolves once for the CPU to read (a color
+  // image) then has a buffer per pass, so the rare copy is a first-seen key: "some" copies it
+  // back, and "fast" does not hand the CPU the other pass's data of the previous resolve.
+  uint64_t GetReadbackResolveKey(uint32_t written_address, uint32_t written_length) const;
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 
@@ -540,6 +548,9 @@ class CommandProcessor {
   uint32_t read_ptr_writeback_ptr_ = 0;
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+  // Set after each guest vblank interrupt: WAIT_REG_MEM sleeps on it, so a value
+  // the interrupt handler changes (the swap and flip waits) ends the wait at once.
+  std::unique_ptr<rex::thread::Event> vblank_event_;
   std::atomic<uint32_t> write_ptr_index_;
 
   // Some titles submit writes beyond the emulated register file range in PM4

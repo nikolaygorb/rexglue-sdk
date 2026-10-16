@@ -33,6 +33,9 @@ REXCVAR_DECLARE(bool, fullscreen_exclusive);
 REXCVAR_DECLARE(int32_t, monitor);
 REXCVAR_DECLARE(std::string, video_driver);
 
+// Graphics card selection (defined in src/ui/presenter.cpp)
+REXCVAR_DECLARE(std::string, gpu_vendor);
+
 // Display (guest video mode; defined in src/ui/window.cpp)
 REXCVAR_DECLARE(int32_t, video_mode_width);
 REXCVAR_DECLARE(int32_t, video_mode_height);

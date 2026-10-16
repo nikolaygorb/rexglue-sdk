@@ -172,13 +172,19 @@ object_ref<XSocket> XSocket::Accept(N_XSOCKADDR* name, int* name_len) {
   socklen_t n_name_len = sizeof(sockaddr);
   uintptr_t ret = accept(native_handle_, &n_sockaddr, &n_name_len);
   if (ret == -1) {
-    std::memset(name, 0, *name_len);
+    if (name) {
+      std::memset(name, 0, *name_len);
+    }
     *name_len = 0;
     return nullptr;
   }
 
-  std::memcpy(name, &n_sockaddr, n_name_len);
-  *name_len = n_name_len;
+  // name is optional; never copy more than the caller's buffer holds.
+  if (name) {
+    n_name_len = std::min(n_name_len, static_cast<socklen_t>(*name_len));
+    std::memcpy(name, &n_sockaddr, n_name_len);
+    *name_len = n_name_len;
+  }
 
   // Create a kernel object to represent the new socket, and copy parameters
   // over.

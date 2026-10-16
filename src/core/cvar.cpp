@@ -14,6 +14,7 @@
 #include <fstream>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string_view>
 #include <unordered_map>
 
@@ -535,13 +536,28 @@ std::vector<std::string> ListModifiedFlags() {
   return result;
 }
 
+namespace {
+
+// Quote a string value as a single-line TOML basic string, escaping backslashes,
+// quotes and control characters. The default formatter flags would also allow
+// literal and multi-line strings, and toml++ 3.4 does not write every multi-line
+// string back correctly.
+std::string TomlString(const std::string& value) {
+  const toml::value<std::string> node{value};
+  std::ostringstream out;
+  out << toml::toml_formatter{node, toml::format_flags::allow_unicode_strings};
+  return out.str();
+}
+
+}  // namespace
+
 std::string SerializeToTOML() {
   std::lock_guard lock(GetRegistryMutex());
   std::string result;
   for (const auto& entry : GetRegistryStorage()) {
     if (entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = " + TomlString(entry.getter()) + "\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }
@@ -556,7 +572,7 @@ std::string SerializeToTOML(std::string_view category) {
   for (const auto& entry : GetRegistryStorage()) {
     if (entry.category == category && entry.getter() != entry.default_value) {
       if (entry.type == FlagType::String) {
-        result += entry.name + " = \"" + entry.getter() + "\"\n";
+        result += entry.name + " = " + TomlString(entry.getter()) + "\n";
       } else {
         result += entry.name + " = " + entry.getter() + "\n";
       }
@@ -698,13 +714,35 @@ void SaveConfig(const std::filesystem::path& config_path) {
   }
 
   try {
-    std::ofstream file(config_path);
-    if (!file) {
-      REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
+    // Write to a temporary sibling and rename it over the target, so an
+    // interrupted write (crash, power loss, full disk) cannot leave a truncated
+    // config behind.
+    std::filesystem::path temp_path = config_path;
+    temp_path += ".tmp";
+    {
+      std::ofstream file(temp_path, std::ios::trunc);
+      if (!file) {
+        REXLOG_ERROR("SaveConfig: failed to open {}", temp_path.string());
+        return;
+      }
+      file << "# Auto-generated cvar configuration\n";
+      file << content;
+      file.flush();
+      if (!file) {
+        REXLOG_ERROR("SaveConfig: failed to write {}", temp_path.string());
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        return;
+      }
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp_path, config_path, ec);
+    if (ec) {
+      REXLOG_ERROR("SaveConfig: failed to replace {}: {}", config_path.string(), ec.message());
+      std::error_code remove_ec;
+      std::filesystem::remove(temp_path, remove_ec);
       return;
     }
-    file << "# Auto-generated cvar configuration\n";
-    file << content;
     REXLOG_INFO("Saved config to {}", config_path.string());
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());

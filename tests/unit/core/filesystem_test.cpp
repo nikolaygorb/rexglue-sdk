@@ -125,3 +125,81 @@ TEST_CASE("OpenExisting failed read reports zero bytes", "[filesystem]") {
   CHECK_FALSE(handle->Read(0, buffer.data(), buffer.size(), &bytes_read));
   CHECK(bytes_read == 0);
 }
+
+namespace {
+
+class ScopedTempDir {
+ public:
+  ScopedTempDir() {
+    path_ = std::filesystem::temp_directory_path() /
+            ("rexglue_filesystem_dir_" + std::to_string(counter_++));
+    std::filesystem::remove_all(path_);
+    REQUIRE(std::filesystem::create_directories(path_));
+  }
+  ~ScopedTempDir() {
+    std::error_code ec;
+    std::filesystem::remove_all(path_, ec);
+  }
+
+  const std::filesystem::path& path() const { return path_; }
+
+  void Touch(const std::filesystem::path& relative) const {
+    std::filesystem::create_directories((path_ / relative).parent_path());
+    REQUIRE(rex::filesystem::CreateEmptyFile(path_ / relative));
+  }
+
+  // macOS (APFS default) and Windows match names ignoring case, Linux does not.
+  bool IsCaseSensitive() const {
+    Touch("probe");
+    return !std::filesystem::exists(path_ / "PROBE");
+  }
+
+ private:
+  std::filesystem::path path_;
+  static inline int counter_ = 0;
+};
+
+}  // namespace
+
+TEST_CASE("ResolvePathCaseInsensitive finds a name that differs in case", "[filesystem]") {
+  ScopedTempDir dir;
+  const bool case_sensitive = dir.IsCaseSensitive();
+  dir.Touch("Assets/Default.xex");
+
+  auto resolved = rex::filesystem::ResolvePathCaseInsensitive(dir.path(), "assets/default.xex");
+  CHECK(std::filesystem::is_regular_file(resolved));
+  if (case_sensitive) {
+    CHECK(resolved == dir.path() / "Assets" / "Default.xex");
+  }
+}
+
+TEST_CASE("ResolvePathCaseInsensitive keeps an exact path", "[filesystem]") {
+  ScopedTempDir dir;
+  dir.Touch("Assets/Default.xex");
+
+  auto resolved = rex::filesystem::ResolvePathCaseInsensitive(dir.path(), "Assets/Default.xex");
+  CHECK(resolved == dir.path() / "Assets" / "Default.xex");
+}
+
+TEST_CASE("ResolvePathCaseInsensitive prefers the exact spelling", "[filesystem]") {
+  ScopedTempDir dir;
+  if (!dir.IsCaseSensitive()) {
+    SKIP("host filesystem ignores case");
+  }
+  dir.Touch("default.xex");
+  dir.Touch("Default.xex");
+
+  CHECK(rex::filesystem::ResolvePathCaseInsensitive(dir.path(), "Default.xex") ==
+        dir.path() / "Default.xex");
+  CHECK(rex::filesystem::ResolvePathCaseInsensitive(dir.path(), "default.xex") ==
+        dir.path() / "default.xex");
+}
+
+TEST_CASE("ResolvePathCaseInsensitive leaves a missing path as given", "[filesystem]") {
+  ScopedTempDir dir;
+  dir.Touch("Assets/Default.xex");
+
+  auto resolved = rex::filesystem::ResolvePathCaseInsensitive(dir.path(), "missing/default.xex");
+  CHECK(resolved == dir.path() / "missing" / "default.xex");
+  CHECK_FALSE(std::filesystem::exists(resolved));
+}

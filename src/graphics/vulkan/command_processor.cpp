@@ -72,6 +72,13 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_depth_bias_force_unorm, true, "GPU/Vulkan",
+                    "Apply the depth bias in constant units on float depth buffers where "
+                    "VK_EXT_depth_bias_control supports it, so the bias keeps its absolute size "
+                    "at every depth. Otherwise, the bias unit of a float depth buffer shrinks "
+                    "with the depth, and decals may Z-fight, especially with reversed depth.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -2258,6 +2265,8 @@ void VulkanCommandProcessor::ShutdownContext() {
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // Only the shader constant blocks are handled here (WriteRegistersFromMem
+  // relies on that for the other registers).
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2364,18 +2373,76 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    // Games rewrite many fetch constants with the values they already have. The
+    // fetch constant buffer, the texture bindings and the vertex buffer
+    // residency only depend on the values, so invalidate them for the dwords
+    // that change only.
+    uint32_t* values = register_file_->values + start_index;
+    uint32_t first_changed = UINT32_MAX, last_changed = 0;
+    for (uint32_t i = 0; i < num_registers; ++i) {
+      uint32_t value = memory::load_and_swap<uint32_t>(base + i);
+      if (values[i] != value) {
+        values[i] = value;
+        if (first_changed == UINT32_MAX) {
+          first_changed = i;
+        }
+        last_changed = i;
+      }
+    }
+    if (first_changed == UINT32_MAX) {
+      return;
+    }
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
-    uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t first_fetch_dword =
+        start_index + first_changed - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t last_fetch_dword = start_index + last_changed - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
     return;
   }
 
-  CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
+  // A range with other registers, or across blocks: split it. The parts in the
+  // constant blocks take the paths above; WriteRegister handles only those
+  // blocks itself, so the other registers go straight to the common handling,
+  // without a virtual call for each.
+  uint32_t index = start_index;
+  const uint32_t range_end = start_index + num_registers;
+  while (index < range_end) {
+    uint32_t part_end;
+    bool constant_block = true;
+    if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+      part_end = XE_GPU_REG_SHADER_CONSTANT_511_W + 1;
+    } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+               index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+      part_end = XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1;
+    } else if (index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+               index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+      part_end = XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1;
+    } else {
+      constant_block = false;
+      if (index < XE_GPU_REG_SHADER_CONSTANT_000_X) {
+        part_end = XE_GPU_REG_SHADER_CONSTANT_000_X;
+      } else if (index < XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) {
+        part_end = XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+      } else if (index < XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031) {
+        part_end = XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031;
+      } else {
+        part_end = range_end;
+      }
+    }
+    part_end = std::min(part_end, range_end);
+    uint32_t* part_base = base + (index - start_index);
+    if (constant_block) {
+      VulkanCommandProcessor::WriteRegistersFromMem(index, part_base, part_end - index);
+    } else {
+      for (uint32_t i = index; i < part_end; ++i) {
+        CommandProcessor::WriteRegister(i, memory::load_and_swap<uint32_t>(part_base + (i - index)));
+      }
+    }
+    index = part_end;
+  }
 }
 
 void VulkanCommandProcessor::SparseBindBuffer(VkBuffer buffer, uint32_t bind_count,
@@ -4584,8 +4651,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
   }
 
-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
-      !memexport_ranges_.empty()) {
+  // Empty first: the setting check looks the legacy setting up by name (a lock, two
+  // strings and a hash lookup), which was 15% of the command processor in a race.
+  if (!memexport_ranges_.empty() &&
+      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       memexport_total_size += memexport_range.size_bytes;
@@ -4998,7 +5067,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   };
 
-  uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+  uint64_t resolve_key = GetReadbackResolveKey(written_address, written_length);
   ReadbackBuffer& readback = readback_buffers_[resolve_key];
   readback.last_used_frame = frame_current_;
   uint32_t write_index = readback.current_index;
@@ -6635,6 +6704,12 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
 
   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     // Depth bias.
+    const ui::vulkan::VulkanDevice::Properties& device_properties =
+        GetVulkanDevice()->properties();
+    const bool depth_bias_force_unorm =
+        REXCVAR_GET(vulkan_depth_bias_force_unorm) && device_properties.depthBiasControl &&
+        device_properties.leastRepresentableValueForceUnormRepresentation &&
+        device_properties.depthBiasExact;
     float depth_bias_constant_factor, depth_bias_slope_factor;
     if (depth_bias_in_pixel_shader) {
       // Applied by the pixel shader instead.
@@ -6643,10 +6718,15 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     } else {
       draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, depth_bias_slope_factor,
                                                depth_bias_constant_factor);
-      depth_bias_constant_factor *=
-          regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
-              ? draw_util::kD3D10PolygonOffsetFactorUnorm24
-              : draw_util::kD3D10PolygonOffsetFactorFloat24;
+      const bool depth_float24 =
+          regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8;
+      depth_bias_constant_factor *= depth_float24 ? draw_util::kD3D10PolygonOffsetFactorFloat24
+                                                  : draw_util::kD3D10PolygonOffsetFactorUnorm24;
+      if (depth_bias_force_unorm && depth_float24) {
+        // With a constant bias unit, the host 0...0.5 depth range no longer
+        // lowers the exponent (see kD3D10PolygonOffsetFactorFloat24).
+        depth_bias_constant_factor *= 0.5f;
+      }
       // With non-square resolution scaling, make sure the worst-case impact is
       // reverted (slope only along the scaled axis), thus max. Per-draw scale
       // so native draws get the guest bias as is. More bias is better than less
@@ -6664,8 +6744,14 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     if (dynamic_depth_bias_update_needed_) {
       dynamic_depth_bias_constant_factor_ = depth_bias_constant_factor;
       dynamic_depth_bias_slope_factor_ = depth_bias_slope_factor;
-      deferred_command_buffer_.CmdVkSetDepthBias(dynamic_depth_bias_constant_factor_, 0.0f,
-                                                 dynamic_depth_bias_slope_factor_);
+      if (depth_bias_force_unorm) {
+        deferred_command_buffer_.CmdVkSetDepthBias2EXT(
+            dynamic_depth_bias_constant_factor_, 0.0f, dynamic_depth_bias_slope_factor_,
+            VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT, true);
+      } else {
+        deferred_command_buffer_.CmdVkSetDepthBias(dynamic_depth_bias_constant_factor_, 0.0f,
+                                                   dynamic_depth_bias_slope_factor_);
+      }
       dynamic_depth_bias_update_needed_ = false;
     }
 

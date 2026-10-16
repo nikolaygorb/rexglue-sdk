@@ -365,7 +365,9 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
 
   X_STATUS result = 0;
   do {
-    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
+    // The kernel wait type is 0 for WaitAll and 1 for WaitAny.
+    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all ? 0 : 1, 1,
+                                                    alertable,
                                                     timeout != -1 ? &timeout_wait : nullptr);
   } while (result == X_STATUS_ALERTED);
 
@@ -374,7 +376,8 @@ u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32
     XThread::SetLastError(error);
     return ~0u;
   }
-  return 0;
+  // The signaled event's index, WSA_WAIT_TIMEOUT or WSA_WAIT_IO_COMPLETION.
+  return result;
 }
 
 u32 NetDll_WSACreateEvent_entry() {
@@ -717,7 +720,8 @@ u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
 
 u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr_ptr,
                         mapped_u32 addrlen_ptr) {
-  if (!addr_ptr) {
+  // The address is optional but one asked for needs room.
+  if (addr_ptr && (!addrlen_ptr || *addrlen_ptr < sizeof(XSOCKADDR))) {
     // WSAEFAULT
     XThread::SetLastError(0x271E);
     return -1;
@@ -730,14 +734,16 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
     return -1;
   }
 
-  N_XSOCKADDR native_addr(addr_ptr);
-  int native_len = *addrlen_ptr;
-  auto new_socket = socket->Accept(&native_addr, &native_len);
+  // Only the 16-byte address is filled, whatever length the guest passes.
+  N_XSOCKADDR native_addr;
+  int native_len = static_cast<int>(sizeof(native_addr));
+  auto new_socket = socket->Accept(addr_ptr ? &native_addr : nullptr, &native_len);
   if (new_socket) {
-    addr_ptr->address_family = native_addr.address_family;
-    std::memcpy(addr_ptr->sa_data, native_addr.sa_data, *addrlen_ptr - 2);
-    *addrlen_ptr = native_len;
-
+    if (addr_ptr) {
+      addr_ptr->address_family = native_addr.address_family;
+      std::memcpy(addr_ptr->sa_data, native_addr.sa_data, sizeof(native_addr.sa_data));
+      *addrlen_ptr = native_len;
+    }
     return new_socket->handle();
   } else {
     return -1;

@@ -1942,6 +1942,12 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
   auto& d3d12_cache = static_cast<D3D12TextureCache&>(texture_cache());
 
   if (texture_3d_as_2d_) {
+    // The wrapper has its own memory watch, but only its creation loaded it: a
+    // texture the guest rewrites (a resolve target every frame) kept showing its
+    // first contents. LoadTextureData only uploads what became outdated.
+    if (texture_3d_as_2d_->outdated_mask() && !d3d12_cache.LoadTextureData(*texture_3d_as_2d_)) {
+      REXGPU_ERROR("D3D12TextureCache: Failed to reload 3D-as-2D wrapper data");
+    }
     d3d12_cache.command_processor_.PushTransitionBarrier(
         texture_3d_as_2d_->resource(), texture_3d_as_2d_->SetResourceState(end_state), end_state);
     return texture_3d_as_2d_->resource();

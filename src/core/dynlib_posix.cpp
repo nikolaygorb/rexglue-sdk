@@ -28,7 +28,13 @@ bool DynamicLibrary::Load(const std::filesystem::path& path, SymbolResolution mo
   Close();
   int flags = (mode == SymbolResolution::kImmediate) ? RTLD_NOW : RTLD_LAZY;
   handle_ = dlopen(path.c_str(), flags);
-  return handle_ != nullptr;
+  if (!handle_) {
+    const char* error = dlerror();
+    last_error_ = error ? error : "unknown dlopen error";
+    return false;
+  }
+  last_error_.clear();
+  return true;
 }
 
 void DynamicLibrary::Close() {

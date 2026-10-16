@@ -29,6 +29,15 @@
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
 
+// Graphics card selection, read by the Vulkan and the Direct3D 12 providers
+// (defined here because either backend may be left out of the build).
+REXCVAR_DEFINE_STRING(
+    gpu_vendor, "", "GPU",
+    "Graphics card to use: nvidia, amd, intel or a PCI vendor id such as 0x10de (Vulkan and "
+    "Direct3D 12). Empty prefers a discrete GPU over an integrated one. vulkan_device / "
+    "d3d12_adapter name an index and win over this.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
 

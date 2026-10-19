@@ -116,7 +116,7 @@ class Entry {
   bool Delete(Entry* entry);
   bool Delete();
   virtual bool Truncate() { return false; }
-  X_STATUS Rename(const std::filesystem::path& file_path);
+  X_STATUS Rename(const std::filesystem::path& file_path, bool replace_existing = false);
   void Touch();
 
   // If successful, out_file points to a new file. When finished, call
@@ -146,8 +146,9 @@ class Entry {
     (void)entry;
     return false;
   }
-  virtual X_STATUS RenameEntryInternal(const std::vector<std::string_view>& path_parts) {
-    (void)path_parts;
+  virtual X_STATUS RenameEntryInternal(Entry* new_parent, const std::string_view name) {
+    (void)new_parent;
+    (void)name;
     return X_STATUS_NOT_SUPPORTED;
   }
 

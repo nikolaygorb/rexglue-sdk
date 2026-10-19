@@ -41,6 +41,7 @@ class StfsContainerDevice : public Device {
     return header_.metadata.volume_type != XContentVolumeType::kStfs ||
            header_.metadata.volume_descriptor.stfs.flags.bits.read_only_format;
   }
+  bool is_io_queued() const override { return true; }
 
   void Dump(string::StringBuffer* string_buffer) override;
   Entry* ResolvePath(const std::string_view path) override;

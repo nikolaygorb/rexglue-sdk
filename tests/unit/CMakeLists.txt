@@ -11,9 +11,16 @@ add_executable(unit_tests
     core/fiber_test.cpp
     core/filesystem_test.cpp
     core/vfs_overwrite_test.cpp
+    core/vfs_io_queued_test.cpp
+    core/vfs_rename_test.cpp
+    core/vfs_mount_path_test.cpp
+    core/vfs_open_status_test.cpp
+    core/vfs_entry_update_test.cpp
+    core/vfs_package_thumbnail_test.cpp
     core/hash_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
+    core/chrono_steady_cast_test.cpp
     core/socket_test.cpp
     core/gpu_vendor_test.cpp
     core/utf8_case_test.cpp

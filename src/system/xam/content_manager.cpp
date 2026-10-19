@@ -30,7 +30,6 @@ namespace rex {
 namespace system {
 namespace xam {
 
-static const char* kThumbnailFileName = "__thumbnail.png";
 
 static const char* kGameUserContentDirName = "profile";
 
@@ -46,8 +45,8 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
-                                                                  /*allow_share_delete=*/true);
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+      device_path_, package_path, false, /*allow_share_delete=*/true, /*package=*/true);
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
@@ -333,7 +332,7 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
                                              std::vector<uint8_t>* buffer) {
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
-  auto thumb_path = package_path / kThumbnailFileName;
+  auto thumb_path = package_path / rex::filesystem::kPackageThumbnailFileName;
   if (std::filesystem::exists(thumb_path)) {
     auto file = rex::filesystem::OpenFile(thumb_path, "rb");
     fseek(file, 0, SEEK_END);
@@ -354,7 +353,7 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
   auto package_path = ResolvePackagePath(xuid, data);
   std::filesystem::create_directories(package_path);
   if (std::filesystem::exists(package_path)) {
-    auto thumb_path = package_path / kThumbnailFileName;
+    auto thumb_path = package_path / rex::filesystem::kPackageThumbnailFileName;
     auto file = rex::filesystem::OpenFile(thumb_path, "wb");
     fwrite(buffer.data(), 1, buffer.size(), file);
     fclose(file);
@@ -481,8 +480,8 @@ ContentManager::FindOpenPackageByData(const XCONTENT_AGGREGATE_DATA& data) {
 ContentPackage* ContentManager::DetachPackage(
     std::unordered_map<string::string_key_case, ContentPackage*,
                        string::string_key_case::Hash>::iterator it) {
-  CloseOpenedFilesFromContent(it->first.view());
   ContentPackage* package = it->second;
+  CloseOpenedFilesFromContent(*package);
   open_packages_.erase(it);
   return package;
 }
@@ -501,18 +500,18 @@ std::filesystem::path ContentManager::GetOpenPackagePath(const std::string_view 
   return it->second->package_path();
 }
 
-void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_name) {
+void ContentManager::CloseOpenedFilesFromContent(const ContentPackage& package) {
   // TODO(Gliniak): Cleanup this code to care only about handles
   // related to provided content
   const std::vector<object_ref<XFile>> all_files_handles =
       kernel_state_->object_table()->GetObjectsByType<XFile>(XObject::Type::File);
 
-  std::string resolved_path = "";
-  kernel_state_->file_system()->FindSymbolicLink(std::string(root_name) + ':', resolved_path);
-
+  // Match on the package's own mount rather than the root link's target: a
+  // failed lookup left the prefix empty and released every open file, and a
+  // title can repoint its root link before closing the content.
   for (const object_ref<XFile>& file : all_files_handles) {
     std::string file_path = file->entry()->absolute_path();
-    bool is_file_inside_content = rex::string::utf8_starts_with(file_path, resolved_path);
+    bool is_file_inside_content = rex::string::utf8_starts_with(file_path, package.device_path());
 
     if (is_file_inside_content) {
       file->ReleaseHandle();

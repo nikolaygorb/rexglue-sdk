@@ -29,6 +29,7 @@ class Device {
 
   const std::string& mount_path() const { return mount_path_; }
   virtual bool is_read_only() const { return true; }
+  virtual bool is_io_queued() const { return false; }
 
   virtual void Dump(string::StringBuffer* string_buffer) = 0;
   /// Resolves a guest-relative path against the device. An empty @p path is

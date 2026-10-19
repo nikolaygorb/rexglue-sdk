@@ -71,6 +71,11 @@ REXCVAR_DEFINE_BOOL(xenos_sample_positions, false, "GPU",
                     "real hardware, if the GPU and driver support it.\n"
                     "Only applies to RTV/FBO - ROV/FSI render targets always use Xenos positions "
                     "since they safely map coverage and calculate depth in-shader.");
+// Used by both the DXBC and the SPIR-V translators.
+REXCVAR_DEFINE_BOOL(texture_point_snap, false, "GPU",
+                    "Snap normalized point sampled 2D texture coordinates to texel centers. Fixes "
+                    "texture seams in titles that use virtual textures, e.g. idTech 5, but may "
+                    "cause rendering issues in other titles.");
 
 bool IsGpuDebugMarkersEnabled() {
   static bool cached = false;

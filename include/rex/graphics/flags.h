@@ -74,6 +74,7 @@ REXCVAR_DECLARE(int32_t, primitive_processor_cache_min_indices);
 REXCVAR_DECLARE(bool, gpu_debug_markers);
 REXCVAR_DECLARE(bool, force_depth_clamp);
 REXCVAR_DECLARE(bool, xenos_sample_positions);
+REXCVAR_DECLARE(bool, texture_point_snap);
 bool IsGpuDebugMarkersEnabled();
 
 // GPU Alpha Test

@@ -110,11 +110,18 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
 }
 
 u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
+  // Based on XAM only first byte is cleared on failure.
   if (user_index >= 4) {
+    if (buffer) {
+      *buffer = '\0';
+    }
     return X_E_INVALIDARG;
   }
 
   if (user_index) {
+    if (buffer) {
+      *buffer = '\0';
+    }
     return X_E_NO_SUCH_USER;
   }
 

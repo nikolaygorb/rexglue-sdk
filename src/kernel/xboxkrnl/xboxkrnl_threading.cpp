@@ -380,7 +380,9 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
     thread->DeliverAPCs();
   }
 
-  X_STATUS result = thread->Delay(processor_mode, alertable, *interval_ptr);
+  // TODO(Ecredes): Verify whether a null interval should be treated as zero.
+  uint64_t interval = interval_ptr ? static_cast<uint64_t>(*interval_ptr) : 0u;
+  X_STATUS result = thread->Delay(processor_mode, alertable, interval);
 
   if (alertable && result == X_STATUS_USER_APC) {
     thread->DeliverAPCs();

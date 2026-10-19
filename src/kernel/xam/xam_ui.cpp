@@ -637,7 +637,6 @@ REX_EXPORT_STUB(__imp__XamIsSysUiInvokedByTitle);
 REX_EXPORT_STUB(__imp__XamIsSysUiInvokedByXenonButton);
 REX_EXPORT_STUB(__imp__XamIsUIThread);
 REX_EXPORT_STUB(__imp__XamNavigate);
-REX_EXPORT_STUB(__imp__XamNavigateBack);
 REX_EXPORT_STUB(__imp__XamOverrideHudOpenType);
 REX_EXPORT_STUB(__imp__XamShowAchievementDetailsUI);
 REX_EXPORT_STUB(__imp__XamShowAchievementsUIEx);

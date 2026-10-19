@@ -79,7 +79,7 @@ u32 CreateFileA_entry(mapped_string lpFileName, u32 dwDesiredAccess, u32 dwShare
   }
 
   auto file =
-      rex::system::object_ref<rex::system::XFile>(new rex::system::XFile(ks, vfs_file, true));
+      rex::system::object_ref<rex::system::XFile>(new rex::system::XFile(ks, vfs_file, true, true));
   auto handle = file->handle();
   REXKRNL_NOISY_DEBUG("rexcrt_CreateFileA: '{}' -> handle={:#x}", path, handle);
   return handle;
@@ -287,7 +287,7 @@ u32 FindFirstFileA_entry(mapped_string lpFileName, mapped_void lpFindFileData) {
   }
 
   auto xfile =
-      rex::system::object_ref<rex::system::XFile>(new rex::system::XFile(ks, vfs_file, true));
+      rex::system::object_ref<rex::system::XFile>(new rex::system::XFile(ks, vfs_file, true, true));
   xfile->SetFindPattern(pattern);
 
   auto* entry = xfile->FindNext();

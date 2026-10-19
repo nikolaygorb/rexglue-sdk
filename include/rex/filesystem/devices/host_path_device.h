@@ -17,12 +17,16 @@
 
 namespace rex::filesystem {
 
+// The runtime keeps a package thumbnail as a file inside the package directory.
+// The console holds it in the STFS header, so the guest never sees it.
+inline constexpr char kPackageThumbnailFileName[] = "__thumbnail.png";
+
 class HostPathEntry;
 
 class HostPathDevice : public Device {
  public:
   HostPathDevice(const std::string_view mount_path, const std::filesystem::path& host_path,
-                 bool read_only, bool allow_share_delete = false);
+                 bool read_only, bool allow_share_delete = false, bool package = false);
   ~HostPathDevice() override;
 
   bool Initialize() override;
@@ -30,6 +34,7 @@ class HostPathDevice : public Device {
   Entry* ResolvePath(const std::string_view path) override;
 
   bool is_read_only() const override { return read_only_; }
+  bool is_io_queued() const override { return is_package_; }
   // NOTE(tomc): When true, host file handles open with FILE_SHARE_DELETE so an open read
   // handle (e.g. a save-slot preview) does not block an overwrite's
   // delete+recreate. Opt-in per device: content/save devices set it; game-data
@@ -54,6 +59,7 @@ class HostPathDevice : public Device {
   std::unique_ptr<Entry> root_entry_;
   bool read_only_;
   bool allow_share_delete_;
+  bool is_package_;
 };
 
 }  // namespace rex::filesystem

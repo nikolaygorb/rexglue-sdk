@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -62,8 +63,10 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 
-u32 XamFeatureEnabled_entry(u32 unk) {
-  return 0;
+u32 XamFeatureEnabled_entry(u64 feature_bit) {
+  // Canary tests the bit in std::bitset<36>(0x40FFFFFFFF), which keeps bits 0-31
+  // only (and throws past bit 35).
+  return feature_bit < 32 ? 1 : 0;
 }
 
 // Empty stub schema binary.
@@ -89,6 +92,19 @@ u32 XamGetOnlineSchema_entry() {
 }
 
 namespace {
+
+// A kernel version packed as 4.4.16.8 bits.
+constexpr uint32_t PackSystemVersion(uint16_t major, uint16_t minor, uint16_t build, uint8_t qfe) {
+  return uint32_t(major) << 28 | (uint32_t(minor) & 0xF) << 24 | uint32_t(build) << 8 | qfe;
+}
+// 2.0.2411.0, a value a retail console reported.
+static_assert(PackSystemVersion(2, 0, 2411, 0) == 0x20096B00);
+
+// The version XboxKrnlVersion exports.
+constexpr uint32_t kXamCurrentSystemVersion = PackSystemVersion(
+    kKernelVersionMajor, kKernelVersionMinor, kKernelVersionBuild, kKernelVersionQfe);
+constexpr uint32_t kXamBaseSystemVersion =
+    PackSystemVersion(kKernelVersionMajor, 0, kBaseKernelBuildVersion, 0);
 
 // FILETIMEs between 2000 and 2100; anything else is not a time, which tells
 // the two signatures of the format functions apart.
@@ -197,12 +213,7 @@ u32 XamBuildXamResourceLocator_entry(mapped_wstring filename, mapped_void buffer
 }
 
 u32 XamGetSystemVersion_entry() {
-  // eh, just picking one. If we go too low we may break new games, but
-  // this value seems to be used for conditionally loading symbols and if
-  // we pretend to be old we have less to worry with implementing.
-  // 0x200A3200
-  // 0x20096B00
-  return 0;
+  return kXamCurrentSystemVersion;
 }
 
 void XCustomRegisterDynamicActions_entry() {
@@ -259,12 +270,15 @@ u32 XamGetExecutionId_entry(mapped_u32 info_ptr) {
   return X_STATUS_SUCCESS;
 }
 
+constexpr uint32_t MAX_LAUNCH_DATA_SIZE = 0x3FC;
+
 u32 XamLoaderSetLaunchData_entry(mapped_void data, u32 size) {
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
   auto& loader_data = xam->loader_data();
   loader_data.launch_data_present = size ? true : false;
-  loader_data.launch_data.resize(size);
-  std::memcpy(loader_data.launch_data.data(), data, size);
+  const uint32_t copy_size = std::min(size, MAX_LAUNCH_DATA_SIZE);
+  loader_data.launch_data.resize(copy_size);
+  std::memcpy(loader_data.launch_data.data(), data, copy_size);
   return 0;
 }
 
@@ -329,6 +343,13 @@ void XamLoaderTerminateTitle_entry() {
   REX_KERNEL_STATE()->TerminateTitle();
 }
 
+// Navigates to the URI pushed with XamPushBackURI, or with none reboots to the
+// dashboard. XamPushBackURI is not implemented, so this always exits.
+void XamNavigateBack_entry() {
+  // This function does not return.
+  REX_KERNEL_STATE()->TerminateTitle();
+}
+
 u32 XamAlloc_entry(u32 unk, u32 size, mapped_u32 out_ptr) {
   assert_true(unk == 0);
 
@@ -372,7 +393,6 @@ u32 XamSwapDisc_entry(u32 disc_number) {
 
 namespace {
 
-constexpr uint32_t kXamBaseKernelBuildVersion = 1888;
 constexpr X_HRESULT kXamPending = X_HRESULT_FROM_WIN32(X_ERROR_IO_PENDING);
 constexpr X_HRESULT kXamNotImplemented = static_cast<X_HRESULT>(0x80004001L);
 constexpr X_HRESULT kXamOnlineNotLoggedOn = static_cast<X_HRESULT>(0x80151802L);
@@ -670,11 +690,11 @@ u32 XamLookupCommonStringByIndex_entry(u32 string_index) {
 }
 
 u32 XamUpdateGetBaseSystemVersion_entry() {
-  return kXamBaseKernelBuildVersion;
+  return kXamBaseSystemVersion;
 }
 
 u32 XamUpdateGetCurrentSystemVersion_entry() {
-  return kXamBaseKernelBuildVersion;
+  return kXamCurrentSystemVersion;
 }
 
 u32 XamXStudioRequest_entry(u32 unk1, mapped_u32 unk2) {
@@ -747,6 +767,7 @@ REX_EXPORT(__imp__XamLoaderGetLaunchDataSize, rex::kernel::xam::XamLoaderGetLaun
 REX_EXPORT(__imp__XamLoaderGetLaunchData, rex::kernel::xam::XamLoaderGetLaunchData_entry)
 REX_EXPORT(__imp__XamLoaderLaunchTitle, rex::kernel::xam::XamLoaderLaunchTitle_entry)
 REX_EXPORT(__imp__XamLoaderTerminateTitle, rex::kernel::xam::XamLoaderTerminateTitle_entry)
+REX_EXPORT(__imp__XamNavigateBack, rex::kernel::xam::XamNavigateBack_entry)
 REX_EXPORT(__imp__XamAlloc, rex::kernel::xam::XamAlloc_entry)
 REX_EXPORT(__imp__XamFree, rex::kernel::xam::XamFree_entry)
 REX_EXPORT(__imp__XamQueryLiveHiveW, rex::kernel::xam::XamQueryLiveHiveW_entry)

@@ -89,10 +89,13 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       // Only a root that links to an XContent package has a volume device
       // type; a title running from disc (an extracted image) gets an error.
+      // A root can also point at an opened content package (e.g. its title
+      // update), which mounts at \Device\Content\N from the HDD content store.
       std::string target;
       const std::string root(data->root_name, strnlen(data->root_name, sizeof(data->root_name)));
       if (!REX_KERNEL_FS()->FindSymbolicLink(root + ':', target) ||
-          !target.starts_with("\\Device\\Package_")) {
+          (!target.starts_with("\\Device\\Package_") &&
+           !target.starts_with("\\Device\\Content\\"))) {
         return X_E_INVALIDARG;
       }
       // Packages live on the (emulated) hard drive.

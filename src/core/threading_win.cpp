@@ -13,6 +13,8 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include "platform_win.h"
 
+#include <algorithm>
+
 #include <spdlog/spdlog.h>
 
 #include <rex/assert.h>
@@ -279,6 +281,12 @@ class Win32Timer : public Win32Handle<Timer> {
   explicit Win32Timer(HANDLE handle) : Win32Handle(handle) {}
   ~Win32Timer() = default;
 
+  // SetWaitableTimer treats a negative due time as relative, so a past
+  // absolute one is clamped to fire at once.
+  static LONGLONG AbsoluteDueTime(WClock_::time_point due_time) {
+    return std::max(due_time.time_since_epoch().count(), WClock_::rep(0));
+  }
+
   bool SetOnceAfter(rex::chrono::hundrednanoseconds rel_time,
                     std::function<void()> opt_callback) override {
     return SetOnceAt(WClock_::now() + rel_time, std::move(opt_callback));
@@ -290,7 +298,7 @@ class Win32Timer : public Win32Handle<Timer> {
     std::lock_guard<std::mutex> lock(mutex_);
     callback_ = std::move(opt_callback);
     LARGE_INTEGER due_time_li;
-    due_time_li.QuadPart = WClock_::to_file_time(due_time);
+    due_time_li.QuadPart = AbsoluteDueTime(due_time);
     auto completion_routine =
         callback_ ? reinterpret_cast<PTIMERAPCROUTINE>(CompletionRoutine) : NULL;
     return SetWaitableTimer(handle_, &due_time_li, 0, completion_routine, this, FALSE) ? true
@@ -311,7 +319,7 @@ class Win32Timer : public Win32Handle<Timer> {
     std::lock_guard<std::mutex> lock(mutex_);
     callback_ = std::move(opt_callback);
     LARGE_INTEGER due_time_li;
-    due_time_li.QuadPart = WClock_::to_file_time(due_time);
+    due_time_li.QuadPart = AbsoluteDueTime(due_time);
     auto completion_routine =
         callback_ ? reinterpret_cast<PTIMERAPCROUTINE>(CompletionRoutine) : NULL;
     return SetWaitableTimer(handle_, &due_time_li, int32_t(period.count()), completion_routine,

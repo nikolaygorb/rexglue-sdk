@@ -23,14 +23,18 @@
 
 namespace rex::system {
 
-XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
-    : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
-  async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous,
+             bool allow_buffering)
+    : XObject(kernel_state, kObjectType),
+      file_(file),
+      is_synchronous_(synchronous),
+      allow_buffering_(allow_buffering) {
+  async_event_ = rex::thread::Event::CreateManualResetEvent(false);
   assert_not_null(async_event_);
 }
 
 XFile::XFile() : XObject(kObjectType) {
-  async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+  async_event_ = rex::thread::Event::CreateManualResetEvent(false);
   assert_not_null(async_event_);
 }
 
@@ -103,15 +107,23 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
 }
 
 X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
-                     uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion) {
+                     uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion,
+                     bool* out_pending) {
   std::lock_guard<std::mutex> lock(file_lock_);
+  if (notify_completion) {
+    // Cleared at issue, so a wait cannot return on an earlier completion.
+    async_event_->Reset();
+  }
   return ReadInternal(buffer_guest_address, buffer_length, byte_offset, out_bytes_read, apc_context,
-                      notify_completion);
+                      notify_completion, out_pending);
 }
 
 X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
                              uint64_t byte_offset, uint32_t* out_bytes_read, uint32_t apc_context,
-                             bool notify_completion) {
+                             bool notify_completion, bool* out_pending) {
+  if (out_pending) {
+    *out_pending = false;
+  }
   if (byte_offset == uint64_t(-1)) {
     // Read from current position.
     byte_offset = position_;
@@ -163,6 +175,10 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                       : memory()->TranslateVirtual(buffer_guest_address),
                   buffer_length),
               size_t(byte_offset), &bytes_read);
+          if (out_pending && !is_synchronous_) {
+            *out_pending = device()->is_io_queued() ||
+                           (!allow_buffering_ && result == X_STATUS_SUCCESS);
+          }
           if (XSUCCEEDED(result)) {
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(
@@ -170,14 +186,13 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                   buffer_length, true, true);
             }
 
-            if (byte_offset) {
-              position_ = byte_offset;
-            }
-            position_ += bytes_read;
+            position_ = byte_offset + bytes_read;
           }
         }
       }
     }
+  } else if (out_pending && !is_synchronous_) {
+    *out_pending = device()->is_io_queued();
   }
 
   if (out_bytes_read) {
@@ -199,8 +214,18 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
 }
 
 X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, uint64_t byte_offset,
-                            uint32_t* out_bytes_read, uint32_t apc_context) {
+                            uint32_t* out_bytes_read, uint32_t apc_context, bool* out_pending) {
   std::lock_guard<std::mutex> lock(file_lock_);
+  async_event_->Reset();
+  if (out_pending) {
+    *out_pending = false;
+  }
+  if (out_bytes_read) {
+    *out_bytes_read = 0;
+  }
+  if (!length) {
+    return ReadInternal(0, 0, byte_offset, out_bytes_read, apc_context, true, out_pending);
+  }
   X_STATUS result = X_STATUS_SUCCESS;
 
   // segments points to an array of buffer pointers of type
@@ -225,10 +250,8 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
     uint32_t bytes_read = 0;
     result = ReadInternal(
         read_buffer, read_length,
-        byte_offset
-            ? ((byte_offset != -1 && byte_offset != -2) ? byte_offset + read_total : byte_offset)
-            : -1,
-        &bytes_read, apc_context, false);
+        byte_offset != uint64_t(-1) ? byte_offset + read_total : byte_offset,
+        &bytes_read, apc_context, false, out_pending);
 
     if (result != X_STATUS_SUCCESS) {
       break;
@@ -255,19 +278,43 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
 }
 
 X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
-                      uint32_t* out_bytes_written, uint32_t apc_context) {
+                      uint32_t* out_bytes_written, uint32_t apc_context, bool* out_pending) {
   std::lock_guard<std::mutex> lock(file_lock_);
+  async_event_->Reset();
+  if (out_pending) {
+    *out_pending = false;
+  }
   if (byte_offset == uint64_t(-1)) {
     // Write from current position.
     byte_offset = position_;
+  } else if (byte_offset == kEndOfFile) {
+    // The entry's size is only refreshed on request.
+    entry()->update();
+    byte_offset = entry()->size();
+  }
+
+  bool extends_file = false;
+  if (out_pending && !is_synchronous_ && !allow_buffering_ && buffer_length &&
+      !device()->is_io_queued()) {
+    // TODO(boma): Compare NtWriteFile returns for unbuffered async writes
+    // within and past EOF on real hardware.
+    entry()->update();
+    uint64_t file_size = entry()->size();
+    extends_file = byte_offset > file_size || buffer_length > file_size - byte_offset;
   }
 
   size_t bytes_written = 0;
   X_STATUS result = file_->WriteSync(
       std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
       size_t(byte_offset), &bytes_written);
-  if (XSUCCEEDED(result)) {
-    position_ += bytes_written;
+  if (out_pending && !is_synchronous_) {
+    *out_pending =
+        device()->is_io_queued() ||
+        (!allow_buffering_ && buffer_length && !extends_file && result == X_STATUS_SUCCESS);
+  }
+  // A zero-length write leaves the position alone.
+  if (XSUCCEEDED(result) && buffer_length) {
+    position_ = byte_offset + bytes_written;
   }
 
   XIOCompletion::IONotification notify;
@@ -290,9 +337,9 @@ X_STATUS XFile::SetLength(size_t length) {
   return file_->SetLength(length);
 }
 
-X_STATUS XFile::Rename(const std::filesystem::path& file_path) {
+X_STATUS XFile::Rename(const std::filesystem::path& file_path, bool replace_existing) {
   std::lock_guard<std::mutex> lock(file_lock_);
-  return entry()->Rename(file_path);
+  return entry()->Rename(file_path, replace_existing);
 }
 
 void XFile::RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port) {
@@ -325,6 +372,7 @@ bool XFile::Save(stream::ByteStream* stream) {
   stream->Write<bool>((file_->entry()->attributes() & rex::filesystem::kFileAttributeDirectory) !=
                       0);
   stream->Write<bool>(is_synchronous_);
+  stream->Write<bool>(allow_buffering_);
 
   return true;
 }
@@ -342,6 +390,7 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state, stream::ByteStream* 
   auto access = stream->Read<uint32_t>();
   auto is_directory = stream->Read<bool>();
   auto is_synchronous = stream->Read<bool>();
+  auto allow_buffering = stream->Read<bool>();
 
   REXSYS_DEBUG("XFile {:08X} ({})", file->handle(), abs_path);
 
@@ -358,6 +407,7 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state, stream::ByteStream* 
   file->file_ = vfs_file;
   file->position_ = position;
   file->is_synchronous_ = is_synchronous;
+  file->allow_buffering_ = allow_buffering;
 
   return object_ref<XFile>(file);
 }

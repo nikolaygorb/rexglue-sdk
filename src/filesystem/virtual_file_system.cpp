@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/string.h>
@@ -73,6 +75,7 @@ bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
 }
 
 bool VirtualFileSystem::FindSymbolicLink(const std::string_view path, std::string& target) {
+  auto global_lock = global_critical_region_.Acquire();
   auto it = std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
     return rex::string::utf8_starts_with_case(path, s.first);
   });
@@ -84,6 +87,7 @@ bool VirtualFileSystem::FindSymbolicLink(const std::string_view path, std::strin
 }
 
 bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::string& result) {
+  auto global_lock = global_critical_region_.Acquire();
   result = path;
   bool was_resolved = false;
   while (true) {
@@ -102,6 +106,31 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
   return was_resolved;
 }
 
+namespace {
+
+// A mount path matches only on a whole path component. Without this a device
+// mounted at ...\Content also swallows ...\Content_Eng.
+bool MountPathMatches(const std::string_view path, const std::string_view mount_path) {
+  if (mount_path.empty()) {
+    return false;
+  }
+  const char last = mount_path.back();
+  // Links name a \Device\Content\N\ root without the trailing separator.
+  if (last == '\\' && path.size() + 1 == mount_path.size()) {
+    return rex::string::utf8_equal_case(path, mount_path.substr(0, path.size()));
+  }
+  if (!rex::string::utf8_starts_with_case(path, mount_path)) {
+    return false;
+  }
+  // Mounts ending in a delimiter already sit on a component boundary.
+  if (last == '\\' || last == ':') {
+    return true;
+  }
+  return path.size() == mount_path.size() || path[mount_path.size()] == '\\';
+}
+
+}  // namespace
+
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
 
@@ -115,11 +144,16 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     normalized_path = resolved_path;
   }
 
-  // Find the device.
-  auto it = std::find_if(devices_.cbegin(), devices_.cend(), [&](const auto& d) {
-    return rex::string::utf8_starts_with_case(normalized_path, d->mount_path());
-  });
-  if (it == devices_.cend()) {
+  // Find the device with the longest matching mount path. Devices can nest, so
+  // the most specific mount must win regardless of registration order.
+  Device* device = nullptr;
+  for (const auto& d : devices_) {
+    if (MountPathMatches(normalized_path, d->mount_path()) &&
+        (!device || d->mount_path().size() > device->mount_path().size())) {
+      device = d.get();
+    }
+  }
+  if (!device) {
     REXFS_WARN("VFS: '{}' -> [no device]", path);
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
@@ -129,8 +163,8 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return nullptr;
   }
 
-  const auto& device = *it;
-  auto relative_path = normalized_path.substr(device->mount_path().size());
+  auto relative_path =
+      normalized_path.substr(std::min(normalized_path.size(), device->mount_path().size()));
   auto* entry = device->ResolvePath(relative_path);
 
   if (entry) {
@@ -220,7 +254,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
     parent_entry = !root_entry ? ResolvePath(base_path) : root_entry->ResolvePath(base_path);
     if (!parent_entry) {
       *out_action = FileAction::kDoesNotExist;
-      return X_STATUS_NO_SUCH_FILE;
+      return X_STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
     auto file_name = rex::string::utf8_find_name_from_guest_path(path);
@@ -254,7 +288,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       // Must exist.
       if (!entry) {
         *out_action = FileAction::kDoesNotExist;
-        return X_STATUS_NO_SUCH_FILE;
+        return X_STATUS_OBJECT_NAME_NOT_FOUND;
       }
       break;
     case FileDisposition::kCreate:

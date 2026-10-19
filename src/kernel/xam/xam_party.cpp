@@ -9,6 +9,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstddef>
+#include <cstring>
+
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -22,7 +25,15 @@ namespace rex {
 namespace kernel {
 namespace xam {
 
+// XPARTY_USER_LIST: a count padded to 8 bytes and 32 XPARTY_USER_INFO of
+// 0x78 bytes.
+constexpr size_t kPartyUserListSize = 0xF08;
+
 u32 XamPartyGetUserList_entry(u32 player_count, mapped_u32 party_list) {
+  // Titles read the count without checking the result.
+  if (party_list) {
+    std::memset(party_list.host_address(), 0, kPartyUserListSize);
+  }
   // 5345085D wants specifically this code to skip loading party data.
   // This code is not documented in NT_STATUS code list
   return 0x807D0003;

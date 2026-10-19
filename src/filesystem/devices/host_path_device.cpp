@@ -23,12 +23,13 @@ namespace rex::filesystem {
 
 HostPathDevice::HostPathDevice(const std::string_view mount_path,
                                const std::filesystem::path& host_path, bool read_only,
-                               bool allow_share_delete)
+                               bool allow_share_delete, bool package)
     : Device(mount_path),
-      name_("STFS"),
+      name_(package ? "STFS" : "FATX"),
       host_path_(host_path),
       read_only_(read_only),
-      allow_share_delete_(allow_share_delete) {}
+      allow_share_delete_(allow_share_delete),
+      is_package_(package) {}
 
 HostPathDevice::~HostPathDevice() = default;
 
@@ -116,6 +117,11 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
   for (auto& child_info : child_infos) {
+    // Runtime bookkeeping, never part of the package the console hands out.
+    if (child_info.type == rex::filesystem::FileInfo::Type::kFile &&
+        child_info.name == kPackageThumbnailFileName) {
+      continue;
+    }
     auto child = HostPathEntry::Create(this, parent_entry,
                                        parent_entry->host_path() / child_info.name, child_info);
     parent_entry->children_.push_back(std::unique_ptr<Entry>(child));

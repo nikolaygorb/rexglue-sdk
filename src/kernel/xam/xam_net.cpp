@@ -14,10 +14,13 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
 #endif
+
+#include <fmt/format.h>
 
 #include <rex/chrono/clock.h>
 #include <rex/kernel/xam/module.h>
@@ -475,9 +478,16 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
   return 1;
 }
 
-void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
-                                     u32 string_size) {
-  rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
+u32 NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
+                                    u32 string_size) {
+  const std::string text = fmt::format("{}.{}.{}.{}", in_addr >> 24, (in_addr >> 16) & 0xFF,
+                                       (in_addr >> 8) & 0xFF, in_addr & 0xFF);
+  if (string_out && string_size) {
+    const size_t count = std::min<size_t>(text.size(), string_size - 1);
+    std::memcpy(string_out.host_address(), text.data(), count);
+    string_out[count] = '\0';
+  }
+  return 0;
 }
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for

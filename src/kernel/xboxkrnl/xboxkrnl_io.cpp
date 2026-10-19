@@ -38,12 +38,39 @@ struct CreateOptions {
   static const uint32_t FILE_DIRECTORY_FILE = 0x00000001;
   // Optimization - files access will be sequential, not random.
   static const uint32_t FILE_SEQUENTIAL_ONLY = 0x00000004;
+  static const uint32_t FILE_NO_INTERMEDIATE_BUFFERING = 0x00000008;
   static const uint32_t FILE_SYNCHRONOUS_IO_ALERT = 0x00000010;
   static const uint32_t FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
   static const uint32_t FILE_NON_DIRECTORY_FILE = 0x00000040;
   // Optimization - file access will be random, not sequential.
   static const uint32_t FILE_RANDOM_ACCESS = 0x00000800;
 };
+
+// The file position is marked -1. A synchronous handle uses it without an offset or with
+// FILE_USE_FILE_POINTER_POSITION (-2). A write given FILE_WRITE_TO_END_OF_FILE (-1) appends at
+// XFile::kEndOfFile. Any other negative offset is invalid.
+static X_STATUS ResolveByteOffset(XFile* file, const mapped_u64& byte_offset_ptr, bool is_write,
+                                  uint64_t* out_byte_offset) {
+  *out_byte_offset = uint64_t(-1);
+  if (!byte_offset_ptr) {
+    // TODO: edge fails an async handle without an offset with
+    // X_STATUS_INVALID_PARAMETER (edge 90f47ed85); it still uses the position here.
+    return X_STATUS_SUCCESS;
+  }
+  int64_t byte_offset = int64_t(static_cast<uint64_t>(*byte_offset_ptr));
+  if (byte_offset == -2 && file->is_synchronous()) {
+    return X_STATUS_SUCCESS;
+  }
+  if (byte_offset == -1 && is_write) {
+    *out_byte_offset = XFile::kEndOfFile;
+    return X_STATUS_SUCCESS;
+  }
+  if (byte_offset < 0) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  *out_byte_offset = uint64_t(byte_offset);
+  return X_STATUS_SUCCESS;
+}
 
 static bool IsValidPath(const std::string_view s, bool is_pattern) {
   // TODO(gibbed): validate path components individually
@@ -163,7 +190,9 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     // If true, desired_access SYNCHRONIZE flag must be set.
     bool synchronous = (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_ALERT) ||
                        (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT);
-    file = object_ref<XFile>(new XFile(REX_KERNEL_STATE(), vfs_file, synchronous));
+    bool allow_buffering = !(create_options & CreateOptions::FILE_NO_INTERMEDIATE_BUFFERING);
+    file =
+        object_ref<XFile>(new XFile(REX_KERNEL_STATE(), vfs_file, synchronous, allow_buffering));
 
     // Handle ref is incremented, so return that.
     handle = file->handle();
@@ -208,23 +237,27 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   bool apc_queued = false;
 
   bool signal_event = false;
+  bool pending = false;
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
   if (event_handle && !ev) {
     result = X_STATUS_INVALID_HANDLE;
   }
 
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  uint64_t file_offset = uint64_t(-1);
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  } else if (XSUCCEEDED(result)) {
+    result = ResolveByteOffset(file.get(), byte_offset_ptr, false, &file_offset);
   }
 
   if (XSUCCEEDED(result)) {
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
-      result = file->Read(buffer.guest_address(), buffer_length,
-                          byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-                          &bytes_read, apc_context.guest_address());
+      result = file->Read(buffer.guest_address(), buffer_length, file_offset, &bytes_read,
+                          apc_context.guest_address(), true, &pending);
+
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
@@ -248,10 +281,6 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
           REXKRNL_IMPORT_TRACE("NtReadFile", "skip_apc_queue (apc_ctx={:#x}, status={:#x})",
                                apc_context.guest_address(), result);
         }
-      }
-
-      if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
-        result = X_STATUS_PENDING;
       }
 
       // Mark that we should signal the event now. We do this after
@@ -302,7 +331,7 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
     REXKRNL_IMPORT_RESULT("NtReadFile", "{:#x} (apc_requested={}, apc_queued={})", result,
                           apc_requested, apc_queued);
   }
-  return result;
+  return pending ? X_STATUS_PENDING : result;
 }
 
 u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
@@ -311,23 +340,26 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
   X_STATUS result = X_STATUS_SUCCESS;
 
   bool signal_event = false;
+  bool pending = false;
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
   if (event_handle && !ev) {
     result = X_STATUS_INVALID_HANDLE;
   }
 
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  uint64_t file_offset = uint64_t(-1);
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  } else if (XSUCCEEDED(result)) {
+    result = ResolveByteOffset(file.get(), byte_offset_ptr, false, &file_offset);
   }
 
   if (XSUCCEEDED(result)) {
     if (true || file->is_synchronous()) {
       // Synchronous.
       uint32_t bytes_read = 0;
-      result = file->ReadScatter(segment_array.guest_address(), length,
-                                 byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-                                 &bytes_read, apc_context.guest_address());
+      result = file->ReadScatter(segment_array.guest_address(), length, file_offset, &bytes_read,
+                                 apc_context.guest_address(), &pending);
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
@@ -342,10 +374,6 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
           thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
                              apc_context.guest_address(), io_status_block.guest_address(), 0);
         }
-      }
-
-      if (!file->is_synchronous()) {
-        result = X_STATUS_PENDING;
       }
 
       // Mark that we should signal the event now. We do this after
@@ -376,7 +404,7 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
     }
   }
 
-  if (XFAILED(result) && io_status_block) {
+  if (XFAILED(result) && io_status_block && !signal_event) {
     io_status_block->status = result;
     io_status_block->information = 0;
   }
@@ -385,7 +413,7 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
     ev->Set(0, false);
   }
 
-  return result;
+  return pending ? X_STATUS_PENDING : result;
 }
 
 u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped_void apc_context,
@@ -395,6 +423,7 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
 
   // Grab event to signal.
   bool signal_event = false;
+  bool pending = false;
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
   if (event_handle && !ev) {
     result = X_STATUS_INVALID_HANDLE;
@@ -402,8 +431,11 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
 
   // Grab file.
   auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  uint64_t file_offset = uint64_t(-1);
   if (!file) {
     result = X_STATUS_INVALID_HANDLE;
+  } else if (XSUCCEEDED(result)) {
+    result = ResolveByteOffset(file.get(), byte_offset_ptr, true, &file_offset);
   }
 
   // Execute write.
@@ -412,9 +444,8 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
     if (true || file->is_synchronous()) {
       // Synchronous request.
       uint32_t bytes_written = 0;
-      result = file->Write(buffer.guest_address(), buffer_length,
-                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
-                           &bytes_written, apc_context.guest_address());
+      result = file->Write(buffer.guest_address(), buffer_length, file_offset, &bytes_written,
+                           apc_context.guest_address(), &pending);
 
       if (io_status_block) {
         io_status_block->status = result;
@@ -430,10 +461,6 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
           thread->EnqueueApc(static_cast<uint32_t>(apc_routine) & ~1u, apc_context.guest_address(),
                              io_status_block.guest_address(), 0);
         }
-      }
-
-      if (!file->is_synchronous()) {
-        result = X_STATUS_PENDING;
       }
 
       // Mark that we should signal the event now. We do this after
@@ -459,7 +486,7 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
     ev->Set(0, false);
   }
 
-  return result;
+  return pending ? X_STATUS_PENDING : result;
 }
 
 u32 NtCreateIoCompletion_entry(mapped_u32 out_handle, u32 desired_access,

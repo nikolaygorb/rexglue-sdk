@@ -70,7 +70,8 @@ class XFile : public XObject {
  public:
   static const XObject::Type kObjectType = XObject::Type::File;
 
-  XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous);
+  XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous,
+        bool allow_buffering);
   ~XFile() override;
 
   rex::filesystem::Device* device() const { return file_->entry()->device(); }
@@ -91,16 +92,20 @@ class XFile : public XObject {
   // may be triggered (as per the usual rule of not doing I/O within the global
   // critical region).
   X_STATUS Read(uint32_t buffer_guess_address, uint32_t buffer_length, uint64_t byte_offset,
-                uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion = true);
+                uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion = true,
+                bool* out_pending = nullptr);
 
   X_STATUS ReadScatter(uint32_t segments_guest_address, uint32_t length, uint64_t byte_offset,
-                       uint32_t* out_bytes_read, uint32_t apc_context);
+                       uint32_t* out_bytes_read, uint32_t apc_context,
+                       bool* out_pending = nullptr);
 
+  // Write() appends when given this offset.
+  static constexpr uint64_t kEndOfFile = uint64_t(1) << 63;
   X_STATUS Write(uint32_t buffer_guess_address, uint32_t buffer_length, uint64_t byte_offset,
-                 uint32_t* out_bytes_written, uint32_t apc_context);
+                 uint32_t* out_bytes_written, uint32_t apc_context, bool* out_pending = nullptr);
 
   X_STATUS SetLength(size_t length);
-  X_STATUS Rename(const std::filesystem::path& file_path);
+  X_STATUS Rename(const std::filesystem::path& file_path, bool replace_existing);
 
   void RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);
   void RemoveIOCompletionPort(uint32_t key);
@@ -109,6 +114,7 @@ class XFile : public XObject {
   static object_ref<XFile> Restore(KernelState* kernel_state, stream::ByteStream* stream);
 
   bool is_synchronous() const { return is_synchronous_; }
+  bool is_buffered() const { return allow_buffering_; }
 
   void SetFindPattern(const std::string_view pattern) {
     find_engine_.SetRule(pattern);
@@ -128,9 +134,12 @@ class XFile : public XObject {
   XFile();
 
   X_STATUS ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
-                        uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion);
+                        uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion,
+                        bool* out_pending);
 
   rex::filesystem::File* file_ = nullptr;
+  // The handle's wait state. Manual reset like NT's file object event, so every
+  // wait after a completion returns until the next request clears it.
   std::unique_ptr<rex::thread::Event> async_event_ = nullptr;
 
   mutable std::mutex file_lock_;
@@ -145,6 +154,7 @@ class XFile : public XObject {
   size_t find_index_ = 0;
 
   bool is_synchronous_ = false;
+  bool allow_buffering_ = false;
 };
 
 }  // namespace rex::system

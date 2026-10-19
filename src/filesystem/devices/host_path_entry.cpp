@@ -133,11 +133,9 @@ bool HostPathEntry::DeleteEntryInternal(Entry* entry) {
   return std::filesystem::status(full_path, ec).type() == std::filesystem::file_type::not_found;
 }
 
-X_STATUS HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>& path_parts) {
-  auto new_host_path = static_cast<HostPathDevice*>(device_)->host_path();
-  for (const auto& path_part : path_parts) {
-    new_host_path /= rex::to_path(path_part);
-  }
+X_STATUS HostPathEntry::RenameEntryInternal(Entry* new_parent, const std::string_view name) {
+  const std::filesystem::path new_host_path =
+      static_cast<HostPathEntry*>(new_parent)->host_path_ / rex::to_path(name);
 
   std::error_code ec;
   std::filesystem::rename(host_path_, new_host_path, ec);
@@ -156,6 +154,10 @@ void HostPathEntry::update() {
   if (!rex::filesystem::GetInfo(host_path_, &file_info)) {
     return;
   }
+  // Creation time never changes, and posix reports st_ctime here, which
+  // moves on every write.
+  access_timestamp_ = file_info.access_timestamp;
+  write_timestamp_ = file_info.write_timestamp;
   if (file_info.type == rex::filesystem::FileInfo::Type::kFile) {
     size_ = file_info.total_size;
     allocation_size_ = rex::round_up(file_info.total_size, device()->bytes_per_sector());

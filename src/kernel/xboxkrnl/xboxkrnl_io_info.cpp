@@ -15,6 +15,7 @@
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
+#include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -307,17 +308,29 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
         return X_STATUS_INVALID_PARAMETER;
       }
 
-      result = file->Rename(target_file_path);
+      result = file->Rename(target_file_path, info->replace_existing != 0);
       out_length = sizeof(*info);
       break;
     }
     case XFileAllocationInformation: {
       auto info = info_ptr.as<X_FILE_ALLOCATION_INFORMATION*>();
-      result = file->SetLength(info->allocation_size);
       out_length = sizeof(*info);
-
-      // Update the file entry information.
+      if (!(file->file_access() & (rex::filesystem::FileAccess::kGenericWrite |
+                                   rex::filesystem::FileAccess::kFileWriteData))) {
+        result = X_STATUS_ACCESS_DENIED;
+        break;
+      }
+      // The allocation rounds up to whole allocation units. A larger one
+      // leaves the file size alone. A smaller one cuts the file to it.
+      auto device = file->device();
+      uint64_t allocation_size = rex::round_up(
+          uint64_t(info->allocation_size),
+          uint64_t(device->sectors_per_allocation_unit()) * device->bytes_per_sector(), false);
       file->entry()->update();
+      if (allocation_size < file->entry()->size()) {
+        result = file->SetLength(allocation_size);
+        file->entry()->update();
+      }
       break;
     }
     case XFileEndOfFileInformation: {

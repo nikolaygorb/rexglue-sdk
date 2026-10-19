@@ -135,24 +135,56 @@ bool Entry::Delete() {
   return parent_->Delete(this);
 }
 
-X_STATUS Entry::Rename(const std::filesystem::path& file_path) {
+X_STATUS Entry::Rename(const std::filesystem::path& file_path, bool replace_existing) {
+  auto global_lock = global_critical_region_.Acquire();
   // Store the string so split path string_views remain valid.
   const std::string path_str = rex::path_to_utf8(file_path);
   std::vector<std::string_view> path_parts = rex::string::utf8_split_path(path_str);
-  if (!path_parts.empty()) {
-    // Drop root path (for example, "game:").
-    path_parts.erase(path_parts.begin());
+  if (path_parts.size() < 2 || !parent_) {
+    return X_STATUS_OBJECT_NAME_INVALID;
   }
 
-  X_STATUS status = RenameEntryInternal(path_parts);
+  // Drop root path (for example, "game:").
+  path_parts.erase(path_parts.begin());
+
+  const std::string guest_path = rex::string::utf8_join_guest_paths(path_parts);
+  Entry* new_parent = device_->ResolvePath(rex::string::utf8_find_base_guest_path(guest_path));
+  if (!new_parent || !(new_parent->attributes() & kFileAttributeDirectory)) {
+    return X_STATUS_OBJECT_PATH_NOT_FOUND;
+  }
+  const std::string_view name = path_parts.back();
+
+  // Renaming to its own name fails too, even a change of case only.
+  Entry* existing = new_parent->GetChild(name);
+  if (existing) {
+    if (!replace_existing || (existing->attributes() & kFileAttributeDirectory)) {
+      return X_STATUS_OBJECT_NAME_COLLISION;
+    }
+    // TODO: edge also refuses an open target; open handles are not tracked
+    // here, so the host rename reports it where the host refuses.
+    if (existing == this) {
+      return X_STATUS_ACCESS_DENIED;
+    }
+  }
+
+  X_STATUS status = RenameEntryInternal(new_parent, name);
   if (status != X_STATUS_SUCCESS) {
     return status;
   }
 
-  const std::string guest_path = rex::string::utf8_join_guest_paths(path_parts);
-  absolute_path_ = rex::string::utf8_join_guest_paths(device_->mount_path(), guest_path);
-  path_ = guest_path;
-  name_ = rex::path_to_utf8(file_path.filename());
+  if (existing) {
+    std::erase_if(new_parent->children_,
+                  [existing](const auto& child) { return child.get() == existing; });
+  }
+  if (new_parent != parent_) {
+    auto it = std::ranges::find(parent_->children_, this, &std::unique_ptr<Entry>::get);
+    new_parent->children_.push_back(std::move(*it));
+    parent_->children_.erase(it);
+    parent_ = new_parent;
+  }
+  path_ = rex::string::utf8_join_guest_paths(new_parent->path(), name);
+  absolute_path_ = rex::string::utf8_join_guest_paths(device_->mount_path(), path_);
+  name_ = name;
   return X_STATUS_SUCCESS;
 }
 

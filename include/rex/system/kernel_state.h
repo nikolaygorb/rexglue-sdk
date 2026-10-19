@@ -90,6 +90,17 @@ namespace rex::system {
 
 constexpr memory::fourcc_t kKernelSaveSignature = memory::make_fourcc("KRNL");
 
+// The kernel version XboxKrnlVersion exports (major.minor.build, then the
+// approval type and QFE bytes). Titles only check it with >=, so minor and build
+// are the highest possible. The XAM system version queries report the same.
+constexpr uint16_t kKernelVersionMajor = 2;
+constexpr uint16_t kKernelVersionMinor = 0xFFFF;
+constexpr uint16_t kKernelVersionBuild = 0xFFFF;
+constexpr uint8_t kKernelVersionApprovalType = 0x80;
+constexpr uint8_t kKernelVersionQfe = 0;
+// The build of the original retail kernel, reported as the base system version.
+constexpr uint16_t kBaseKernelBuildVersion = 1888;
+
 class Dispatcher;
 class XHostThread;
 class KernelModule;

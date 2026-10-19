@@ -199,7 +199,12 @@ int XexModule::ApplyPatch(XexModule* module) {
   // Grab the delta descriptor and get to work.
   xex2_opt_delta_patch_descriptor* patch_header = nullptr;
   GetOptHeader(XEX_HEADER_DELTA_PATCH_DESCRIPTOR, reinterpret_cast<void**>(&patch_header));
-  assert_not_null(patch_header);
+  if (!patch_header) {
+    // is_patch() only checks the module flags, so a malformed patch file can
+    // still lack the descriptor.
+    REXLOG_ERROR("XEX patch has no delta patch descriptor");
+    return 1;
+  }
 
   // Compare hash inside delta descriptor to base XEX signature
   uint8_t digest[0x14];
@@ -590,12 +595,20 @@ int XexModule::ReadImageBasicCompressed(const void* xex_addr, size_t xex_length)
     const uint32_t data_size = comp_info.blocks[n].data_size;
     const uint32_t zero_size = comp_info.blocks[n].zero_size;
 
+    // Block sizes come from the file. Decryption works in 16-byte blocks.
+    const size_t copy_size = opt_file_format_info()->encryption_type == XEX_ENCRYPTION_NORMAL
+                                 ? rex::align<size_t>(data_size, 16)
+                                 : data_size;
+    const size_t source_offset = size_t(p - source_buffer);
+    const size_t dest_offset = size_t(d - buffer);
+    if (copy_size > exe_length - source_offset || dest_offset > total_size ||
+        copy_size > total_size - dest_offset) {
+      REXLOG_ERROR("XEX basic compression block {} is out of bounds", n);
+      return 1;
+    }
+
     switch (opt_file_format_info()->encryption_type) {
       case XEX_ENCRYPTION_NONE:
-        if (data_size > uncompressed_size - (d - buffer)) {
-          // Overflow.
-          return 1;
-        }
         memcpy(d, p, data_size);
         break;
       case XEX_ENCRYPTION_NORMAL: {

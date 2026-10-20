@@ -56,8 +56,12 @@ REXCVAR_DEFINE_STRING(occlusion_query, "fast", "GPU",
                       "           unresolved reports. May improve effects relying on precise\n"
                       "           visibility, but may be less stable for occlusion culling.\n"
                       " strict: Ask the GPU and wait for the real result before continuing.\n"
-                      "         Most accurate, but may be somewhat less performant.")
-    .allowed({"fake", "fast", "fast-alt", "strict"})
+                      "         Most accurate, but may be somewhat less performant.\n"
+                      " async: Ask the GPU and write the real result once it arrives, without\n"
+                      "        waiting. Until then the query reads as not ready. As accurate\n"
+                      "        as strict for titles that poll results frames later (lens\n"
+                      "        flares), but titles that spin on a result wait longer.")
+    .allowed({"fake", "fast", "fast-alt", "strict", "async"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_full_counters, false, "GPU",
@@ -148,6 +152,8 @@ ZPDMode GetZPDMode() {
     return ZPDMode::kStrict;
   } else if (mode == "fast-alt") {
     return ZPDMode::kFastAlt;
+  } else if (mode == "async") {
+    return ZPDMode::kAsync;
   }
   return ZPDMode::kFast;
 }
@@ -303,8 +309,9 @@ void CommandProcessor::WorkerThreadMain() {
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
           // Strict ZPD may still owe the guest a report it's spinning on with
-          // nothing left in the ring.
-          if (zpd_mode_ == ZPDMode::kStrict && zpd_awaited_report_count_) {
+          // nothing left in the ring. Async keeps retiring what resolves.
+          if ((zpd_mode_ == ZPDMode::kStrict && zpd_awaited_report_count_) ||
+              (zpd_mode_ == ZPDMode::kAsync && !zpd_reports_.empty())) {
             PrepareForWait();
           }
         }
@@ -721,6 +728,8 @@ void CommandProcessor::MakeCoherent() {
 void CommandProcessor::PrepareForWait() {
   if (zpd_mode_ == ZPDMode::kStrict && zpd_awaited_report_count_) {
     PrepareZPDForWait();
+  } else if (zpd_mode_ == ZPDMode::kAsync && !zpd_reports_.empty()) {
+    PollZPDForWait();
   }
   if (viz_pending_resolves_) {
     PollCompletedSubmission();
@@ -1925,7 +1934,9 @@ void CommandProcessor::QueueZPDReport(uint32_t report_address) {
 
   ZPDReport& report = zpd_current_report_;
   report.address = report_address;
-  if (zpd_mode_ == ZPDMode::kStrict) {
+  if (zpd_mode_ == ZPDMode::kStrict || zpd_mode_ == ZPDMode::kAsync) {
+    // Nothing is written until the report retires, so the guest keeps seeing
+    // the sentinel and reads the query as not ready.
     // See EVENT_WRITE_ZPD for additional information on the pending sentinel.
     const uint32_t kPendingSentinel = rex::byte_swap(0xFFFFFEEDu);
     const auto* guest =
@@ -2166,6 +2177,14 @@ void CommandProcessor::PrepareZPDForWait() {
   // Keep what resolved, with a floor of one so culling doesn't flash occluded.
   front.delta.z_pass = std::max<uint64_t>(front.delta.z_pass, 1);
   front.pending_segments = 0;
+  PumpPendingRetire();
+}
+
+void CommandProcessor::PollZPDForWait() {
+  // The completed submission is otherwise only refreshed when a submission
+  // begins, so results that landed in the meantime would wait for the guest's
+  // next frame.
+  PollCompletedSubmission();
   PumpPendingRetire();
 }
 

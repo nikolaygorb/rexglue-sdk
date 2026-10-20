@@ -55,6 +55,7 @@ enum class ZPDMode {
   kFast,     // Real queries, speculative writes biased visible (fast)
   kFastAlt,  // Fast, but replays cached zero deltas too (fast-alt)
   kStrict,   // Real queries, waits before writeback (strict)
+  kAsync,    // Real queries, writeback once resolved, never waits (async)
 };
 
 ZPDMode GetZPDMode();
@@ -245,7 +246,7 @@ class CommandProcessor {
     XenosZPDReport speculative_value;
     XenosZPDReport speculative_delta;
     bool speculative = false;
-    // For strict, when a report holds the D3D sentinel.
+    // For strict and async, when a report holds the D3D sentinel.
     // Only these are worth blocking a wait for.
     bool awaited = false;
   };
@@ -321,6 +322,8 @@ class CommandProcessor {
   ZPDReport* FindZPDReport(ReportHandle report_handle);
   // Handles a strict report the guest is waiting on while the ring is empty.
   void PrepareZPDForWait();
+  // Async: retires what resolved while the ring is empty, without blocking.
+  void PollZPDForWait();
   // Called from PrepareForWait and submission boundaries so retired reports
   // reach the guest before it loops again. Fast modes give up on a stuck front
   // report after kFastZPDRetireDeadlineMs.

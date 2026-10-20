@@ -396,6 +396,21 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
 }
 
 //=============================================================================
+// Single -> double load
+//=============================================================================
+// lfs widens a single to a double. cvtss2sd reads a denormal single as zero
+// when DAZ is set (the VMX flush mode), so a denormal is rebuilt from its
+// integer mantissa instead: the value is a normal double, exact whatever the
+// MXCSR. The result never depends on the flush mode, so lfs needs no switch.
+inline double fp_load_single(uint32_t bits) {
+  if ((bits & 0x7F800000u) == 0 && (bits & 0x007FFFFFu) != 0) [[unlikely]] {
+    double v = double(bits & 0x007FFFFFu) * 0x1p-149;
+    return (bits & 0x80000000u) ? -v : v;
+  }
+  return double(std::bit_cast<float>(bits));
+}
+
+//=============================================================================
 // Multiply-add NaN rules
 //=============================================================================
 // fmadd/fmsub/fnmadd/fnmsub (and their single forms), vmaddfp and vnmsubfp

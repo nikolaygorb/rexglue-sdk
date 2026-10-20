@@ -547,6 +547,15 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
         rex::thread::current_thread_id());
+    // Tells a stray pointer (free or reserved pages) from a write to a protected allocation.
+    memory::HeapAllocationInfo info = {};
+    if (heap && heap->QueryRegionInfo(virtual_address, &info)) {
+      REXSYS_ERROR(
+          "  guest region {:08X}+{:08X} state {:X} protect {:X}; allocation {:08X}+{:08X} "
+          "protect {:X}",
+          info.base_address, info.region_size, info.state, info.protect, info.allocation_base,
+          info.allocation_size, info.allocation_protect);
+    }
     return false;
   }
 

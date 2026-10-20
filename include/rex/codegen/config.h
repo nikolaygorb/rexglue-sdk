@@ -96,6 +96,9 @@ struct RecompilerConfig {
   bool crRegistersAsLocalVariables = false;
   bool nonArgumentRegistersAsLocalVariables = false;
   bool nonVolatileRegistersAsLocalVariables = false;
+  /// Scalar FP code runs in the VMX MXCSR too (denormals flushed): no mode
+  /// switches between FPU and VMX code, no denormal assists on the host.
+  bool fpuFlushDenormals = false;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
 
   // === Analysis tuning (optional) ===

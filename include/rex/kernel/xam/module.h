@@ -10,8 +10,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <mutex>
+#include <span>
 #include <string>
 
+#include <rex/net/xnet_startup.h>
 #include <rex/ppc/function.h>
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_module.h>
@@ -40,8 +43,19 @@ class XamModule : public system::KernelModule {
   const LoaderData& loader_data() const { return loader_data_; }
   LoaderData& loader_data() { return loader_data_; }
 
+  // XNetStartup, or WSAStartup with |wsa| and no |params|. Only the first
+  // start since everything was cleaned up takes its parameters.
+  void StartXNet(bool wsa, std::span<const uint8_t> params);
+  // XNetCleanup, or WSACleanup with |wsa|.
+  void CleanupXNet(bool wsa);
+  net::XNetStartupParams xnet_startup_params();
+
  private:
   LoaderData loader_data_;
+
+  std::mutex xnet_mutex_;
+  uint32_t xnet_starts_ = 0, wsa_starts_ = 0;
+  net::XNetStartupParams xnet_startup_params_ = net::NormalizeXNetStartupParams({});
 };
 
 }  // namespace xam

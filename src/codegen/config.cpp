@@ -114,6 +114,8 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("non_argument_as_local"), "non_argument_as_local");
   MergeBool(cfg.nonVolatileRegistersAsLocalVariables, toml["non_volatile_as_local"].value_or(false),
             hasBool("non_volatile_as_local"), "non_volatile_as_local");
+  MergeBool(cfg.fpuFlushDenormals, toml["fpu_flush_denormals"].value_or(false),
+            hasBool("fpu_flush_denormals"), "fpu_flush_denormals");
   MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
             hasBool("generate_exception_handlers"), "generate_exception_handlers");
   if (hasBool("is_dll")) {

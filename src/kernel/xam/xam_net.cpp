@@ -184,15 +184,15 @@ struct XNetStartupParams {
   uint8_t cfgQosPairWaitTimeInSeconds;
 };
 
-XNetStartupParams xnet_startup_params = {};
+static_assert_size(XNetStartupParams, rex::net::kXNetStartupParamsSize);
 
 u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
-  if (params) {
-    assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
-    std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
-  }
-
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
+  std::span<const uint8_t> given;
+  if (params) {
+    given = {reinterpret_cast<const uint8_t*>(params.host_address()), sizeof(XNetStartupParams)};
+  }
+  xam->StartXNet(false, given);
 
   /*
   if (!xam->xnet()) {
@@ -208,6 +208,7 @@ u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
 
 u32 NetDll_XNetCleanup_entry(u32 caller, mapped_void params) {
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
+  xam->CleanupXNet(false);
   // auto xnet = xam->xnet();
   // xam->set_xnet(nullptr);
 
@@ -221,13 +222,17 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
                             mapped_u32 buffer_size) {
   assert_true(one == 1);
   switch (option_id) {
-    case 1:
+    case 1: {
       if (*buffer_size < sizeof(XNetStartupParams)) {
         *buffer_size = sizeof(XNetStartupParams);
         return 0x2738;  // WSAEMSGSIZE
       }
-      std::memcpy(buffer_ptr, &xnet_startup_params, sizeof(XNetStartupParams));
+      const auto params =
+          REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex")->xnet_startup_params();
+      std::memcpy(buffer_ptr, params.data(), params.size());
+      *buffer_size = sizeof(XNetStartupParams);
       return 0;
+    }
     default:
       REXKRNL_ERROR("NetDll_XNetGetOpt: option {} unimplemented", option_id);
       return 0x2726;  // WSAEINVAL
@@ -243,6 +248,8 @@ u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
 }
 
 u32 NetDll_WSAStartup_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_ptr) {
+  REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex")->StartXNet(true, {});
+
 // TODO(benvanik): abstraction layer needed.
 #if REX_PLATFORM_WIN32
   WSADATA wsaData;
@@ -291,7 +298,8 @@ u32 NetDll_WSAStartup_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_p
 }
 
 u32 NetDll_WSACleanup_entry(u32 caller) {
-  // This does nothing. Xenia needs WSA running.
+  // Host WSA keeps running, the runtime needs it.
+  REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex")->CleanupXNet(true);
   return 0;
 }
 
@@ -508,6 +516,14 @@ u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<X
 // Reserves a port for use by system link
 u32 NetDll_XNetSetSystemLinkPort_entry(u32 caller, u32 port) {
   return 1;
+}
+
+// Flags for system link broadcasts seen from other versions of the title:
+// XNET_BROADCAST_VERSION_OLDER (1), XNET_BROADCAST_VERSION_NEWER (2). There is
+// no system link here, so none were seen. The stub left r3 (the caller, 1 for a
+// title) as the result: "an older version is on the network".
+u32 NetDll_XNetGetBroadcastVersionStatus_entry(u32 caller, u32 reset) {
+  return 0;
 }
 
 // https://github.com/ILOVEPIE/Cxbx-Reloaded/blob/master/src/CxbxKrnl/EmuXOnline.h#L39
@@ -1107,6 +1123,8 @@ REX_EXPORT(__imp__NetDll_XNetXnAddrToInAddr, rex::kernel::xam::NetDll_XNetXnAddr
 REX_EXPORT(__imp__NetDll_XNetInAddrToXnAddr, rex::kernel::xam::NetDll_XNetInAddrToXnAddr_entry)
 REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
            rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
+REX_EXPORT(__imp__NetDll_XNetGetBroadcastVersionStatus,
+           rex::kernel::xam::NetDll_XNetGetBroadcastVersionStatus_entry)
 REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
            rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
 REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
@@ -1189,7 +1207,6 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
 REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);

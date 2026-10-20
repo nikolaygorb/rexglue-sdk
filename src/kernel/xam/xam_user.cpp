@@ -572,6 +572,9 @@ class XStaticAchievementEnumerator : public XEnumerator {
 
   void AppendItem(AchievementDetails item) { items_.push_back(std::move(item)); }
 
+  // First item to return; past the end, the first enumeration returns no items.
+  void SetStartItem(size_t index) { current_item_ = std::min(index, items_.size()); }
+
   uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data, uint32_t* written_count) override {
     size_t count = std::min(items_.size() - current_item_, items_per_enumerate());
     if (!count) {
@@ -713,6 +716,11 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
       }
     }
   }
+
+  // Titles page through the list with a new enumerator per page, moving the offset by the page
+  // size until a page comes back short (GoldenEye 007 Reloaded: 25 per page). Ignoring the
+  // offset returned the first page forever and the title grew its list until its heap ran out.
+  e->SetStartItem(offset);
 
   *handle_ptr = e->handle();
   return X_ERROR_SUCCESS;

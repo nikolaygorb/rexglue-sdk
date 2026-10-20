@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -21,9 +22,116 @@
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
 
+#if REX_PLATFORM_WIN32 && REX_ARCH_AMD64
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 using namespace rex::arch;
 
 namespace rex::runtime {
+
+namespace {
+
+// Logs the host call chain of a guest memory fault nobody handled, as module+offset per frame.
+// In a recompiled title each frame is a generated sub_XXXXXXXX: resolve the offsets against the
+// build's PDB (WinDbg `ln <module>+<offset>`) to find the guest function. The fault usually ends
+// the process, unless a guest __try (SEH_TRY in generated code) catches it, so only the first
+// few are logged.
+void LogUnhandledFaultBacktrace(const Exception& ex, bool is_write) {
+  static std::atomic<uint32_t> logged_count{0};
+  constexpr uint32_t kMaxLoggedFaults = 8;
+  if (logged_count.fetch_add(1, std::memory_order_relaxed) >= kMaxLoggedFaults) {
+    return;
+  }
+
+#if REX_PLATFORM_WIN32 && REX_ARCH_AMD64
+  const HostThreadContext& thread_context = *ex.thread_context();
+  CONTEXT context = {};
+  context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+  context.Rip = thread_context.rip;
+  context.Rax = thread_context.rax;
+  context.Rcx = thread_context.rcx;
+  context.Rdx = thread_context.rdx;
+  context.Rbx = thread_context.rbx;
+  context.Rsp = thread_context.rsp;
+  context.Rbp = thread_context.rbp;
+  context.Rsi = thread_context.rsi;
+  context.Rdi = thread_context.rdi;
+  context.R8 = thread_context.r8;
+  context.R9 = thread_context.r9;
+  context.R10 = thread_context.r10;
+  context.R11 = thread_context.r11;
+  context.R12 = thread_context.r12;
+  context.R13 = thread_context.r13;
+  context.R14 = thread_context.r14;
+  context.R15 = thread_context.r15;
+
+  REXLOG_ERROR("Unhandled {} fault at host {:016X}: rip {:016X} rsp {:016X} rax {:016X} "
+               "rcx {:016X} rdx {:016X} rbx {:016X} rsi {:016X} rdi {:016X}",
+               is_write ? "write" : "read", ex.fault_address(), context.Rip, context.Rsp,
+               context.Rax, context.Rcx, context.Rdx, context.Rbx, context.Rsi, context.Rdi);
+
+  // The handler runs on the faulting thread, so its stack is the one being walked. A stack
+  // pointer outside it (a corrupted stack) stops the walk instead of faulting in the handler.
+  ULONG_PTR stack_low = 0;
+  ULONG_PTR stack_high = 0;
+  GetCurrentThreadStackLimits(&stack_low, &stack_high);
+  auto rsp_on_stack = [&](DWORD64 rsp) {
+    return rsp >= stack_low && rsp + sizeof(DWORD64) <= stack_high && !(rsp & 7);
+  };
+
+  for (int frame = 0; frame < 32 && context.Rip; ++frame) {
+    char path[MAX_PATH] = "?";
+    const char* module_name = path;
+    HMODULE module = nullptr;
+    if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(context.Rip), &module) &&
+        module) {
+      DWORD length = GetModuleFileNameA(module, path, MAX_PATH);
+      if (length && length < MAX_PATH) {
+        const char* name = std::strrchr(path, '\\');
+        module_name = name ? name + 1 : path;
+      } else {
+        path[0] = '?';
+        path[1] = '\0';
+      }
+    }
+    REXLOG_ERROR("  #{:02} {:016X} {}+0x{:X}", frame, context.Rip, module_name,
+                 module ? context.Rip - reinterpret_cast<uint64_t>(module) : 0);
+
+    if (!rsp_on_stack(context.Rsp)) {
+      REXLOG_ERROR("  stack pointer {:016X} is outside the thread stack, walk stopped",
+                   context.Rsp);
+      break;
+    }
+    DWORD64 image_base = 0;
+    PRUNTIME_FUNCTION function_entry = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+    if (function_entry) {
+      PVOID handler_data = nullptr;
+      DWORD64 establisher_frame = 0;
+      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function_entry, &context,
+                       &handler_data, &establisher_frame, nullptr);
+    } else if (frame == 0) {
+      // A leaf function, or a call through a bad pointer: the return address is on top of the
+      // stack.
+      context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+      context.Rsp += 8;
+    } else {
+      // A return address without unwind data is not code the walk can trust.
+      break;
+    }
+  }
+#else
+  REXLOG_ERROR("Unhandled {} fault at host {:016X}, host pc {:016X}", is_write ? "write" : "read",
+               ex.fault_address(), ex.pc());
+#endif
+}
+
+}  // namespace
 
 MMIOHandler* MMIOHandler::global_handler_ = nullptr;
 
@@ -416,10 +524,17 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     }
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
-    if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+    if (access_violation_callback_ &&
+        access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                   fault_host_address, is_write)) {
+      return true;
     }
+    // The callback took the lock and released it; without a callback it is released here, so
+    // the walk does not run under the global lock.
+    if (lock.owns_lock()) {
+      lock.unlock();
+    }
+    LogUnhandledFaultBacktrace(*ex, is_write);
     return false;
   }
 

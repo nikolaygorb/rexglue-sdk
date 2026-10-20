@@ -301,36 +301,15 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
 
     case TargetKind::Function:
     case TargetKind::Import:
-      // Conditional tail call to another function - check pre-resolved call target
-      if (const auto* callTarget = findCallTarget(base)) {
-        if (callTarget->isFunction()) {
-          auto* targetFn = callTarget->asFunction();
-          emitCtx.reference(targetFn->name());
-          println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-          println("\t\t{}(ctx, base);", targetFn->name());
-          println("\t\treturn;");
-          println("\t}}");
-        } else if (callTarget->isImport()) {
-          const auto& importTarget = std::get<CallTarget::ToImport>(callTarget->value);
-          std::string func_name = "__imp__" + importTarget.name;
-          std::replace(func_name.begin(), func_name.end(), '@', '_');
-          std::replace(func_name.begin(), func_name.end(), '.', '_');
-          emitCtx.reference(func_name);
-          println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-          println("\t\t{}(ctx, base);", func_name);
-          println("\t\treturn;");
-          println("\t}}");
-        }
-      } else if (auto* targetFn = graph().getFunction(target)) {
-        // classifyTarget already established this is a function; the per-site
-        // CallTarget table simply has no entry for this branch. Falling through
-        // to REX_FATAL here turns a resolvable tail call into a guaranteed
-        // runtime abort: on Gears of War Judgment that is 28 conditional
-        // back-edges (e.g. `blt cr6,0x8270d2a8` at 0x8270D36C) whose targets are
-        // registered functions. Resolve straight from the graph instead.
-        emitCtx.reference(targetFn->name());
+      // Conditional tail call to another function: the same call as an unconditional `b`
+      // (emit_function_call), so a share_registers target gets the localized non-volatiles
+      // through ctx, save/restore helpers stay elided under non_volatile_as_local and imports
+      // resolve by ordinal. A target missing from the per-site CallTarget table resolves
+      // through the graph there too (on Gears of War Judgment, 28 conditional back-edges such
+      // as `blt cr6,0x8270d2a8` at 0x8270D36C would otherwise be a guaranteed runtime abort).
+      if (findCallTarget(base) || graph().getFunction(target)) {
         println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-        println("\t\t{}(ctx, base);", targetFn->name());
+        emit_function_call(target);
         println("\t\treturn;");
         println("\t}}");
       } else {
@@ -351,6 +330,10 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
 }
 
 void BuilderContext::emit_set_flush_mode(bool enable) {
+  // fpu_flush_denormals: the FPU shares the VMX mode, so code only switches
+  // into it (once per function / label, a check that is usually a no-op).
+  if (config().fpuFlushDenormals)
+    enable = true;
   auto newState = enable ? CSRState::VMX : CSRState::FPU;
   if (csrState != newState) {
     auto prefix = enable ? "enable" : "disable";

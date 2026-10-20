@@ -7,6 +7,7 @@ add_executable(unit_tests
     kernel/bignum_rsa_test.cpp
     kernel/xecrypt_md5_test.cpp
     kernel/ob_name_test.cpp
+    kernel/xnet_startup_params_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/filesystem_test.cpp

@@ -248,9 +248,11 @@ bool build_ldarx(BuilderContext& ctx) {
 //=============================================================================
 // Floating Point Loads
 //=============================================================================
+// The loads and the double / integer stores move bits and switch no flush mode:
+// their results are the same in the FPU and the VMX MXCSR (lfs through
+// fp_load_single), so VMX code that loads a scalar keeps its mode.
 
 bool build_lfd(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
   ctx.print("\t{}.u64 = REX_LOAD_U64(", ctx.f(ctx.insn.operands[0]));
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
@@ -259,7 +261,6 @@ bool build_lfd(BuilderContext& ctx) {
 }
 
 bool build_lfdx(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
   ctx.print("\t{}.u64 = REX_LOAD_U64(", ctx.f(ctx.insn.operands[0]));
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
@@ -268,28 +269,27 @@ bool build_lfdx(BuilderContext& ctx) {
 }
 
 bool build_lfs(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
   ctx.print("\t{}.u32 = REX_LOAD_U32(", ctx.temp());
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{});", static_cast<int32_t>(ctx.insn.operands[1]));
-  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
+  ctx.println("\t{}.f64 = rex::ppc::fp_load_single({}.u32);", ctx.f(ctx.insn.operands[0]),
+              ctx.temp());
   return true;
 }
 
 bool build_lfsx(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
   ctx.print("\t{}.u32 = REX_LOAD_U32(", ctx.temp());
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
   ctx.println("{}.u32);", ctx.r(ctx.insn.operands[2]));
-  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
+  ctx.println("\t{}.f64 = rex::ppc::fp_load_single({}.u32);", ctx.f(ctx.insn.operands[0]),
+              ctx.temp());
   return true;
 }
 
 bool build_lfdu(BuilderContext& ctx) {
   // Load Floating-point Double with Update
-  ctx.emit_set_flush_mode(false);
   ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}.u64 = REX_LOAD_U64({});", ctx.f(ctx.insn.operands[0]), ctx.ea());
@@ -299,7 +299,6 @@ bool build_lfdu(BuilderContext& ctx) {
 
 bool build_lfdux(BuilderContext& ctx) {
   // Load Floating-point Double with Update Indexed
-  ctx.emit_set_flush_mode(false);
   ctx.println("\t{} = {}.u32 + {}.u32;", ctx.ea(), ctx.r(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}.u64 = REX_LOAD_U64({});", ctx.f(ctx.insn.operands[0]), ctx.ea());
@@ -309,22 +308,22 @@ bool build_lfdux(BuilderContext& ctx) {
 
 bool build_lfsu(BuilderContext& ctx) {
   // Load Floating-point Single with Update (convert to double)
-  ctx.emit_set_flush_mode(false);
   ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}.u32 = REX_LOAD_U32({});", ctx.temp(), ctx.ea());
-  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
+  ctx.println("\t{}.f64 = rex::ppc::fp_load_single({}.u32);", ctx.f(ctx.insn.operands[0]),
+              ctx.temp());
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[2]), ctx.ea());
   return true;
 }
 
 bool build_lfsux(BuilderContext& ctx) {
   // Load Floating-point Single with Update Indexed (convert to double)
-  ctx.emit_set_flush_mode(false);
   ctx.println("\t{} = {}.u32 + {}.u32;", ctx.ea(), ctx.r(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}.u32 = REX_LOAD_U32({});", ctx.temp(), ctx.ea());
-  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
+  ctx.println("\t{}.f64 = rex::ppc::fp_load_single({}.u32);", ctx.f(ctx.insn.operands[0]),
+              ctx.temp());
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[1]), ctx.ea());
   return true;
 }
@@ -486,7 +485,6 @@ bool build_stdbrx(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_stfd(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
   ctx.print("{}", ctx.mmio_check_d_form() ? "\tREX_MM_STORE_U64(" : "\tREX_STORE_U64(");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
@@ -496,7 +494,6 @@ bool build_stfd(BuilderContext& ctx) {
 }
 
 bool build_stfdx(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
   ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U64(" : "\tREX_STORE_U64(");
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
@@ -506,7 +503,6 @@ bool build_stfdx(BuilderContext& ctx) {
 
 bool build_stfdux(BuilderContext& ctx) {
   // Store Floating-point Double with Update Indexed: EA = rA + rB; MEM(EA) = FRS; rA = EA
-  ctx.emit_set_flush_mode(false);
   ctx.println("\t{} = {}.u32 + {}.u32;", ctx.ea(), ctx.r(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
   ctx.println("\tREX_STORE_U64({}, {}.u64);", ctx.ea(), ctx.f(ctx.insn.operands[0]));
@@ -515,7 +511,6 @@ bool build_stfdux(BuilderContext& ctx) {
 }
 
 bool build_stfiwx(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
   ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
@@ -545,7 +540,6 @@ bool build_stfsx(BuilderContext& ctx) {
 
 bool build_stfdu(BuilderContext& ctx) {
   // Store Floating-point Double with Update
-  ctx.emit_set_flush_mode(false);
   ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
   ctx.println("\tREX_STORE_U64({}, {}.u64);", ctx.ea(), ctx.f(ctx.insn.operands[0]));

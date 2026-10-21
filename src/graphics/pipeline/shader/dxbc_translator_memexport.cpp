@@ -652,11 +652,15 @@ void DxbcShaderTranslator::ExportToMemory(uint8_t export_eM) {
     // Convert eM1...4 indices to global byte addresses.
     a_.OpIShL(eM14_address_dest, eM14_address_src, element_size_src);
     a_.OpIAdd(eM14_address_dest, base_address_src, eM14_address_src);
+    // Masked to physical - the guest may use a mirror window.
+    a_.OpAnd(eM14_address_dest, eM14_address_src, dxbc::Src::LU(0x1FFFFFFF));
   }
   if (export_eM & 0b1) {
     // Convert eM0 index to a global byte address if it's needed.
     a_.OpIShL(eM0_address_dest, eM0_address_src, element_size_src);
     a_.OpIAdd(eM0_address_dest, base_address_src, eM0_address_src);
+    // Masked to physical - the guest may use a mirror window.
+    a_.OpAnd(eM0_address_dest, eM0_address_src, dxbc::Src::LU(0x1FFFFFFF));
     // base_address_src and index_count_src are deallocated at this point (even
     // if eM0 isn't potentially written), temp.zw are now free.
     // Extract if eM0 was actually written by the invocation to temp.z.

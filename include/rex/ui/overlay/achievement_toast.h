@@ -11,6 +11,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <mutex>
@@ -35,6 +36,12 @@ class AchievementToastDialog : public AchievementNotificationDialog {
   // Thread-safe: safe to call from any thread, including guest threads.
   void Push(const rex::system::AchievementEvent& event) override;
 
+  // The window repaints over and over only while a toast is on screen (to fade
+  // it). The dialog exists for the whole session, so with the default the
+  // window painted and presented UI-only frames on top of the game's own
+  // frames all the time.
+  bool WantsContinuousRepaint() const override { return showing_.load(std::memory_order_relaxed); }
+
  protected:
   void OnDraw(ImGuiIO& io) override;
 
@@ -49,6 +56,7 @@ class AchievementToastDialog : public AchievementNotificationDialog {
 
   std::mutex mutex_;
   std::deque<PendingToast> queue_;
+  std::atomic<bool> showing_{false};  // queue_ not empty; written under mutex_
   AchievementIconCache icon_cache_;
 };
 

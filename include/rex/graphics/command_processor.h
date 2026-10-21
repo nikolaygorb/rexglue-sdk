@@ -134,6 +134,20 @@ class CommandProcessor {
   void CallInThread(std::function<void()> fn);
 
   virtual void ClearCaches();
+
+  // Requests a change of the draw resolution scale while the title is running.
+  // Callable from any thread and cheap: it only records the request (replacing
+  // an older one not applied yet). The command processor applies it between two
+  // guest frames by recreating everything that depends on the scale (render
+  // targets and the EDRAM buffer, the texture cache with the resolved textures,
+  // translated shaders and pipelines), which causes a hitch, and the contents
+  // of render targets and resolved textures are lost. If the new scale can't be
+  // set up (not enough memory, for instance), 1x is used instead. With
+  // force_rebuild, everything is recreated even if the scale stays the same.
+  // Changing draw_resolution_scale_x, draw_resolution_scale_y or
+  // resolution_scale requests the scale they configure (rexglue PR #524,
+  // cod3 0014).
+  static void RequestDrawResolutionScale(uint32_t x, uint32_t y, bool force_rebuild = false);
   virtual void InvalidateGpuMemory();
 
   // "Desired" is for the external thread managing the post-processing effect.
@@ -485,6 +499,13 @@ class CommandProcessor {
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 
+  // For the implementations, on the command processor thread at the end of a
+  // frame: whether a RequestDrawResolutionScale request should be applied now,
+  // taking it. A request is returned only once it has stayed the same for a
+  // whole frame: the scale cvars are usually changed one after another, each
+  // making a request, and the combinations in between shouldn't each rebuild.
+  bool TakeDrawResolutionScaleRequest(uint32_t& x_out, uint32_t& y_out, bool& force_rebuild_out);
+
   memory::Memory* memory_ = nullptr;
   system::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
@@ -579,6 +600,10 @@ class CommandProcessor {
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
 
  private:
+  // The pending draw resolution scale request seen at the previous end of a
+  // frame (packed, 0 if none).
+  uint32_t draw_resolution_scale_request_seen_ = 0;
+
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;

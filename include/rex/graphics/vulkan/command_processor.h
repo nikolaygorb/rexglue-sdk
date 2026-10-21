@@ -468,6 +468,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool CanEndSubmissionImmediately() const;
 
   void ClearTransientDescriptorPools();
+  // At the end of a frame, applies a pending RequestDrawResolutionScale
+  // request, recreating everything that depends on the draw resolution scale.
+  void ApplyDrawResolutionScaleRequest();
+  // Creates the texture cache and initializes the render target cache
+  // (previously shut down) for the draw resolution scale, cleaning up if failed.
+  bool CreateDrawResolutionScaleDependentCaches(uint32_t draw_resolution_scale_x,
+                                                uint32_t draw_resolution_scale_y,
+                                                RenderTargetCache::Path render_target_path);
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
@@ -590,6 +598,14 @@ class VulkanCommandProcessor : public CommandProcessor {
                                          const VkDescriptorImageInfo* texture_image_info,
                                          const VkDescriptorImageInfo* sampler_image_info,
                                          VkWriteDescriptorSet* descriptor_set_writes_out);
+  // A texture descriptor set written earlier in this submission and frame with
+  // the same layout, image views, image layouts and samplers, or VK_NULL_HANDLE
+  // (then RememberTextureDescriptorSet stores the set written instead).
+  VkDescriptorSet FindTextureDescriptorSet(bool is_vertex, uint32_t texture_count,
+                                           uint32_t sampler_count,
+                                           const VkDescriptorImageInfo* texture_image_info,
+                                           const VkDescriptorImageInfo* sampler_image_info);
+  void RememberTextureDescriptorSet(VkDescriptorSet set);
 
   bool device_lost_ = false;
 
@@ -710,7 +726,32 @@ class VulkanCommandProcessor : public CommandProcessor {
                      TextureDescriptorSetLayoutKey::Hasher>
       texture_transient_descriptor_sets_free_;
 
+  // Texture descriptor sets written in the current submission and frame, by
+  // their contents, so a draw binding the same textures and samplers as an
+  // earlier one (not only the one just before, which keeps its set anyway)
+  // reuses that set instead of writing another (vulkan_reuse_texture_descriptors).
+  // Cleared when the submission or the frame changes: image views and samplers
+  // used in a submission are destroyed only after it completes, so a handle in
+  // a set here still names the same object, and the sets themselves are
+  // recycled only once their frame is done.
+  struct TextureDescriptorSetReuse {
+    uint32_t contents_offset;  // In texture_descriptor_reuse_contents_.
+    uint32_t contents_count;
+    VkDescriptorSet set;
+  };
+  std::unordered_multimap<uint64_t, TextureDescriptorSetReuse, rex::IdentityHasher<uint64_t>>
+      texture_descriptor_reuse_;
+  std::vector<uint64_t> texture_descriptor_reuse_contents_;
+  // The contents of the set looked up last (FindTextureDescriptorSet).
+  std::vector<uint64_t> texture_descriptor_reuse_key_;
+  uint64_t texture_descriptor_reuse_key_hash_ = 0;
+  uint64_t texture_descriptor_reuse_submission_ = UINT64_MAX;
+  uint64_t texture_descriptor_reuse_frame_ = UINT64_MAX;
+
   std::unique_ptr<VulkanSharedMemory> shared_memory_;
+  // Number of the bindings the shared memory is split into, for the render
+  // target cache (also when reinitializing it for a different scale).
+  uint32_t shared_memory_binding_count_ = 0;
 
   std::unique_ptr<VulkanPrimitiveProcessor> primitive_processor_;
 

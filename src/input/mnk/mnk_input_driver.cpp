@@ -311,7 +311,8 @@ MnkInputDriver::MnkInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order) {}
 
 MnkInputDriver::~MnkInputDriver() {
-  // Detach handled by OnClosing; if window outlives the driver, clean up here.
+  // Detach handled by OnClosing / OnDestroying; if the window outlives the
+  // driver, clean up here.
   DetachFromWindow();
 }
 
@@ -331,6 +332,12 @@ void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 }
 
 void MnkInputDriver::OnClosing(rex::ui::UIEvent&) {
+  DetachFromWindow();
+}
+
+void MnkInputDriver::OnDestroying(rex::ui::UIEvent&) {
+  // A window destroyed without being closed first (an app tearing down while
+  // the window is open) sends no OnClosing; the driver must not keep it.
   DetachFromWindow();
 }
 

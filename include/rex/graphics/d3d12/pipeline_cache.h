@@ -68,6 +68,15 @@ class PipelineCache {
 
   void EndSubmission();
   bool IsCreatingPipelines();
+
+  // For changing the draw resolution scale at runtime, with the GPU idle and no
+  // pipeline being created. Destroy releases all pipelines, all shader
+  // translations and the translator, which have the scale baked in. Create,
+  // called once the render target cache has been reinitialized with the new
+  // scale, recreates the translator; translations and pipelines are then made
+  // on demand.
+  void DestroyDrawResolutionScaleDependentObjects();
+  void CreateDrawResolutionScaleDependentObjects();
   // Waits for any pipeline creation needed by the current draw path to finish
   // before state is consumed. This was added so strict ZPD query paths stop
   // racing pipeline compilation and then blocking work on incomplete state.
@@ -116,7 +125,15 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->description.description.host_msaa_samples;
   }
 
+
  private:
+  // Creates the shader translator for the render target cache's draw
+  // resolution scale and the internal shaders it generates.
+  void CreateTranslatorAndInternalShaders();
+  void StartCreationThreads();
+  void StopCreationThreads();
+  void DestroyAllPipelines();
+
   // Update PipelineDescription::kVersion if any of the Pipeline* enums are
   // changed!
 

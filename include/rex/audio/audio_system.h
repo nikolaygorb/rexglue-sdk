@@ -77,7 +77,9 @@ class AudioSystem : public system::IAudioSystem {
   std::atomic<bool> worker_running_ = {false};
   system::object_ref<system::XHostThread> worker_thread_;
 
-  rex::thread::global_critical_region global_critical_region_;
+  // Guards clients_. The global lock is never taken while holding it, so its
+  // holders (guest I/O, the heap) can't delay the audio pump.
+  std::mutex clients_mutex_;
   static const size_t kMaximumClientCount = 8;
   struct ClientSlot {
     AudioDriver* driver = nullptr;

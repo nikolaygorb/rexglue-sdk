@@ -29,6 +29,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/float_constants.h>
 #include <rex/graphics/util/smaa_textures.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -47,6 +48,12 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
+
+REXCVAR_DEFINE_BOOL(vulkan_reuse_texture_descriptors, true, "GPU/Vulkan",
+                    "A draw that binds the same textures and samplers as an earlier draw in the "
+                    "same submission reuses its descriptor set instead of writing a new one (off: "
+                    "a new set whenever the bindings change)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
@@ -828,6 +835,7 @@ bool VulkanCommandProcessor::SetupContext() {
       SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
           device_properties.maxStorageBufferRange);
   uint32_t shared_memory_binding_count = UINT32_C(1) << shared_memory_binding_count_log2;
+  shared_memory_binding_count_ = shared_memory_binding_count;
 
   uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
   bool draw_resolution_scale_not_clamped =
@@ -4459,7 +4467,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 static_cast<uint32_t>(vfetch_constant.type));
             return false;
         }
-        vfetch_addresses[vfetch_current_queued] = vfetch_constant.address;
+        // Mask to physical like the shader - the guest may use a mirror window.
+        vfetch_addresses[vfetch_current_queued] = xenos::CpuToGpu(vfetch_constant.address << 2) >> 2;
         vfetch_sizes[vfetch_current_queued++] = vfetch_constant.size;
       }
     }
@@ -6268,8 +6277,162 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
       shared_memory_->ClearCache();
     }
+
+    // Between frames, with the submission closed: nothing recorded refers to
+    // the objects that may be recreated for a different scale.
+    ApplyDrawResolutionScaleRequest();
   }
 
+  return true;
+}
+
+void VulkanCommandProcessor::ApplyDrawResolutionScaleRequest() {
+  uint32_t requested_scale_x, requested_scale_y;
+  bool force_rebuild;
+  if (!TakeDrawResolutionScaleRequest(requested_scale_x, requested_scale_y, force_rebuild)) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
+  // Scaled resolves beyond what the device can back are clamped as at startup.
+  if (!TextureCache::ClampDrawResolutionScaleToMaxSupported(
+          requested_scale_x, requested_scale_y,
+          device_properties.sparseBinding && device_properties.sparseResidencyBuffer, 0)) {
+    REXGPU_WARN(
+        "The requested draw resolution scale is not supported by the device, reducing to {}x{}",
+        requested_scale_x, requested_scale_y);
+  }
+  uint32_t old_scale_x = texture_cache_->draw_resolution_scale_x();
+  uint32_t old_scale_y = texture_cache_->draw_resolution_scale_y();
+  if (!force_rebuild && requested_scale_x == old_scale_x && requested_scale_y == old_scale_y) {
+    return;
+  }
+  // Pipelines still being created (including those from the storage) would be
+  // dropped with their threads: try again at the end of a later frame.
+  if (pipeline_cache_->IsCreatingPipelines()) {
+    RequestDrawResolutionScale(requested_scale_x, requested_scale_y, force_rebuild);
+    return;
+  }
+  // The objects being destroyed may still be used by the GPU.
+  if (!AwaitAllQueueOperationsCompletion()) {
+    if (!device_lost_) {
+      RequestDrawResolutionScale(requested_scale_x, requested_scale_y, force_rebuild);
+    }
+    return;
+  }
+  assert_true(command_buffers_submitted_.empty());
+
+  // The pipeline layouts and the shared memory and EDRAM descriptor set layout
+  // depend on the render target path, so it must stay the same.
+  RenderTargetCache::Path render_target_path = render_target_cache_->GetPath();
+
+  // Destroy everything that has the old scale baked in before creating anything
+  // for the new one, not to need memory for both at once.
+  pipeline_cache_->DestroyDrawResolutionScaleDependentObjects();
+  texture_cache_->InvalidateScaledResolveRangesInSharedMemory();
+  texture_cache_.reset();
+  render_target_cache_->Shutdown();
+
+  // Recreate for the new scale, or for 1x if that fails (not enough memory).
+  uint32_t new_scale_x = requested_scale_x;
+  uint32_t new_scale_y = requested_scale_y;
+  bool caches_created =
+      CreateDrawResolutionScaleDependentCaches(new_scale_x, new_scale_y, render_target_path);
+  if (!caches_created && (new_scale_x > 1 || new_scale_y > 1)) {
+    new_scale_x = 1;
+    new_scale_y = 1;
+    caches_created =
+        CreateDrawResolutionScaleDependentCaches(new_scale_x, new_scale_y, render_target_path);
+  }
+  if (!caches_created || !pipeline_cache_->CreateDrawResolutionScaleDependentObjects()) {
+    // This has also succeeded at startup, though.
+    rex::FatalError("Failed to recreate the GPU emulation state for a draw resolution scale");
+  }
+
+  // The fragment shader interlock descriptor set references the EDRAM buffer,
+  // which has been recreated (binding 2, as in SetupContext).
+  if (render_target_path == RenderTargetCache::Path::kPixelShaderInterlock) {
+    VkDescriptorBufferInfo edram_descriptor_buffer_info;
+    edram_descriptor_buffer_info.buffer = render_target_cache_->edram_buffer();
+    edram_descriptor_buffer_info.offset = 0;
+    edram_descriptor_buffer_info.range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet write_descriptor_set_edram;
+    write_descriptor_set_edram.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_edram.pNext = nullptr;
+    write_descriptor_set_edram.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_edram.dstBinding = 2;
+    write_descriptor_set_edram.dstArrayElement = 0;
+    write_descriptor_set_edram.descriptorCount = 1;
+    write_descriptor_set_edram.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write_descriptor_set_edram.pImageInfo = nullptr;
+    write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
+    write_descriptor_set_edram.pTexelBufferView = nullptr;
+    dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_edram, 0, nullptr);
+  }
+
+  // Occlusion query sample counts are normalized by the scale.
+  zpd_draw_resolution_scale_x_ = new_scale_x;
+  zpd_draw_resolution_scale_y_ = new_scale_y;
+
+  // Drop the state referring to the destroyed objects (most of the rest is
+  // reset when the next submission and frame begin).
+  current_samplers_vertex_.clear();
+  current_samplers_pixel_.clear();
+  current_written_samplers_vertex_.clear();
+  current_written_samplers_pixel_.clear();
+  current_textures_vertex_shader_ = nullptr;
+  current_textures_pixel_shader_ = nullptr;
+  current_graphics_descriptor_set_values_up_to_date_ = 0;
+  current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+  texture_descriptor_reuse_.clear();
+  texture_descriptor_reuse_contents_.clear();
+  current_render_pass_ = VK_NULL_HANDLE;
+  current_framebuffer_ = nullptr;
+  current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+  current_guest_graphics_pipeline_layout_ = nullptr;
+  // Only used for downscaling scaled resolves for readback, recreated when
+  // needed; the readback buffers themselves hold unscaled data and are kept.
+  if (new_scale_x <= 1 && new_scale_y <= 1) {
+    resolve_downscale_buffer_size_ = 0;
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, resolve_downscale_buffer_);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                           resolve_downscale_buffer_memory_);
+  }
+
+  if (new_scale_x != requested_scale_x || new_scale_y != requested_scale_y) {
+    REXGPU_WARN(
+        "GPU: draw resolution scale changed to {}x{} - failed to set up {}x{} (not enough GPU "
+        "memory?)",
+        new_scale_x, new_scale_y, requested_scale_x, requested_scale_y);
+  } else {
+    REXGPU_INFO("GPU: draw resolution scale changed to {}x{}", new_scale_x, new_scale_y);
+  }
+}
+
+bool VulkanCommandProcessor::CreateDrawResolutionScaleDependentCaches(
+    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+    RenderTargetCache::Path render_target_path) {
+  // The texture cache first, as its scaled resolve buffer is the largest
+  // allocation.
+  texture_cache_ =
+      VulkanTextureCache::Create(*register_file_, *shared_memory_, draw_resolution_scale_x,
+                                 draw_resolution_scale_y, *this, guest_shader_pipeline_stages_);
+  if (!texture_cache_) {
+    REXGPU_WARN("Failed to create the texture cache for {}x{} draw resolution scale",
+                draw_resolution_scale_x, draw_resolution_scale_y);
+    return false;
+  }
+  render_target_cache_->SetDrawResolutionScale(draw_resolution_scale_x, draw_resolution_scale_y);
+  if (!render_target_cache_->Initialize(shared_memory_binding_count_, render_target_path) ||
+      render_target_cache_->GetPath() != render_target_path) {
+    REXGPU_WARN("Failed to initialize the render target cache for {}x{} draw resolution scale",
+                draw_resolution_scale_x, draw_resolution_scale_y);
+    render_target_cache_->Shutdown();
+    texture_cache_.reset();
+    return false;
+  }
   return true;
 }
 
@@ -7550,18 +7713,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       if (!mapping) {
         return false;
       }
-      for (uint32_t i = 0; i < 4; ++i) {
-        uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
-        uint32_t float_constant_index;
-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          std::memcpy(
-              mapping,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
-              sizeof(float) * 4);
-          mapping += sizeof(float) * 4;
-        }
-      }
+      CopyFloatConstantRuns(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X],
+                            current_float_constant_map_vertex_);
     }
     // Pixel shader float constants.
     if (!(current_constant_buffers_up_to_date_ &
@@ -7573,18 +7726,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       if (!mapping) {
         return false;
       }
-      for (uint32_t i = 0; i < 4; ++i) {
-        uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
-        uint32_t float_constant_index;
-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          std::memcpy(
-              mapping,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
-              sizeof(float) * 4);
-          mapping += sizeof(float) * 4;
-        }
-      }
+      CopyFloatConstantRuns(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X],
+                            current_float_constant_map_pixel_);
     }
     // Bool and loop constants.
     if (!(current_constant_buffers_up_to_date_ &
@@ -7768,7 +7911,21 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         constants_descriptor_set;
   }
   // Vertex shader textures and samplers.
-  if (write_vertex_textures) {
+  VkDescriptorSet reused_vertex_textures =
+      write_vertex_textures
+          ? FindTextureDescriptorSet(
+                true, texture_count_vertex, sampler_count_vertex,
+                descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
+                descriptor_write_image_info_.data() + vertex_sampler_image_info_offset)
+          : VK_NULL_HANDLE;
+  if (reused_vertex_textures != VK_NULL_HANDLE) {
+    write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
+        reused_vertex_textures;
+    // Remember what this set was written for, to reuse it in later draws.
+    current_textures_vertex_shader_ = vertex_shader;
+    current_written_samplers_vertex_ = current_samplers_vertex_;
+  } else if (write_vertex_textures) {
     VkWriteDescriptorSet* write_textures =
         write_descriptor_sets.data() + write_descriptor_set_count;
     uint32_t texture_descriptor_set_write_count = WriteTransientTextureBindings(
@@ -7783,12 +7940,27 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
         write_textures[0].dstSet;
+    RememberTextureDescriptorSet(write_textures[0].dstSet);
     // Remember what this set was written for, to reuse it in later draws.
     current_textures_vertex_shader_ = vertex_shader;
     current_written_samplers_vertex_ = current_samplers_vertex_;
   }
   // Pixel shader textures and samplers.
-  if (write_pixel_textures) {
+  VkDescriptorSet reused_pixel_textures =
+      write_pixel_textures
+          ? FindTextureDescriptorSet(
+                false, texture_count_pixel, sampler_count_pixel,
+                descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+                descriptor_write_image_info_.data() + pixel_sampler_image_info_offset)
+          : VK_NULL_HANDLE;
+  if (reused_pixel_textures != VK_NULL_HANDLE) {
+    write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+        reused_pixel_textures;
+    // Remember what this set was written for, to reuse it in later draws.
+    current_textures_pixel_shader_ = pixel_shader;
+    current_written_samplers_pixel_ = current_samplers_pixel_;
+  } else if (write_pixel_textures) {
     VkWriteDescriptorSet* write_textures =
         write_descriptor_sets.data() + write_descriptor_set_count;
     uint32_t texture_descriptor_set_write_count = WriteTransientTextureBindings(
@@ -7797,12 +7969,16 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
         descriptor_write_image_info_.data() + pixel_sampler_image_info_offset, write_textures);
     if (!texture_descriptor_set_write_count) {
+      // A vertex set remembered above is never written now: forget them all.
+      texture_descriptor_reuse_.clear();
+      texture_descriptor_reuse_contents_.clear();
       return false;
     }
     write_descriptor_set_count += texture_descriptor_set_write_count;
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
         write_textures[0].dstSet;
+    RememberTextureDescriptorSet(write_textures[0].dstSet);
     // Remember what this set was written for, to reuse it in later draws.
     current_textures_pixel_shader_ = pixel_shader;
     current_written_samplers_pixel_ = current_samplers_pixel_;
@@ -7857,6 +8033,67 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   current_graphics_descriptor_sets_bound_up_to_date_ |= descriptor_sets_needed;
 
   return true;
+}
+
+VkDescriptorSet VulkanCommandProcessor::FindTextureDescriptorSet(
+    bool is_vertex, uint32_t texture_count, uint32_t sampler_count,
+    const VkDescriptorImageInfo* texture_image_info,
+    const VkDescriptorImageInfo* sampler_image_info) {
+  texture_descriptor_reuse_key_.clear();
+  if (!REXCVAR_GET(vulkan_reuse_texture_descriptors)) {
+    return VK_NULL_HANDLE;
+  }
+  const uint64_t submission = GetCurrentSubmission();
+  if (submission != texture_descriptor_reuse_submission_ ||
+      frame_current_ != texture_descriptor_reuse_frame_) {
+    texture_descriptor_reuse_.clear();
+    texture_descriptor_reuse_contents_.clear();
+    texture_descriptor_reuse_submission_ = submission;
+    texture_descriptor_reuse_frame_ = frame_current_;
+  }
+  // The contents: the layout (stage and counts), then each texture's view and
+  // layout, then each sampler.
+  auto handle_bits = [](auto handle) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, &handle, std::min(sizeof(bits), sizeof(handle)));
+    return bits;
+  };
+  std::vector<uint64_t>& key = texture_descriptor_reuse_key_;
+  key.push_back(uint64_t(is_vertex) | (uint64_t(texture_count) << 1) |
+                (uint64_t(sampler_count) << 32));
+  for (uint32_t i = 0; i < texture_count; ++i) {
+    key.push_back(handle_bits(texture_image_info[i].imageView));
+    key.push_back(uint64_t(texture_image_info[i].imageLayout));
+  }
+  for (uint32_t i = 0; i < sampler_count; ++i) {
+    key.push_back(handle_bits(sampler_image_info[i].sampler));
+  }
+  texture_descriptor_reuse_key_hash_ = XXH3_64bits(key.data(), key.size() * sizeof(uint64_t));
+  auto range = texture_descriptor_reuse_.equal_range(texture_descriptor_reuse_key_hash_);
+  for (auto it = range.first; it != range.second; ++it) {
+    const TextureDescriptorSetReuse& reuse = it->second;
+    if (reuse.contents_count == key.size() &&
+        std::memcmp(texture_descriptor_reuse_contents_.data() + reuse.contents_offset, key.data(),
+                    key.size() * sizeof(uint64_t)) == 0) {
+      return reuse.set;
+    }
+  }
+  return VK_NULL_HANDLE;
+}
+
+void VulkanCommandProcessor::RememberTextureDescriptorSet(VkDescriptorSet set) {
+  if (texture_descriptor_reuse_key_.empty() || set == VK_NULL_HANDLE) {
+    return;
+  }
+  TextureDescriptorSetReuse reuse;
+  reuse.contents_offset = uint32_t(texture_descriptor_reuse_contents_.size());
+  reuse.contents_count = uint32_t(texture_descriptor_reuse_key_.size());
+  reuse.set = set;
+  texture_descriptor_reuse_contents_.insert(texture_descriptor_reuse_contents_.end(),
+                                            texture_descriptor_reuse_key_.begin(),
+                                            texture_descriptor_reuse_key_.end());
+  texture_descriptor_reuse_.emplace(texture_descriptor_reuse_key_hash_, reuse);
+  texture_descriptor_reuse_key_.clear();
 }
 
 uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(

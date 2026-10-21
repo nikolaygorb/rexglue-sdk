@@ -698,6 +698,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
   }
+  // Presenter (NVIDIA Image Scaling writes the guest output format).
+  XE_UI_VULKAN_FEATURE(shaderStorageImageExtendedFormats)
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     if (with_gpu_emulation) {

@@ -12,7 +12,10 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -20,17 +23,20 @@
 #include <unordered_map>
 #include <vector>
 
-#include <spdlog/sinks/basic_file_sink.h>
+#include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/platform/env.h>
 
 #if REX_PLATFORM_WIN32
+#include <share.h>
+
 #include <spdlog/sinks/msvc_sink.h>
 #else
 #include <spdlog/sinks/stdout_sinks.h>
@@ -59,6 +65,57 @@ std::vector<LogCategoryEntry> g_registry;
 spdlog::sink_ptr g_console_sink;
 spdlog::sink_ptr g_file_sink;
 spdlog::sink_ptr g_early_sink;
+
+// spdlog's file sinks take narrow names, which Windows opens in the ANSI code
+// page, so a log path with characters outside it (a profile folder with an
+// accent, in Cyrillic or in Japanese) went to the wrong place or threw. This
+// sink opens the file through std::filesystem::path and, like spdlog's basic
+// file sink, appends and lets other processes read the file while it is
+// written.
+class PathFileSink final : public spdlog::sinks::base_sink<std::mutex> {
+ public:
+  explicit PathFileSink(const std::filesystem::path& path) {
+    rex::filesystem::CreateParentFolder(path);
+#if REX_PLATFORM_WIN32
+    file_ = _wfsopen(path.c_str(), L"ab", _SH_DENYNO);
+#else
+    file_ = std::fopen(path.c_str(), "ab");
+#endif
+  }
+  ~PathFileSink() override {
+    if (file_) {
+      std::fclose(file_);
+    }
+  }
+
+ protected:
+  void sink_it_(const spdlog::details::log_msg& msg) override {
+    if (!file_) {
+      return;
+    }
+    spdlog::memory_buf_t formatted;
+    formatter_->format(msg, formatted);
+    std::fwrite(formatted.data(), 1, formatted.size(), file_);
+  }
+  void flush_() override {
+    if (file_) {
+      std::fflush(file_);
+    }
+  }
+
+ private:
+  FILE* file_ = nullptr;
+};
+
+// Cvar values are UTF-8; one that is not is taken as it is.
+std::filesystem::path PathFromUtf8(const std::string& path) {
+  try {
+    return rex::to_path(path);
+  } catch (const std::exception&) {
+    return std::filesystem::path(path);
+  }
+}
+
 std::vector<spdlog::sink_ptr> g_extra_sinks;
 bool g_early_initialized = false;
 bool g_initialized = false;
@@ -69,7 +126,7 @@ std::optional<int> RunNumber(const std::filesystem::path& file, std::string_view
   if (file.extension() != ".log") {
     return std::nullopt;
   }
-  std::string stem = file.stem().string();
+  std::string stem = rex::path_to_utf8(file.stem());
   if (!stem.starts_with(prefix)) {
     return std::nullopt;
   }
@@ -268,7 +325,7 @@ void InitLogging(const LogConfig& config) {
     resolved_path = NextSequentialLogPath(log_dir, config.app_name);
   }
   if (!resolved_path.empty()) {
-    auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(resolved_path.string(), false);
+    auto sink = CreateFileSink(resolved_path);
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;
@@ -452,6 +509,10 @@ void RegisterLogLevelCallback() {
   });
 }
 
+spdlog::sink_ptr CreateFileSink(const std::filesystem::path& path) {
+  return std::make_shared<PathFileSink>(path);
+}
+
 void AddSink(spdlog::sink_ptr sink) {
   std::lock_guard lock(g_mutex);
   g_extra_sinks.push_back(sink);
@@ -576,7 +637,7 @@ LogConfig BuildLogConfig(const std::string& cli_level,
 
 void ApplyLogCvarOverrides(LogConfig& config) {
   if (rex::cvar::HasNonDefaultValue("log_file")) {
-    config.log_file = std::string(REXCVAR_GET(log_file));
+    config.log_file = PathFromUtf8(std::string(REXCVAR_GET(log_file)));
   }
   if (rex::cvar::HasNonDefaultValue("log_flush_interval")) {
     config.flush_interval = std::chrono::seconds(REXCVAR_GET(log_flush_interval));
@@ -594,7 +655,13 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
     return result;
 
   try {
-    auto config = toml::parse_file(config_path.string());
+    // Read through the path: path::string() is in the ANSI code page on
+    // Windows (and throws for characters outside it).
+    std::ifstream file(config_path, std::ios::binary);
+    if (!file)
+      return result;
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    auto config = toml::parse(text, rex::path_to_utf8(config_path));
     auto* log_table = config["log"].as_table();
     if (!log_table)
       return result;

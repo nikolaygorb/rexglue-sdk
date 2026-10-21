@@ -276,8 +276,11 @@ int XexModule::ApplyPatch(XexModule* module) {
   auto file_format_header = opt_file_format_info();
   assert_not_null(file_format_header);
 
-  // Apply header patch...
-  uint32_t headerpatch_size = patch_header->info.compressed_len + 0xC;
+  // Apply header patch. The descriptor's size bounds the whole header delta,
+  // which may hold several records (for example a copy record followed by an
+  // LZX record); the first record's length alone truncates such patches and
+  // leaves the base's AES key in place.
+  uint32_t headerpatch_size = patch_header->size;
 
   int result_code =
       lzxdelta_apply_patch(&patch_header->info, headerpatch_size,

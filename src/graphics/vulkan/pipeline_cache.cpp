@@ -298,6 +298,34 @@ VulkanPipelineCache::~VulkanPipelineCache() {
 bool VulkanPipelineCache::Initialize() {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
 
+  if (!CreateTranslatorAndInternalShaders()) {
+    return false;
+  }
+
+  if (REXCVAR_GET(force_depth_clamp) && !vulkan_device->properties().depthClamp) {
+    REXGPU_WARN(
+        "force_depth_clamp is enabled, but the device doesn't support depth "
+        "clamping - guest draws with clipping enabled will still be clipped "
+        "to the host planes");
+  }
+
+  VkPipelineCacheCreateInfo pipeline_cache_create_info = {};
+  pipeline_cache_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  if (vulkan_device->functions().vkCreatePipelineCache(vulkan_device->device(),
+                                                       &pipeline_cache_create_info, nullptr,
+                                                       &vk_pipeline_cache_) != VK_SUCCESS) {
+    REXGPU_WARN("VulkanPipelineCache: Failed to create pipeline cache");
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
+
+  StartCreationThreads();
+
+  return true;
+}
+
+bool VulkanPipelineCache::CreateTranslatorAndInternalShaders() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
@@ -388,22 +416,10 @@ bool VulkanPipelineCache::Initialize() {
     }
   }
 
-  if (REXCVAR_GET(force_depth_clamp) && !vulkan_device->properties().depthClamp) {
-    REXGPU_WARN(
-        "force_depth_clamp is enabled, but the device doesn't support depth "
-        "clamping - guest draws with clipping enabled will still be clipped "
-        "to the host planes");
-  }
+  return true;
+}
 
-  VkPipelineCacheCreateInfo pipeline_cache_create_info = {};
-  pipeline_cache_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
-  if (vulkan_device->functions().vkCreatePipelineCache(vulkan_device->device(),
-                                                       &pipeline_cache_create_info, nullptr,
-                                                       &vk_pipeline_cache_) != VK_SUCCESS) {
-    REXGPU_WARN("VulkanPipelineCache: Failed to create pipeline cache");
-    vk_pipeline_cache_ = VK_NULL_HANDLE;
-  }
-
+void VulkanPipelineCache::StartCreationThreads() {
   uint32_t logical_processor_count = rex::thread::logical_processor_count();
   if (!logical_processor_count) {
     logical_processor_count = 6;
@@ -430,8 +446,6 @@ bool VulkanPipelineCache::Initialize() {
       creation_threads_.push_back(std::move(creation_thread));
     }
   }
-
-  return true;
 }
 
 void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
@@ -484,9 +498,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
               return true;  // Continue reading.
             }
             shader->set_ucode_storage_index(storage_index);
-            if (!shader->is_ucode_analyzed()) {
-              shader->AnalyzeUcode(ucode_disasm_buffer_);
-            }
+            // Not analyzed here: TranslateShadersForStorage analyzes, in
+            // parallel, only the shaders a stored pipeline uses, and a draw
+            // analyzes any other one when it first uses it (as on D3D12).
             return true;
           },
           // Shader translate callback - handles parallel translation.
@@ -735,7 +749,7 @@ void VulkanPipelineCache::EndSubmission() {
   }
 }
 
-void VulkanPipelineCache::Shutdown() {
+void VulkanPipelineCache::StopCreationThreads() {
   // Shut down creation threads before destroying any pipelines they may touch.
   if (!creation_threads_.empty()) {
     {
@@ -761,19 +775,12 @@ void VulkanPipelineCache::Shutdown() {
     creation_completion_callback_ = nullptr;
   }
   creation_completion_event_.reset();
+}
 
-  ShutdownShaderStorage();
-
+void VulkanPipelineCache::DestroyAllPipelines() {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-
-  if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyPipelineCache(device, vk_pipeline_cache_, nullptr);
-    vk_pipeline_cache_ = VK_NULL_HANDLE;
-  }
-
-  // Destroy all pipelines.
   last_pipeline_ = nullptr;
   for (const auto& pipeline_pair : pipelines_) {
     VkPipeline pipeline = pipeline_pair.second.pipeline.load(std::memory_order_acquire);
@@ -782,8 +789,12 @@ void VulkanPipelineCache::Shutdown() {
     }
   }
   pipelines_.clear();
+}
 
-  // Destroy all internal shaders.
+void VulkanPipelineCache::DestroyInternalShaders() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          depth_only_fragment_shader_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
@@ -798,6 +809,58 @@ void VulkanPipelineCache::Shutdown() {
                                          depth_float24_truncate_fragment_shader_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          depth_float24_round_fragment_shader_);
+}
+
+void VulkanPipelineCache::DestroyDrawResolutionScaleDependentObjects() {
+  // The draw resolution scale is baked into the translated shaders (pixel
+  // position and resolved texture coordinate scaling, fragment shader interlock
+  // EDRAM addressing) and thus into the pipelines, and neither is keyed by the
+  // scale, so all of them are destroyed and recreated on demand.
+  StopCreationThreads();
+  DestroyAllPipelines();
+  // The guest shaders themselves (microcode, its analysis and the binding
+  // layouts, which don't depend on the scale) are kept; only their
+  // translations go.
+  std::vector<uint64_t> modifications;
+  for (const auto& shader_pair : shaders_) {
+    VulkanShader* shader = shader_pair.second;
+    modifications.clear();
+    for (const auto& translation_pair : shader->translations()) {
+      modifications.push_back(translation_pair.first);
+    }
+    for (uint64_t modification : modifications) {
+      shader->DestroyTranslation(modification);
+    }
+  }
+  DestroyInternalShaders();
+  shader_translator_.reset();
+}
+
+bool VulkanPipelineCache::CreateDrawResolutionScaleDependentObjects() {
+  if (!CreateTranslatorAndInternalShaders()) {
+    return false;
+  }
+  StartCreationThreads();
+  return true;
+}
+
+void VulkanPipelineCache::Shutdown() {
+  StopCreationThreads();
+
+  ShutdownShaderStorage();
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineCache(device, vk_pipeline_cache_, nullptr);
+    vk_pipeline_cache_ = VK_NULL_HANDLE;
+  }
+
+  DestroyAllPipelines();
+
+  DestroyInternalShaders();
   if (tessellation_indexed_vertex_shader_ != VK_NULL_HANDLE) {
     dfn.vkDestroyShaderModule(device, tessellation_indexed_vertex_shader_, nullptr);
     tessellation_indexed_vertex_shader_ = VK_NULL_HANDLE;
@@ -1236,22 +1299,20 @@ void VulkanPipelineCache::TranslateShadersForStorage(
     const std::set<std::pair<uint64_t, uint64_t>>& translations_needed, bool edram_fsi_used) {
   uint64_t translation_start = rex::chrono::Clock::QueryHostTickCount();
 
-  std::vector<std::pair<VulkanShader*, uint64_t>> translations_to_do;
-  translations_to_do.reserve(translations_needed.size());
-  for (const auto& needed : translations_needed) {
-    auto shader_it = shaders_.find(needed.first);
-    if (shader_it == shaders_.end()) {
-      continue;
+  // One work item per shader, so the shader is analyzed (once, by the thread
+  // that translates it) before its translations; the set is sorted by the
+  // ucode hash, so a shader's modifications are consecutive.
+  std::vector<VulkanShader*> shaders_to_translate;
+  for (auto needed_it = translations_needed.begin(); needed_it != translations_needed.end();) {
+    const uint64_t ucode_data_hash = needed_it->first;
+    auto shader_it = shaders_.find(ucode_data_hash);
+    if (shader_it != shaders_.end()) {
+      shaders_to_translate.push_back(shader_it->second);
     }
-    VulkanShader* shader = shader_it->second;
-    VulkanShader::VulkanTranslation* translation = static_cast<VulkanShader::VulkanTranslation*>(
-        shader->GetOrCreateTranslation(needed.second));
-    if (translation && !translation->is_translated()) {
-      translations_to_do.emplace_back(shader, needed.second);
-    }
+    needed_it = translations_needed.upper_bound(std::make_pair(ucode_data_hash, UINT64_MAX));
   }
 
-  if (translations_to_do.empty()) {
+  if (shaders_to_translate.empty()) {
     return;
   }
 
@@ -1264,25 +1325,34 @@ void VulkanPipelineCache::TranslateShadersForStorage(
   uint32_t draw_res_x = render_target_cache_.draw_resolution_scale_x();
   uint32_t draw_res_y = render_target_cache_.draw_resolution_scale_y();
 
-  auto translate_function = [this, &translations_to_do, &translation_index, &translations_completed,
-                             vulkan_device, msaa_2x_attachments, msaa_2x_no_attachments,
-                             edram_fsi_used, draw_res_x, draw_res_y]() {
+  auto translate_function = [this, &translations_needed, &shaders_to_translate, &translation_index,
+                             &translations_completed, vulkan_device, msaa_2x_attachments,
+                             msaa_2x_no_attachments, edram_fsi_used, draw_res_x, draw_res_y]() {
     // Each thread needs its own translator.
     SpirvShaderTranslator translator(SpirvShaderTranslator::Features(vulkan_device),
                                      msaa_2x_attachments, msaa_2x_no_attachments, edram_fsi_used,
                                      draw_res_x, draw_res_y);
 
+    string::StringBuffer ucode_disasm_buffer;
     while (true) {
       size_t index = translation_index.fetch_add(1);
-      if (index >= translations_to_do.size()) {
+      if (index >= shaders_to_translate.size()) {
         break;
       }
-      VulkanShader* shader = translations_to_do[index].first;
-      uint64_t modification = translations_to_do[index].second;
-      VulkanShader::VulkanTranslation* translation =
-          static_cast<VulkanShader::VulkanTranslation*>(shader->GetTranslation(modification));
-      if (translation && !translation->is_translated()) {
-        if (TranslateAnalyzedShader(translator, *translation)) {
+      VulkanShader* shader = shaders_to_translate[index];
+      if (!shader->is_ucode_analyzed()) {
+        shader->AnalyzeUcode(ucode_disasm_buffer);
+      }
+      const uint64_t ucode_data_hash = shader->ucode_data_hash();
+      for (auto needed_it =
+               translations_needed.lower_bound(std::make_pair(ucode_data_hash, uint64_t(0)));
+           needed_it != translations_needed.end() && needed_it->first == ucode_data_hash;
+           ++needed_it) {
+        VulkanShader::VulkanTranslation* translation =
+            static_cast<VulkanShader::VulkanTranslation*>(
+                shader->GetOrCreateTranslation(needed_it->second));
+        if (translation && !translation->is_translated() &&
+            TranslateAnalyzedShader(translator, *translation)) {
           translations_completed.fetch_add(1);
         }
       }
@@ -1299,7 +1369,7 @@ void VulkanPipelineCache::TranslateShadersForStorage(
       thread_count = std::min(uint32_t(REXCVAR_GET(vulkan_pipeline_creation_threads)),
                               logical_processor_count);
     }
-    thread_count = std::min(thread_count, translations_to_do.size());
+    thread_count = std::min(thread_count, shaders_to_translate.size());
   }
 
   std::vector<std::unique_ptr<rex::thread::Thread>> translation_threads;

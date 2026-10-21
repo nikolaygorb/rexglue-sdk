@@ -162,6 +162,13 @@ void SetAllLevels(spdlog::level::level_enum level);
 void RegisterLogLevelCallback();
 
 /**
+ * Create the sink the log file uses. It opens the file through
+ * std::filesystem::path, so non-ASCII paths work on Windows, appends to it, and
+ * lets other processes read it while it is written.
+ */
+spdlog::sink_ptr CreateFileSink(const std::filesystem::path& path);
+
+/**
  * Add a sink to all current and future loggers.
  *
  * @param sink  Shared pointer to the spdlog sink.

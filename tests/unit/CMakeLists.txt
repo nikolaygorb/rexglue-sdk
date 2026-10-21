@@ -3,6 +3,7 @@
 add_executable(unit_tests
     test_memory.cpp
     memory/heap_allocation_test.cpp
+    memory/unwatched_invalidation_test.cpp
     kernel/object_table_test.cpp
     kernel/bignum_rsa_test.cpp
     kernel/xecrypt_md5_test.cpp
@@ -25,6 +26,10 @@ add_executable(unit_tests
     core/socket_test.cpp
     core/gpu_vendor_test.cpp
     core/utf8_case_test.cpp
+    core/dynlib_attach_test.cpp
+    core/bit_scan_test.cpp
+    core/sleep_duration_test.cpp
+    core/logging_file_sink_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
     ppc/fpscr_test.cpp
@@ -54,6 +59,7 @@ add_executable(unit_tests
     graphics/gamma_midpoint_test.cpp
     graphics/zpd_report_test.cpp
     graphics/gpu_completion_timeline_test.cpp
+    graphics/float_constant_runs_test.cpp
     ui/presenter_paint_config_test.cpp
 )
 

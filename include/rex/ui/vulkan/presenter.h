@@ -58,6 +58,8 @@ class VulkanUIDrawContext final : public UIDrawContext {
   VkFormat render_pass_format_;
 };
 
+class VulkanNisUpscaler;
+
 class VulkanPresenter final : public Presenter {
  public:
   // Maximum number of different guest output image versions still potentially
@@ -413,17 +415,10 @@ class VulkanPresenter final : public Presenter {
     std::vector<VkSemaphore> swapchain_image_present_semaphores;
   };
 
+  // Out of line: the members include a std::unique_ptr of a type complete
+  // only in vulkan_presenter.cpp.
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
-                           VulkanDevice* vulkan_device, const UISamplers* ui_samplers)
-      : Presenter(host_gpu_loss_callback),
-        vulkan_device_(vulkan_device),
-        ui_samplers_(ui_samplers),
-        guest_output_image_refresher_completion_timeline_(vulkan_device),
-        ui_completion_timeline_(vulkan_device),
-        paint_context_(vulkan_device) {
-    assert_not_null(vulkan_device);
-    assert_not_null(ui_samplers);
-  }
+                           VulkanDevice* vulkan_device, const UISamplers* ui_samplers);
 
   bool InitializeSurfaceIndependent();
 
@@ -440,8 +435,22 @@ class VulkanPresenter final : public Presenter {
   void DestroyTemporalUpscalerContext();
 #endif
 
+  // NVIDIA Image Scaling in the first EASU slot (present_effect = "nis"),
+  // recorded into command_buffer of the paint `submission`. False if it is
+  // unavailable, then the slot is drawn with EASU.
+  bool DispatchNisUpscaler(VkCommandBuffer command_buffer, uint64_t submission,
+                           const GuestOutputImage& input, uint32_t input_width,
+                           uint32_t input_height, const GuestOutputImage& output,
+                           uint32_t output_width, uint32_t output_height,
+                           const GuestOutputPaintConfig& config);
+
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
+
+  // Created on the first NIS paint (paint thread), destroyed after the paint
+  // submissions complete.
+  std::unique_ptr<VulkanNisUpscaler> nis_upscaler_;
+  bool nis_upscaler_attempted_ = false;
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

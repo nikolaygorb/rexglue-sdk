@@ -653,7 +653,8 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
         (dimension == xenos::FetchOpDimension::k1D || dimension == xenos::FetchOpDimension::k2D);
     if (force_special_view) {
       Texture* texture = nullptr;
-      bool use_signed = is_signed && texture_util::IsAnySignSigned(binding->swizzled_signs);
+      bool use_signed = texture_util::IsSignedViewBound(binding->swizzled_signs, is_signed) &&
+                        texture_util::IsAnySignSigned(binding->swizzled_signs);
       if (use_signed && IsSignedVersionSeparateForFormat(binding->key)) {
         texture = binding->texture_signed;
       } else {
@@ -666,7 +667,9 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
     } else {
       const VulkanTextureBinding& vulkan_binding = vulkan_texture_bindings_[fetch_constant_index];
       image_view =
-          is_signed ? vulkan_binding.image_view_signed : vulkan_binding.image_view_unsigned;
+          texture_util::IsSignedViewBound(binding->swizzled_signs, is_signed)
+              ? vulkan_binding.image_view_signed
+              : vulkan_binding.image_view_unsigned;
     }
   }
   if (image_view != VK_NULL_HANDLE) {
@@ -700,8 +703,13 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   if (xenos::ClampModeUsesBorder(parameters.clamp_x) ||
       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
       xenos::ClampModeUsesBorder(parameters.clamp_z)) {
-    parameters.border_color = fetch.border_color;
-    parameters.force_bc_w_to_max = fetch.force_bc_w_to_max;
+    if (binding.border_color_forced) {
+      // getBCF's black and white border samplers.
+      parameters.border_color = binding.forced_border_color;
+    } else {
+      parameters.border_color = fetch.border_color;
+      parameters.force_bc_w_to_max = fetch.force_bc_w_to_max;
+    }
   } else {
     parameters.border_color = xenos::BorderColor::k_ABGR_Black;
   }

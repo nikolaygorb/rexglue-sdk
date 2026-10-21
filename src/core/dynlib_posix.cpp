@@ -37,6 +37,20 @@ bool DynamicLibrary::Load(const std::filesystem::path& path, SymbolResolution mo
   return true;
 }
 
+bool DynamicLibrary::Attach(const std::filesystem::path& path, SymbolResolution mode) {
+  // RTLD_NOLOAD only succeeds if the library is already loaded (and then bumps its refcount).
+  Close();
+  int flags = ((mode == SymbolResolution::kImmediate) ? RTLD_NOW : RTLD_LAZY) | RTLD_NOLOAD;
+  handle_ = dlopen(path.c_str(), flags);
+  if (!handle_) {
+    const char* error = dlerror();
+    last_error_ = error ? error : "library not loaded";
+    return false;
+  }
+  last_error_.clear();
+  return true;
+}
+
 void DynamicLibrary::Close() {
   if (handle_) {
     dlclose(handle_);

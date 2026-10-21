@@ -11,6 +11,7 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
 #include <rex/filesystem/vfs.h>
@@ -299,7 +300,8 @@ bool Runtime::SetupVfs() {
 
   auto abs_game_root = std::filesystem::absolute(game_data_root_);
   if (!std::filesystem::exists(abs_game_root)) {
-    REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
+    REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}",
+                 rex::path_to_utf8(abs_game_root));
     return false;
   }
 
@@ -315,7 +317,7 @@ bool Runtime::SetupVfs() {
     REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
     return false;
   }
-  REXSYS_DEBUG("  Mounted {} at {}", abs_game_root.string(), mount_path);
+  REXSYS_DEBUG("  Mounted {} at {}", rex::path_to_utf8(abs_game_root), mount_path);
 
   // Register symbolic links for game: and D:
   file_system_->RegisterSymbolicLink("game:", mount_path);
@@ -331,7 +333,7 @@ bool Runtime::SetupVfs() {
           std::make_unique<rex::filesystem::HostPathDevice>(update_mount, abs_update_root, true);
       if (update_device->Initialize() && file_system_->RegisterDevice(std::move(update_device))) {
         file_system_->RegisterSymbolicLink("update:", update_mount);
-        REXSYS_DEBUG("  Mounted {} at update:", abs_update_root.string());
+        REXSYS_DEBUG("  Mounted {} at update:", rex::path_to_utf8(abs_update_root));
       }
     }
   }

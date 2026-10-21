@@ -92,10 +92,14 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
       render_target_cache_(render_target_cache),
       bindless_resources_used_(bindless_resources_used),
       zpd_hybrid_supported_(zpd_hybrid_supported) {
+  CreateTranslatorAndInternalShaders();
+}
+
+void PipelineCache::CreateTranslatorAndInternalShaders() {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
 
   bool edram_rov_used =
-      render_target_cache.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
 
   shader_translator_ = std::make_unique<DxbcShaderTranslator>(
       provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
@@ -103,6 +107,11 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
       render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
 
+  depth_only_pixel_shader_.clear();
+  viz_survey_depth_only_pixel_shader_.clear();
+  zpd_total_depth_only_pixel_shader_.clear();
+  zpd_total_float24_truncate_pixel_shader_.clear();
+  zpd_total_float24_round_pixel_shader_.clear();
   depth_only_pixel_shader_ = std::move(shader_translator_->CreateDepthOnlyPixelShader());
   if (edram_rov_used) {
     using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
@@ -153,6 +162,12 @@ bool PipelineCache::Initialize() {
     }
   }
 
+  StartCreationThreads();
+
+  return true;
+}
+
+void PipelineCache::StartCreationThreads() {
   uint32_t logical_processor_count = rex::thread::logical_processor_count();
   if (!logical_processor_count) {
     // Pick some reasonable amount if couldn't determine the number of cores.
@@ -182,10 +197,9 @@ bool PipelineCache::Initialize() {
       creation_threads_.push_back(std::move(creation_thread));
     }
   }
-  return true;
 }
 
-void PipelineCache::Shutdown() {
+void PipelineCache::StopCreationThreads() {
   // Shut down all threads, before destroying the pipelines since they may be
   // creating them.
   if (!creation_threads_.empty()) {
@@ -199,12 +213,19 @@ void PipelineCache::Shutdown() {
     }
     creation_threads_.clear();
   }
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    while (!creation_queue_.empty()) {
+      creation_queue_.pop();
+    }
+    creation_threads_busy_ = 0;
+    creation_completion_set_event_ = false;
+    creation_threads_shutdown_from_ = SIZE_MAX;
+  }
   creation_completion_event_.reset();
+}
 
-  // Shut down the persistent shader / pipeline storage.
-  ShutdownShaderStorage();
-
-  // Destroy all pipelines.
+void PipelineCache::DestroyAllPipelines() {
   current_pipeline_ = nullptr;
   for (auto it : pipelines_) {
     ID3D12PipelineState* state = it.second->state.load(std::memory_order_acquire);
@@ -215,6 +236,50 @@ void PipelineCache::Shutdown() {
   }
   pipelines_.clear();
   COUNT_profile_set("gpu/pipeline_cache/pipelines", 0);
+}
+
+void PipelineCache::DestroyDrawResolutionScaleDependentObjects() {
+  // The draw resolution scale is baked into the translated shaders (pixel
+  // position and resolved texture coordinate scaling, rasterizer-ordered view
+  // EDRAM addressing) and into the pipeline state objects (the slope-scaled
+  // depth bias), and neither is keyed by the scale, so all of them are
+  // destroyed and recreated on demand.
+  StopCreationThreads();
+  DestroyAllPipelines();
+  // The guest shaders themselves (microcode, its analysis and the binding
+  // layouts, which don't depend on the scale) are kept; only their
+  // translations go.
+  std::vector<uint64_t> modifications;
+  for (const auto& shader_pair : shaders_) {
+    D3D12Shader* shader = shader_pair.second;
+    modifications.clear();
+    for (const auto& translation_pair : shader->translations()) {
+      modifications.push_back(translation_pair.first);
+    }
+    for (uint64_t modification : modifications) {
+      shader->DestroyTranslation(modification);
+    }
+  }
+  depth_only_pixel_shader_.clear();
+  viz_survey_depth_only_pixel_shader_.clear();
+  zpd_total_depth_only_pixel_shader_.clear();
+  zpd_total_float24_truncate_pixel_shader_.clear();
+  zpd_total_float24_round_pixel_shader_.clear();
+  shader_translator_.reset();
+}
+
+void PipelineCache::CreateDrawResolutionScaleDependentObjects() {
+  CreateTranslatorAndInternalShaders();
+  StartCreationThreads();
+}
+
+void PipelineCache::Shutdown() {
+  StopCreationThreads();
+
+  // Shut down the persistent shader / pipeline storage.
+  ShutdownShaderStorage();
+
+  DestroyAllPipelines();
 
   // Destroy all shaders.
   if (bindless_resources_used_) {

@@ -36,6 +36,19 @@ bool DynamicLibrary::Load(const std::filesystem::path& path, SymbolResolution /*
   return true;
 }
 
+bool DynamicLibrary::Attach(const std::filesystem::path& path, SymbolResolution /*mode*/) {
+  // Flag 0 increments the module refcount, so FreeLibrary in Close() stays balanced.
+  Close();
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(0, path.c_str(), &module)) {
+    last_error_ = "GetModuleHandleExW error " + std::to_string(GetLastError());
+    return false;
+  }
+  handle_ = static_cast<void*>(module);
+  last_error_.clear();
+  return true;
+}
+
 void DynamicLibrary::Close() {
   if (handle_) {
     FreeLibrary(static_cast<HMODULE>(handle_));

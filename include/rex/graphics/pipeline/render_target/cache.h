@@ -167,6 +167,12 @@ class RenderTargetCache {
   bool IsDrawResolutionScaled() const {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
   }
+  // For changing the draw resolution scale at runtime: everything sized or
+  // compiled for the scale (the EDRAM buffer, render targets, resolve and
+  // transfer pipelines) is created by the implementation's Initialize, so the
+  // scale may only be changed between its Shutdown and Initialize, when there
+  // are no render targets.
+  void SetDrawResolutionScale(uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y);
 
   // Whether surfaces with this pitch render native per the scale threshold.
   // Compares the tile-aligned width, so it's a pure function of key fields.

@@ -60,10 +60,19 @@ TEST_CASE("tfetch1D with a replicated swizzle reads one component", "[graphics][
 }
 
 TEST_CASE("Other 1D fetch opcodes keep one component", "[graphics][fetch]") {
-  ParsedTextureFetchInstruction parsed = Parse(ucode::FetchOpcode::kGetTextureBorderColorFrac,
+  ParsedTextureFetchInstruction parsed = Parse(ucode::FetchOpcode::kGetTextureComputedLod,
                                                xenos::FetchOpDimension::k1D, 0b00'01'00);
   REQUIRE(parsed.operand_count >= 1);
   CHECK(parsed.operands[0].component_count == 1);
+}
+
+// xenia-edge 669b4266f: getBCF goes with a tfetch and reads the same coordinates.
+TEST_CASE("getBCF1D with a nonreplicated swizzle reads two components like tfetch1D",
+          "[graphics][fetch]") {
+  ParsedTextureFetchInstruction parsed = Parse(ucode::FetchOpcode::kGetTextureBorderColorFrac,
+                                               xenos::FetchOpDimension::k1D, 0b00'01'00);
+  REQUIRE(parsed.operand_count >= 1);
+  CHECK(parsed.operands[0].component_count == 2);
 }
 
 namespace {
@@ -94,5 +103,15 @@ TEST_CASE("Point sampled normalized tfetch2D snaps to texel centers", "[graphics
       ParseTfetch2D(0, uint32_t(xenos::TextureFilter::kLinear) << 12).CanSnapToTexelCenter(true));
   // 1D fetches don't snap.
   CHECK_FALSE(Parse(ucode::FetchOpcode::kTextureFetch, xenos::FetchOpDimension::k1D, 0b10'10'10)
+                  .CanSnapToTexelCenter(true));
+}
+
+// xenia-edge 669b4266f: getBCF2D snaps like the tfetch2D it goes with.
+TEST_CASE("Point sampled normalized getBCF2D snaps to texel centers", "[graphics][fetch]") {
+  CHECK(Parse(ucode::FetchOpcode::kGetTextureBorderColorFrac, xenos::FetchOpDimension::k2D,
+              0b00'01'00)
+            .CanSnapToTexelCenter(true));
+  CHECK_FALSE(Parse(ucode::FetchOpcode::kGetTextureComputedLod, xenos::FetchOpDimension::k2D,
+                    0b00'01'00)
                   .CanSnapToTexelCenter(true));
 }

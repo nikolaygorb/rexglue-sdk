@@ -266,18 +266,27 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Setjmp/Longjmp
 //=============================================================================
 
-inline std::unordered_map<u32, jmp_buf>& get_jmp_buf_map() {
-  static thread_local std::unordered_map<u32, jmp_buf> map;
+// A host jmp_buf in a 16-byte aligned slot. On x64 Windows setjmp and longjmp
+// save and load xmm6-xmm15 with aligned SSE moves. With MinGW headers the
+// 16-byte alignment of jmp_buf belongs to the typedef and is lost as a
+// template argument, so in a std::unordered_map<u32, jmp_buf> node the buffer
+// sat 8 bytes off and the first setjmp crashed.
+struct alignas(16) ppc_jmp_buf_slot {
+  jmp_buf buf;
+};
+
+inline std::unordered_map<u32, ppc_jmp_buf_slot>& get_jmp_buf_map() {
+  static thread_local std::unordered_map<u32, ppc_jmp_buf_slot> map;
   return map;
 }
 
-#define ppc_setjmp(guest_buf_addr) (setjmp(::get_jmp_buf_map()[(guest_buf_addr)]))
+#define ppc_setjmp(guest_buf_addr) (setjmp(::get_jmp_buf_map()[(guest_buf_addr)].buf))
 
 [[noreturn]] inline void ppc_longjmp(u32 guest_buf_addr, int val) {
   auto& map = get_jmp_buf_map();
   auto it = map.find(guest_buf_addr);
   if (it != map.end()) {
-    longjmp(it->second, val);
+    longjmp(it->second.buf, val);
   }
   std::abort();
 }

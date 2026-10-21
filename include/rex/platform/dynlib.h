@@ -32,6 +32,10 @@ class DynamicLibrary {
   DynamicLibrary& operator=(DynamicLibrary&& other) noexcept;
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
+  // Gets a handle to a library that is already loaded into the process and never
+  // loads it; returns false if it is not loaded. The handle is released by
+  // Close(), like one from Load().
+  bool Attach(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
   void Close();
   explicit operator bool() const { return handle_ != nullptr; }
 

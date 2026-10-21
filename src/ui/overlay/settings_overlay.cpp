@@ -11,6 +11,7 @@
  */
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/string.h>
 #include <rex/string/numeric.h>
 #include <rex/ui/keybinds.h>
@@ -251,7 +252,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
     }
   };
   // Root node named after the config file
-  std::string root_label = config_path_.stem().string();
+  std::string root_label = rex::path_to_utf8(config_path_.stem());
   ImGuiTreeNodeFlags root_flags = ImGuiTreeNodeFlags_DefaultOpen;
   if (selected_category_.empty())
     root_flags |= ImGuiTreeNodeFlags_Selected;
@@ -506,7 +507,7 @@ void SettingsDialog::OnDraw(ImGuiIO& /*io*/) {
     rex::cvar::SaveConfig(config_path_);
   }
   ImGui::SameLine();
-  ImGui::TextDisabled("(%s)", config_path_.filename().string().c_str());
+  ImGui::TextDisabled("(%s)", rex::path_to_utf8(config_path_.filename()).c_str());
 
   ImGui::End();
 }

@@ -54,16 +54,23 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
 // experimental: the presenter has no depth, motion vectors or jitter yet.
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
-                      "Guest output effect: bilinear, cas, fsr, fsr2 or fsr3 (experimental, "
-                      "single-frame until temporal inputs exist)")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
+                      "Guest output effect: bilinear, cas, fsr, nis (Vulkan), fsr2 or fsr3 "
+                      "(experimental, single-frame until temporal inputs exist)")
+    .allowed({"bilinear", "cas", "fsr", "nis", "fsr2", "fsr3"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
-                      "Guest output effect: bilinear, cas, fsr")
-    .allowed({"bilinear", "cas", "fsr"})
+                      "Guest output effect: bilinear, cas, fsr, nis (Vulkan)")
+    .allowed({"bilinear", "cas", "fsr", "nis"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #endif
+
+REXCVAR_DEFINE_DOUBLE(present_nis_sharpness,
+                      rex::ui::Presenter::GuestOutputPaintConfig::kNisSharpnessDefault,
+                      "UI/Presenter", "NVIDIA Image Scaling sharpness in [0, 1]")
+    .range(rex::ui::Presenter::GuestOutputPaintConfig::kNisSharpnessMin,
+           rex::ui::Presenter::GuestOutputPaintConfig::kNisSharpnessMax)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -113,6 +120,9 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   }
   if (lowered == "fsr") {
     return GuestOutputPaintConfig::Effect::kFsr;
+  }
+  if (lowered == "nis") {
+    return GuestOutputPaintConfig::Effect::kNis;
   }
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   if (lowered == "fsr2") {
@@ -286,6 +296,7 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
   config.SetFsrMaxUpsamplingPasses(
       uint32_t(std::max(int32_t(1), REXCVAR_GET(present_fsr_max_upsampling_passes))));
   config.SetFsrSharpnessReduction(float(REXCVAR_GET(present_fsr_sharpness_reduction)));
+  config.SetNisSharpness(float(REXCVAR_GET(present_nis_sharpness)));
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   config.SetFsrQualityMode(ParsePresentFsrQualityMode(REXCVAR_GET(present_fsr_quality_mode)));
 #endif
@@ -699,6 +710,12 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
       request_repaint = true;
     }
   }
+  if (guest_output_paint_config_.GetNisSharpness() != new_config.GetNisSharpness()) {
+    modified = true;
+    if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kNis) {
+      request_repaint = true;
+    }
+  }
   if (guest_output_paint_config_.GetDither() != new_config.GetDither()) {
     modified = true;
     request_repaint = true;
@@ -1050,7 +1067,8 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
-      config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
+      config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3 ||
+      config.GetEffect() == GuestOutputPaintConfig::Effect::kNis) {
     // FidelityFX Super Resolution and Contrast Adaptive Sharpening only work
     // good for up to 2x2 upscaling due to the way they fetch texels.
     // CAS is primarily a sharpening filter, not an upscaling one (its upscaling
@@ -1077,10 +1095,25 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     bool temporal_quality_mode_forced =
         is_temporal_effect &&
         config.GetFsrQualityMode() != GuestOutputPaintConfig::FsrQualityMode::kAuto;
-    if ((config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr || is_temporal_effect) &&
-        ((ffx_last_size.first < output_width_clamped ||
-          ffx_last_size.second < output_height_clamped) ||
-         temporal_quality_mode_forced)) {
+    if (config.GetEffect() == GuestOutputPaintConfig::Effect::kNis &&
+        (ffx_last_size.first < output_width_clamped ||
+         ffx_last_size.second < output_height_clamped)) {
+      // NVIDIA Image Scaling: one pass of up to 2x2 (it sharpens as it scales),
+      // dispatched by the Vulkan presenter in this EASU slot, or EASU itself
+      // where NIS is unavailable; then bilinear for the rest. The NIS pass
+      // writes an intermediate image, so it never is the final effect.
+      ffx_last_size.first = std::min(ffx_last_size.first * uint32_t(2), output_width_clamped);
+      ffx_last_size.second = std::min(ffx_last_size.second * uint32_t(2), output_height_clamped);
+      assert_true(flow.effect_count + 1 < flow.effects.size());
+      flow.effect_output_sizes[flow.effect_count] = ffx_last_size;
+      flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kFsrEasu;
+      flow.effect_output_sizes[flow.effect_count] = std::make_pair(output_width, output_height);
+      flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kBilinear;
+    } else if ((config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
+                is_temporal_effect) &&
+               ((ffx_last_size.first < output_width_clamped ||
+                 ffx_last_size.second < output_height_clamped) ||
+                temporal_quality_mode_forced)) {
       // AMD FidelityFX Super Resolution - upsample along at least one axis.
       // Using the output size clamped to the maximum render target size here as
       // EASU will always write to intermediate images, and RCAS supports only
@@ -1618,8 +1651,14 @@ void Presenter::WaitForUITickFromUIThread() {
 
 void Presenter::ForceUIThreadPaintTick() {
 #if REX_PLATFORM_WIN32
-  std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
-  dxgi_ui_tick_force_requested_ = true;
+  {
+    std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+    dxgi_ui_tick_force_requested_ = true;
+  }
+  // A UI thread already waiting for the next vblank (WaitForUITickFromUIThread)
+  // shows the new frame now, not up to a refresh later (rexglue PR #524, cod3
+  // 0029).
+  dxgi_ui_tick_signal_condition_.notify_all();
 #endif  // XE_PLATFORM
 }
 

@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <string>
 
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform/env.h>
 #include <rex/ui/vulkan/spirv_tools_context.h>
@@ -40,13 +41,14 @@ bool SpirvToolsContext::Initialize(unsigned int spirv_version) {
       Shutdown();
       return false;
     }
-    std::filesystem::path vulkan_sdk_path(*vulkan_sdk_env);
+    // The variable is UTF-8; a narrow path would read it in the ANSI code page.
+    std::filesystem::path vulkan_sdk_path = rex::to_path(*vulkan_sdk_env);
     library_path = vulkan_sdk_path / platform::lib_names::kSpirvToolsSdkPath;
   }
 
   if (!library_.Load(library_path)) {
     REXLOG_INFO("SPIRV-Tools: Failed to load {}; SPIR-V validation is disabled",
-                library_path.string());
+                rex::path_to_utf8(library_path));
     Shutdown();
     return false;
   }

@@ -1076,7 +1076,10 @@ void ParseTextureFetchInstruction(const TextureFetchInstruction& op,
   src_op.component_count = opcode_info.override_component_count
                                ? opcode_info.override_component_count
                                : xenos::GetFetchOpDimensionComponentCount(op.dimension());
-  if (op.opcode() == FetchOpcode::kTextureFetch && op.dimension() == xenos::FetchOpDimension::k1D) {
+  // getBCF goes with a tfetch and needs the same coordinates.
+  if ((op.opcode() == FetchOpcode::kTextureFetch ||
+       op.opcode() == FetchOpcode::kGetTextureBorderColorFrac) &&
+      op.dimension() == xenos::FetchOpDimension::k1D) {
     uint32_t src_swizzle = op.src_swizzle();
     uint32_t src_select_x = src_swizzle & 0x3;
     if (((src_swizzle >> 2) & 0x3) != src_select_x || ((src_swizzle >> 4) & 0x3) != src_select_x) {

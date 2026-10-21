@@ -12,6 +12,7 @@
 #include <charconv>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -21,6 +22,7 @@
 #include <CLI/CLI.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform/env.h>
 
@@ -596,6 +598,32 @@ void UnregisterChangeCallbacks(std::string_view name) {
 //=============================================================================
 
 std::vector<std::string> Init(int argc, char** argv) {
+  // CLI11 rejects an empty "--name=" value with a parse error that drops
+  // every other argument, yet an empty string is a meaningful value (an
+  // empty android_gpu_driver selects the system driver). Apply those here
+  // and hand CLI11 the rest.
+  std::vector<char*> args;
+  for (int i = 0; i < argc; i++) {
+    std::string_view view(argv[i]);
+    if (i > 0 && view.starts_with("--") && view.size() > 3 && view.back() == '=' &&
+        view.find('=') == view.size() - 1) {
+      const std::string name(view.substr(2, view.size() - 3));
+      auto& entries = GetRegistryStorage();
+      auto entry = std::find_if(entries.begin(), entries.end(),
+                                [&](const auto& e) { return e.name == name; });
+      if (entry == entries.end()) {
+        std::lock_guard lock(GetRegistryMutex());
+        GetPendingValuesStorage()[name].cmdline = std::string();
+      } else if (entry->type != FlagType::Boolean) {
+        ApplyFromSource(*entry, "", Source::kCommandLine);
+      }
+      continue;
+    }
+    args.push_back(argv[i]);
+  }
+  argc = int(args.size());
+  argv = args.data();
+
   CLI::App app{"", ""};
   app.allow_extras();
 
@@ -654,16 +682,26 @@ std::vector<std::string> Init(int argc, char** argv) {
 
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
-    REXLOG_DEBUG("Config file not found: {}", config_path.string());
+    REXLOG_DEBUG("Config file not found: {}", rex::path_to_utf8(config_path));
     return;
   }
 
+  // Read through the path: path::string() is in the ANSI code page on
+  // Windows, which toml++ would read as UTF-8 (or which throws for characters
+  // outside it), so a config under a non-ASCII profile folder was skipped.
+  const std::string name = rex::path_to_utf8(config_path);
   try {
-    auto config = toml::parse_file(config_path.string());
+    std::ifstream file(config_path, std::ios::binary);
+    if (!file) {
+      REXLOG_ERROR("Failed to open config {}", name);
+      return;
+    }
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    auto config = toml::parse(text, name);
     ApplyTomlTable(config, "");
-    REXLOG_DEBUG("Loaded config from {}", config_path.string());
+    REXLOG_DEBUG("Loaded config from {}", name);
   } catch (const toml::parse_error& err) {
-    REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+    REXLOG_ERROR("Failed to parse config {}: {}", name, err.what());
   }
 }
 
@@ -722,14 +760,14 @@ void SaveConfig(const std::filesystem::path& config_path) {
     {
       std::ofstream file(temp_path, std::ios::trunc);
       if (!file) {
-        REXLOG_ERROR("SaveConfig: failed to open {}", temp_path.string());
+        REXLOG_ERROR("SaveConfig: failed to open {}", rex::path_to_utf8(temp_path));
         return;
       }
       file << "# Auto-generated cvar configuration\n";
       file << content;
       file.flush();
       if (!file) {
-        REXLOG_ERROR("SaveConfig: failed to write {}", temp_path.string());
+        REXLOG_ERROR("SaveConfig: failed to write {}", rex::path_to_utf8(temp_path));
         std::error_code remove_ec;
         std::filesystem::remove(temp_path, remove_ec);
         return;
@@ -738,12 +776,13 @@ void SaveConfig(const std::filesystem::path& config_path) {
     std::error_code ec;
     std::filesystem::rename(temp_path, config_path, ec);
     if (ec) {
-      REXLOG_ERROR("SaveConfig: failed to replace {}: {}", config_path.string(), ec.message());
+      REXLOG_ERROR("SaveConfig: failed to replace {}: {}", rex::path_to_utf8(config_path),
+                   ec.message());
       std::error_code remove_ec;
       std::filesystem::remove(temp_path, remove_ec);
       return;
     }
-    REXLOG_INFO("Saved config to {}", config_path.string());
+    REXLOG_INFO("Saved config to {}", rex::path_to_utf8(config_path));
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
   }

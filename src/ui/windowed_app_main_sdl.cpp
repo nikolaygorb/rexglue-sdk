@@ -32,14 +32,83 @@
 #include <windows.h>
 #include <objbase.h>
 #include <shellapi.h>
+
+#include <SDL3/SDL_hints.h>
+
+REXCVAR_DEFINE_BOOL(win32_high_resolution_timer, true, "Win32",
+                    "Requests the highest timer resolution the NT kernel offers (usually "
+                    "0.5 ms), so sleeps and waits wake on time")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(win32_mmcss, true, "Win32",
+                    "Opts in to the Multimedia Class Scheduler Service (MMCSS) for prioritized "
+                    "access to CPU resources")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 #endif
 
 namespace {
+
+#if REX_PLATFORM_WIN32
+// From canary (src/xenia/base/main_win.cc).
+void RequestWin32HighResolutionTimer() {
+  HMODULE ntdll_module = GetModuleHandleW(L"ntdll.dll");
+  if (!ntdll_module) {
+    return;
+  }
+  // clang-format off
+  LONG (NTAPI* nt_query_timer_resolution)(PULONG minimum_resolution,
+                                          PULONG maximum_resolution,
+                                          PULONG current_resolution);
+  LONG (NTAPI* nt_set_timer_resolution)(ULONG desired_resolution,
+                                        BOOLEAN set_resolution,
+                                        PULONG current_resolution);
+  // clang-format on
+  nt_query_timer_resolution = reinterpret_cast<decltype(nt_query_timer_resolution)>(
+      GetProcAddress(ntdll_module, "NtQueryTimerResolution"));
+  nt_set_timer_resolution = reinterpret_cast<decltype(nt_set_timer_resolution)>(
+      GetProcAddress(ntdll_module, "NtSetTimerResolution"));
+  if (!nt_query_timer_resolution || !nt_set_timer_resolution) {
+    return;
+  }
+  ULONG minimum_resolution, maximum_resolution, current_resolution;
+  nt_query_timer_resolution(&minimum_resolution, &maximum_resolution, &current_resolution);
+  // The maximum resolution is the smallest period (in 100 ns units).
+  nt_set_timer_resolution(maximum_resolution, TRUE, &current_resolution);
+  REXLOG_INFO("Win32 timer resolution: {:.2f} ms", double(current_resolution) / 10000.0);
+}
+
+void RequestWin32MMCSS() {
+  HMODULE dwmapi_module = LoadLibraryW(L"dwmapi.dll");
+  if (!dwmapi_module) {
+    return;
+  }
+  HRESULT(STDAPICALLTYPE * dwm_enable_mmcss)(BOOL enable_mmcss);
+  dwm_enable_mmcss = reinterpret_cast<decltype(dwm_enable_mmcss)>(
+      GetProcAddress(dwmapi_module, "DwmEnableMMCSS"));
+  if (dwm_enable_mmcss) {
+    dwm_enable_mmcss(TRUE);
+  }
+  FreeLibrary(dwmapi_module);
+}
+#endif
 
 int RunWindowedApp(int argc, char** argv) {
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
+
+#if REX_PLATFORM_WIN32
+  // Request high-performance timing and scheduling, as canary does.
+  if (REXCVAR_GET(win32_high_resolution_timer)) {
+    // SDL calls timeBeginPeriod(1) on init, which would replace the finer
+    // resolution requested below (fps drops in canary); the timer resolution
+    // is managed here instead.
+    SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "0", SDL_HINT_OVERRIDE);
+    RequestWin32HighResolutionTimer();
+  }
+  if (REXCVAR_GET(win32_mmcss)) {
+    RequestWin32MMCSS();
+  }
+#endif
 
   int result;
   {

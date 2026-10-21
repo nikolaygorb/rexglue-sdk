@@ -478,7 +478,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
       // Get the index buffer memory range.
       uint32_t index_size_log2 = guest_index_format == xenos::IndexFormat::kInt16 ? 1 : 2;
       // The base should already be aligned, but aligning here too for safety.
-      guest_index_base = regs[XE_GPU_REG_VGT_DMA_BASE] & ~uint32_t((1 << index_size_log2) - 1);
+      guest_index_base =
+          xenos::CpuToGpu(regs[XE_GPU_REG_VGT_DMA_BASE]) & ~uint32_t((1 << index_size_log2) - 1);
       guest_index_buffer_needed_bytes = guest_draw_vertex_count << index_size_log2;
       if (guest_index_base > SharedMemory::kBufferSize ||
           SharedMemory::kBufferSize - guest_index_base < guest_index_buffer_needed_bytes) {
@@ -668,7 +669,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
     // Get the index buffer memory range.
     uint32_t index_size_log2 = guest_index_format == xenos::IndexFormat::kInt16 ? 1 : 2;
     // The base should already be aligned, but aligning here too for safety.
-    guest_index_base = regs[XE_GPU_REG_VGT_DMA_BASE] & ~uint32_t((1 << index_size_log2) - 1);
+    guest_index_base =
+          xenos::CpuToGpu(regs[XE_GPU_REG_VGT_DMA_BASE]) & ~uint32_t((1 << index_size_log2) - 1);
     guest_index_buffer_needed_bytes = guest_draw_vertex_count << index_size_log2;
     if (guest_index_base > SharedMemory::kBufferSize ||
         SharedMemory::kBufferSize - guest_index_base < guest_index_buffer_needed_bytes) {

@@ -111,6 +111,9 @@ class VulkanDevice {
     bool shaderCullDistance = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;
+    // Storage images of formats like A2B10G10R10 (the guest output), for the
+    // presenter's NVIDIA Image Scaling pass.
+    bool shaderStorageImageExtendedFormats = false;
 
     // VK_KHR_sampler_mirror_clamp_to_edge (#15, promoted to 1.2)
 

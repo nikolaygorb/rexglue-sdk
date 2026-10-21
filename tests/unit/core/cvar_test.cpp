@@ -310,6 +310,20 @@ TEST_CASE("cvar source precedence", "[cvar]") {
     CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kRuntime);
   }
 
+  SECTION("An empty command-line value applies and keeps the other arguments") {
+    char argv0[] = "cvar_test";
+    char arg1[] = "--test_int32_flag=333";
+    char arg2[] = "--test_string_flag=";
+    char* argv[] = {argv0, arg1, arg2};
+    rex::cvar::Init(3, argv);
+
+    rex::cvar::LoadConfig(config_path);
+
+    CHECK(REXCVAR_GET(test_string_flag).empty());
+    CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kCommandLine);
+    CHECK(REXCVAR_GET(test_int32_flag) == 333);
+  }
+
   SECTION("Boolean negation from the command line beats the config file") {
     {
       std::ofstream file(config_path);
@@ -750,6 +764,29 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
     rex::cvar::SaveConfig(save_path);
     // Either file doesn't exist or is minimal (just header comment)
   }
+}
+
+TEST_CASE("cvar LoadConfig reads a config under a non-ASCII folder", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  // Cyrillic and Japanese: path::string() would give toml++ ANSI bytes on
+  // Windows, or throw for characters outside the code page.
+  const auto dir =
+      std::filesystem::temp_directory_path() / std::filesystem::path(u8"rex_профиль_日本語");
+  const auto config_path = dir / "config.toml";
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  std::filesystem::create_directories(dir);
+  {
+    std::ofstream file(config_path);
+    file << "test_int32_flag = 4242\n";
+  }
+
+  rex::cvar::LoadConfig(config_path);
+  CHECK(REXCVAR_GET(test_int32_flag) == 4242);
+
+  std::filesystem::remove_all(dir, ec);
+  rex::cvar::testing::ResetAllForTesting();
 }
 
 TEST_CASE("cvar ApplyEnvironment", "[cvar]") {

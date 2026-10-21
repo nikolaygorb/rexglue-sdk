@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cfloat>
 #include <cstring>
 #include <filesystem>
@@ -436,12 +437,13 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   // it now if needed.
   DetachIfLastDialogRemoved();
 
-  if (!dialogs_.empty()) {
-    // Repaint (and handle input) continuously if still active. In detached mode
-    // there is no presenter; the app drives repaint via its own present loop.
-    if (presenter_) {
-      presenter_->RequestUIPaintFromUIThread();
-    }
+  // Repaint (and handle input) continuously while a dialog needs it. In
+  // detached mode there is no presenter; the app drives repaint via its own
+  // present loop.
+  if (presenter_ && std::any_of(dialogs_.cbegin(), dialogs_.cend(), [](const ImGuiDialog* dialog) {
+        return dialog->WantsContinuousRepaint();
+      })) {
+    presenter_->RequestUIPaintFromUIThread();
   }
 }
 

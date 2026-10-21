@@ -128,12 +128,30 @@ class VulkanPipelineCache {
                          VulkanRenderTargetCache::RenderPassKey render_pass_key, bool zpd_total,
                          bool viz_survey, Pipeline** pipeline_out);
   bool IsCreatingPipelines() const;
+
+  // For changing the draw resolution scale at runtime, with the GPU idle and no
+  // pipeline being created. Destroy releases all pipelines, all shader
+  // translations, the internal shaders and the translator, which have the scale
+  // baked in. Create, called once the render target cache has been
+  // reinitialized with the new scale, recreates the translator and the
+  // internal shaders; translations and pipelines are then made on demand.
+  void DestroyDrawResolutionScaleDependentObjects();
+  bool CreateDrawResolutionScaleDependentObjects();
   // Waits for any pipeline creation needed by the current draw path to finish
   // before state is consumed. This was added so strict ZPD query paths stop
   // racing pipeline compilation and then blocking work on incomplete state.
   void AwaitPipelineCompletion();
 
+
  private:
+  // Creates the shader translator for the render target cache's draw
+  // resolution scale and the internal shaders it generates.
+  bool CreateTranslatorAndInternalShaders();
+  void DestroyInternalShaders();
+  void StartCreationThreads();
+  void StopCreationThreads();
+  void DestroyAllPipelines();
+
   enum class PipelineGeometryShader : uint32_t {
     kNone,
     kPointList,

@@ -93,8 +93,9 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
       a_.OpFToI(address_dest, address_src);
       // Extract the byte address from the fetch constant to
       // system_temp_result_.w (which is not used yet).
+      // Masked to physical - the guest may use a mirror window.
       a_.OpAnd(dxbc::Dest::R(system_temp_result_, 0b1000), fetch_constant_src.SelectFromSwizzled(0),
-               dxbc::Src::LU(~uint32_t(3)));
+               dxbc::Src::LU(0x1FFFFFFC));
       // Merge the index and the base address.
       a_.OpIMAd(address_dest, address_src,
                 dxbc::Src::LU(instr.attributes.stride * sizeof(uint32_t)),
@@ -102,7 +103,7 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     } else {
       // Fetching from the same location - extract the byte address of the
       // beginning of the buffer.
-      a_.OpAnd(address_dest, fetch_constant_src.SelectFromSwizzled(0), dxbc::Src::LU(~uint32_t(3)));
+      a_.OpAnd(address_dest, fetch_constant_src.SelectFromSwizzled(0), dxbc::Src::LU(0x1FFFFFFC));
     }
   }
 
@@ -152,7 +153,7 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
             fetch_constant_src.SelectFromSwizzled(1));
   // bounds_temp.y = base address of the buffer in bytes.
   a_.OpAnd(dxbc::Dest::R(bounds_temp, 0b0010), fetch_constant_src.SelectFromSwizzled(0),
-           dxbc::Src::LU(~uint32_t(3)));
+           dxbc::Src::LU(0x1FFFFFFC));
   // bounds_temp.x = exclusive end of the buffer in bytes.
   a_.OpUMAd(dxbc::Dest::R(bounds_temp, 0b0001), dxbc::Src::R(bounds_temp, dxbc::Src::kXXXX),
             dxbc::Src::LU(4), dxbc::Src::R(bounds_temp, dxbc::Src::kYYYY));

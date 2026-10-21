@@ -15,6 +15,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 
 #include <rex/graphics/flags.h>
@@ -93,7 +94,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   // Transient descriptor set layouts must be initialized in the command
   // processor.
-  bool Initialize(uint32_t shared_memory_binding_count);
+  // The path is chosen from the configuration unless required_path is given:
+  // when reinitializing for a different draw resolution scale, the path must
+  // stay the same, as other subsystems depend on it.
+  bool Initialize(uint32_t shared_memory_binding_count,
+                  std::optional<Path> required_path = std::nullopt);
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
 

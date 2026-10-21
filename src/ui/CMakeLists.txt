@@ -34,6 +34,7 @@ set(REXUI_OVERLAY_SOURCES
 # Vulkan UI backend
 set(REXUI_VULKAN_SOURCES
     vulkan/linked_type_descriptor_set_allocator.cpp
+    vulkan/nis_upscaler.cpp
     vulkan/vulkan_moltenvk.cpp
     vulkan/single_layout_descriptor_set_pool.cpp
     vulkan/spirv_tools_context.cpp
@@ -106,6 +107,7 @@ target_include_directories(rexui PRIVATE
     ${PROJECT_BINARY_DIR}/include  # Generated macOS Vulkan path data
     ${REXGLUE_ROOT}/src  # For ui/shaders/bytecode includes
     ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h for icon decoding
+    ${REXGLUE_ROOT}/thirdparty/nis  # NIS_Config.h for the Vulkan presenter's NIS pass
 )
 
 target_link_libraries(rexui PUBLIC

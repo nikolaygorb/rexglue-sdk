@@ -786,6 +786,15 @@ void Window::OnTouchEvent(TouchEvent& e, WindowDestructionReceiver& destruction_
   }
 }
 
+void Window::NotifyDestroyingWhileOpen() {
+  if (!CanSendEventsToListeners()) {
+    return;
+  }
+  WindowDestructionReceiver destruction_receiver(this);
+  UIEvent e(this);
+  SendEventToListeners([&e](auto listener) { listener->OnDestroying(e); }, destruction_receiver);
+}
+
 void Window::SendEventToListeners(std::function<void(WindowListener*)> fn,
                                   WindowDestructionReceiver& destruction_receiver) {
   if (!CanSendEventsToListeners()) {

@@ -223,6 +223,10 @@ class Presenter {
       kFsr2,
       // Same as kFsr2 (both go through the same ffx-api upscaler provider).
       kFsr3,
+      // NVIDIA Image Scaling: one compute pass of up to 2x2 in the first EASU
+      // slot, then bilinear. Vulkan only; elsewhere, or when unavailable, FSR
+      // EASU runs in that slot instead.
+      kNis,
     };
 
     enum class FsrQualityMode {
@@ -256,6 +260,10 @@ class Presenter {
     static constexpr float kFsrSharpnessReductionDefault = 0.2f;
     static_assert(kFsrSharpnessReductionDefault >= kFsrSharpnessReductionMin &&
                   kFsrSharpnessReductionDefault <= kFsrSharpnessReductionMax);
+
+    static constexpr float kNisSharpnessMin = 0.0f;
+    static constexpr float kNisSharpnessMax = 1.0f;
+    static constexpr float kNisSharpnessDefault = 0.5f;
 
     // In the sharpness setters, min / max with a constant as the first argument
     // also drops NaNs.
@@ -294,6 +302,11 @@ class Presenter {
       fsr_quality_mode_ = new_fsr_quality_mode;
     }
 
+    float GetNisSharpness() const { return nis_sharpness_; }
+    void SetNisSharpness(float new_nis_sharpness) {
+      nis_sharpness_ = std::min(kNisSharpnessMax, std::max(kNisSharpnessMin, new_nis_sharpness));
+    }
+
     // Very tiny effect, but highly noticeable, for instance, on the sky in the
     // 4D5307E6 main menu (prominently in Custom Games, especially with FSR -
     // banding around the clouds can be clearly seen without dithering with 8bpc
@@ -311,6 +324,7 @@ class Presenter {
     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
     FsrQualityMode fsr_quality_mode_ = FsrQualityMode::kAuto;
+    float nis_sharpness_ = kNisSharpnessDefault;
     bool dither_ = false;
   };
 

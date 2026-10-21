@@ -54,6 +54,7 @@ class MnkInputDriver final : public InputDriver,
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
+  void OnDestroying(rex::ui::UIEvent& e) override;
   void OnLostFocus(rex::ui::UISetupEvent& e) override;
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 

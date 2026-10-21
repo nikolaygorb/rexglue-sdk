@@ -196,3 +196,18 @@ TEST_CASE("Format info has fixed-point component widths", "[graphics][texture]")
   CHECK_FALSE(FormatInfo::Get(xenos::TextureFormat::k_DXT1)->fixed);
   CHECK(FormatInfo::Get(xenos::TextureFormat::k_DXN)->fixed);
 }
+
+// xenia-edge 669b4266f: an unsigned binding of a fully signed texture (getBCF samples
+// one image for both border colors) gets the signed view, as there is no unsigned one.
+TEST_CASE("Signed view is bound for signed bindings and fully signed textures",
+          "[graphics][texture]") {
+  constexpr uint8_t kAllSigned = 0b01'01'01'01;
+  constexpr uint8_t kAllUnsigned = 0b00'00'00'00;
+  constexpr uint8_t kMixed = 0b00'01'00'01;
+  CHECK(texture_util::IsSignedViewBound(kAllSigned, false));
+  CHECK(texture_util::IsSignedViewBound(kAllSigned, true));
+  CHECK_FALSE(texture_util::IsSignedViewBound(kAllUnsigned, false));
+  CHECK(texture_util::IsSignedViewBound(kAllUnsigned, true));
+  CHECK_FALSE(texture_util::IsSignedViewBound(kMixed, false));
+  CHECK(texture_util::IsSignedViewBound(kMixed, true));
+}

@@ -461,6 +461,11 @@ class Window {
   // beginning of the implementation's destructor so the implementation can
   // destroy the platform window without doing something unsafe in destruction.
   void EnterDestructor() {
+    // Called by the implementation's destructor and again by ~Window; only the
+    // first call notifies.
+    if (phase_ != Phase::kDeleting) {
+      NotifyDestroyingWhileOpen();
+    }
     phase_ = Phase::kDeleting;
     // Disconnect from the surface before destroying the window behind it.
     OnSurfaceChanged(false);
@@ -679,6 +684,9 @@ class Window {
     // actual state during the final listener invocation.
     return phase_ >= Phase::kOpen && phase_ <= Phase::kOpenBeforeClosing;
   }
+
+  // Sends OnDestroying if the window is still open (EnterDestructor).
+  void NotifyDestroyingWhileOpen();
 
   bool CanSendEventsToListeners() const {
     return phase_ >= Phase::kOpen && phase_ <= Phase::kOpenBeforeClosing;

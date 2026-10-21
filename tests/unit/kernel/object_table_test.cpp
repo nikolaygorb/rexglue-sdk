@@ -10,6 +10,10 @@
 #include <rex/system/util/object_table.h>
 #include <rex/system/xobject.h>
 
+#include <atomic>
+#include <thread>
+#include <vector>
+
 using namespace rex;
 using namespace rex::system;
 using namespace rex::system::util;
@@ -549,6 +553,46 @@ TEST_CASE("ObjectTable GetAllObjects returns all objects", "[kernel][object_tabl
   CHECK(all.size() == 2);
 
   table.Reset();
+}
+
+TEST_CASE("ObjectTable RemoveHandle while another thread grows the table",
+          "[kernel][object_table]") {
+  InitTestLogging();
+  DestructorCountReset reset;
+
+  ObjectTable table;
+  // The first growth makes the table 16384 entries; this many handles move it
+  // twice more (Resize reallocates and frees the old table).
+  constexpr int kGrowHandles = 40000;
+  std::atomic<bool> growing{true};
+
+  std::thread grower([&] {
+    for (int i = 0; i < kGrowHandles; ++i) {
+      auto* obj = new TestObject();
+      table.AddHandle(obj, nullptr);
+      obj->Release();  // The table holds the only reference.
+    }
+    growing = false;
+  });
+
+  // RemoveHandle must not hold an entry pointer into a table that a Resize
+  // on the other thread frees.
+  int removed = 0;
+  while (growing || removed == 0) {
+    auto* obj = new TestObject();
+    X_HANDLE handle = 0;
+    REQUIRE(table.AddHandle(obj, &handle) == X_STATUS_SUCCESS);
+    obj->Release();
+    REQUIRE(table.RemoveHandle(handle) == X_STATUS_SUCCESS);
+    ++removed;
+  }
+  grower.join();
+
+  CHECK(TestObject::destructor_count == removed);
+  CHECK(table.GetAllObjects().size() == size_t(kGrowHandles));
+
+  table.Reset();
+  CHECK(TestObject::destructor_count == removed + kGrowHandles);
 }
 
 // =============================================================================

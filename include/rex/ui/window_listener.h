@@ -26,6 +26,10 @@ class WindowListener {
   // OnOpened will be followed by various initial setup listeners.
   virtual void OnOpened(UISetupEvent&) {}
   virtual void OnClosing(UIEvent&) {}
+  // Called when the window object is destroyed while still open, so without
+  // OnClosing, before the platform window behind it goes away. A listener
+  // holding a pointer to the window must drop it here.
+  virtual void OnDestroying(UIEvent&) {}
 
   // Called when the user asks to close the window (close button, Alt+F4).
   // Return false to veto: the window stays open and the vetoing party is

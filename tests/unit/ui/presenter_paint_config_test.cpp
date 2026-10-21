@@ -64,3 +64,19 @@ TEST_CASE("Paint config clamps sharpness and pass count", "[ui][presenter]") {
   config.SetFsrMaxUpsamplingPasses(100);
   CHECK(config.GetFsrMaxUpsamplingPasses() == GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax);
 }
+
+TEST_CASE("Paint config offers NIS with a clamped sharpness", "[ui][presenter]") {
+  GuestOutputPaintConfig config;
+  config.SetEffect(GuestOutputPaintConfig::Effect::kNis);
+  CHECK(config.GetEffect() == GuestOutputPaintConfig::Effect::kNis);
+  CHECK(config.GetNisSharpness() == GuestOutputPaintConfig::kNisSharpnessDefault);
+
+  config.SetNisSharpness(0.25f);
+  CHECK(config.GetNisSharpness() == 0.25f);
+  config.SetNisSharpness(3.0f);
+  CHECK(config.GetNisSharpness() == GuestOutputPaintConfig::kNisSharpnessMax);
+  config.SetNisSharpness(-1.0f);
+  CHECK(config.GetNisSharpness() == GuestOutputPaintConfig::kNisSharpnessMin);
+  config.SetNisSharpness(std::numeric_limits<float>::quiet_NaN());
+  CHECK_FALSE(std::isnan(config.GetNisSharpness()));
+}

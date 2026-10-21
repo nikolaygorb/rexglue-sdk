@@ -139,7 +139,7 @@ void AudioSystem::WorkerThreadMain() {
       uint32_t client_callback = 0;
       uint32_t client_callback_arg = 0;
       {
-        auto global_lock = global_critical_region_.Acquire();
+        std::lock_guard<std::mutex> clients_lock(clients_mutex_);
         if (clients_[index].in_use) {
           client_callback = clients_[index].callback;
           client_callback_arg = clients_[index].wrapped_callback_arg;
@@ -233,13 +233,21 @@ void AudioSystem::Shutdown() {
 
   // Destroy all active client drivers (closes SDL audio devices, stopping
   // callback threads) before the semaphores they reference are destroyed.
-  for (size_t i = 0; i < kMaximumClientCount; i++) {
-    if (clients_[i].in_use) {
-      DestroyDriver(clients_[i].driver);
-      if (clients_[i].wrapped_callback_arg) {
-        memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
+  uint32_t wrapped_callback_args[kMaximumClientCount] = {};
+  {
+    std::lock_guard<std::mutex> clients_lock(clients_mutex_);
+    for (size_t i = 0; i < kMaximumClientCount; i++) {
+      if (clients_[i].in_use) {
+        DestroyDriver(clients_[i].driver);
+        wrapped_callback_args[i] = clients_[i].wrapped_callback_arg;
+        ResetClient(clients_[i]);
       }
-      ResetClient(clients_[i]);
+    }
+  }
+  // Outside clients_mutex_, as the heap takes the global lock.
+  for (uint32_t wrapped_callback_arg : wrapped_callback_args) {
+    if (wrapped_callback_arg) {
+      memory()->SystemHeapFree(wrapped_callback_arg);
     }
   }
 }
@@ -247,10 +255,19 @@ void AudioSystem::Shutdown() {
 X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, size_t* out_index) {
   REXAPU_DEBUG("AudioSystem::RegisterClient: callback={:08X} callback_arg={:08X}", callback,
                callback_arg);
-  auto global_lock = global_critical_region_.Acquire();
+  // Outside clients_mutex_, as the heap takes the global lock.
+  uint32_t ptr = memory()->SystemHeapAlloc(0x4);
+  memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
+
+  std::unique_lock<std::mutex> clients_lock(clients_mutex_);
 
   auto index = FindFreeClient();
   assert_true(index >= 0);
+  if (index < 0) {
+    clients_lock.unlock();
+    memory()->SystemHeapFree(ptr);
+    return X_STATUS_UNSUCCESSFUL;
+  }
   REXAPU_DEBUG("AudioSystem::RegisterClient: using client index={} queued_frames={}", index,
                queued_frames_);
 
@@ -261,12 +278,11 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   AudioDriver* driver;
   auto result = CreateDriver(index, client_semaphore, &driver);
   if (XFAILED(result)) {
+    clients_lock.unlock();
+    memory()->SystemHeapFree(ptr);
     return result;
   }
   assert_not_null(driver);
-
-  uint32_t ptr = memory()->SystemHeapAlloc(0x4);
-  memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   auto& client = clients_[index];
   client.driver = driver;
@@ -292,7 +308,7 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
     submit_count++;
   }
 
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::mutex> clients_lock(clients_mutex_);
   assert_true(index < kMaximumClientCount);
   // A title can submit a last frame after unregistering its client.
   if (!clients_[index].driver) {
@@ -307,14 +323,14 @@ void AudioSystem::UnregisterClient(size_t index) {
   assert_true(index < kMaximumClientCount);
   AudioDriver* driver;
   {
-    auto global_lock = global_critical_region_.Acquire();
+    std::lock_guard<std::mutex> clients_lock(clients_mutex_);
     driver = clients_[index].driver;
     // wrapped_callback_arg is leaked: a callback in flight may hold it.
     ResetClient(clients_[index]);
   }
 
-  // Wait for a callback in flight. Not under the global lock, which the
-  // callback can take.
+  // Wait for a callback in flight. Not under clients_mutex_: the callback
+  // re-enters (SubmitFrame).
   clients_[index].callback_mutex.lock();
   clients_[index].callback_mutex.unlock();
 

@@ -22,6 +22,22 @@ Builds made with the optional AMD FidelityFX SDK (`REXGLUE_ENABLE_FIDELITYFX=ON`
 
 DLSS, XeSS, FSR 2 and later as real temporal upscalers, frame generation inside the title, and ambient occlusion are not available yet. They need per-title support.
 
+## Texture replacement (HD texture packs)
+
+A pack is a folder with an `index.tsv` and DDS files: textures whose original data is in the pack are drawn with the pack's images, at any size with the original's aspect ratio (2x, 4x, 2.5x …). Only 2D textures in DXT1, DXT3, DXT5, DXN (ATI2) and 32-bit RGBA are replaced, and the image must be in the same format as the original. Both backends. How it works, how to make a pack, and an example: [texture-replacement.md](texture-replacement.md).
+
+| Setting | Values | What it does |
+|---|---|---|
+| `texture_replacement_path` | folder (default empty: off) | The pack to use. Read once at startup. |
+| `texture_replacement_user_path` | folder (default empty) | A second pack, read after the first: a texture in both comes from this one. Its images may not be more see-through than the originals (an opaque original makes the image opaque). |
+| `texture_replacement_enabled` | `true` (default), `false` | Turns replacement off and on while the game runs. |
+| `texture_replacement_allow_list` | file (default empty) | A file of texture keys (one 16-digit hex key per line, `#` comments): only those are replaced, and every image is checked against the original's alpha. Can change while the game runs. |
+| `texture_replacement_memory_limit` | 4096 MB (default), 0 = no limit | Most memory the replaced textures may take at once; a texture beyond it is drawn from the original data. A 2x pack takes 4x the memory of the originals. |
+| `texture_replacement_log` | `false` (default), `true` | Logs every texture that could be replaced: its key, size, format, and whether it was. |
+| `texture_replacement_dump_path` | folder (default empty: off) | Writes every texture that could be replaced to the folder as a pack: `<key>.dds` files and their `index.tsv`. Read once at startup. |
+
+Making a pack, in short: play with `texture_replacement_dump_path` set, edit or upscale the DDS files you want (same format, file name and aspect ratio), then point `texture_replacement_path` at the folder. Details in [texture-replacement.md](texture-replacement.md).
+
 ## Direct3D 12 and Vulkan
 
 Titles can render with Direct3D 12 (Windows only) or Vulkan (Windows, Linux). All built-in options above work the same on both.
@@ -77,6 +93,9 @@ The presenter then uses mailbox (no tearing, low latency) or, without mailbox, F
 | `video_mode_width`, `video_mode_height` | 1280 × 720 (default), from 640 × 480 | The video mode the game is told the console outputs. Most games render at their own size anyway; for a sharper image use `resolution_scale`. `resolution` sets these together with the window. |
 | `avpack` | 8 = HDMI (default), 0 to 8 | The video cable the game is told is connected: 0 = PAL-60 component (SD), 2 = PAL-60 SCART, 3 = 480p component (HD), 4 = HDMI + audio, 5 = PAL-60 composite / S-Video, 6 = VGA, 7 = TV PAL-60, 8 = HDMI. Some games offer other resolutions or refresh rates per cable. |
 | `video_mode_refresh_rate` | 60.0 (default), 24.0 to 480.0 | The refresh rate the game is told the console outputs, in Hz. |
+| `display_output_transfer` | `none` (default), `bt1886` | `bt1886` shows the picture the way an HDTV does (BT.1886, gamma 2.4): Xbox 360 games are made for a TV, which shows dark tones darker than a PC monitor (sRGB). Use it if the image looks washed out or too bright in the shadows. Applied through the game's own gamma ramp, at no cost; can be changed while the game runs. |
+| `kernel_display_gamma_type` | 2 = BT.709 HDTV (default), 1 = sRGB, 0 = linear, 3 = power | The display the game is told it draws for; the game adjusts its gamma ramp to it. With 2 (what a console on a TV reports) the console's Direct3D puts BT.709's curve on top of the game's ramp; with 1 the game's ramp is used as it is. Takes effect when the game next sets its gamma ramp. |
+| `kernel_display_gamma_power` | 2.22222 (default), 1.0 to 3.0 | With `kernel_display_gamma_type = 3`, the display's gamma power. |
 | `present_letterbox` | `true` (default), `false` | Keeps the game's aspect ratio with black bars when the window has another shape. `false` stretches the image to the window. |
 | `present_allow_overscan_cutoff` | `false` (default), `true` | Crops the image edges like a TV's overscan, keeping the safe area below. Hides garbage some games draw at the very edges. |
 | `present_safe_area_x`, `present_safe_area_y` | 90 (default), 0 to 100 | With `present_allow_overscan_cutoff`, the share of the width and height (in %) that stays visible. |

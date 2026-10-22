@@ -78,6 +78,7 @@ class VulkanTextureCache final : public TextureCache {
 
   ~VulkanTextureCache();
 
+  void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
   void BeginSubmission(uint64_t new_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
@@ -228,6 +229,10 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t GetMaxHostTextureDepthOrArraySize(xenos::DataDimension dimension) const override;
 
   std::unique_ptr<Texture> CreateTexture(TextureKey key) override;
+
+  bool CanCreateReplacementTexture(TextureKey key) const override;
+  std::unique_ptr<Texture> CreateReplacementTexture(
+      TextureKey key, const texture_replacement::Image& image) override;
 
   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
                                           uint32_t length_scaled_alignment_log2 = 0) override;
@@ -403,6 +408,12 @@ class VulkanTextureCache final : public TextureCache {
 
   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
 
+  // Creates the image of a texture for the key, width x height with
+  // mip_levels levels: the key's own size and levels for CreateTexture, a
+  // replacement image's for CreateReplacementTexture.
+  std::unique_ptr<VulkanTexture> CreateVulkanTexture(TextureKey key, uint32_t width,
+                                                     uint32_t height, uint32_t mip_levels);
+
   void GetTextureUsageMasks(VulkanTexture::Usage usage, VkPipelineStageFlags& stage_mask,
                             VkAccessFlags& access_mask, VkImageLayout& layout);
 
@@ -510,6 +521,15 @@ class VulkanTextureCache final : public TextureCache {
   uint32_t scaled_resolve_heap_count_ = 0;
   // Memory type for sparse allocations
   uint32_t scaled_resolve_memory_type_ = UINT32_MAX;
+
+  // Staging buffers of replacement images (CreateReplacementTexture), each
+  // destroyed once the submission copying from it has completed.
+  struct ReplacementStagingBuffer {
+    uint64_t submission_index;
+    VkBuffer buffer;
+    VmaAllocation allocation;
+  };
+  std::vector<ReplacementStagingBuffer> replacement_staging_buffers_;
 };
 
 }  // namespace rex::graphics::vulkan

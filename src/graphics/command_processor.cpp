@@ -29,6 +29,7 @@
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
+#include <rex/graphics/util/display_transfer.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -118,6 +119,20 @@ REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
                     "automatic fallback to full synchronous readback")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// How the picture reaches the screen. The game's output is what the display
+// it was told about (kernel_display_gamma_type) expects. "none" sends it as it
+// is. "bt1886" shows it the way an HDTV does: decoded with BT.1886 (gamma 2.4,
+// black at 0) and encoded again for a PC display (sRGB); with
+// kernel_display_gamma_type 2 (BT.709, the console's) that is the console's
+// picture on a TV. BT.709 and sRGB share their primaries and white point, so
+// only the tone curve changes. It is folded into the gamma ramp the presenter
+// applies anyway (no extra pass), and a change shows at the next frame.
+REXCVAR_DEFINE_STRING(display_output_transfer, "none", "GPU",
+                      "How the picture is shown: none (as the game made it) or bt1886 (as an HDTV "
+                      "shows it, BT.1886 gamma 2.4, encoded for an sRGB PC display)")
+    .allowed({"none", "bt1886"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "Compile shaders and create pipelines asynchronously in background "
                     "threads. This reduces stutter but may cause brief visual artifacts while "
@@ -172,6 +187,10 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
 constexpr uint32_t kDrawResolutionScaleRequestForceRebuild = UINT32_C(1) << 16;
 constexpr uint32_t kDrawResolutionScaleRequestValid = UINT32_C(1) << 17;
 std::atomic<uint32_t> pending_draw_resolution_scale_request{0};
+
+// Set by display_output_transfer's change callback (any thread), taken at the
+// next swap (UpdateDisplayOutputTransfer). Starts set, so the first swap reads it.
+std::atomic<bool> g_display_output_transfer_changed{true};
 
 // Cvars that configure the draw resolution scale (combined by
 // TextureCache::GetConfigDrawResolutionScale).
@@ -236,6 +255,9 @@ bool CommandProcessor::Initialize() {
   // Let the draw resolution scale cvars be changed while running. The callbacks
   // run on the thread changing the cvar, so they only record the request for
   // the command processor thread.
+  rex::cvar::RegisterChangeCallback("display_output_transfer", [](std::string_view, std::string_view) {
+    g_display_output_transfer_changed.store(true, std::memory_order_release);
+  });
   for (const char* cvar_name : kDrawResolutionScaleCvars) {
     rex::cvar::RegisterChangeCallback(cvar_name, [](std::string_view, std::string_view) {
       uint32_t x, y;
@@ -260,6 +282,7 @@ void CommandProcessor::Shutdown() {
   // The callbacks are code of the GPU plugin, which may be unloaded after the
   // shutdown, while the cvar registry may outlive it. This removes all the
   // callbacks of these cvars, but they're defined by the GPU emulation.
+  rex::cvar::UnregisterChangeCallbacks("display_output_transfer");
   for (const char* cvar_name : kDrawResolutionScaleCvars) {
     rex::cvar::UnregisterChangeCallbacks(cvar_name);
   }
@@ -624,7 +647,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
                         rex::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         }
         if (write_gamma_ramp_component) {
-          OnGammaRamp256EntryTableValueWritten();
+          GammaRamp256EntryTableValueWritten();
         }
       } break;
 
@@ -659,7 +682,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
                         rex::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         }
         if (write_gamma_ramp_component) {
-          OnGammaRampPWLValueWritten();
+          GammaRampPWLValueWritten();
         }
       } break;
 
@@ -692,7 +715,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
         WriteRegister(XE_GPU_REG_DC_LUT_RW_INDEX,
                       rex::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         if (gamma_ramp_write_enable_mask) {
-          OnGammaRamp256EntryTableValueWritten();
+          GammaRamp256EntryTableValueWritten();
         }
       } break;
     }
@@ -1182,6 +1205,60 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   return true;
 }
 
+void CommandProcessor::GammaRamp256EntryTableValueWritten() {
+  display_gamma_ramp_256_entry_table_stale_ = true;
+  OnGammaRamp256EntryTableValueWritten();
+}
+
+void CommandProcessor::GammaRampPWLValueWritten() {
+  display_gamma_ramp_pwl_stale_ = true;
+  OnGammaRampPWLValueWritten();
+}
+
+void CommandProcessor::UpdateDisplayOutputTransfer() {
+  if (!g_display_output_transfer_changed.exchange(false, std::memory_order_acq_rel)) return;
+  const bool bt1886 = REXCVAR_GET(display_output_transfer) == "bt1886";
+  if (bt1886 == display_output_bt1886_) return;
+  display_output_bt1886_ = bt1886;
+  REXGPU_INFO("Display output: {}", bt1886 ? "BT.1886 (an HDTV's gamma 2.4) shown on an sRGB display"
+                                           : "as the game made it");
+  GammaRamp256EntryTableValueWritten();
+  GammaRampPWLValueWritten();
+}
+
+const reg::DC_LUT_30_COLOR* CommandProcessor::gamma_ramp_256_entry_table() const {
+  if (display_gamma_ramp_256_entry_table_stale_) {
+    display_gamma_ramp_256_entry_table_stale_ = false;
+    for (uint32_t i = 0; i < 256; ++i) {
+      reg::DC_LUT_30_COLOR entry = gamma_ramp_256_entry_table_[i];
+      if (display_output_bt1886_) {
+        entry.color_10_red = display_transfer::Bt1886ToSrgb10(entry.color_10_red);
+        entry.color_10_green = display_transfer::Bt1886ToSrgb10(entry.color_10_green);
+        entry.color_10_blue = display_transfer::Bt1886ToSrgb10(entry.color_10_blue);
+      }
+      display_gamma_ramp_256_entry_table_[i] = entry;
+    }
+  }
+  return display_gamma_ramp_256_entry_table_;
+}
+
+const reg::DC_LUT_PWL_DATA* CommandProcessor::gamma_ramp_pwl_rgb() const {
+  if (display_gamma_ramp_pwl_stale_) {
+    display_gamma_ramp_pwl_stale_ = false;
+    if (!display_output_bt1886_) {
+      std::memcpy(display_gamma_ramp_pwl_rgb_, gamma_ramp_pwl_rgb_, sizeof(gamma_ramp_pwl_rgb_));
+    } else {
+      for (uint32_t channel = 0; channel < 3; ++channel) {
+        for (uint32_t i = 0; i < 128; ++i) {
+          display_gamma_ramp_pwl_rgb_[i][channel] =
+              display_transfer::Bt1886ToSrgbPwl(gamma_ramp_pwl_rgb_[i][channel]);
+        }
+      }
+    }
+  }
+  return display_gamma_ramp_pwl_rgb_[0];
+}
+
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
@@ -1214,6 +1291,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  UpdateDisplayOutputTransfer();
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   // counter_ is the vblank counter (advanced by MarkVblank), not a swap counter:

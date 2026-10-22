@@ -1932,7 +1932,28 @@ BlockDiscoveryResult discoverBlocks(
               result.externalCalls.push_back(*target);
             }
           }
-          // Calls don't terminate block, fall through
+          // Calls don't terminate block, fall through - unless another known
+          // function starts right after the call (past nop padding): then the
+          // call doesn't return here, as a catch funclet ending in a rethrow
+          // (bl _CxxThrowException) followed by the next funclet (issue #511,
+          // ReXGlue fork). Those funclets come from the C++ EH tables and have
+          // no .pdata size to stop the scan; with a .pdata size, it decides.
+          uint32_t next = addr + 4;
+          for (int padding = 0; padding < 8 && isWithinFunction(next); ++padding) {
+            auto* next_insn = decoded.get(next);
+            if (!next_insn || static_cast<uint32_t>(next_insn->code) != 0x60000000) {
+              break;
+            }
+            next += 4;
+          }
+          if (pdataSize == 0 && next != entryPoint && knownFunctions.contains(next)) {
+            REXCODEGEN_TRACE(
+                "discoverBlocks: 0x{:08X} call at 0x{:08X} is followed by function 0x{:08X}, "
+                "ending the block there",
+                entryPoint, addr, next);
+            block.size = addr - blockStart + 4;
+            break;
+          }
         } else if (isReturn(*insn)) {
           // blr - end of function path
           block.size = addr - blockStart + 4;

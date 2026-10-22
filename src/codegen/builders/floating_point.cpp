@@ -129,10 +129,20 @@ bool build_fadd(BuilderContext& ctx) {
   return true;
 }
 
-bool build_fadds(BuilderContext& ctx) {
+// The single-precision arithmetic of fadds, fsubs and fmuls: a denormal
+// operand answers with the default QNaN (rex::ppc::fp_single_denormal_operand).
+static void emit_fp_single_arithmetic(BuilderContext& ctx, char op) {
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float({}.f64 + {}.f64));", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+  const auto a = ctx.f(ctx.insn.operands[1]);
+  const auto b = ctx.f(ctx.insn.operands[2]);
+  ctx.println(
+      "\t{0}.f64 = rex::ppc::fp_single_denormal_operand({1}.f64, {2}.f64) ? "
+      "rex::ppc::kFpDefaultQNaN : double(float({1}.f64 {3} {2}.f64));",
+      ctx.f(ctx.insn.operands[0]), a, b, op);
+}
+
+bool build_fadds(BuilderContext& ctx) {
+  emit_fp_single_arithmetic(ctx, '+');
   return true;
 }
 
@@ -148,9 +158,7 @@ bool build_fsub(BuilderContext& ctx) {
 }
 
 bool build_fsubs(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float({}.f64 - {}.f64));", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+  emit_fp_single_arithmetic(ctx, '-');
   return true;
 }
 
@@ -166,9 +174,7 @@ bool build_fmul(BuilderContext& ctx) {
 }
 
 bool build_fmuls(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float({}.f64 * {}.f64));", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+  emit_fp_single_arithmetic(ctx, '*');
   return true;
 }
 
@@ -184,9 +190,14 @@ bool build_fdiv(BuilderContext& ctx) {
 }
 
 bool build_fdivs(BuilderContext& ctx) {
+  // A denormal operand keeps the double quotient, not rounded to single.
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float({}.f64 / {}.f64));", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+  const auto a = ctx.f(ctx.insn.operands[1]);
+  const auto b = ctx.f(ctx.insn.operands[2]);
+  ctx.println(
+      "\t{0}.f64 = rex::ppc::fp_single_denormal_operand({1}.f64, {2}.f64) ? {1}.f64 / {2}.f64 "
+      ": double(float({1}.f64 / {2}.f64));",
+      ctx.f(ctx.insn.operands[0]), a, b);
   return true;
 }
 
@@ -208,7 +219,11 @@ static void emit_fp_madd(BuilderContext& ctx, bool subtract, bool negate, bool s
       "{3}.f64, {1}.f64, {4})",
       a, c, subtract ? "-" : "", b, negate ? "true" : "false");
   if (single) {
-    ctx.println("\t{}.f64 = double(float({}));", d, result);
+    // A denormal operand answers with the default QNaN.
+    ctx.println(
+        "\t{}.f64 = rex::ppc::fp_single_denormal_operand({}.f64, {}.f64, {}.f64) ? "
+        "rex::ppc::kFpDefaultQNaN : double(float({}));",
+        d, a, c, b, result);
   } else {
     ctx.println("\t{}.f64 = {};", d, result);
   }
@@ -279,9 +294,13 @@ bool build_fsqrt(BuilderContext& ctx) {
 }
 
 bool build_fsqrts(BuilderContext& ctx) {
+  // A denormal operand keeps the double root, not rounded to single.
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float(sqrt({}.f64)));", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]));
+  const auto b = ctx.f(ctx.insn.operands[1]);
+  ctx.println(
+      "\t{0}.f64 = rex::ppc::fp_single_denormal_operand({1}.f64) ? sqrt({1}.f64) : "
+      "double(float(sqrt({1}.f64)));",
+      ctx.f(ctx.insn.operands[0]), b);
   return true;
 }
 

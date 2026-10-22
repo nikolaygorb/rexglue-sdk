@@ -9,6 +9,7 @@
  */
 
 #include "builders/builder_context.h"
+#include "builders/helpers.h"
 #include "builders.h"
 
 #include <unordered_map>
@@ -55,6 +56,23 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_SUBFIC, build_subfic},
       {PPC_INST_SUBFZE, build_subfze},
       {PPC_INST_SUBFME, build_subfme},
+      {PPC_INST_ADDO, build_addo},
+      {PPC_INST_ADDCO, build_addco},
+      {PPC_INST_ADDEO, build_addeo},
+      {PPC_INST_ADDMEO, build_addmeo},
+      {PPC_INST_ADDZEO, build_addzeo},
+      {PPC_INST_SUBFO, build_subfo},
+      {PPC_INST_SUBFCO, build_subfco},
+      {PPC_INST_SUBFEO, build_subfeo},
+      {PPC_INST_SUBFMEO, build_subfmeo},
+      {PPC_INST_SUBFZEO, build_subfzeo},
+      {PPC_INST_NEGO, build_nego},
+      {PPC_INST_MULLWO, build_mullwo},
+      {PPC_INST_MULLDO, build_mulldo},
+      {PPC_INST_DIVWO, build_divwo},
+      {PPC_INST_DIVWUO, build_divwuo},
+      {PPC_INST_DIVDO, build_divdo},
+      {PPC_INST_DIVDUO, build_divduo},
       {PPC_INST_MULHD, build_mulhd},
       {PPC_INST_MULHDU, build_mulhdu},
 
@@ -440,6 +458,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_MTFSB0, build_mtfsb0},
       {PPC_INST_MTFSB1, build_mtfsb1},
       {PPC_INST_MCRFS, build_mcrfs},
+      {PPC_INST_MCRXR, build_mcrxr},
       {PPC_INST_MTXER, build_mtxer},
       {PPC_INST_MTVRSAVE, build_mtvrsave},
       {PPC_INST_CLRLDI, build_clrldi},
@@ -729,7 +748,11 @@ bool DispatchInstruction(int id, BuilderContext& ctx) {
   const auto& table = GetDispatchTable();
   auto it = table.find(id);
   if (it != table.end()) {
-    return it->second(ctx);
+    if (!it->second(ctx)) {
+      return false;
+    }
+    emitFpRecordCR1(ctx);
+    return true;
   }
 
   // Emit trap code for unimplemented instruction - allows tests to be generated

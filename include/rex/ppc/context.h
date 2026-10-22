@@ -157,8 +157,69 @@ struct FPSCRRegister {
   // Bits the guest owns; the rest is host policy seeded by InitHost.
   static constexpr uint32_t GuestMask = uint32_t(RoundMaskVal) | uint32_t(FlushMask);
 
+  // Exception bits (ReXGlue fork). They live in the host's sticky exception
+  // status flags, which the guest's arithmetic sets as the Xenon FPU would set
+  // these: OX, UX, ZX, XX, and VX for an invalid operation (reported as
+  // VXSOFT, the host doesn't say which kind). FX is reported while any is set;
+  // FEX stays 0 (the guest's exception enables are kept masked). Host code
+  // running on the thread (the kernel, the runtime) sets them too.
+  static constexpr uint32_t kFX = 0x80000000;
+  static constexpr uint32_t kVX = 0x20000000;
+  static constexpr uint32_t kOX = 0x10000000;
+  static constexpr uint32_t kUX = 0x08000000;
+  static constexpr uint32_t kZX = 0x04000000;
+  static constexpr uint32_t kXX = 0x02000000;
+  static constexpr uint32_t kVXSOFT = 0x00000400;
+  // VXSNAN, VXISI, VXIDI, VXZDZ, VXIMZ, VXVC, VXSOFT, VXSQRT, VXCVI.
+  static constexpr uint32_t kVXCauses = 0x01F80000 | 0x00000700;
+  // What a guest write can change.
+  static constexpr uint32_t kExceptionBits = kOX | kUX | kZX | kXX | kVXCauses;
+
+  inline uint32_t loadExceptionsFromHost() const noexcept {
+    const uint32_t status = Platform::getstatus();
+    uint32_t bits = 0;
+    if (status & Platform::StatusInvalid) bits |= kVX | kVXSOFT;
+    if (status & Platform::StatusOverflow) bits |= kOX;
+    if (status & Platform::StatusUnderflow) bits |= kUX;
+    if (status & Platform::StatusDivideByZero) bits |= kZX;
+    if (status & Platform::StatusInexact) bits |= kXX;
+    return bits ? bits | kFX : 0;
+  }
+
+  // Writes the exception bits of `value` that `mask` selects. FX, FEX and VX
+  // are derived, not written. An invalid operation is cleared when the write
+  // covers VXSOFT (how it's reported) or every VX cause.
+  inline void storeExceptionsFromGuest(uint32_t value, uint32_t mask) noexcept {
+    mask &= kExceptionBits;
+    if (!mask) {
+      return;
+    }
+    uint32_t status = Platform::getstatus();
+    auto apply = [&](uint32_t bits, uint32_t flag) {
+      if (!(mask & bits)) {
+        return;
+      }
+      if (value & mask & bits) {
+        status |= flag;
+      } else if (bits != kVXCauses || (mask & kVXSOFT) || (mask & kVXCauses) == kVXCauses) {
+        status &= ~flag;
+      }
+    };
+    apply(kVXCauses, Platform::StatusInvalid);
+    apply(kOX, Platform::StatusOverflow);
+    apply(kUX, Platform::StatusUnderflow);
+    apply(kZX, Platform::StatusDivideByZero);
+    apply(kXX, Platform::StatusInexact);
+    Platform::setstatus(status);
+  }
+
   inline uint32_t getcsr() noexcept { return Platform::getcsr(); }
   inline void setcsr(uint32_t csr) noexcept {
+    // Where the status flags share the register (x86 MXCSR), a cached value
+    // must not bring back older flags or drop newer ones.
+    if constexpr (Platform::CsrStatusMask != 0) {
+      csr = (csr & ~Platform::CsrStatusMask) | (Platform::getcsr() & Platform::CsrStatusMask);
+    }
     // Keep host FP exceptions masked on every write, not just in InitHost.
     // Recompiled guest code reaches setcsr via storeFromGuest /
     // enableFlushMode / etc., and a csr value that still has the exception

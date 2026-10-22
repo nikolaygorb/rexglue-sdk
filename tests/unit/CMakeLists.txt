@@ -60,6 +60,8 @@ add_executable(unit_tests
     graphics/zpd_report_test.cpp
     graphics/gpu_completion_timeline_test.cpp
     graphics/float_constant_runs_test.cpp
+    graphics/texture_replacement_test.cpp
+    graphics/display_transfer_test.cpp
     ui/presenter_paint_config_test.cpp
 )
 
@@ -78,6 +80,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/shader.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator_disasm.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/replacement.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
 )
 

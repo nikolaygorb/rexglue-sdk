@@ -323,8 +323,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool EndSubmission(bool is_swap);
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
-  // as when there are unfinished graphics pipeline creation requests that would
-  // need to be fulfilled before actually submitting the command list.
+  // as when, without async shader compilation, there are unfinished graphics
+  // pipeline creation requests that would need to be fulfilled before
+  // actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionCompletion(GetCurrentSubmission());

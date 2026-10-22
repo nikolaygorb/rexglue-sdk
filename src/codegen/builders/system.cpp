@@ -300,7 +300,8 @@ bool build_mfmsr(BuilderContext& ctx) {
 }
 
 bool build_mffs(BuilderContext& ctx) {
-  ctx.println("\t{}.u64 = ctx.fpscr.loadFromHost();", ctx.f(ctx.insn.operands[0]));
+  ctx.println("\t{}.u64 = ctx.fpscr.loadFromHost() | ctx.fpscr.loadExceptionsFromHost();",
+              ctx.f(ctx.insn.operands[0]));
   return true;
 }
 
@@ -374,14 +375,12 @@ bool build_mtmsrd(BuilderContext& ctx) {
   return true;
 }
 
-// FPSCR is modelled as its rounding mode (RN, the low two bits of field 7);
-// the exception and status bits are not tracked and read as zero. So CR1 of a
-// record-form FPSCR instruction (FX, FEX, VX, OX) is always clear.
-static void emit_fpscr_record(BuilderContext& ctx) {
-  if (isRecordForm(ctx.insn)) {
-    ctx.println("\t{0}.lt = 0; {0}.gt = 0; {0}.eq = 0; {0}.so = 0;", ctx.cr(1));
-  }
-}
+// FPSCR is modelled as its rounding mode (RN, the low two bits of field 7)
+// and its exception bits (FX, VX, OX, UX, ZX, XX and the VX causes), which
+// live in the host's sticky exception status flags (rex::ppc::FPSCRRegister).
+// NI, FR, FI, FPRF and the enables are not modelled and read as zero. CR1 of a
+// record form is set by DispatchInstruction (emitFpRecordCR1) for every
+// floating-point instruction.
 
 bool build_mtfsf(BuilderContext& ctx) {
   // FM bit 7 (the leftmost) selects field 0, the top nibble of FPSCR; bit 0
@@ -392,41 +391,44 @@ bool build_mtfsf(BuilderContext& ctx) {
     if (fm & (1 << j))
       mask |= 0xF << (4 * j);
   }
-  if (mask == 0xFFFFFFFF) {
-    ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", ctx.f(ctx.insn.operands[1]));
-  } else {
-    ctx.println(
-        "\tctx.fpscr.storeFromGuest((ctx.fpscr.loadFromHost() & 0x{:08X}) | ({}.u32 & 0x{:08X}));",
-        ~mask, ctx.f(ctx.insn.operands[1]), mask);
+  const auto f = ctx.f(ctx.insn.operands[1]);
+  if (mask & 0xF) {
+    ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", f);
   }
-  emit_fpscr_record(ctx);
+  if (mask & ~0xFu) {
+    ctx.println("\tctx.fpscr.storeExceptionsFromGuest({}.u32, 0x{:08X});", f, mask);
+  }
   return true;
 }
 
 bool build_mtfsfi(BuilderContext& ctx) {
-  // FPSCR[BF] <- U. Only field 7 holds modelled bits.
+  // FPSCR[BF] <- U: field 7 holds RN, fields 0-3 and 5 exception bits.
   const uint32_t field = ctx.insn.operands[0];
   const uint32_t imm = ctx.insn.operands[1] & 0xF;
   if (field == 7) {
     ctx.println("\tctx.fpscr.storeFromGuest({});", imm);
+  } else {
+    const uint32_t shift = 4 * (7 - field);
+    ctx.println("\tctx.fpscr.storeExceptionsFromGuest(0x{:08X}, 0x{:08X});", imm << shift,
+                0xFu << shift);
   }
-  emit_fpscr_record(ctx);
   return true;
 }
 
 static void emit_mtfsb(BuilderContext& ctx, bool set) {
-  // FPSCR bit BT (0 = leftmost). Bits 30 and 31 are RN; the rest are not
-  // modelled.
+  // FPSCR bit BT (0 = leftmost). Bits 30 and 31 are RN.
   const uint32_t bt = ctx.insn.operands[0];
+  const uint32_t bit = 1u << (31 - bt);
   if (bt == 30 || bt == 31) {
-    const uint32_t bit = 1u << (31 - bt);
     if (set) {
       ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() | {});", bit);
     } else {
       ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() & ~{}u);", bit);
     }
+  } else {
+    ctx.println("\tctx.fpscr.storeExceptionsFromGuest(0x{:08X}, 0x{:08X});", set ? bit : 0u,
+                bit);
   }
-  emit_fpscr_record(ctx);
 }
 
 bool build_mtfsb0(BuilderContext& ctx) {
@@ -440,17 +442,32 @@ bool build_mtfsb1(BuilderContext& ctx) {
 }
 
 bool build_mcrfs(BuilderContext& ctx) {
-  // CR[BF] <- FPSCR[BFA]. Field 7 is (0, NI, RN); NI is not modelled. The
-  // exception bits mcrfs would clear are not tracked either.
+  // CR[BF] <- FPSCR[BFA], then the exception bits of that field are cleared
+  // (FX and OX in field 0; UX, ZX, XX, VXSNAN in 1; VXISI, VXIDI, VXZDZ, VXIMZ
+  // in 2; VXVC in 3; VXSOFT, VXSQRT, VXCVI in 5). Field 7 is (0, NI, RN).
   const auto cr = ctx.cr(ctx.insn.operands[0]);
-  if (ctx.insn.operands[1] == 7) {
-    ctx.println("\t{{");
-    ctx.println("\t\tuint32_t rn = ctx.fpscr.loadFromHost();");
-    ctx.println("\t\t{0}.lt = 0; {0}.gt = 0; {0}.eq = (rn >> 1) & 1; {0}.so = rn & 1;", cr);
-    ctx.println("\t}}");
-  } else {
-    ctx.println("\t{0}.lt = 0; {0}.gt = 0; {0}.eq = 0; {0}.so = 0;", cr);
+  const uint32_t field = ctx.insn.operands[1];
+  const uint32_t shift = 4 * (7 - field);
+  ctx.println("\t{{");
+  ctx.println(
+      "\t\tconst uint32_t fpscr = ctx.fpscr.loadFromHost() | ctx.fpscr.loadExceptionsFromHost();");
+  ctx.println(
+      "\t\t{0}.lt = (fpscr >> {1}) & 1; {0}.gt = (fpscr >> {2}) & 1; {0}.eq = (fpscr >> {3}) & 1; "
+      "{0}.so = (fpscr >> {4}) & 1;",
+      cr, shift + 3, shift + 2, shift + 1, shift);
+  if (field != 7) {
+    // FX is derived from the others: clearing field 0 clears OX only.
+    ctx.println("\t\tctx.fpscr.storeExceptionsFromGuest(0, 0x{:08X});", 0xFu << shift);
   }
+  ctx.println("\t}}");
+  return true;
+}
+
+bool build_mcrxr(BuilderContext& ctx) {
+  // CR[BF] <- XER[SO, OV, CA, 0], then XER[SO, OV, CA] <- 0 (ReXGlue fork).
+  const auto cr = ctx.cr(ctx.insn.operands[0]);
+  ctx.println("\t{0}.lt = {1}.so; {0}.gt = {1}.ov; {0}.eq = {1}.ca; {0}.so = 0;", cr, ctx.xer());
+  ctx.println("\t{0}.so = 0; {0}.ov = 0; {0}.ca = 0;", ctx.xer());
   return true;
 }
 

@@ -4024,7 +4024,12 @@ bool D3D12CommandProcessor::CreateDrawResolutionScaleDependentCaches(
 }
 
 bool D3D12CommandProcessor::CanEndSubmissionImmediately() const {
-  return !submission_open_ || !pipeline_cache_->IsCreatingPipelines();
+  // With async shader compilation, draws whose pipeline isn't created yet are
+  // skipped, so nothing in the submission waits for pipeline creation (edge
+  // 06fb359de). Without it, draws bind pipelines by handle, and EndSubmission
+  // creates the pending ones first.
+  return !submission_open_ || REXCVAR_GET(async_shader_compilation) ||
+         !pipeline_cache_->IsCreatingPipelines();
 }
 
 void D3D12CommandProcessor::ClearCommandAllocatorCache() {
@@ -5671,15 +5676,11 @@ bool D3D12CommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
                                               uint64_t wait_for_submission) {
   assert_not_zero(wait_for_submission);
 
-  // Resolve is still pending. Wait for async pipeline creation to finish.
+  // The resolve is still in the open submission. Pipelines still being
+  // created don't hold it back (edge 06fb359de): with async shader compilation
+  // their draws were skipped, and without it EndSubmission creates them.
   if (wait_for_submission >= GetCurrentSubmission()) {
-    if (!submission_open_) {
-      return false;
-    }
-    if (!CanEndSubmissionImmediately()) {
-      pipeline_cache_->AwaitPipelineCompletion();
-    }
-    if (!CanEndSubmissionImmediately() || !EndSubmission(false)) {
+    if (!submission_open_ || !EndSubmission(false)) {
       return false;
     }
   }

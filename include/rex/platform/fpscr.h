@@ -41,9 +41,26 @@ struct FPSCRPlatform {
   static constexpr size_t GuestToHost[] = {SIMDE_MM_ROUND_NEAREST, SIMDE_MM_ROUND_TOWARD_ZERO,
                                            SIMDE_MM_ROUND_UP, SIMDE_MM_ROUND_DOWN};
 
+  // Sticky exception status flags (IE, ZE, OE, UE, PE; DE has no FPSCR bit).
+  // They are in MXCSR itself (CsrStatusMask), so a write of a cached MXCSR
+  // must keep the current ones.
+  static constexpr u32 StatusInvalid = 1 << 0;
+  static constexpr u32 StatusDivideByZero = 1 << 2;
+  static constexpr u32 StatusOverflow = 1 << 3;
+  static constexpr u32 StatusUnderflow = 1 << 4;
+  static constexpr u32 StatusInexact = 1 << 5;
+  static constexpr u32 StatusMask = 0x3F;
+  static constexpr u32 CsrStatusMask = StatusMask;
+
   static inline u32 getcsr() noexcept { return simde_mm_getcsr(); }
 
   static inline void setcsr(u32 csr) noexcept { simde_mm_setcsr(csr); }
+
+  static inline u32 getstatus() noexcept { return simde_mm_getcsr() & StatusMask; }
+
+  static inline void setstatus(u32 status) noexcept {
+    simde_mm_setcsr((simde_mm_getcsr() & ~StatusMask) | (status & StatusMask));
+  }
 
   static inline void InitHostExceptions(u32& csr) noexcept {
     csr |= ExceptionMask;  // Set mask bits to disable exceptions
@@ -76,6 +93,29 @@ struct FPSCRPlatform {
   }
 
   static inline void setcsr(u32 csr) noexcept { __asm__ __volatile__("msr fpcr, %0" : : "r"(csr)); }
+
+  // Sticky exception status flags, in FPSR (IOC, DZC, OFC, UFC, IXC; IDC has
+  // no FPSCR bit), not in FPCR.
+  static constexpr u32 StatusInvalid = 1 << 0;
+  static constexpr u32 StatusDivideByZero = 1 << 1;
+  static constexpr u32 StatusOverflow = 1 << 2;
+  static constexpr u32 StatusUnderflow = 1 << 3;
+  static constexpr u32 StatusInexact = 1 << 4;
+  static constexpr u32 StatusMask = 0x9F;
+  static constexpr u32 CsrStatusMask = 0;
+
+  static inline u32 getstatus() noexcept {
+    u64 fpsr;
+    __asm__ __volatile__("mrs %0, fpsr" : "=r"(fpsr));
+    return u32(fpsr) & StatusMask;
+  }
+
+  static inline void setstatus(u32 status) noexcept {
+    u64 fpsr;
+    __asm__ __volatile__("mrs %0, fpsr" : "=r"(fpsr));
+    fpsr = (fpsr & ~u64(StatusMask)) | (status & StatusMask);
+    __asm__ __volatile__("msr fpsr, %0" : : "r"(fpsr));
+  }
 
   static inline void InitHostExceptions(u32& csr) noexcept {
     csr &= ~ExceptionMask;  // Clear enable bits to disable exceptions

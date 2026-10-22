@@ -15,6 +15,15 @@
 
 #include "platform_win.h"
 
+#include <atomic>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <string>
+#include <typeinfo>
+
 #include <rex/assert.h>
 #include <rex/math.h>
 
@@ -101,9 +110,188 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// Last-chance crash report (upstream PR #440, with changes for the ReXGlue
+// fork). The handler above only claims the faults guest memory emulation
+// needs; anything else ended the process with nothing written down. Now an
+// unhandled exception, std::terminate and abort() append a report to
+// rexglue-crash.txt beside the executable: what happened, the host registers
+// and a backtrace as module+RVA, to symbolize with llvm-symbolizer against the
+// title's PDB. A file rather than the log, as the logger may be what broke;
+// appended, so the next run never overwrites a crash.
+
+namespace {
+
+std::atomic<bool> crash_report_written{false};
+
+std::FILE* OpenCrashReport() {
+  wchar_t path[MAX_PATH];
+  DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+  if (length && length < MAX_PATH) {
+    wchar_t* slash = std::wcsrchr(path, L'\\');
+    std::FILE* file = nullptr;
+    if (slash &&
+        !wcscpy_s(slash + 1, MAX_PATH - size_t(slash + 1 - path), L"rexglue-crash.txt") &&
+        !_wfopen_s(&file, path, L"a") && file) {
+      return file;
+    }
+  }
+  // The executable's folder may be read-only: the working directory then.
+  std::FILE* file = nullptr;
+  return !fopen_s(&file, "rexglue-crash.txt", "a") ? file : nullptr;
+}
+
+void WriteFrame(std::FILE* file, uint32_t index, uint64_t address) {
+  HMODULE module = nullptr;
+  char name[MAX_PATH] = "?";
+  if (GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(address), &module) &&
+      module) {
+    char full[MAX_PATH];
+    if (GetModuleFileNameA(module, full, MAX_PATH)) {
+      const char* slash = std::strrchr(full, '\\');
+      std::snprintf(name, sizeof(name), "%s", slash ? slash + 1 : full);
+    }
+  }
+  std::fprintf(file, "    %2u  %-28s +0x%llX\n", index, name,
+               static_cast<unsigned long long>(address - reinterpret_cast<uintptr_t>(module)));
+}
+
+// The faulting thread's stack, unwound from its context (the frames of the
+// report itself aren't in it). Every function of the recompiled code has
+// unwind data; a frame without (a leaf) returns through the top of its stack.
+void WriteBacktraceFromContext(std::FILE* file, const CONTEXT& fault_context) {
+  ULONG_PTR stack_low = 0, stack_high = 0;
+  GetCurrentThreadStackLimits(&stack_low, &stack_high);
+  CONTEXT context = fault_context;
+  std::fprintf(file, "  backtrace (module+RVA, for llvm-symbolizer):\n");
+  for (uint32_t i = 0; i < 64 && context.Rip; ++i) {
+    WriteFrame(file, i, context.Rip);
+    DWORD64 image_base = 0;
+    PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+    const DWORD64 rsp = context.Rsp;
+    if (function) {
+      void* handler_data = nullptr;
+      DWORD64 establisher_frame = 0;
+      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+                       &handler_data, &establisher_frame, nullptr);
+    } else {
+      if (rsp < stack_low || rsp + sizeof(DWORD64) > stack_high) {
+        break;
+      }
+      context.Rip = *reinterpret_cast<const DWORD64*>(rsp);
+      context.Rsp = rsp + sizeof(DWORD64);
+    }
+    // A broken stack: stop rather than loop or walk off it.
+    if (context.Rsp <= rsp || context.Rsp < stack_low || context.Rsp > stack_high) {
+      break;
+    }
+  }
+}
+
+void WriteBacktraceHere(std::FILE* file) {
+  void* frames[62];
+  USHORT count = CaptureStackBackTrace(1, USHORT(rex::countof(frames)), frames, nullptr);
+  std::fprintf(file, "  backtrace (module+RVA, for llvm-symbolizer; includes the report's frames):\n");
+  for (USHORT i = 0; i < count; ++i) {
+    WriteFrame(file, i, reinterpret_cast<uintptr_t>(frames[i]));
+  }
+}
+
+void WriteCrashReport(const char* what, const char* detail, const CONTEXT* context) {
+  // Once: a crash while reporting, or abort() after terminate, adds nothing.
+  if (crash_report_written.exchange(true)) {
+    return;
+  }
+  std::FILE* file = OpenCrashReport();
+  if (!file) {
+    return;
+  }
+  SYSTEMTIME time;
+  GetLocalTime(&time);
+  std::fprintf(file, "\n=== %04u-%02u-%02u %02u:%02u:%02u  pid %lu  thread %lu ===\n", time.wYear,
+               time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+               GetCurrentProcessId(), GetCurrentThreadId());
+  std::fprintf(file, "%s%s%s\n", what, detail && *detail ? ": " : "", detail ? detail : "");
+  if (context) {
+    const DWORD64* gpr = &context->Rax;
+    static const char* const kGprNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp",
+                                              "rsi", "rdi", "r8",  "r9",  "r10", "r11",
+                                              "r12", "r13", "r14", "r15"};
+    std::fprintf(file, "  rip=%016llX eflags=%08lX\n",
+                 static_cast<unsigned long long>(context->Rip), context->EFlags);
+    for (uint32_t i = 0; i < 16; ++i) {
+      std::fprintf(file, "  %-3s=%016llX%s", kGprNames[i], static_cast<unsigned long long>(gpr[i]),
+                   (i & 3) == 3 ? "\n" : "");
+    }
+    WriteBacktraceFromContext(file, *context);
+  } else {
+    WriteBacktraceHere(file);
+  }
+  std::fflush(file);
+  std::fclose(file);
+}
+
+// The type and message of the exception in flight, if any.
+std::string DescribeCurrentException() {
+  std::exception_ptr exception = std::current_exception();
+  if (!exception) {
+    return "no exception in flight";
+  }
+  try {
+    std::rethrow_exception(exception);
+  } catch (const std::exception& e) {
+    return std::string(typeid(e).name()) + " -- " + e.what();
+  } catch (...) {
+    return "an exception not derived from std::exception";
+  }
+}
+
+std::terminate_handler previous_terminate_handler = nullptr;
+
+void TerminateHandler() {
+  WriteCrashReport("std::terminate called", DescribeCurrentException().c_str(), nullptr);
+  // Another handler may log more (the guest thread's, xthread.cpp).
+  if (previous_terminate_handler) {
+    previous_terminate_handler();
+  }
+  std::_Exit(3);
+}
+
+// std::set_terminate is per thread in the Microsoft C runtime, so on other
+// threads an exception nobody catches reaches abort(), which raises SIGABRT
+// (process-wide) before failing fast past the unhandled exception filter.
+void AbortSignalHandler(int) {
+  WriteCrashReport("abort() called", DescribeCurrentException().c_str(), nullptr);
+  std::_Exit(3);
+}
+
+LONG WINAPI CrashUnhandledExceptionFilter(EXCEPTION_POINTERS* ex_info) {
+  const EXCEPTION_RECORD& record = *ex_info->ExceptionRecord;
+  char detail[192];
+  if (record.ExceptionCode == STATUS_ACCESS_VIOLATION && record.NumberParameters >= 2) {
+    const ULONG_PTR operation = record.ExceptionInformation[0];
+    std::snprintf(detail, sizeof(detail), "access violation at %p: %s of %p",
+                  record.ExceptionAddress,
+                  operation == 0 ? "read" : operation == 1 ? "write" : operation == 8 ? "execute"
+                                                                                   : "access",
+                  reinterpret_cast<void*>(record.ExceptionInformation[1]));
+  } else {
+    std::snprintf(detail, sizeof(detail), "code 0x%08lX at %p", record.ExceptionCode,
+                  record.ExceptionAddress);
+  }
+  WriteCrashReport("unhandled exception", detail, ex_info->ContextRecord);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+}  // namespace
+
 void ExceptionHandler::Install(Handler fn, void* data) {
   if (!veh_handle_) {
     veh_handle_ = AddVectoredExceptionHandler(1, ExceptionHandlerCallback);
+    previous_terminate_handler = std::set_terminate(TerminateHandler);
+    std::signal(SIGABRT, AbortSignalHandler);
+    SetUnhandledExceptionFilter(CrashUnhandledExceptionFilter);
 
     if (IsDebuggerPresent()) {
       // TODO(benvanik): do we need a continue handler if a debugger is

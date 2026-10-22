@@ -251,6 +251,10 @@ nlohmann::json SerializeRegisters(const std::vector<RegValue>& regs) {
     if (rv.reg == "cr") {
       reg["type"] = "cr";
       reg["value"] = rv.value;
+    } else if (rv.reg == "xer") {
+      // SO, OV and CA in bits 31, 30 and 29, as mfxer reads them.
+      reg["type"] = "xer";
+      reg["value"] = rv.value;
     } else if (rv.is_vector) {
       reg["type"] = "vector";
       reg["values"] = {rv.vec_values[3], rv.vec_values[2], rv.vec_values[1], rv.vec_values[0]};

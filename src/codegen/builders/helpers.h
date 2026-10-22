@@ -84,6 +84,27 @@ inline void emitRecordFormCompare(BuilderContext& ctx) {
 }
 
 /**
+ * Emit CR1 for a record-form floating-point instruction (primary opcode 59 or
+ * 63 with Rc = 1): CR1 <- FPSCR[FX, FEX, VX, OX], after the instruction
+ * (ReXGlue fork; see rex::ppc::FPSCRRegister for what FPSCR models).
+ *
+ * @param ctx The builder context containing the instruction being processed
+ */
+inline void emitFpRecordCR1(BuilderContext& ctx) {
+  const uint32_t primary = ctx.insn.instruction >> 26;
+  if ((primary != 59 && primary != 63) || !(ctx.insn.instruction & 1)) {
+    return;
+  }
+  ctx.println("\t{{");
+  ctx.println("\t\tconst uint32_t fpscr_exceptions = ctx.fpscr.loadExceptionsFromHost();");
+  ctx.println(
+      "\t\t{0}.lt = fpscr_exceptions >> 31; {0}.gt = (fpscr_exceptions >> 30) & 1; "
+      "{0}.eq = (fpscr_exceptions >> 29) & 1; {0}.so = (fpscr_exceptions >> 28) & 1;",
+      ctx.cr(1));
+  ctx.println("\t}}");
+}
+
+/**
  * Emit a CR bit operation: crD = crA <op> crB
  *
  * CR bit operations work on individual CR bits (0-31). This helper:

@@ -11,15 +11,21 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <string>
+#include <string_view>
 #include <utility>
+
+#include <fmt/format.h>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/filesystem.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
@@ -194,6 +200,10 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
     scaled_resolve_global_watch_handle_ =
         shared_memory.RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
   }
+
+  // Reads the pack's index the first time a texture cache is created (nullptr
+  // if texture_replacement_path is empty or the index is unusable).
+  replacement_index_ = texture_replacement::GetIndex();
 }
 
 TextureCache::~TextureCache() {
@@ -275,6 +285,20 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       REXCVAR_GET(texture_cache_memory_limit_hard) + limit_scaled_resolve_add_mb;
   uint32_t limit_soft_lifetime = REXCVAR_GET(texture_cache_memory_limit_soft_lifetime) * 1000;
   bool destroyed_any = false;
+  // Retired textures (RetireTexture) that the GPU is
+  // done with.
+  for (auto it = retired_textures_.begin(); it != retired_textures_.end();) {
+    if (it->last_usage_submission_index > completed_submission_index) {
+      ++it;
+      continue;
+    }
+    if (!destroyed_any) {
+      destroyed_any = true;
+      // As below: a binding may still point to it.
+      ResetTextureBindings();
+    }
+    it = retired_textures_.erase(it);
+  }
   while (texture_used_first_ != nullptr) {
     uint64_t total_host_memory_usage_mb =
         (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20;
@@ -484,6 +508,24 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
+
+  if (texture.is_replacement()) {
+    // Guest data is never loaded into a replacement texture. Its ranges have
+    // been requested like a normal texture's anyway, which makes the GPU's
+    // copy of them valid and protects them, so the CPU's next writes to them
+    // are caught by the watches set here. The guest data may have changed
+    // since the texture was looked up, though.
+    if (IsReplacementUpToDate(texture)) {
+      texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+    } else {
+      // It stays outdated, and the next lookup of its key (in the next
+      // RequestTextures, which looks up all bindings again because of this)
+      // retires it and creates a normal texture.
+      texture_became_outdated_.store(true, std::memory_order_release);
+    }
+    return true;
+  }
+
   if (texture_key.scaled_resolve) {
     // Make sure all the scaled resolve memory is resident and accessible from
     // the shader, including any possible padding that hasn't yet been touched
@@ -513,6 +555,23 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   }
   texture.LogAction("Loaded");
 
+  // Texture dumping (texture_replacement_dump_path): every base level loaded
+  // that a pack could replace, also when the game streams new data into a
+  // texture's memory.
+  if (pending_load.load_base && IsReplacementCandidate(texture_key)) {
+    const std::filesystem::path& dump_folder = texture_replacement::GetDumpFolder();
+    uint64_t replacement_key;
+    if (!dump_folder.empty() && ComputeReplacementKey(texture_key, replacement_key)) {
+      std::string error;
+      if (!texture_replacement::DumpTexture(dump_folder, replacement_key, texture_key.format,
+                                            texture_key.GetWidth(), texture_key.GetHeight(),
+                                            replacement_key_scratch_.data(),
+                                            replacement_key_scratch_.size(), error)) {
+        REXGPU_WARN("Texture replacement: can't dump {:016x}: {}", replacement_key, error);
+      }
+    }
+  }
+
   return true;
 }
 
@@ -523,6 +582,17 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   // bindings below to avoid resyncing all slots on unrelated texture updates.
   texture_became_outdated_.exchange(false, std::memory_order_acquire);
   InvalidateUsedOutdatedBindings(used_texture_mask);
+  if (replacement_index_) {
+    // The texture replacement policy has changed (for example a multiplayer
+    // match started): every binding is looked up again, so textures whose
+    // replacement decision no longer holds are made again
+    // (ReplacementDecisionChanged), also those that stay bound.
+    uint32_t policy_generation = texture_replacement::GetPolicyGeneration();
+    if (policy_generation != replacement_policy_generation_seen_) {
+      replacement_policy_generation_seen_ = policy_generation;
+      ResetTextureBindings();
+    }
+  }
 
   // Update the texture keys and the textures.
   uint32_t bindings_changed = 0;
@@ -546,6 +616,36 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     pending_texture_loads.push_back(pending_load);
     for (size_t i = 0; i < pending_range_count; ++i) {
       pending_shared_memory_ranges.push_back(pending_ranges[i]);
+    }
+  };
+  // An outdated binding with an unchanged key is reloaded into the same
+  // texture, but guest data is never loaded into a replacement texture: it's
+  // looked up again, so FindOrCreateTexture keeps it if its guest data is
+  // still what it stands for, or retires it and makes a new texture. A normal
+  // texture is retired and looked up again when the game has streamed data a
+  // pack has into its memory, so its key gets a replacement texture. (ReXGlue
+  // fork: our bindings, from xenia-edge, aren't all looked up again when a
+  // texture becomes outdated.)
+  auto refind_outdated_replacement = [&](Texture*& texture, const TextureKey& key,
+                                         uint32_t index_bit) {
+    if (!replacement_index_) {
+      return;
+    }
+    if (!texture->is_replacement()) {
+      if (!IsNewGuestDataInPack(*texture)) {
+        return;
+      }
+      // Another binding may have retired it already: then the key has a new
+      // texture, or gets one below.
+      auto texture_it = textures_.find(key);
+      if (texture_it != textures_.end() && texture_it->second.get() == texture) {
+        RetireTexture(texture_it, "the guest data has changed to a texture in the pack");
+      }
+    }
+    Texture* found_texture = FindOrCreateTexture(key);
+    if (found_texture != texture) {
+      texture = found_texture;
+      bindings_changed |= index_bit;
     }
   };
   uint32_t textures_remaining = used_texture_mask & ~texture_bindings_in_sync_;
@@ -601,6 +701,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         } else if (binding_was_outdated && binding.texture != nullptr) {
           // Fetch constants unchanged but watched guest memory changed - force
           // a data upload against the same Texture*.
+          refind_outdated_replacement(binding.texture, binding.key, index_bit);
           load_unsigned_data = true;
         }
       } else {
@@ -625,6 +726,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         binding.texture = FindOrCreateTexture(binding.key);
         load_unsigned_data = true;
       } else if (binding_was_outdated && binding.texture != nullptr) {
+        refind_outdated_replacement(binding.texture, binding.key, index_bit);
         load_unsigned_data = true;
       }
       binding.texture_signed = nullptr;
@@ -783,6 +885,9 @@ TextureCache::Texture::~Texture() {
   }
 
   texture_cache_.UpdateTexturesTotalHostMemoryUsage(0, host_memory_usage_);
+  if (is_replacement()) {
+    texture_cache_.UpdateReplacementHostMemoryUsage(0, host_memory_usage_);
+  }
 }
 
 bool TextureCache::Texture::MakeUpToDateAndWatch(
@@ -844,6 +949,25 @@ void TextureCache::Texture::MarkAsUsed() {
   texture_cache_.texture_used_last_ = this;
 }
 
+void TextureCache::Texture::RemoveFromUsageList() {
+  if (!in_usage_list_) {
+    return;
+  }
+  if (used_previous_) {
+    used_previous_->used_next_ = used_next_;
+  } else {
+    texture_cache_.texture_used_first_ = used_next_;
+  }
+  if (used_next_) {
+    used_next_->used_previous_ = used_previous_;
+  } else {
+    texture_cache_.texture_used_last_ = used_previous_;
+  }
+  used_previous_ = nullptr;
+  used_next_ = nullptr;
+  in_usage_list_ = false;
+}
+
 void TextureCache::Texture::WatchCallback(
     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
   if (is_mip) {
@@ -870,6 +994,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
   textures_.clear();
+  retired_textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
 
@@ -973,17 +1098,48 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // previously 0, now not 0, to save memory - common case in streaming.
   auto found_texture_it = textures_.find(key);
   if (found_texture_it != textures_.end()) {
-    return found_texture_it->second.get();
+    Texture* found_texture = found_texture_it->second.get();
+    if (replacement_index_ && ReplacementDecisionChanged(*found_texture)) {
+      // The policy changed since the texture was made (replacement turned
+      // off for a multiplayer match, or back on): the key gets a new texture
+      // made under the current policy.
+      RetireTexture(found_texture_it, "the replacement policy has changed");
+    } else if (!found_texture->is_replacement() || !found_texture->outdated_mask() ||
+               IsReplacementUpToDate(*found_texture)) {
+      return found_texture;
+    } else {
+      // A replacement texture whose guest memory has been written to stays
+      // only while the guest data is still what it stands for; otherwise the
+      // key gets a new texture (normal, or another replacement if the new
+      // data is in the pack too).
+      RetireTexture(found_texture_it, "the guest data has changed");
+    }
   }
 
   // Create the texture and add it to the map.
   Texture* texture;
   {
-    std::unique_ptr<Texture> new_texture = CreateTexture(key);
+    std::unique_ptr<Texture> new_texture;
+    std::optional<uint64_t> denied_key;
+    uint32_t policy_generation = 0;
+    if (replacement_index_ && IsReplacementCandidate(key)) {
+      // The policy as of now: the texture remembers the generation, so a
+      // later change is noticed (ReplacementDecisionChanged).
+      texture_replacement::Policy policy = texture_replacement::GetPolicy();
+      policy_generation = policy.generation;
+      new_texture = TryCreateReplacementTexture(key, policy, denied_key);
+    }
+    if (!new_texture) {
+      new_texture = CreateTexture(key);
+      if (new_texture && denied_key) {
+        new_texture->SetReplacementDenied(*denied_key);
+      }
+    }
     if (!new_texture) {
       key.LogAction("Failed to create");
       return nullptr;
     }
+    new_texture->set_replacement_policy_generation(policy_generation);
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
@@ -1038,7 +1194,7 @@ uint32_t TextureCache::GetIntegerScaleBits(const xenos::xe_gpu_texture_fetch_t& 
       }
       carries_width = false;
     } else if (!fetch.num_format && sign == xenos::TextureSign::kUnsigned) {
-      carries_width = point_sampled && width >= 4 && width <= 7;
+      carries_width = point_sampled && width >= 4 && width <= 6;
     }
 
     uint32_t component_scale = uint32_t(sign) << 4;
@@ -1069,6 +1225,253 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   }
 
   return CommitPreparedTextureLoad(pending_load);
+}
+
+bool TextureCache::IsReplacementCandidate(const TextureKey& key) {
+  return key.dimension == xenos::DataDimension::k2DOrStacked &&
+         !key.depth_or_array_size_minus_1 && !key.scaled_resolve && !key.signed_separate &&
+         key.base_page && texture_replacement::IsFormatSupported(key.format);
+}
+
+bool TextureCache::ComputeReplacementKey(const TextureKey& key, uint64_t& replacement_key_out) {
+  // Read no more than the memory the base level is known to occupy (what the
+  // normal path uploads), from the guest memory itself: the GPU's copy of it
+  // may not be up to date yet.
+  uint32_t base_address = key.base_page << 12;
+  uint32_t base_size = key.GetGuestLayout().base.level_data_extent_bytes;
+  if (!base_size || base_address >= SharedMemory::kBufferSize) {
+    return false;
+  }
+  base_size = std::min(base_size, SharedMemory::kBufferSize - base_address);
+  if (shared_memory().IsRangeWrittenByGpu(base_address, base_size)) {
+    return false;
+  }
+  texture_replacement::GuestBaseLevel level;
+  level.data = shared_memory().TranslatePhysical(base_address);
+  level.data_size = base_size;
+  level.width = key.GetWidth();
+  level.height = key.GetHeight();
+  level.pitch_texels = key.pitch << 5;
+  level.tiled = key.tiled;
+  level.format = key.format;
+  level.endianness = key.endianness;
+  if (key.packed_mips) {
+    // A base level with a side of 16 texels or less lies in the packed mip
+    // tile, 16 texels in (zeros otherwise).
+    uint32_t z_offset;
+    texture_util::GetPackedMipOffset(level.width, level.height, 1, key.format, 0,
+                                     level.x_offset_blocks, level.y_offset_blocks, z_offset);
+  }
+  return texture_replacement::ComputeKey(level, replacement_key_scratch_, replacement_key_out);
+}
+
+bool TextureCache::IsReplacementUpToDate(Texture& texture) {
+  uint64_t replacement_key;
+  return ComputeReplacementKey(texture.key(), replacement_key) &&
+         replacement_key == texture.replacement_key();
+}
+
+bool TextureCache::IsNewGuestDataInPack(Texture& texture) {
+  const TextureKey& key = texture.key();
+  if (texture.is_replacement() || !IsReplacementCandidate(key)) {
+    return false;
+  }
+  uint64_t replacement_key;
+  if (!ComputeReplacementKey(key, replacement_key)) {
+    return false;
+  }
+  const texture_replacement::IndexEntry* entry = replacement_index_->Find(replacement_key);
+  return entry && entry->width == key.GetWidth() && entry->height == key.GetHeight() &&
+         entry->format == key.format && texture_replacement::GetPolicy().Allows(replacement_key);
+}
+
+std::unique_ptr<TextureCache::Texture> TextureCache::TryCreateReplacementTexture(
+    const TextureKey& key, const texture_replacement::Policy& policy,
+    std::optional<uint64_t>& denied_key_out) {
+  const bool log = REXCVAR_GET(texture_replacement_log);
+  const uint32_t width = key.GetWidth();
+  const uint32_t height = key.GetHeight();
+  const uint32_t base_address = key.base_page << 12;
+  uint64_t replacement_key = 0;
+  denied_key_out.reset();
+  // One line per texture that could be replaced, in the columns of the pack's
+  // hd_keys.tsv: key, width, height, Xenos format number.
+  auto log_result = [&](std::string_view result) {
+    if (log) {
+      REXGPU_INFO("Texture replacement: {:016x} {}x{} format {} at 0x{:08X}: {}", replacement_key,
+                  width, height, uint32_t(key.format), base_address, result);
+    }
+  };
+
+  if (!ComputeReplacementKey(key, replacement_key)) {
+    if (log) {
+      REXGPU_INFO(
+          "Texture replacement: ---------------- {}x{} format {} at 0x{:08X}: no key (the base "
+          "level holds data written by the GPU, or doesn't fit in the texture's memory)",
+          width, height, uint32_t(key.format), base_address);
+    }
+    return nullptr;
+  }
+  const texture_replacement::IndexEntry* entry = replacement_index_->Find(replacement_key);
+  if (!entry) {
+    log_result("not in the pack");
+    return nullptr;
+  }
+  if (!policy.Allows(replacement_key)) {
+    // Remembered by the normal texture, so it's replaced once the policy
+    // allows it again.
+    denied_key_out = replacement_key;
+    log_result(policy.enabled ? "in the pack, but not on the allow list, not used"
+                              : "in the pack, but texture replacement is off, not used");
+    return nullptr;
+  }
+  if (entry->width != width || entry->height != height || entry->format != key.format) {
+    log_result(fmt::format("in the pack as {}x{} format {}, not used", entry->width,
+                           entry->height, uint32_t(entry->format)));
+    return nullptr;
+  }
+  if (!CanCreateReplacementTexture(key)) {
+    log_result(
+        "in the pack, but the GPU backend doesn't keep this texture in the format's native "
+        "host format, not used");
+    return nullptr;
+  }
+  // The file's full path names it in logs and in the failed set: two packs
+  // may hold files of one name.
+  const std::filesystem::path file_path = replacement_index_->FilePath(*entry);
+  const std::string file_name = rex::path_to_utf8(file_path);
+  if (replacement_failed_files_.count(file_name)) {
+    log_result(fmt::format("in the pack, but {} can't be used (see above)", file_name));
+    return nullptr;
+  }
+  // The file must be inside its pack: the index can't name a path outside
+  // (texture_replacement::IsPlainPackFile), but a symbolic link could lead
+  // out of the folder.
+  if (!texture_replacement::IsInsideFolder(replacement_index_->folder(entry->pack), file_path)) {
+    replacement_failed_files_.insert(file_name);
+    REXGPU_WARN("Texture replacement: can't use {}: it isn't inside the pack folder, or doesn't "
+                "exist",
+                file_name);
+    log_result(fmt::format("in the pack, but {} can't be used", file_name));
+    return nullptr;
+  }
+
+  // The replacement's size is the file's, at whatever scale it was made (not
+  // necessarily a whole number); its levels are its larger ones, then the
+  // guest's sizes down to about the guest's smallest level (LoadDds). The
+  // memory the image may take is what's left under the memory limit.
+  const uint64_t memory_limit = texture_replacement::GetMemoryLimitBytes();
+  uint64_t memory_left = 0;
+  if (memory_limit) {
+    memory_left = memory_limit > replacement_host_memory_usage_
+                      ? memory_limit - replacement_host_memory_usage_
+                      : 1;  // Nothing left: any image is too large.
+  }
+  texture_replacement::Image image;
+  std::string error;
+  bool too_large = false;
+  if (!texture_replacement::LoadDds(file_path, key.format, width, height, key.mip_max_level + 1,
+                                    GetMaxHostTextureWidthHeight(key.dimension), memory_left,
+                                    image, error, &too_large)) {
+    if (too_large) {
+      // Not the file's fault: it may fit later, when other replacement
+      // textures are gone. Said once per texture cache.
+      if (!replacement_over_limit_count_++) {
+        REXGPU_WARN(
+            "Texture replacement: {} isn't used: {} ({} MB of replacement textures are loaded, "
+            "texture_replacement_memory_limit is {} MB); further textures over the limit aren't "
+            "logged",
+            file_name, error, replacement_host_memory_usage_ >> 20, memory_limit >> 20);
+      }
+      log_result(fmt::format("in the pack, but over the memory limit ({})", file_name));
+      return nullptr;
+    }
+    // A broken pack (or an image too large for this GPU): said once per
+    // file, whatever texture_replacement_log is.
+    replacement_failed_files_.insert(file_name);
+    REXGPU_WARN("Texture replacement: can't use {}: {}", file_name, error);
+    log_result(fmt::format("in the pack, but {} can't be used", file_name));
+    return nullptr;
+  }
+  // The user's own images, and every image while an allow list is in force
+  // (a multiplayer match), may not be more see-through than the original:
+  // replacement_key_scratch_ still holds the guest base level that
+  // ComputeReplacementKey gathered.
+  uint64_t forced_opaque = 0;
+  const bool strict_pack = replacement_index_->strict_alpha(entry->pack);
+  if (strict_pack || policy.allow_list) {
+    if (!texture_replacement::EnforceAlpha(width, height, replacement_key_scratch_.data(),
+                                           replacement_key_scratch_.size(), image, forced_opaque,
+                                           error)) {
+      // Refused for good when the pack itself is strict; under the policy
+      // alone, only while it lasts (the texture is made again when it ends).
+      if (strict_pack) {
+        replacement_failed_files_.insert(file_name);
+      }
+      REXGPU_WARN("Texture replacement: can't use {}: {}", file_name, error);
+      log_result(fmt::format("in the pack, but {} can't be used", file_name));
+      return nullptr;
+    }
+  }
+  std::unique_ptr<Texture> texture = CreateReplacementTexture(key, image);
+  if (!texture) {
+    log_result(fmt::format("in the pack, but the host texture for {} couldn't be created",
+                           file_name));
+    return nullptr;
+  }
+  assert_true(texture->key() == key);
+  texture->SetReplacement(replacement_key, uint32_t(image.levels.size()));
+  // Counted from now on (SetReplacement came after the constructor's
+  // SetHostMemoryUsage).
+  UpdateReplacementHostMemoryUsage(texture->host_memory_usage(), 0);
+  log_result(fmt::format("replaced with {} ({}x{}, {:.2f}x, {} levels{}{})", file_name,
+                         image.width, image.height,
+                         double(std::max(image.width, image.height)) / std::max(width, height),
+                         image.levels.size(), strict_pack ? ", user pack" : "",
+                         forced_opaque ? fmt::format(", {} block(s) made opaque like the original",
+                                                     forced_opaque)
+                                       : std::string()));
+  return texture;
+}
+
+bool TextureCache::ReplacementDecisionChanged(Texture& texture) {
+  const uint32_t generation = texture_replacement::GetPolicyGeneration();
+  if (texture.replacement_policy_generation() == generation) {
+    return false;
+  }
+  // A texture that isn't in the pack is never replaced, whatever the policy:
+  // nothing to do but note the generation. Textures made before the index
+  // existed (generation 0 and never a candidate) are left alone too.
+  if (!texture.is_replacement() && !texture.replacement_denied()) {
+    texture.set_replacement_policy_generation(generation);
+    return false;
+  }
+  const bool allowed = texture_replacement::GetPolicy().Allows(texture.replacement_key());
+  if (texture.is_replacement() == allowed) {
+    texture.set_replacement_policy_generation(generation);
+    return false;
+  }
+  return true;
+}
+
+void TextureCache::RetireTexture(
+    std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher>::iterator
+        texture_it,
+    const char* why) {
+  Texture* texture = texture_it->second.get();
+  if (REXCVAR_GET(texture_replacement_log)) {
+    REXGPU_INFO("Texture replacement: {:016x} at 0x{:08X}: {}, the texture is made again",
+                texture->replacement_key(), texture->key().base_page << 12, why);
+  }
+  // The GPU may still be using it, and bindings may still point to it, so
+  // it's destroyed later. Bindings are all looked up again in the next
+  // RequestTextures (texture_became_outdated_), so it can't be bound after
+  // the current submission: destroying it once that's completed is safe
+  // (out of the usage list, MarkAsUsed doesn't track it anymore).
+  texture->RemoveFromUsageList();
+  retired_textures_.push_back({std::move(texture_it->second), current_submission_index_});
+  textures_.erase(texture_it);
+  texture_became_outdated_.store(true, std::memory_order_release);
 }
 
 void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch,

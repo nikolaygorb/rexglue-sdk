@@ -19,10 +19,26 @@
 
 #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 
+#include <fcntl.h>
 #include <signal.h>
+#include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <exception>
+#include <string>
+#include <typeinfo>
+
+#if __has_include(<execinfo.h>)
+#include <execinfo.h>
+#define REX_CRASH_REPORT_BACKTRACE 1
+#endif
+#if REX_PLATFORM_MAC
+#include <mach-o/dyld.h>
+#endif
 
 #include <rex/assert.h>
 #include <rex/logging.h>
@@ -32,6 +48,178 @@
 #include <ucontext.h>
 
 namespace rex::arch {
+
+namespace {
+
+// Last-chance crash report, as on Windows (exception_handler_win.cpp, upstream
+// PR #440 with changes for the ReXGlue fork): a fault no handler claims, an
+// uncaught C++ exception or abort() appends a report to rexglue-crash.txt
+// beside the executable. Written from a signal handler, so only with
+// async-signal-safe calls (open, write, backtrace_symbols_fd); the path is
+// worked out when the handlers are installed.
+
+char crash_report_path[4096] = "rexglue-crash.txt";
+std::atomic<bool> crash_report_written{false};
+
+void ComputeCrashReportPath() {
+  char exe[sizeof(crash_report_path)] = {};
+#if REX_PLATFORM_MAC
+  uint32_t size = sizeof(exe);
+  if (_NSGetExecutablePath(exe, &size) != 0) {
+    return;
+  }
+#else
+  ssize_t length = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  if (length <= 0) {
+    return;
+  }
+  exe[length] = '\0';
+#endif
+  char* slash = std::strrchr(exe, '/');
+  constexpr char kName[] = "rexglue-crash.txt";
+  if (!slash || size_t(slash + 1 - exe) + sizeof(kName) > sizeof(crash_report_path)) {
+    return;
+  }
+  std::memcpy(slash + 1, kName, sizeof(kName));
+  std::memcpy(crash_report_path, exe, sizeof(crash_report_path));
+#if REX_CRASH_REPORT_BACKTRACE
+  // The first backtrace() may load the unwinder (and allocate): not in a
+  // signal handler.
+  void* frames[1];
+  backtrace(frames, 1);
+#endif
+}
+
+void WriteText(int fd, const char* text) {
+  size_t length = std::strlen(text);
+  while (length) {
+    ssize_t written = write(fd, text, length);
+    if (written <= 0) {
+      return;
+    }
+    text += written;
+    length -= size_t(written);
+  }
+}
+
+void WriteHex(int fd, uint64_t value) {
+  char text[19] = "0x";
+  for (int i = 0; i < 16; ++i) {
+    text[2 + i] = "0123456789ABCDEF"[(value >> (60 - 4 * i)) & 0xF];
+  }
+  text[18] = '\0';
+  WriteText(fd, text);
+}
+
+void WriteDecimal(int fd, uint64_t value) {
+  char text[21];
+  char* end = text + sizeof(text) - 1;
+  *end = '\0';
+  char* p = end;
+  do {
+    *--p = char('0' + value % 10);
+    value /= 10;
+  } while (value);
+  WriteText(fd, p);
+}
+
+void WriteCrashReport(const char* what, const char* detail,
+                      const HostThreadContext* context) {
+  // Once: a crash while reporting, or abort() after terminate, adds nothing.
+  if (crash_report_written.exchange(true)) {
+    return;
+  }
+  int fd = open(crash_report_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    // The executable's folder may be read-only: the working directory then.
+    fd = open("rexglue-crash.txt", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) {
+      return;
+    }
+  }
+  WriteText(fd, "\n=== unix time ");
+  WriteDecimal(fd, uint64_t(time(nullptr)));
+  WriteText(fd, "  pid ");
+  WriteDecimal(fd, uint64_t(getpid()));
+  WriteText(fd, " ===\n");
+  WriteText(fd, what);
+  if (detail && *detail) {
+    WriteText(fd, ": ");
+    WriteText(fd, detail);
+  }
+  WriteText(fd, "\n");
+  if (context) {
+#if REX_ARCH_AMD64
+    static const char* const kNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp",
+                                           "rsi", "rdi", "r8",  "r9",  "r10", "r11",
+                                           "r12", "r13", "r14", "r15"};
+    WriteText(fd, "  rip=");
+    WriteHex(fd, context->rip);
+    WriteText(fd, " eflags=");
+    WriteHex(fd, context->eflags);
+    for (uint32_t i = 0; i < 16; ++i) {
+      WriteText(fd, (i & 3) ? "  " : "\n  ");
+      WriteText(fd, kNames[i]);
+      WriteText(fd, "=");
+      WriteHex(fd, context->int_registers[i]);
+    }
+#elif REX_ARCH_ARM64
+    WriteText(fd, "  pc=");
+    WriteHex(fd, context->pc);
+    WriteText(fd, " sp=");
+    WriteHex(fd, context->sp);
+    for (uint32_t i = 0; i < 31; ++i) {
+      WriteText(fd, (i & 3) ? "  " : "\n  x");
+      if (i & 3) {
+        WriteText(fd, "x");
+      }
+      WriteDecimal(fd, i);
+      WriteText(fd, "=");
+      WriteHex(fd, context->x[i]);
+    }
+#endif
+    WriteText(fd, "\n");
+  }
+#if REX_CRASH_REPORT_BACKTRACE
+  // From the signal handler, the faulting frame follows the signal trampoline.
+  WriteText(fd, "  backtrace (module(symbol+offset) [address], for addr2line or llvm-symbolizer):\n");
+  void* frames[64];
+  int count = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, count, fd);
+#endif
+  close(fd);
+}
+
+// The type and message of the exception in flight, if any (not from a fault).
+std::string DescribeCurrentException() {
+  std::exception_ptr exception = std::current_exception();
+  if (!exception) {
+    return "no exception in flight";
+  }
+  try {
+    std::rethrow_exception(exception);
+  } catch (const std::exception& e) {
+    return std::string(typeid(e).name()) + " -- " + e.what();
+  } catch (...) {
+    return "an exception not derived from std::exception";
+  }
+}
+
+std::terminate_handler previous_terminate_handler = nullptr;
+
+void TerminateHandler() {
+  WriteCrashReport("std::terminate called", DescribeCurrentException().c_str(), nullptr);
+  // Another handler may log more (the guest thread's, xthread.cpp).
+  if (previous_terminate_handler) {
+    previous_terminate_handler();
+  }
+  std::abort();
+}
+
+// abort() still ends the process when this returns.
+void AbortSignalHandler(int) { WriteCrashReport("abort() called", nullptr, nullptr); }
+
+}  // namespace
 
 bool signal_handlers_installed_ = false;
 struct sigaction original_sigill_handler_;
@@ -417,10 +605,42 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+  // No handler claimed it. Returning would run the faulting instruction again
+  // and fault again forever (a hang, not a crash): report it, put back the
+  // handler that was there before (normally the default action) and return,
+  // so the fault ends the process as it would without us.
+  const char* what = signal_number == SIGILL   ? "unhandled SIGILL (illegal instruction)"
+                     : signal_number == SIGBUS ? "unhandled SIGBUS"
+                                               : "unhandled SIGSEGV (access violation)";
+  char detail[64] = "at address ";
+  {
+    const uint64_t address = reinterpret_cast<uint64_t>(signal_info->si_addr);
+    char* p = detail + std::strlen(detail);
+    *p++ = '0';
+    *p++ = 'x';
+    for (int i = 0; i < 16; ++i) {
+      *p++ = "0123456789ABCDEF"[(address >> (60 - 4 * i)) & 0xF];
+    }
+    *p = '\0';
+  }
+  WriteCrashReport(what, detail, &thread_context);
+  const struct sigaction* original = signal_number == SIGILL ? &original_sigill_handler_
+                                                             : &original_sigsegv_handler_;
+#if REX_PLATFORM_MAC
+  if (signal_number == SIGBUS) {
+    original = &original_sigbus_handler_;
+  }
+#endif
+  sigaction(signal_number, original, nullptr);
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {
   if (!signal_handlers_installed_) {
+    ComputeCrashReportPath();
+    previous_terminate_handler = std::set_terminate(TerminateHandler);
+    signal(SIGABRT, AbortSignalHandler);
+
     struct sigaction signal_handler;
 
     std::memset(&signal_handler, 0, sizeof(signal_handler));

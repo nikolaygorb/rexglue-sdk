@@ -301,6 +301,12 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
                                mapped_u32 is_creator_ptr, mapped_u64 creator_xuid_ptr,
                                mapped_void overlapped_ptr) {
   auto result = X_ERROR_SUCCESS;
+  if (!is_creator_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  // xam clears it before anything can fail (xenia-edge 35c0b7c4e): SC
+  // Conviction creates its saves only when it reads false for missing content.
+  *is_creator_ptr = 0;
 
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
@@ -315,7 +321,6 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
         *creator_xuid_ptr = xuid;
       }
     } else {
-      *is_creator_ptr = 0;
       if (creator_xuid_ptr) {
         *creator_xuid_ptr = 0;
       }

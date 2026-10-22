@@ -464,7 +464,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     return !submission_open_ && GetCompletedSubmission() + 1u >= GetCurrentSubmission();
   }
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
-  // when immediate submission is safe.
+  // when immediate submission is safe (no scratch buffer in use).
   bool CanEndSubmissionImmediately() const;
 
   void ClearTransientDescriptorPools();

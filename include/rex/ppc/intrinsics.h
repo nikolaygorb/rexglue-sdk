@@ -434,6 +434,31 @@ inline double fp_madd_result(double r, double a, double b, double c, bool negate
   return std::bit_cast<double>(0x7FF8000000000000ull);
 }
 
+//=============================================================================
+// Single-precision denormal operand quirk
+//=============================================================================
+// The Xenon FPU's single-precision arithmetic treats a denormalized double
+// operand specially (xenia-edge 28f38affe, 8b19ee756, from its tests made on
+// hardware): fadds, fsubs, fmuls and the single multiply-adds answer with the
+// default QNaN; fdivs and fsqrts keep the double result, not rounded to
+// single. A NaN or infinite operand takes precedence over the quirk.
+
+// Whether every operand is finite and at least one is denormal (a zero isn't:
+// subtracting one wraps its magnitude to the top).
+template <typename... Operands>
+inline bool fp_single_denormal_operand(Operands... operands) {
+  bool any_denormal = false;
+  bool any_nonfinite = false;
+  for (double x : {double(operands)...}) {
+    const uint64_t magnitude = std::bit_cast<uint64_t>(x) & 0x7FFFFFFFFFFFFFFFull;
+    any_denormal |= magnitude - 1 < 0x000FFFFFFFFFFFFFull;
+    any_nonfinite |= magnitude >= 0x7FF0000000000000ull;
+  }
+  return any_denormal && !any_nonfinite;
+}
+
+inline constexpr double kFpDefaultQNaN = std::bit_cast<double>(0x7FF8000000000000ull);
+
 // Fixes up the result `r` of a vector multiply-add with operands a, b, c.
 inline simde__m128 vec_madd_result(simde__m128 r, simde__m128 a, simde__m128 b, simde__m128 c,
                                    bool negate) {

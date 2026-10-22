@@ -284,4 +284,134 @@ bool build_subfme(BuilderContext& ctx) {
   return true;
 }
 
+//=============================================================================
+// Overflow-Enabled (OE) Forms
+//=============================================================================
+// addo, subfo, mullwo, divwo... (ReXGlue fork; semantics as xenia-edge
+// 10da45ea4 and 4d83110dc): XER[OV] is set when the result overflows and
+// cleared otherwise, and XER[SO] is sticky. Both are written before the base
+// builder runs: it writes rD, which may be rA or rB, and its record form copies
+// XER[SO] into CR0. Titles run in 32-bit mode, so the word and the add,
+// subtract and negate forms judge overflow on the low 32 bits; the doubleword
+// multiply and divide forms on 64 bits.
+
+namespace {
+
+// `wide` is the exact result in int64_t of operands taken as int32_t.
+void emitOverflowWord(BuilderContext& ctx, const std::string& wide) {
+  ctx.println("\t{}.ov = ({}) != int64_t(int32_t({}));", ctx.xer(), wide, wide);
+  ctx.println("\t{}.so |= {}.ov;", ctx.xer(), ctx.xer());
+}
+
+void emitOverflow(BuilderContext& ctx, const std::string& condition) {
+  ctx.println("\t{}.ov = {};", ctx.xer(), condition);
+  ctx.println("\t{}.so |= {}.ov;", ctx.xer(), ctx.xer());
+}
+
+std::string sext(BuilderContext& ctx, uint32_t operand) {
+  return fmt::format("int64_t({}.s32)", ctx.r(ctx.insn.operands[operand]));
+}
+
+// ~rA as int32_t, widened: exactly -rA - 1.
+std::string notsext(BuilderContext& ctx, uint32_t operand) {
+  return fmt::format("int64_t(int32_t(~{}.u32))", ctx.r(ctx.insn.operands[operand]));
+}
+
+std::string carry(BuilderContext& ctx) { return fmt::format("int64_t({}.ca)", ctx.xer()); }
+
+}  // namespace
+
+bool build_addo(BuilderContext& ctx) {
+  emitOverflowWord(ctx, sext(ctx, 1) + " + " + sext(ctx, 2));
+  return build_add(ctx);
+}
+
+bool build_addco(BuilderContext& ctx) {
+  emitOverflowWord(ctx, sext(ctx, 1) + " + " + sext(ctx, 2));
+  return build_addc(ctx);
+}
+
+bool build_addeo(BuilderContext& ctx) {
+  emitOverflowWord(ctx, sext(ctx, 1) + " + " + sext(ctx, 2) + " + " + carry(ctx));
+  return build_adde(ctx);
+}
+
+bool build_addmeo(BuilderContext& ctx) {
+  emitOverflowWord(ctx, sext(ctx, 1) + " + " + carry(ctx) + " - 1");
+  return build_addme(ctx);
+}
+
+bool build_addzeo(BuilderContext& ctx) {
+  emitOverflowWord(ctx, sext(ctx, 1) + " + " + carry(ctx));
+  return build_addze(ctx);
+}
+
+bool build_subfo(BuilderContext& ctx) {
+  emitOverflowWord(ctx, sext(ctx, 2) + " - " + sext(ctx, 1));
+  return build_subf(ctx);
+}
+
+bool build_subfco(BuilderContext& ctx) {
+  emitOverflowWord(ctx, sext(ctx, 2) + " - " + sext(ctx, 1));
+  return build_subfc(ctx);
+}
+
+bool build_subfeo(BuilderContext& ctx) {
+  emitOverflowWord(ctx, notsext(ctx, 1) + " + " + sext(ctx, 2) + " + " + carry(ctx));
+  return build_subfe(ctx);
+}
+
+bool build_subfmeo(BuilderContext& ctx) {
+  emitOverflowWord(ctx, notsext(ctx, 1) + " + " + carry(ctx) + " - 1");
+  return build_subfme(ctx);
+}
+
+bool build_subfzeo(BuilderContext& ctx) {
+  emitOverflowWord(ctx, notsext(ctx, 1) + " + " + carry(ctx));
+  return build_subfze(ctx);
+}
+
+bool build_nego(BuilderContext& ctx) {
+  emitOverflowWord(ctx, "-" + sext(ctx, 1));
+  return build_neg(ctx);
+}
+
+bool build_mullwo(BuilderContext& ctx) {
+  emitOverflowWord(ctx, sext(ctx, 1) + " * " + sext(ctx, 2));
+  return build_mullw(ctx);
+}
+
+bool build_mulldo(BuilderContext& ctx) {
+  emitOverflow(ctx, fmt::format("__builtin_mul_overflow({}.s64, {}.s64, &{}.s64)",
+                                ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[2]),
+                                ctx.temp()));
+  return build_mulld(ctx);
+}
+
+bool build_divwo(BuilderContext& ctx) {
+  auto rA = ctx.r(ctx.insn.operands[1]);
+  auto rB = ctx.r(ctx.insn.operands[2]);
+  emitOverflow(ctx,
+               fmt::format("{1}.s32 == 0 || ({0}.s32 == INT32_MIN && {1}.s32 == -1)", rA, rB));
+  return build_divw(ctx);
+}
+
+bool build_divwuo(BuilderContext& ctx) {
+  emitOverflow(ctx, fmt::format("{}.u32 == 0", ctx.r(ctx.insn.operands[2])));
+  return build_divwu(ctx);
+}
+
+bool build_divdo(BuilderContext& ctx) {
+  auto rA = ctx.r(ctx.insn.operands[1]);
+  auto rB = ctx.r(ctx.insn.operands[2]);
+  emitOverflow(ctx,
+               fmt::format("{1}.s64 == 0 || ({0}.s64 == INT64_MIN && {1}.s64 == -1)", rA, rB));
+  return build_divd(ctx);
+}
+
+bool build_divduo(BuilderContext& ctx) {
+  emitOverflow(ctx, fmt::format("{}.u64 == 0", ctx.r(ctx.insn.operands[2])));
+  return build_divdu(ctx);
+}
+
 }  // namespace rex::codegen

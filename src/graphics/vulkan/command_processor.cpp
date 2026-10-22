@@ -5630,14 +5630,11 @@ bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
                                                uint64_t wait_for_submission) {
   assert_not_zero(wait_for_submission);
 
-  // The resolve is still in the open submission. Pipelines being created
-  // asynchronously have to finish before it can be executed.
+  // The resolve is still in the open submission. Pipelines still being created
+  // don't hold it back (edge 06fb359de): their draws were skipped.
   if (wait_for_submission >= GetCurrentSubmission()) {
     if (!submission_open_) {
       return false;
-    }
-    if (!CanEndSubmissionImmediately()) {
-      pipeline_cache_->AwaitPipelineCompletion();
     }
     EndRenderPass();
     if (!EndSubmission(false)) {
@@ -5906,7 +5903,9 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(uint64_t awa
 }
 
 bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
-  return !submission_open_ || (!scratch_buffer_used_ && !pipeline_cache_->IsCreatingPipelines());
+  // Pipelines still being created don't matter (edge 06fb359de): a draw whose
+  // pipeline isn't created yet is skipped, never recorded.
+  return !submission_open_ || !scratch_buffer_used_;
 }
 
 bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {

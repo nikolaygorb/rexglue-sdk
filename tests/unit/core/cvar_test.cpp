@@ -14,6 +14,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/cvar.h>
+#include <rex/cvar_file.h>
 
 // Test cvars
 REXCVAR_DEFINE_BOOL(test_bool_flag, false, "Test", "Test boolean flag");
@@ -27,6 +28,9 @@ REXCVAR_DEFINE_STRING(test_init_only_flag, "initial", "Test", "Init-only flag")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(test_restart_flag, false, "Test", "Requires restart")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Only for the SetDefaultValue test: its default is changed for the whole run.
+REXCVAR_DEFINE_INT32(test_app_default_flag, 10, "TestAppDefault", "App default test flag")
+    .range(0, 100);
 
 // Command dispatch test fixtures.
 static int g_noarg_cmd_calls = 0;
@@ -764,6 +768,92 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
     rex::cvar::SaveConfig(save_path);
     // Either file doesn't exist or is minimal (just header comment)
   }
+}
+
+namespace {
+
+std::string ReadTextFile(const std::filesystem::path& path) {
+  std::ifstream file(path);
+  return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+}  // namespace
+
+// rexglue PR #524 (cod3 0042): a command-line value is a one-off for that run.
+TEST_CASE("cvar SaveConfig keeps the file's value for a command-line flag", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto config_path = std::filesystem::temp_directory_path() / "test_one_off_config.toml";
+  auto save_path = std::filesystem::temp_directory_path() / "test_one_off_saved.toml";
+  {
+    std::ofstream file(config_path);
+    file << "test_string_flag = \"from file\"\n";
+    file << "test_int32_flag = 111\n";
+  }
+  char argv0[] = "cvar_test";
+  char arg1[] = "--test_string_flag=one-off";
+  char arg2[] = "--test_double_flag=2.5";
+  char* argv[] = {argv0, arg1, arg2};
+  rex::cvar::Init(3, argv);
+  rex::cvar::LoadConfig(config_path);
+  REQUIRE(REXCVAR_GET(test_string_flag) == "one-off");
+  CHECK(rex::cvar::GetConfigFileValue("test_string_flag") == "from file");
+  CHECK_FALSE(rex::cvar::GetConfigFileValue("test_double_flag").has_value());
+
+  rex::cvar::SaveConfig(save_path);
+  std::string content = ReadTextFile(save_path);
+  CHECK(content.find("test_string_flag = \"from file\"") != std::string::npos);
+  CHECK(content.find("one-off") == std::string::npos);
+  CHECK(content.find("test_int32_flag = 111") != std::string::npos);
+  // Not in the file before: stays out.
+  CHECK(content.find("test_double_flag") == std::string::npos);
+
+  // Changed while the app runs: saved over the command-line value.
+  REXCVAR_SET(test_string_flag, "changed in app");
+  rex::cvar::SaveConfig(save_path);
+  content = ReadTextFile(save_path);
+  CHECK(content.find("test_string_flag = \"changed in app\"") != std::string::npos);
+
+  std::filesystem::remove(config_path);
+  std::filesystem::remove(save_path);
+}
+
+TEST_CASE("cvar SaveConfig keeps lines of flags nobody registered", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto config_path = std::filesystem::temp_directory_path() / "test_unknown_lines.toml";
+  {
+    std::ofstream file(config_path);
+    file << "plugin_only_setting = \"kept\"\n";
+    file << "another_plugin_number = 5\n";
+  }
+  rex::cvar::LoadConfig(config_path);
+  REXCVAR_SET(test_int32_flag, 9);
+  rex::cvar::SaveConfig(config_path);
+
+  const std::string content = ReadTextFile(config_path);
+  CHECK(content.find("test_int32_flag = 9") != std::string::npos);
+  CHECK(content.find("plugin_only_setting = \"kept\"") != std::string::npos);
+  CHECK(content.find("another_plugin_number = 5") != std::string::npos);
+
+  std::filesystem::remove(config_path);
+}
+
+TEST_CASE("cvar SetDefaultValue makes an app default", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  REQUIRE(rex::cvar::SetDefaultValue("test_app_default_flag", "20"));
+  CHECK(REXCVAR_GET(test_app_default_flag) == 20);
+  // At the app's default: not written.
+  CHECK(rex::cvar::SerializeToTOML("TestAppDefault").empty());
+  // The SDK's old default is now a choice of its own, and is written.
+  REXCVAR_SET(test_app_default_flag, 10);
+  CHECK(rex::cvar::SerializeToTOML("TestAppDefault") == "test_app_default_flag = 10\n");
+  rex::cvar::ResetToDefault("test_app_default_flag");
+  CHECK(REXCVAR_GET(test_app_default_flag) == 20);
+
+  CHECK_FALSE(rex::cvar::SetDefaultValue("test_app_default_flag", "1000"));
+  CHECK_FALSE(rex::cvar::SetDefaultValue("no_such_flag_anywhere", "1"));
 }
 
 TEST_CASE("cvar LoadConfig reads a config under a non-ASCII folder", "[cvar]") {

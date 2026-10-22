@@ -107,6 +107,9 @@ const std::vector<uint32_t> kTextWords = {
     0x38600014, 0x4E800020, 0x38600015, 0x4E800020, 0x3860FFFF, 0x4E800020,
     // o, t
     0x7C8903A6, 0x38630001, 0x4200FFFC, 0x4E800020,
+    // r1: li r4,0; li r3,0; bl a      a catch funclet ending in a rethrow
+    // r2: li r3,7; blr                the next funclet, right after it
+    0x38800000, 0x38600000, 0x4BFFFE11, 0x38600007, 0x4E800020,
 };
 
 const std::vector<uint32_t> kRodataWords = {
@@ -272,6 +275,25 @@ TEST_CASE("A bdnz to the entry of an overlapping function is a tail call", "[cod
   REQUIRE_FALSE(code.empty());
   CHECK(code.find("goto loc_820001EC;") == std::string::npos);
   CHECK(code.find("sub_820001EC(ctx, base);") != std::string::npos);
+}
+
+TEST_CASE("A call followed by another function ends the function", "[codegen][analysis]") {
+  // A catch funclet that rethrows ends in bl _CxxThrowException, and the next
+  // funclet follows; neither has a .pdata size. Running on, the first took the
+  // next one's code and branched to labels it doesn't own (issue #511).
+  constexpr uint32_t kR1 = 0x820001F8, kR2 = 0x82000204;
+  RecompilerConfig config;
+  config.functions[kR1] = FunctionConfig{};
+  config.functions[kR2] = FunctionConfig{};
+  auto [ctx, error] = AnalyzeSynthetic(std::move(config));
+  INFO(error);
+  REQUIRE(error.empty());
+  const std::string first = EmitFunction(ctx, kR1);
+  const std::string second = EmitFunction(ctx, kR2);
+  INFO(first);
+  REQUIRE_FALSE(first.empty());
+  CHECK(first.find("s64 = 7;") == std::string::npos);
+  CHECK(second.find("s64 = 7;") != std::string::npos);
 }
 
 TEST_CASE("Analysis keeps setjmp and longjmp from the config", "[codegen][analysis]") {

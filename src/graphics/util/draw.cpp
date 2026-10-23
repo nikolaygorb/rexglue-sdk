@@ -29,6 +29,12 @@
 
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
 
+REXCVAR_DEFINE_BOOL(draw_resolution_scaled_half_pixel_offset, false, "GPU",
+                    "With resolution scaling, apply the Direct3D 9 half-pixel offset as half a "
+                    "host pixel instead of half a guest pixel. Every host pixel of a render "
+                    "target stays covered, so scaled resolves need no edge fill and resolve "
+                    "boundaries inside the frame (predicated tiling) show no seam.");
+
 REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
                     "Fill half pixel offset during resolution scale resolve");
 
@@ -452,8 +458,12 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t draw_resolution_scal
     offset_add_xy[1] += float(pa_sc_window_offset.window_y_offset);
   }
   if (REXCVAR_GET(half_pixel_offset) && pa_su_vtx_cntl.pix_center == xenos::PixelCenter::kD3DZero) {
-    offset_add_xy[0] += 0.5f;
-    offset_add_xy[1] += 0.5f;
+    // Half a guest pixel is one or more whole host pixels at a scale above 1,
+    // which leaves the first host row and column of a region uncovered; the
+    // host-pixel mode keeps them covered (see the cvar).
+    const bool in_host_pixels = REXCVAR_GET(draw_resolution_scaled_half_pixel_offset);
+    offset_add_xy[0] += GetHalfPixelOffset(draw_resolution_scale_x, in_host_pixels);
+    offset_add_xy[1] += GetHalfPixelOffset(draw_resolution_scale_y, in_host_pixels);
   }
   // Only scale the whole pixel part of the viewport offset. Keep the Xenos
   // sample offset in host pixels since programmed sample positions don't scale
@@ -1385,6 +1395,8 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
       (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) &&
       REXCVAR_GET(resolve_resolution_scale_fill_half_pixel_offset) &&
       REXCVAR_GET(half_pixel_offset) &&
+      // No coverage gap in the host-pixel mode; a fill would overwrite valid pixels.
+      !REXCVAR_GET(draw_resolution_scaled_half_pixel_offset) &&
       regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero;
   int32_t exp_bias = is_depth ? 0 : rb_copy_dest_info.copy_dest_exp_bias;
   ResolveEdramInfo depth_edram_info;

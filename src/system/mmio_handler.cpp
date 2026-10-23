@@ -514,6 +514,33 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
     auto lock = global_critical_region_.Acquire();
+#if REX_PLATFORM_LINUX
+    // QueryProtect reads /proc/self/maps on Linux (one ioctl from 6.11, else the whole text,
+    // thousands of lines once guest memory is watched page by page), and this ran it under the
+    // global lock at every write-watch fault: about 0.55 ms a fault, half the frame rate on a
+    // Steam Deck (issue #523). For a write the callback settles a watch from the heaps' own
+    // records, including one another thread cleared meanwhile (see the recovery path of
+    // Memory::AccessViolationCallback), so it runs first and the maps are read only for a
+    // fault it does not handle. Reads keep the old order: the physical heap watches writes only.
+    if (is_write && access_violation_callback_) {
+      if (access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                     fault_host_address, is_write)) {
+        return true;
+      }
+      lock = global_critical_region_.Acquire();
+      memory::PageAccess unhandled_access;
+      size_t unhandled_length = memory::page_size();
+      memory::QueryProtect(fault_host_address, unhandled_length, unhandled_access);
+      if (unhandled_access != memory::PageAccess::kNoAccess &&
+          unhandled_access != memory::PageAccess::kReadOnly) {
+        // Another thread has cleared this watch. Abort.
+        return true;
+      }
+      lock.unlock();
+      LogUnhandledFaultBacktrace(*ex, is_write);
+      return false;
+    }
+#endif
     memory::PageAccess cur_access;
     size_t page_length = memory::page_size();
     memory::QueryProtect(fault_host_address, page_length, cur_access);

@@ -156,6 +156,21 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
   auto run = [content_manager, xuid, root_name = std::string(root_name.value()), flags,
               content_data, disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    // A name FATX refuses fails before any root is closed or content deleted;
+    // so does a root name the UTF-8 helpers would throw on.
+    X_RESULT name_result = rex::system::xam::ContentManager::CheckRootName(root_name);
+    if (!name_result) {
+      name_result = content_manager->CheckPackageName(content_data);
+    }
+    if (name_result) {
+      if (disposition_ptr) {
+        *disposition_ptr = static_cast<uint32_t>(kDispositionState::Unknown);
+      }
+      extended_error = X_HRESULT_FROM_WIN32(name_result);
+      length = 0;
+      return name_result;
+    }
+
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
     switch (flags & 0xF) {
@@ -311,9 +326,13 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
-  bool content_exists = REX_KERNEL_STATE()->content_manager()->ContentExists(xuid, content_data);
+  auto content_manager = REX_KERNEL_STATE()->content_manager();
+  result = content_manager->CheckPackageName(content_data);
+  if (!result && !content_manager->ContentExists(xuid, content_data)) {
+    result = X_ERROR_PATH_NOT_FOUND;
+  }
 
-  if (content_exists) {
+  if (!result) {
     if (content_data.content_type == XContentType::kSavedGame) {
       // User always creates saves.
       *is_creator_ptr = 1;
@@ -325,8 +344,6 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
         *creator_xuid_ptr = 0;
       }
     }
-  } else {
-    result = X_ERROR_PATH_NOT_FOUND;
   }
 
   if (overlapped_ptr) {
@@ -350,19 +367,14 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
   auto result =
       REX_KERNEL_STATE()->content_manager()->GetContentThumbnail(xuid, content_data, &buffer);
 
-  *buffer_size_ptr = uint32_t(buffer.size());
-
   if (result == X_ERROR_SUCCESS) {
-    // Write data, if we were given a pointer.
-    // This may have just been a size query.
-    if (buffer_ptr) {
-      if (buffer_size < buffer.size()) {
-        // Dest buffer too small.
-        result = X_ERROR_INSUFFICIENT_BUFFER;
-      } else {
-        // Copy data.
-        std::memcpy((uint8_t*)buffer_ptr, buffer.data(), buffer.size());
-      }
+    if (!buffer_ptr) {
+      // Only a query for the size gets it back.
+      *buffer_size_ptr = uint32_t(buffer.size());
+    } else if (buffer_size < buffer.size()) {
+      result = X_ERROR_INSUFFICIENT_BUFFER;
+    } else {
+      std::memcpy((uint8_t*)buffer_ptr, buffer.data(), buffer.size());
     }
   }
 

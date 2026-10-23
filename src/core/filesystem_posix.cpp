@@ -31,7 +31,6 @@
 #include <rex/string.h>
 
 #include <dirent.h>
-#include <ftw.h>
 #include <libgen.h>
 #include <pwd.h>
 
@@ -154,20 +153,12 @@ bool TruncateStdioFile(FILE* file, uint64_t length) {
   return true;
 }
 
-static int removeCallback(const char* fpath, const struct stat* sb, int typeflag,
-                          struct FTW* ftwbuf) {
-  int rv = remove(fpath);
-  return rv;
-}
-
 static uint64_t convertUnixtimeToWinFiletime(time_t unixtime) {
-  // Linux uses number of seconds since 1/1/1970, and Windows uses
-  // number of nanoseconds since 1/1/1601
-  // so we convert linux time to nanoseconds and then add the number of
-  // nanoseconds from 1601 to 1970
-  // see https://msdn.microsoft.com/en-us/library/ms724228
-  uint64_t filetime = filetime = (unixtime * 10000000) + 116444736000000000;
-  return filetime;
+  // Unix uses seconds since 1/1/1970, Windows uses 100ns intervals since
+  // 1/1/1601. Convert (in 64 bits: a 32-bit time_t would overflow) and add
+  // the epoch difference.
+  // See https://msdn.microsoft.com/en-us/library/ms724228
+  return (uint64_t(unixtime) * 10000000) + 116444736000000000ULL;
 }
 
 bool CreateEmptyFile(const std::filesystem::path& path) {
@@ -181,8 +172,8 @@ bool CreateEmptyFile(const std::filesystem::path& path) {
 
 class PosixFileHandle : public FileHandle {
  public:
-  PosixFileHandle(std::filesystem::path path, int handle)
-      : FileHandle(std::move(path)), handle_(handle) {}
+  PosixFileHandle(std::filesystem::path path, int handle, bool append_only)
+      : FileHandle(std::move(path)), handle_(handle), append_only_(append_only) {}
   ~PosixFileHandle() override {
     close(handle_);
     handle_ = -1;
@@ -199,7 +190,10 @@ class PosixFileHandle : public FileHandle {
   }
   bool Write(size_t file_offset, const void* buffer, size_t buffer_length,
              size_t* out_bytes_written) override {
-    ssize_t out = pwrite(handle_, buffer, buffer_length, file_offset);
+    // Linux pwrite(2) ignores the offset on an O_APPEND descriptor and
+    // appends instead, so an append-only handle writes with write().
+    ssize_t out = append_only_ ? write(handle_, buffer, buffer_length)
+                               : pwrite(handle_, buffer, buffer_length, file_offset);
     if (out < 0) {
       *out_bytes_written = 0;
       return false;
@@ -212,6 +206,7 @@ class PosixFileHandle : public FileHandle {
 
  private:
   int handle_ = -1;
+  bool append_only_ = false;
 };
 
 std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path& path,
@@ -237,14 +232,23 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(const std::filesystem::path
     open_access = O_WRONLY;
   }
 
-  // No O_APPEND for kFileAppendData: writes go through pwrite with an explicit
-  // offset, which O_APPEND would override.
+  // O_APPEND only when append is the sole write right, matching Win32, where
+  // FILE_APPEND_DATA without FILE_WRITE_DATA makes a handle append-only.
+  // Linux pwrite(2) ignores the offset on an O_APPEND descriptor, so a handle
+  // that also writes normally keeps pwrite with its offsets.
+  const bool append_only =
+      (desired_access & FileAccess::kFileAppendData) &&
+      !(desired_access &
+        (FileAccess::kGenericWrite | FileAccess::kFileWriteData | FileAccess::kGenericAll));
+  if (append_only) {
+    open_access |= O_APPEND;
+  }
   int handle = open(path.c_str(), open_access);
   if (handle == -1) {
     // TODO(benvanik): pick correct response.
     return nullptr;
   }
-  return std::make_unique<PosixFileHandle>(path, handle);
+  return std::make_unique<PosixFileHandle>(path, handle, append_only);
 }
 
 bool GetInfo(const std::filesystem::path& path, FileInfo* out_info) {
@@ -284,19 +288,21 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
 
     info.name = ent->d_name;
     struct stat st = {};
-    // stat() follows symlinks, so a symlinked directory reports S_ISDIR here even
-    // though readdir() gives it d_type DT_LNK (and some filesystems only ever give
-    // DT_UNKNOWN). Trusting d_type alone listed such directories as files, which
-    // left everything under a symlinked folder unreachable.
-    const bool have_stat = stat((path / info.name).c_str(), &st) == 0;
+    // A failed stat (a dangling symlink, an entry deleted between the readdir
+    // and the stat, EACCES on a path component) falls back to lstat, else
+    // leaves the struct zeroed for the timestamps and the size.
+    const auto child_path = path / info.name;
+    if (stat(child_path.c_str(), &st) != 0 && lstat(child_path.c_str(), &st) != 0) {
+      st = {};
+    }
     info.create_timestamp = convertUnixtimeToWinFiletime(st.st_ctime);
     info.access_timestamp = convertUnixtimeToWinFiletime(st.st_atime);
     info.write_timestamp = convertUnixtimeToWinFiletime(st.st_mtime);
     info.path = path;
-    const bool is_dir =
-        ent->d_type == DT_DIR ||
-        ((ent->d_type == DT_LNK || ent->d_type == DT_UNKNOWN) && have_stat && S_ISDIR(st.st_mode));
-    if (is_dir) {
+    // Classified from the stat, not d_type: that is DT_LNK for a symlinked
+    // directory and DT_UNKNOWN on filesystems that don't fill it in (many FUSE
+    // and network mounts, some XFS configurations).
+    if (S_ISDIR(st.st_mode)) {
       info.type = FileInfo::Type::kDirectory;
       info.total_size = 0;
     } else {

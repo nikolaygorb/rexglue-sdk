@@ -34,10 +34,16 @@ HostPathDevice::HostPathDevice(const std::string_view mount_path,
 HostPathDevice::~HostPathDevice() = default;
 
 bool HostPathDevice::Initialize() {
-  if (!std::filesystem::exists(host_path_)) {
+  std::error_code ec;
+  if (!std::filesystem::exists(host_path_, ec)) {
     if (!read_only_) {
-      // Create the path.
-      std::filesystem::create_directories(host_path_);
+      // Create the path. A host refusal fails the mount instead of throwing.
+      std::filesystem::create_directories(host_path_, ec);
+      if (ec) {
+        REXFS_ERROR("Cannot create host path '{}': {} ({})", rex::path_to_utf8(host_path_),
+                    ec.message(), ec.value());
+        return false;
+      }
     } else {
       REXFS_ERROR("Host path does not exist");
       return false;
@@ -47,7 +53,8 @@ bool HostPathDevice::Initialize() {
   auto root_entry = new HostPathEntry(this, nullptr, "", host_path_);
   root_entry->attributes_ = kFileAttributeDirectory;
   root_entry_ = std::unique_ptr<Entry>(root_entry);
-  PopulateEntry(root_entry);
+  std::vector<std::filesystem::path> ancestors;
+  PopulateEntry(root_entry, ancestors);
 
   return true;
 }
@@ -114,21 +121,57 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
   return current_entry;
 }
 
-void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
+void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry,
+                                   std::vector<std::filesystem::path>& ancestors) {
+  // Directory symlinks are walked (the type comes from the stat), so a link
+  // back into a directory already on this path would recurse until the stack
+  // runs out. A link to a sibling subtree is still walked: it duplicates
+  // entries but ends, so only genuine self-containment is cut.
+  std::error_code ec;
+  const auto canonical_self = std::filesystem::canonical(parent_entry->host_path(), ec);
+  if (!ec) {
+    for (const auto& seen : ancestors) {
+      if (seen == canonical_self) {
+        REXFS_WARN("HostPathDevice: {} is already on the path being walked; not following it again",
+                   rex::path_to_utf8(parent_entry->host_path()));
+        return;
+      }
+    }
+    ancestors.push_back(canonical_self);
+  }
   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
+  // The overlay folder at this directory's relative path (set_overlay_path).
+  const std::filesystem::path overlay_dir =
+      overlay_path_.empty()
+          ? std::filesystem::path()
+          : overlay_path_ / parent_entry->host_path().lexically_relative(host_path_);
   for (auto& child_info : child_infos) {
     // Runtime bookkeeping, never part of the package the console hands out.
     if (child_info.type == rex::filesystem::FileInfo::Type::kFile &&
         child_info.name == kPackageThumbnailFileName) {
       continue;
     }
-    auto child = HostPathEntry::Create(this, parent_entry,
-                                       parent_entry->host_path() / child_info.name, child_info);
+    std::filesystem::path child_path = parent_entry->host_path() / child_info.name;
+    if (!overlay_dir.empty() && child_info.type == rex::filesystem::FileInfo::Type::kFile) {
+      // The overlay's file of that name, if there is one, stands in for it.
+      rex::filesystem::FileInfo overlay_info;
+      const std::filesystem::path overlay_file = overlay_dir / child_info.name;
+      if (rex::filesystem::GetInfo(overlay_file, &overlay_info) &&
+          overlay_info.type == rex::filesystem::FileInfo::Type::kFile) {
+        overlay_info.name = child_info.name;
+        child_info = overlay_info;
+        child_path = overlay_file;
+      }
+    }
+    auto child = HostPathEntry::Create(this, parent_entry, child_path, child_info);
     parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
 
     if (child_info.type == rex::filesystem::FileInfo::Type::kDirectory) {
-      PopulateEntry(child);
+      PopulateEntry(child, ancestors);
     }
+  }
+  if (!ec) {
+    ancestors.pop_back();
   }
 }
 

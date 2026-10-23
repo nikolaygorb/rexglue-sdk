@@ -37,6 +37,15 @@ struct PPCCodegenFlags {
   bool non_volatile_as_local = false;
 };
 
+/// The XEX the code was recompiled from, recorded by codegen. All zero in code
+/// generated before it was recorded: the startup check is then skipped.
+struct PPCImageIdentity {
+  u64 fingerprint = 0;  ///< FNV-1a 64 of the XEX page descriptor table
+  u32 page_count = 0;   ///< Entries in that table
+  u32 title_id = 0;     ///< Shown in the log and the warning only
+  u32 media_id = 0;     ///< Shown in the log and the warning only
+};
+
 /// PPC image layout passed from the generated config header into ReXApp.
 struct PPCImageInfo {
   u32 code_base;
@@ -47,6 +56,7 @@ struct PPCImageInfo {
   bool rexcrt_heap = false;  ///< Set by codegen when [rexcrt] has heap functions
   RegisterModulesFunc register_modules = nullptr;  ///< Set by codegen for multi-binary projects
   PPCCodegenFlags codegen_flags{};                 ///< Set by codegen from the config flags
+  PPCImageIdentity image_identity{};               ///< Set by codegen from the loaded XEX
 };
 
 }  // namespace rex

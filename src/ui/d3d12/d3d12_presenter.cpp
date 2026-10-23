@@ -50,6 +50,42 @@ namespace shaders {
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
+namespace {
+// Present may see the loss before the command processor does; DRED data needs d3d12_dred or
+// d3d12_debug.
+void LogPresentDeviceLoss(ID3D12Device* device, HRESULT present_result) {
+  REXLOG_ERROR("D3D12 Present lost the device: result 0x{:08X}, removed reason 0x{:08X}",
+               static_cast<unsigned>(present_result),
+               static_cast<unsigned>(device->GetDeviceRemovedReason()));
+  Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+  if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+      for (const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode; node;
+           node = node->pNext) {
+        if (!node->pLastBreadcrumbValue || !node->pCommandHistory ||
+            *node->pLastBreadcrumbValue == 0) {
+          continue;
+        }
+        uint32_t last = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
+        REXLOG_ERROR("DRED breadcrumb: completed {} of {} ops", last, node->BreadcrumbCount);
+        uint32_t end = std::min(last + 1, node->BreadcrumbCount);
+        for (uint32_t i = last > 3 ? last - 3 : 0; i < end; ++i) {
+          REXLOG_ERROR("  [{}] op type {}{}", i, static_cast<int>(node->pCommandHistory[i]),
+                       i == last ? " <-- FAULT" : "");
+        }
+      }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) &&
+        page_fault.PageFaultVA != 0) {
+      REXLOG_ERROR("DRED page fault at VA 0x{:016X}", page_fault.PageFaultVA);
+    }
+  }
+  rex::FlushLogging();
+}
+}  // namespace
+
 D3D12Presenter::~D3D12Presenter() {
   // Await completion of the usage of everything before destroying anything,
   // irrespective of the declaration order in the class.
@@ -1169,6 +1205,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
   paint_context_.present_completion_timeline->SignalAndAdvance(direct_queue);
+  if (present_result == DXGI_ERROR_DEVICE_REMOVED || present_result == DXGI_ERROR_DEVICE_RESET) {
+    LogPresentDeviceLoss(provider_.GetDevice(), present_result);
+  }
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;

@@ -83,6 +83,24 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
     auto pip_m = rex::perf::GetSnapshotCounter(rex::perf::CounterId::kPipelineCacheMisses);
     ImGui::Text("TexCache: %" PRId64 "/%" PRId64 "  PipeCache: %" PRId64 "/%" PRId64, tex_h,
                 tex_h + tex_m, pip_h, pip_h + pip_m);
+    ImGui::Text("TexLoads: %" PRId64 " (%.1f MB)",
+                rex::perf::GetSnapshotCounter(rex::perf::CounterId::kTextureLoads),
+                double(rex::perf::GetSnapshotCounter(rex::perf::CounterId::kTextureLoadBytes)) /
+                    (1024.0 * 1024.0));
+
+    // Graphics card time (Vulkan with vulkan_gpu_time), by the frame its work
+    // completed in.
+    auto gpu_ms = [](rex::perf::CounterId id) {
+      return double(rex::perf::GetSnapshotCounter(id)) / 1000.0;
+    };
+    ImGui::Text("GPU card: %.2f ms", gpu_ms(rex::perf::CounterId::kGpuTimeUs));
+    ImGui::Text("  draw %.2f  xfer %.2f  resolve %.2f", gpu_ms(rex::perf::CounterId::kGpuDrawUs),
+                gpu_ms(rex::perf::CounterId::kGpuTransferUs),
+                gpu_ms(rex::perf::CounterId::kGpuResolveUs));
+    ImGui::Text("  tex %.2f  upload %.2f  swap %.2f  other %.2f",
+                gpu_ms(rex::perf::CounterId::kGpuTextureLoadUs),
+                gpu_ms(rex::perf::CounterId::kGpuUploadUs), gpu_ms(rex::perf::CounterId::kGpuSwapUs),
+                gpu_ms(rex::perf::CounterId::kGpuOtherUs));
 #endif
   }
   ImGui::End();

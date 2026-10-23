@@ -188,7 +188,10 @@ i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
   // If this function fails they assume zero, so let's fail AND
   // set zero just to be safe.
   *out_ptr = 0;
-  if (!user_index || (user_index & 0xFF) == 0xFF) {
+  // Any signed-in local user, as canary (the device context is the user index;
+  // canary's microphone case needs allow_mic_initialization, which we lack).
+  if (xeXamUserGetSigninState(user_index) || (user_index & 0xFF) == 0xFF) {
+    *out_ptr = user_index;
     return X_E_SUCCESS;
   } else {
     return X_E_DEVICE_NOT_CONNECTED;

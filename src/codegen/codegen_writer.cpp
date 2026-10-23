@@ -91,6 +91,15 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"non_volatile_as_local", cfg.nonVolatileRegistersAsLocalVariables},
   };
 
+  // The XEX this code comes from, checked by ReXApp at startup
+  const auto& identity = ctx.imageIdentity();
+  nlohmann::json imageIdentity = {
+      {"fingerprint", fmt::format("0x{:016X}ull", identity.fingerprint)},
+      {"page_count", identity.page_count},
+      {"title_id", fmt::format("0x{:08X}", identity.title_id)},
+      {"media_id", fmt::format("0x{:08X}", identity.media_id)},
+  };
+
   return {
       {"project", cfg.projectName},
       {"image_base", fmt::format("0x{:X}", ctx.binary().baseAddress())},
@@ -102,6 +111,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"has_dll_modules", ctx.hasDllModules()},
       {"is_dll", ctx.isDllModule()},
       {"config_flags", configFlags},
+      {"image_identity", imageIdentity},
       {"functions", functionsJson},
       {"recomp_files", nlohmann::json::array()},
   };

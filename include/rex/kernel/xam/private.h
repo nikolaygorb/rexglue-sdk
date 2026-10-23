@@ -22,6 +22,19 @@ bool xeXamIsUIActive();
 // XamUserGetSigninState for user_index; 0 when nobody is signed in there.
 uint32_t xeXamUserGetSigninState(uint32_t user_index);
 
+// Local players (split-screen). User 0 is always signed in; users 1-3 are
+// while a controller is assigned to them (max_local_users).
+bool IsLocalUserSignedIn(uint32_t user_index);
+// The profile of a local user (user 0 is the kernel state's own), null for an
+// index past 3.
+system::xam::UserProfile* ProfileForUser(uint32_t user_index);
+// The local user an XUID belongs to, or -1.
+int LocalUserOfXuid(uint64_t xuid);
+// Re-checks which local users are signed in (at most every 250 ms) and sends
+// XN_SYS_SIGNINCHANGED on a change. Every sign-in query does this; it is also
+// called where a title waits for that notification without asking.
+void RefreshLocalUserSignins();
+
 rex::runtime::Export* RegisterExport_xam(rex::runtime::Export* export_entry);
 
 // Registration functions, one per file.

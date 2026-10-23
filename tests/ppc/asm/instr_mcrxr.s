@@ -1,8 +1,10 @@
+# mcrxr is not in the POWER7 ISA the assembler targets, so it is encoded by hand.
 test_mcrxr_1:
   #_ REGISTER_IN r3 0x0000000000000001
   #_ REGISTER_IN r4 0x0000000000000001
   addc r5, r3, r4
-  mcrxr 1
+  # mcrxr cr1
+  .long 0x7C800400
   blr
   #_ REGISTER_OUT r3 0x0000000000000001
   #_ REGISTER_OUT r4 0x0000000000000001
@@ -14,7 +16,8 @@ test_mcrxr_2:
   #_ REGISTER_IN r3 0xFFFFFFFFFFFFFFFF
   #_ REGISTER_IN r4 0x0000000000000001
   addc r5, r3, r4
-  mcrxr 2
+  # mcrxr cr2
+  .long 0x7D000400
   blr
   #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFF
   #_ REGISTER_OUT r4 0x0000000000000001
@@ -27,7 +30,8 @@ test_mcrxr_3:
   #_ REGISTER_IN r3 0x000000007FFFFFFF
   #_ REGISTER_IN r4 0x0000000000000001
   addo r5, r3, r4
-  mcrxr 0
+  # mcrxr cr0
+  .long 0x7C000400
   blr
   #_ REGISTER_OUT r5 0x0000000080000000
   #_ REGISTER_OUT cr 0xC0000000

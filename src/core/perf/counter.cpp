@@ -49,6 +49,16 @@ constexpr const char* kCounterNames[] = {
     "texture_cache_misses",
     "pipeline_cache_hits",
     "pipeline_cache_misses",
+    "gpu_time_us",
+    "gpu_draw_us",
+    "gpu_transfer_us",
+    "gpu_resolve_us",
+    "gpu_texture_load_us",
+    "gpu_upload_us",
+    "gpu_swap_us",
+    "gpu_other_us",
+    "texture_loads",
+    "texture_load_bytes",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -72,6 +82,16 @@ constexpr bool kIsGauge[] = {
     false,  // kTextureCacheMisses
     false,  // kPipelineCacheHits
     false,  // kPipelineCacheMisses
+    false,  // kGpuTimeUs
+    false,  // kGpuDrawUs
+    false,  // kGpuTransferUs
+    false,  // kGpuResolveUs
+    false,  // kGpuTextureLoadUs
+    false,  // kGpuUploadUs
+    false,  // kGpuSwapUs
+    false,  // kGpuOtherUs
+    false,  // kTextureLoads
+    false,  // kTextureLoadBytes
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

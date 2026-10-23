@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -114,6 +115,12 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
   ID3D12PipelineState* AwaitD3D12PipelineByHandle(void* handle);
+  // Whether the pipeline is queued for background creation or being created
+  // (false once creation succeeded or failed).
+  bool IsD3D12PipelineCreationPendingByHandle(void* handle) const {
+    return reinterpret_cast<const Pipeline*>(handle)->creation_pending.load(
+        std::memory_order_acquire);
+  }
 
   // With async compilation, only valid when GetD3D12PipelineByHandle returns
   // non-null for the handle (the root signature is set by the creation thread
@@ -411,6 +418,9 @@ class PipelineCache {
   struct Pipeline {
     // nullptr if creation has failed or still pending.
     std::atomic<ID3D12PipelineState*> state{nullptr};
+    // Queued for background creation and not created or failed yet. Cleared
+    // after state is stored.
+    std::atomic<bool> creation_pending{false};
     PipelineRuntimeDescription description;
     // For background creation: stores the untranslated shaders.
     // Background thread translates both VS and PS together, then creates the
@@ -455,6 +465,25 @@ class PipelineCache {
   // Storage writer for shaders and pipelines (owns file handles and storage
   // index).
   ShaderStorageWriter<PipelineStoredDescription> storage_writer_;
+
+  // Driver-compiled pipelines kept across runs in an ID3D12PipelineLibrary
+  // (d3d12_pipeline_library), in the local shader storage folder (GPU and
+  // driver specific, never shared). A hit takes microseconds instead of a
+  // driver compile. Library calls are serialized by pipeline_library_mutex_;
+  // compiling a missing pipeline stays outside the lock.
+  void InitializePipelineLibrary(const std::filesystem::path& cache_root, uint32_t title_id,
+                                 const std::string& file_suffix);
+  // Writes the library to its file if anything was stored since the last write.
+  void FlushPipelineLibrary();
+  void ShutdownPipelineLibrary();
+  ID3D12PipelineLibrary* pipeline_library_ = nullptr;
+  // The loaded file, which the library references for its whole life.
+  std::vector<uint8_t> pipeline_library_blob_;
+  std::filesystem::path pipeline_library_path_;
+  std::mutex pipeline_library_mutex_;
+  std::atomic<uint32_t> pipeline_library_loads_{0};
+  std::atomic<uint32_t> pipeline_library_stores_{0};
+  std::atomic<bool> pipeline_library_dirty_{false};
 
   // Pipeline creation threads.
   void CreationThread(size_t thread_index);

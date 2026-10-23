@@ -12,6 +12,8 @@
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
 
+#include <algorithm>
+
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/devices/host_path_device.h>
@@ -27,6 +29,21 @@ HostPathEntry::HostPathEntry(Device* device, Entry* parent, const std::string_vi
     : Entry(device, parent, path), host_path_(host_path) {}
 
 HostPathEntry::~HostPathEntry() = default;
+
+bool HostPathEntry::has_open_files() const {
+  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  // Deleting a directory frees its children, so their handles count too.
+  return open_files_.load() != 0 || std::ranges::any_of(children_, [](const auto& child) {
+           return child->has_open_files();
+         });
+}
+
+void HostPathEntry::ReleaseFile() {
+  auto global_lock = global_critical_region_.Acquire();
+  if (open_files_.fetch_sub(1) == 1 && delete_on_close() && parent()) {
+    Delete();
+  }
+}
 
 HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
                                      const std::filesystem::path& full_path,
@@ -98,7 +115,14 @@ std::unique_ptr<Entry> HostPathEntry::CreateEntryInternal(const std::string_view
                                                           uint32_t attributes) {
   auto full_path = host_path_ / rex::to_path(name);
   if (attributes & kFileAttributeDirectory) {
-    if (!std::filesystem::create_directories(full_path)) {
+    // A name the host refuses (Windows: ':' in it, or a path past MAX_PATH) must fail the
+    // guest's call, not throw through NtCreateFile into guest code.
+    std::error_code ec;
+    if (!std::filesystem::create_directories(full_path, ec)) {
+      if (ec) {
+        REXFS_WARN("CreateEntryInternal: cannot create directory '{}': {} ({})",
+                   rex::path_to_utf8(full_path), ec.message(), ec.value());
+      }
       return nullptr;
     }
   } else {

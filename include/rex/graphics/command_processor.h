@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -21,6 +22,7 @@
 #include <queue>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <rex/graphics/register_file.h>
@@ -505,6 +507,91 @@ class CommandProcessor {
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 
+  // How many bytes of a resolve readback_resolve copies back: all of them, or
+  // at a draw resolution scale the whole 32x32 tiles the downscale handles
+  // (pixel_size_log2_out gets its texel size). 0 when it can't be copied back.
+  static uint32_t GetResolveReadbackLength(uint32_t written_address, uint32_t written_length,
+                                           reg::RB_COPY_DEST_INFO copy_dest_info, bool is_scaled,
+                                           uint32_t& pixel_size_log2_out);
+
+  // readback_resolve_cpu_reads_only: for the implementations, on the command
+  // processor thread, after a resolve readback_resolve would copy back:
+  // whether to copy it back now. Only destinations the guest has accessed
+  // since they were first resolved to are. Any other one is read-watched
+  // (rex/system/xmemory_read_watch.h): its first access waits while it is
+  // copied back on the spot (ReadBackResolvesNow), and from then on it is
+  // copied back after each resolve like before. `length` is what the copy
+  // covers (GetResolveReadbackLength); buffer_key (GetReadbackResolveKey),
+  // pixel_size_log2 and is_scaled are kept for that later copy.
+  bool ShouldReadbackResolve(uint32_t physical_address, uint32_t length, uint64_t buffer_key,
+                             uint32_t pixel_size_log2, bool is_scaled);
+
+  // A resolve destination a guest thread is waiting for.
+  struct ResolveFetch {
+    uint32_t address;  // Physical.
+    uint32_t length;
+    // From its last resolve (ShouldReadbackResolve).
+    uint64_t buffer_key;
+    uint32_t pixel_size_log2;
+    bool scaled;
+    uint64_t serial;
+    bool in_progress;  // Being copied back by the command processor thread.
+    bool cancelled;    // The waiting thread gave up: don't write guest memory.
+    // readback_resolve_full_deferred: the copy recorded at the destination's
+    // last resolve has what the access needs; it is only waited for.
+    bool deferred;
+  };
+  // For the implementations, on the command processor thread: copies resolve
+  // destinations from the GPU's memory to host memory now, waiting for the
+  // GPU. data_out gets a pointer to each one's bytes (nullptr where that
+  // failed), valid until the next submission. Implementations that can't do
+  // this return false from CanReadBackResolvesNow; every resolve is copied
+  // back then.
+  virtual bool CanReadBackResolvesNow() const { return false; }
+  virtual void ReadBackResolvesNow(const ResolveFetch* /* fetches */, size_t count,
+                                   std::vector<const uint8_t*>& data_out) {
+    data_out.assign(count, nullptr);
+  }
+  // readback_resolve full with readback_resolve_full_deferred: for the
+  // implementations, on the command processor thread, once a resolve's copy
+  // back (all of it, or `pieces` of it) is recorded but not waited for:
+  // whether the guest gets it at its next access to the destination instead
+  // of now. The command processor thread then doesn't wait for the GPU at
+  // the resolve; the access waits for the copy (CompleteDeferredReadbacks),
+  // which has usually finished by then. False: copy it back now, as before.
+  bool DeferResolveReadback(uint32_t physical_address, uint32_t length, bool all,
+                            const std::vector<std::pair<uint32_t, uint32_t>>& pieces);
+  // For the implementations that defer: waits for the copies recorded at
+  // each fetched destination's last resolve and gives each one's bytes
+  // (nullptr where it has none: that one is copied back the usual way).
+  virtual bool CanDeferResolveReadbacks() const { return false; }
+  virtual void CompleteDeferredReadbacks(const ResolveFetch* /* fetches */, size_t count,
+                                         std::vector<const uint8_t*>& data_out) {
+    data_out.assign(count, nullptr);
+  }
+  // For the implementations, after a resolve ShouldReadbackResolve said to
+  // copy back: copies the resolve's bytes (`data`, `length` of them) into
+  // guest memory at `physical_address`, all of them or, for a destination in
+  // pieces (readback_resolve_cpu_pages_only), the pieces the guest reads.
+  // Returns how many bytes were copied.
+  uint64_t CopyResolveToGuest(uint32_t physical_address, uint32_t length, const uint8_t* data);
+  // The same in two steps, for an implementation that also copies only the
+  // pieces from the GPU: which pieces (offset, length) a resolve's copy back
+  // is, or true for all of it; then the copy of those.
+  bool GetResolveCopyPieces(uint32_t physical_address, uint32_t length,
+                            std::vector<std::pair<uint32_t, uint32_t>>& pieces);
+  uint64_t CopyResolvePiecesToGuest(uint32_t physical_address, uint32_t length,
+                                    const uint8_t* data, bool all,
+                                    const std::vector<std::pair<uint32_t, uint32_t>>& pieces);
+
+  // Copies back the resolves guest threads are waiting for. On the command
+  // processor thread between packets and while it waits; cheap when none.
+  void ProcessResolveFetches() {
+    if (resolve_fetch_requested_.load(std::memory_order_acquire)) {
+      ProcessResolveFetchesNow();
+    }
+  }
+
   // For the implementations, on the command processor thread at the end of a
   // frame: whether a RequestDrawResolutionScale request should be applied now,
   // taking it. A request is returned only once it has stayed the same for a
@@ -609,6 +696,102 @@ class CommandProcessor {
   // The pending draw resolution scale request seen at the previous end of a
   // frame (packed, 0 if none).
   uint32_t draw_resolution_scale_request_seen_ = 0;
+
+  // readback_resolve_cpu_reads_only (see ShouldReadbackResolve).
+  struct ResolveDestination {
+    uint32_t address;  // Physical.
+    uint32_t length;
+    // From its last resolve.
+    uint64_t buffer_key;
+    uint32_t pixel_size_log2;
+    bool scaled;
+    // Its copy for the guest's first access, 0 if none.
+    uint64_t fetch_serial;
+    // The guest has accessed it: copied back after each resolve.
+    bool cpu_reads;
+    bool cpu_reads_logged;
+    // readback_resolve_cpu_pages_only: the 4 KB pieces of it the guest has
+    // touched, a bit each from the one holding `address`. After each resolve
+    // only these are copied back; the others stay watched, and touching one
+    // brings in this resolve's data (one fetch per resolve) and adds it here.
+    std::vector<uint64_t> read_chunks;
+    uint32_t read_chunk_count;
+    // The guest's copy of all of it holds the last resolve's data (a whole
+    // copy or a fetch since that resolve): touching a watched piece then only
+    // needs it unwatched.
+    bool current;
+    // Copied back whole after each resolve: pages-only is off, or the guest
+    // has touched too much of it for pieces to pay.
+    bool whole;
+    // readback_resolve_full_deferred: the last resolve's copy back is
+    // recorded but not in guest memory yet (all of it, or deferred_pieces as
+    // (offset, length)); those pieces are watched, and the guest's next access
+    // brings it in.
+    bool deferred_pending;
+    bool deferred_all;
+    std::vector<std::pair<uint32_t, uint32_t>> deferred_pieces;
+  };
+  // The 4 KB pieces readback_resolve_cpu_pages_only works in.
+  static constexpr uint32_t kResolveChunkShift = 12;
+  // Marks the pieces of a destination that a touched physical range covers
+  // as read; returns whether any was new.
+  static bool MarkResolveChunksRead(ResolveDestination& destination, uint32_t physical_address,
+                                    uint32_t length);
+  // Watches the pieces of a destination the guest hasn't touched (for the
+  // data of the resolve just made).
+  void WatchUnreadResolveChunks(const ResolveDestination& destination);
+  // Called by the memory system on the thread that touched a read-watched
+  // page, with the global critical region locked once.
+  static std::pair<uint32_t, uint32_t> ResolveReadCallbackThunk(
+      void* context, std::unique_lock<std::recursive_mutex>& global_lock,
+      uint32_t physical_address_start, uint32_t length);
+  std::pair<uint32_t, uint32_t> ResolveReadCallback(
+      std::unique_lock<std::recursive_mutex>& global_lock, uint32_t physical_address_start,
+      uint32_t length);
+  void ProcessResolveFetchesNow();
+  // Writes a fetched destination into guest memory, the pages still
+  // read-watched only (the others were written or freed since its resolve).
+  void CopyResolveFetchToGuest(const ResolveFetch& fetch, const uint8_t* data);
+  // The same for a deferred copy back: only the pieces it holds, which are
+  // then no longer watched.
+  void CopyDeferredReadbackToGuest(ResolveDestination& destination, const ResolveFetch& fetch,
+                                   const uint8_t* data);
+  // Stops a destination's deferred copy back that the guest never asked for
+  // (a new resolve replaces it). Its pieces stay watched, for the new copy or
+  // a fetch at the guest's next access.
+  void DropDeferredReadback(ResolveDestination& destination);
+  // Stops watching a range without counting it as the guest's access:
+  // DisablePhysicalMemoryReadWatch calls the read callbacks first, this one
+  // among them, which would mark its pieces read and, under
+  // resolve_fetch_mutex_, wait on itself. The caller holds the global lock.
+  void UnwatchResolveRangeQuietly(uint32_t physical_address, uint32_t length);
+  // A destination is remembered while the guest may still access it; past
+  // this many, new ones are copied back after every resolve like before.
+  static constexpr size_t kMaxResolveDestinations = 256;
+  // Guarded by the global critical region.
+  std::vector<ResolveDestination> resolve_destinations_;
+  // CopyResolveToGuest's pieces (offset, length), kept for their storage.
+  std::vector<std::pair<uint32_t, uint32_t>> resolve_copy_runs_;
+  void* resolve_read_callback_handle_ = nullptr;
+  // Host thread ID of the command processor thread, which can't wait for
+  // itself.
+  std::atomic<uint32_t> worker_thread_id_{0};
+  std::mutex resolve_fetch_mutex_;
+  std::condition_variable resolve_fetch_cv_;
+  // Queued and in progress; guarded by resolve_fetch_mutex_ (taken after the
+  // global critical region, never before).
+  std::vector<ResolveFetch> resolve_fetches_;
+  uint64_t resolve_fetch_next_serial_ = 1;
+  std::atomic<bool> resolve_fetch_requested_{false};
+  std::atomic<uint32_t> resolve_read_callbacks_running_{0};
+  // Set while UnwatchResolveRangeQuietly runs (under the global lock, which
+  // every read callback runs under too): ResolveReadCallback returns at once.
+  bool resolve_unwatching_quietly_ = false;
+  // Command processor thread only.
+  std::vector<ResolveFetch> resolve_fetch_batch_;
+  std::vector<const uint8_t*> resolve_fetch_data_;
+  std::vector<ResolveFetch> resolve_fetch_deferred_batch_;
+  std::vector<const uint8_t*> resolve_fetch_deferred_data_;
 
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};

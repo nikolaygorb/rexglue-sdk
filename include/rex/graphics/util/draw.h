@@ -321,6 +321,14 @@ struct ViewportInfo {
   float ndc_scale[3];
   float ndc_offset[3];
 };
+// The Direct3D 9 half-pixel offset along one axis, in guest pixels. Half a
+// guest pixel (canary), or half a host pixel when in_host_pixels and the axis
+// is scaled: then every host pixel stays covered and scaled resolves need no
+// edge fill.
+inline float GetHalfPixelOffset(uint32_t draw_resolution_scale, bool in_host_pixels) {
+  return in_host_pixels && draw_resolution_scale > 1 ? 0.5f / float(draw_resolution_scale) : 0.5f;
+}
+
 // Converts the guest viewport (or fakes one if drawing without a viewport) to
 // a viewport, plus values to multiply-add the returned position by, usable on
 // host graphics APIs such as Direct3D 11+ and Vulkan, also forcing it to the

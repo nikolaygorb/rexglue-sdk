@@ -33,6 +33,7 @@
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/system/user_module.h>
+#include <rex/system/xex_identity.h>
 #include <rex/system/xex_module.h>
 
 #include <chrono>
@@ -317,6 +318,8 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     auto ctx = CodegenContext::Create(std::move(bv), std::move(cfg));
     ctx.setResolver(resolver);
     ctx.setConfigDir(configDir);
+    // The XEX this code comes from, checked by ReXApp at startup
+    ctx.setImageIdentity(rex::runtime::ReadXexImageIdentity(*execMod->xex_module()));
     ctx.analysisState().format = "xex";
     ctx.analysisState().loadAddress = ctx.binary().baseAddress();
     ctx.analysisState().entryPoint = ctx.binary().entryPoint();
@@ -340,6 +343,7 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     auto ctx = CodegenContext::Create(std::move(bv), std::move(cfg));
     ctx.setResolver(resolver);
     ctx.setConfigDir(configDir);
+    ctx.setImageIdentity(rex::runtime::ReadXexImageIdentity(*userMod->xex_module()));
     ctx.analysisState().format = "xex";
     ctx.analysisState().loadAddress = ctx.binary().baseAddress();
     ctx.analysisState().entryPoint = ctx.binary().entryPoint();

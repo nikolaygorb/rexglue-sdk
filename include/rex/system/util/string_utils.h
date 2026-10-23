@@ -38,12 +38,15 @@ inline std::string TranslateAnsiPath(const memory::Memory* memory,
   return rex::string::trim_string(std::string(TranslateAnsiString(memory, ansi_string)));
 }
 
+// A null pointer is no string. Translating it would point at guest address 0.
+inline const X_ANSI_STRING* TranslateAnsiStringPointer(const memory::Memory* memory,
+                                                       uint32_t guest_address) {
+  return guest_address ? memory->TranslateVirtual<const X_ANSI_STRING*>(guest_address) : nullptr;
+}
+
 inline std::string_view TranslateAnsiStringAddress(const memory::Memory* memory,
                                                    uint32_t guest_address) {
-  if (!guest_address) {
-    return "";
-  }
-  return TranslateAnsiString(memory, memory->TranslateVirtual<const X_ANSI_STRING*>(guest_address));
+  return TranslateAnsiString(memory, TranslateAnsiStringPointer(memory, guest_address));
 }
 
 inline std::u16string TranslateUnicodeString(const memory::Memory* memory,

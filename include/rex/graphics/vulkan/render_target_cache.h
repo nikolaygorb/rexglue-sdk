@@ -101,6 +101,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                   std::optional<Path> required_path = std::nullopt);
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
+  // Frees the cached render targets that hold no EDRAM data, as ClearCache
+  // does, but keeps the render passes (pipelines being created may reference
+  // them). Only between frames, after the GPU has finished all submitted work.
+  void TrimRenderTargets();
+  uint64_t render_target_memory_bytes() const { return render_target_memory_bytes_; }
+  uint32_t render_target_count() const { return render_target_count_; }
+  // Whether creating a render target image failed since the last call.
+  bool TakeRenderTargetAllocationFailure() {
+    const bool failed = render_target_allocation_failed_;
+    render_target_allocation_failed_ = false;
+    return failed;
+  }
 
   void CompletedSubmissionUpdated();
   void EndSubmission();
@@ -393,6 +405,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
+
+    // Device memory of the image, counted in the cache's
+    // render_target_memory_bytes_.
+    VkDeviceSize memory_size_ = 0;
 
    private:
     VulkanRenderTargetCache& render_target_cache_;
@@ -862,6 +878,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch, bool native_layout);
 
+  // After a resolve copied (and dumped, so dump_rectangles_ are its render
+  // targets): a 32bpp 1x color surface copied without conversion out of one
+  // render target is also copied straight into the texture the game samples it
+  // as, if that texture exists (vulkan_resolve_into_textures), instead of the
+  // texture being loaded again from the resolved memory.
+  void CopyResolveIntoTexture(const draw_util::ResolveInfo& resolve_info,
+                              draw_util::ResolveCopyShaderIndex copy_shader,
+                              VulkanTextureCache& texture_cache);
+
   bool gamma_render_target_as_unorm16_ = false;
 
   bool depth_unorm24_vulkan_format_supported_ = false;
@@ -884,6 +909,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   std::unordered_map<RenderPassKey, VkRenderPass, RenderPassKey::Hasher> render_passes_;
 
   std::unordered_map<FramebufferKey, Framebuffer, FramebufferKey::Hasher> framebuffers_;
+
+  uint64_t render_target_memory_bytes_ = 0;
+  uint32_t render_target_count_ = 0;
+  bool render_target_allocation_failed_ = false;
 
   // Set 0 - EDRAM storage buffer, set 1 - source depth sampled image (and
   // unused stencil from the transfer descriptor set), HostDepthStoreConstants

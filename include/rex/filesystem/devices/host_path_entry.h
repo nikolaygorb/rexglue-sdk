@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string>
 
 #include <rex/filesystem.h>
@@ -39,6 +40,10 @@ class HostPathEntry : public Entry {
   std::unique_ptr<memory::MappedMemory> OpenMapped(memory::MappedMemory::Mode mode, size_t offset,
                                                    size_t length) override;
   void update() override;
+  bool has_open_files() const override;
+  void RetainFile() override { open_files_.fetch_add(1); }
+  // The last handle closing deletes an entry set for deletion.
+  void ReleaseFile() override;
   bool SetAttributes(uint64_t attributes) override;
   bool SetCreateTimestamp(uint64_t timestamp) override;
   bool SetAccessTimestamp(uint64_t timestamp) override;
@@ -53,6 +58,7 @@ class HostPathEntry : public Entry {
   X_STATUS RenameEntryInternal(Entry* new_parent, const std::string_view name) override;
 
   std::filesystem::path host_path_;
+  std::atomic<size_t> open_files_{0};
 };
 
 }  // namespace rex::filesystem

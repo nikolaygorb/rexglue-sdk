@@ -16,9 +16,15 @@ namespace rex::filesystem {
 
 HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
                            std::unique_ptr<rex::filesystem::FileHandle> file_handle)
-    : File(file_access, entry), file_handle_(std::move(file_handle)) {}
+    : File(file_access, entry), file_handle_(std::move(file_handle)) {
+  entry->RetainFile();
+}
 
-HostPathFile::~HostPathFile() = default;
+HostPathFile::~HostPathFile() {
+  // Windows can't delete the file while this handle is still open.
+  file_handle_.reset();
+  entry_->ReleaseFile();
+}
 
 void HostPathFile::Destroy() {
   delete this;

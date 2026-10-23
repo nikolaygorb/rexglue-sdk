@@ -145,7 +145,10 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   }
   assert_not_null(handle_out);
 
-  auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
+  // A null name opens what the root directory handle refers to. That's how a
+  // file is reopened from a handle.
+  auto object_name =
+      util::TranslateAnsiStringPointer(REX_KERNEL_MEMORY(), object_attrs->name_ptr);
 
   rex::filesystem::Entry* root_entry = nullptr;
 
@@ -369,7 +372,9 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
       // though were are completing immediately.
       // Low bit probably means do not queue to IO ports.
       if ((uint32_t)apc_routine_ptr & ~1) {
-        if (apc_context) {
+        // Only for a read that succeeded, as NtReadFile (the handle is always
+        // completed synchronously here, never told PENDING).
+        if (apc_context && result == X_STATUS_SUCCESS) {
           auto thread = XThread::GetCurrentThread();
           thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
                              apc_context.guest_address(), io_status_block.guest_address(), 0);
@@ -551,7 +556,8 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
 
 u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
                                     ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
-  auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
+  auto object_name =
+      util::TranslateAnsiStringPointer(REX_KERNEL_MEMORY(), obj_attribs->name_ptr);
   auto path_str = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
   REXKRNL_IMPORT_TRACE("NtQueryFullAttributesFile", "path={}", path_str);
 
@@ -659,7 +665,8 @@ u32 NtOpenSymbolicLinkObject_entry(mapped_u32 handle_out,
 
   assert_true(object_attrs->attributes == 64);  // case insensitive
 
-  auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(object_attrs->name_ptr);
+  auto object_name =
+      util::TranslateAnsiStringPointer(REX_KERNEL_MEMORY(), object_attrs->name_ptr);
 
   // The prefix goes before the check: IsValidPath rejects '?'.
   auto target_path =

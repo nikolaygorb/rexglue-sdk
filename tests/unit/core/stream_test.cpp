@@ -380,3 +380,34 @@ TEST_CASE("BitStream BitsRemaining decreases", "[stream][bitstream]") {
   stream.Read(32);
   CHECK(stream.BitsRemaining() == 16);
 }
+
+// =============================================================================
+// BitStream Copy Tests (ForzaHorizon1-ReImagined SDK patch 0105)
+// =============================================================================
+
+TEST_CASE("BitStream Copy shorter than the rest of the first byte", "[stream][bitstream]") {
+  // 0xAB = 10101011: bits 3 and 4 (from the most significant) are 0 and 1.
+  std::array<uint8_t, 16> buffer = {0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A};
+  BitStream stream(buffer.data(), buffer.size() * 8);
+  stream.SetOffset(3);
+
+  // Taking the whole rest of the byte made the bit count wrap around, and the
+  // memcpy that followed was handed about 2^61 bytes.
+  std::array<uint8_t, 4> dest = {0x00, 0xEE, 0xEE, 0xEE};
+  CHECK(stream.Copy(dest.data(), 2) == 3);
+  CHECK(stream.offset_bits() == 5);
+  CHECK(dest[0] == 0x08);
+  CHECK(dest[1] == 0xEE);
+}
+
+TEST_CASE("BitStream Copy never goes past the end of the stream", "[stream][bitstream]") {
+  std::array<uint8_t, 16> buffer = {0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A};
+  BitStream stream(buffer.data(), 64);
+  stream.SetOffset(56);
+
+  std::array<uint8_t, 4> dest = {0x00, 0xEE, 0xEE, 0xEE};
+  stream.Copy(dest.data(), 1000);
+  CHECK(stream.offset_bits() == 64);
+  CHECK(dest[0] == 0x9A);
+  CHECK(dest[1] == 0xEE);
+}

@@ -13,6 +13,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <signal.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>
@@ -30,6 +31,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <fcntl.h>
 #endif
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -209,22 +211,9 @@ void Sleep(std::chrono::microseconds duration) {
 // TODO(bwrsandman) Implement by allowing alert interrupts from IO operations
 thread_local bool alertable_state_ = false;
 bool DispatchCurrentThreadUserCallback();
+SleepResult AlertableSleepUntil(std::chrono::steady_clock::time_point deadline);
 SleepResult AlertableSleep(std::chrono::microseconds duration) {
-  alertable_state_ = true;
-  auto deadline = std::chrono::steady_clock::now() + duration;
-  while (true) {
-    if (DispatchCurrentThreadUserCallback()) {
-      alertable_state_ = false;
-      return SleepResult::kAlerted;
-    }
-    auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) {
-      alertable_state_ = false;
-      return SleepResult::kSuccess;
-    }
-    auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
-    Sleep(std::min(remaining, std::chrono::microseconds(1000)));
-  }
+  return AlertableSleepUntil(std::chrono::steady_clock::now() + duration);
 }
 
 TlsHandle AllocateTlsHandle() {
@@ -267,20 +256,42 @@ static sem_t* RexCreateAnonymousSemaphore() {
 }
 #endif  // __APPLE__
 
-// Wakes threads blocked in PosixConditionBase::WaitMultiple. They sleep on one global condition
-// variable and re-scan their handles when the epoch changes, instead of polling every 1 ms
-// (the Audio Worker waits on its nine client handles this way and burned ~75% of a core).
-// Every state change that can satisfy a wait bumps the epoch after the change, via NotifyAll().
-struct MultiWaitState {
-  std::atomic<uint64_t> epoch{0};
-  std::atomic<int> waiters{0};
+// A thread blocked in PosixConditionBase::WaitMultiple (several handles, or an alertable wait).
+// It registers its Waiter with each handle it waits on, and with its own thread for queued user
+// callbacks; a state change wakes only the threads registered with that handle. (The previous
+// version, upstream #501, had one process-wide condition variable: every signal anywhere woke
+// every thread in WaitMultiple, about 4,000 times a second each in Forza, and alertable waits
+// re-checked every 1 ms.)
+struct Waiter {
   std::mutex mutex;
   std::condition_variable cv;
+  bool woken = false;
+
+  void Reset() {
+    std::lock_guard<std::mutex> lock(mutex);
+    woken = false;
+  }
+  void Wake() {
+    std::lock_guard<std::mutex> lock(mutex);
+    woken = true;
+    cv.notify_one();
+  }
+  void WaitUntil(std::chrono::steady_clock::time_point deadline) {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait_until(lock, deadline, [this] { return woken; });
+  }
 };
-static MultiWaitState& GetMultiWaitState() {
-  static MultiWaitState* state = new MultiWaitState();  // never destroyed: threads outlive statics
-  return *state;
-}
+
+// The current thread's queued user callbacks, for alertable waits.
+class AlertSource {
+ public:
+  virtual bool DispatchQueuedUserCallbacks() = 0;
+  // A callback queued while `waiter` is set wakes it; nullptr clears.
+  virtual void SetAlertWaiter(Waiter* waiter) = 0;
+
+ protected:
+  ~AlertSource() = default;
+};
 
 class PosixConditionBase {
  public:
@@ -305,17 +316,17 @@ class PosixConditionBase {
   // Call after the state changed, with mutex_ held.
   void NotifyAll() {
     cond_.notify_all();
-    auto& ms = GetMultiWaitState();
-    ms.epoch.fetch_add(1, std::memory_order_seq_cst);
-    if (ms.waiters.load(std::memory_order_seq_cst) > 0) {
-      { std::lock_guard<std::mutex> lock(ms.mutex); }  // a waiter is either not yet checking or waiting
-      ms.cv.notify_all();
+    std::lock_guard<std::mutex> lock(waiters_mutex_);
+    for (Waiter* waiter : waiters_) {
+      waiter->Wake();
     }
   }
 
   WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
-    auto predicate = [this] { return this->signaled(); };
+    // Taken once the lock is held: a pulse counts only for threads already waiting.
+    uint64_t entered = 0;
+    auto predicate = [this, &entered] { return this->SignaledFor(entered); };
 #if REX_PLATFORM_LINUX
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     int lock_result = pthread_mutex_lock(native_mutex);
@@ -328,30 +339,39 @@ class PosixConditionBase {
 #else
     std::unique_lock<std::mutex> lock(mutex_);
 #endif
+    entered = pulse_epoch_;
     if (predicate()) {
       executed = true;
     } else {
+      // Counted while blocked, so that a pulse knows whom it has to release.
+      ++blocked_;
       if (timeout == std::chrono::milliseconds::max()) {
         cond_.wait(lock, predicate);
         executed = true;  // Did not time out;
       } else {
         executed = cond_.wait_for(lock, timeout, predicate);
       }
+      --blocked_;
     }
     if (executed) {
       post_execution();
       return WaitResult::kSuccess;
     } else {
+      waiter_left();
       return WaitResult::kTimeout;
     }
   }
 
+  // Waits for one (or, with wait_all, every) handle. With `alert` the wait also ends when a user
+  // callback is queued for this thread: it runs one and returns kUserCallback. No handles and an
+  // alert source make an alertable sleep.
   static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
                                                     bool wait_all,
-                                                    std::chrono::milliseconds timeout) {
-    assert_true(!handles.empty());
+                                                    std::chrono::milliseconds timeout,
+                                                    AlertSource* alert = nullptr) {
+    assert_true(!handles.empty() || alert);
 
-    if (handles.size() == 1) {
+    if (handles.size() == 1 && !alert) {
       auto result = handles[0]->Wait(timeout);
       return std::make_pair(result, 0);
     }
@@ -361,21 +381,73 @@ class PosixConditionBase {
                         ? std::chrono::steady_clock::time_point::max()
                         : start_time + timeout;
 
-    auto& ms = GetMultiWaitState();
-    struct WaiterGuard {
-      std::atomic<int>& n;
-      explicit WaiterGuard(std::atomic<int>& n_) : n(n_) { n.fetch_add(1, std::memory_order_seq_cst); }
-      ~WaiterGuard() { n.fetch_sub(1, std::memory_order_seq_cst); }
-    } waiter_guard(ms.waiters);
+    Waiter waiter;
+    // Unregisters from the handles (and the alert source) on every way out, unwinding included.
+    struct Registration {
+      std::vector<PosixConditionBase*>& handles;
+      Waiter* waiter;
+      AlertSource* alert;
+      bool on_handles = false;
+      // Each handle's pulse epoch when this wait first blocked on it.
+      std::vector<uint64_t> entered;
+      Registration(std::vector<PosixConditionBase*>& h, Waiter* w, AlertSource* a)
+          : handles(h), waiter(w), alert(a) {
+        if (alert) alert->SetAlertWaiter(waiter);
+      }
+      // Registered from the first time the wait blocks until it ends, and counted as blocked
+      // on every handle meanwhile, so that a pulse is kept until this thread has looked.
+      void AddLocked() {  // every handle's mutex_ held
+        if (on_handles) return;
+        entered.resize(handles.size());
+        for (size_t i = 0; i < handles.size(); ++i) {
+          handles[i]->AddWaiter(waiter);
+          ++handles[i]->blocked_;
+          entered[i] = handles[i]->pulse_epoch_;
+        }
+        on_handles = true;
+      }
+      // Whether handle i is signalled for this wait (its mutex_ held). Before the wait blocks it
+      // is a newcomer: a pulse owes it nothing.
+      bool Signaled(size_t i) const {
+        return handles[i]->SignaledFor(on_handles ? entered[i] : handles[i]->pulse_epoch_);
+      }
+      void RemoveLocked() {  // every handle's mutex_ held
+        if (!on_handles) return;
+        for (auto* handle : handles) {
+          handle->RemoveWaiter(waiter);
+          --handle->blocked_;
+          handle->waiter_left();
+        }
+        on_handles = false;
+      }
+      // Unwinding (Thread::Exit from a user callback run by this wait, or pthread_cancel):
+      // only the handles' waiters_mutex_, never their mutex_. The thread's own handle is
+      // already signalled, and a WaitAll on it holds every handle's mutex_ while it joins the
+      // thread (Thread::post_execution); taking mutex_ here would hang both. blocked_ is atomic
+      // for this; a pulse owed to this thread is trimmed by the next pulse or departure.
+      ~Registration() {
+        if (on_handles) {
+          for (auto* handle : handles) {
+            handle->RemoveWaiter(waiter);
+            --handle->blocked_;
+          }
+        }
+        if (alert) alert->SetAlertWaiter(nullptr);
+      }
+    } registration(handles, &waiter, alert);
 
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(handles.size());
     while (true) {
-      const uint64_t seen_epoch = ms.epoch.load(std::memory_order_seq_cst);
+      // Before the checks: a change after them wakes the wait below.
+      waiter.Reset();
+      if (alert && alert->DispatchQueuedUserCallbacks()) {
+        return std::make_pair<WaitResult, size_t>(WaitResult::kUserCallback, 0);
+      }
+
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
-
-      std::vector<std::unique_lock<std::mutex>> locks;
-      locks.reserve(handles.size());
 
       for (size_t i = 0; i < handles.size(); ++i) {
 #if REX_PLATFORM_LINUX
@@ -405,10 +477,12 @@ class PosixConditionBase {
         continue;
       }
 
-      if (wait_all) {
+      if (handles.empty()) {
+        condition_met = false;
+      } else if (wait_all) {
         bool all_signaled = true;
         for (size_t i = 0; i < handles.size(); ++i) {
-          if (!handles[i]->signaled()) {
+          if (!registration.Signaled(i)) {
             all_signaled = false;
             break;
           }
@@ -419,7 +493,7 @@ class PosixConditionBase {
         condition_met = all_signaled;
       } else {
         for (size_t i = 0; i < handles.size(); ++i) {
-          if (handles[i]->signaled()) {
+          if (registration.Signaled(i)) {
             first_signaled = i;
             condition_met = true;
             break;
@@ -428,6 +502,8 @@ class PosixConditionBase {
       }
 
       if (condition_met) {
+        // Consume first: leaving trims the wake-ups a pulse owes to blocked threads, and this
+        // thread's own would be trimmed before it took it.
         if (wait_all) {
           for (size_t i = 0; i < handles.size(); ++i) {
             handles[i]->post_execution();
@@ -435,27 +511,23 @@ class PosixConditionBase {
         } else {
           handles[first_signaled]->post_execution();
         }
+        registration.RemoveLocked();
+        locks.clear();
         return std::make_pair(WaitResult::kSuccess, first_signaled);
       }
 
-      locks.clear();
-
       auto now = std::chrono::steady_clock::now();
       if (now >= end_time) {
+        registration.RemoveLocked();
+        locks.clear();
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
+      registration.AddLocked();
+      locks.clear();
 
-      // Sleep until some handle changes state. The cap covers state changes that do not
-      // notify (and bounds the damage of any missed one to the old polling behaviour).
-      auto sleep_time = std::chrono::milliseconds(20);
-      if (timeout != std::chrono::milliseconds::max()) {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        sleep_time = std::min(remaining + std::chrono::milliseconds(1), sleep_time);
-      }
-      std::unique_lock<std::mutex> wait_lock(ms.mutex);
-      ms.cv.wait_for(wait_lock, sleep_time, [&] {
-        return ms.epoch.load(std::memory_order_seq_cst) != seen_epoch;
-      });
+      // Sleep until a handle changes state, a user callback is queued or the timeout. The cap
+      // covers state changes that do not notify.
+      waiter.WaitUntil(std::min(end_time, now + std::chrono::milliseconds(20)));
     }
   }
 
@@ -465,9 +537,38 @@ class PosixConditionBase {
 
  protected:
   inline virtual bool signaled() const = 0;
+  // Signalled for a waiter that started waiting at pulse epoch `entered`. Only events pulse.
+  virtual bool SignaledFor(uint64_t entered) const { return signaled(); }
   inline virtual void post_execution() = 0;
+  // A blocked waiter gave up (timeout, or another handle of a WaitMultiple fired). Called with
+  // mutex_ held.
+  virtual void waiter_left() {}
+  void AddWaiter(Waiter* waiter) {
+    std::lock_guard<std::mutex> lock(waiters_mutex_);
+    waiters_.push_back(waiter);
+  }
+  void RemoveWaiter(Waiter* waiter) {
+    std::lock_guard<std::mutex> lock(waiters_mutex_);
+    for (size_t i = 0; i < waiters_.size(); ++i) {
+      if (waiters_[i] == waiter) {
+        waiters_[i] = waiters_.back();
+        waiters_.pop_back();
+        return;
+      }
+    }
+  }
   std::condition_variable cond_;
   std::mutex mutex_;
+  // Threads in WaitMultiple on this handle. Its own lock, taken after mutex_ (NotifyAll) or
+  // alone, so a waiter can leave without mutex_ (see ~Registration).
+  std::mutex waiters_mutex_;
+  std::vector<Waiter*> waiters_;
+  // Threads blocked in Wait() or WaitMultiple() on this handle. Changed under mutex_, except by
+  // an unwinding WaitMultiple (see ~Registration).
+  std::atomic<uint32_t> blocked_{0};
+  // Pulses so far (PulseEvent), under mutex_. A waiter that entered at an older epoch is owed
+  // the wake-ups of a later pulse; one that entered after it is not.
+  uint64_t pulse_epoch_ = 0;
 };
 
 // There really is no native POSIX handle for a single wait/signal construct
@@ -496,15 +597,48 @@ class PosixCondition<Event> : public PosixConditionBase {
     signal_ = false;
   }
 
+  // PulseEvent: release the threads blocked right now (one for an auto-reset event, all of
+  // them for a manual-reset one) and leave the event reset. The release is kept as a count of
+  // wake-ups owed to those threads until they have run, never as signal_ for a moment: a woken
+  // waiter that doesn't get a CPU in time would see the event reset again and go back to
+  // sleep, and the wake-up would be lost (Windows releases them atomically). Pulses of an
+  // auto-reset event add up (two pulses release two waiters, even if the first one hasn't run
+  // yet), up to the number of waiters. A thread that starts waiting after the pulse cannot
+  // take them (pulse_epoch_).
+  void Pulse() {
+    auto lock = std::unique_lock<std::mutex>(mutex_);
+    signal_ = false;
+    const uint32_t blocked = blocked_.load();
+    if (blocked == 0) {
+      pulses_ = 0;
+      return;  // Nobody waiting: a pulse does nothing.
+    }
+    pulses_ = manual_reset_ ? blocked : std::min(pulses_ + 1, blocked);
+    ++pulse_epoch_;
+    NotifyAll();
+  }
+
  private:
   inline bool signaled() const override { return signal_; }
+  bool SignaledFor(uint64_t entered) const override {
+    return signal_ || (pulses_ > 0 && entered < pulse_epoch_);
+  }
   inline void post_execution() override {
-    if (!manual_reset_) {
-      signal_ = false;
+    if (signal_) {
+      if (!manual_reset_) {
+        signal_ = false;
+      }
+    } else if (pulses_ > 0) {
+      --pulses_;
     }
+  }
+  void waiter_left() override {
+    // Don't keep wake-ups for waiters that are gone.
+    pulses_ = std::min(pulses_, blocked_.load());
   }
   bool signal_;
   const bool manual_reset_;
+  uint32_t pulses_ = 0;  // Wake-ups Pulse() owes to blocked threads; mutex_
 };
 
 template <>
@@ -660,7 +794,7 @@ struct ThreadStartData {
 };
 
 template <>
-class PosixCondition<Thread> : public PosixConditionBase {
+class PosixCondition<Thread> : public PosixConditionBase, public AlertSource {
   enum class State {
     kUninitialized,
     kRunning,
@@ -717,6 +851,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
   /// Thread::GetCurrentThread() on the main thread
   explicit PosixCondition(pthread_t thread)
       : thread_(thread),
+#if !defined(__APPLE__)
+        tid_(static_cast<pid_t>(syscall(SYS_gettid))),
+#endif
         signaled_(false),
         exit_code_(0),
         state_(State::kRunning),
@@ -824,8 +961,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
     uint64_t result = 0;
     auto cpu_count = std::min(CPU_SETSIZE, 64);
     for (auto i = 0u; i < cpu_count; i++) {
-      auto set = CPU_ISSET(i, &cpu_set);
-      result |= set << i;
+      // CPU_ISSET returns int, so `set << i` was an int shift: undefined from
+      // bit 31 and wrapping above it.
+      if (CPU_ISSET(i, &cpu_set)) {
+        result |= uint64_t(1) << i;
+      }
     }
     return result;
 #endif
@@ -859,6 +999,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   int priority() {
     WaitStarted();
+#if !defined(__APPLE__)
+    if (fifo_failed_) {
+      // Map the nice value back to the SCHED_FIFO range (1-32) so callers see
+      // one priority space: nice -16..15 is fifo 32..1.
+      return 16 - getpriority(PRIO_PROCESS, tid_);
+    }
+#endif
     int policy;
     sched_param param{};
     int ret = pthread_getschedparam(thread_, &policy, &param);
@@ -871,13 +1018,18 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_priority(int new_priority) {
     WaitStarted();
-    sched_param param{};
-    param.sched_priority = new_priority;
-    int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
-    if (result != 0) {
+#if !defined(__APPLE__)
+    if (!fifo_failed_) {
+#endif
+      sched_param param{};
+      param.sched_priority = new_priority;
+      int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
+      if (result == 0) {
+        return;
+      }
       switch (result) {
         case EPERM:
-          REXSYS_WARN("set_priority: permission denied");
+          REXSYS_WARN("set_priority: permission denied for SCHED_FIFO");
           break;
         case EINVAL:
           assert_always();
@@ -886,7 +1038,19 @@ class PosixCondition<Thread> : public PosixConditionBase {
           REXSYS_WARN("set_priority: pthread_setschedparam failed ({})", result);
           break;
       }
+#if !defined(__APPLE__)
+      // SCHED_FIFO needs CAP_SYS_NICE or root. Stop asking for it and use
+      // nice values under SCHED_OTHER from now on.
+      fifo_failed_ = true;
     }
+    // Map the SCHED_FIFO range (1-32) to nice values, fifo 16 being nice 0.
+    // Unprivileged threads can raise their nice value but only lower it
+    // within RLIMIT_NICE, so a boost may fail; that is not an error here.
+    const int nice_value = std::clamp(16 - new_priority, -20, 19);
+    if (tid_ > 0) {
+      setpriority(PRIO_PROCESS, tid_, nice_value);
+    }
+#endif
   }
 
   void QueueUserCallback(std::function<void()> callback) {
@@ -895,6 +1059,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
       std::unique_lock<std::mutex> lock(callback_mutex_);
       user_callbacks_.push_back(std::move(callback));
       has_pending_user_callbacks_.store(true, std::memory_order_release);
+      if (alert_waiter_) {
+        alert_waiter_->Wake();
+      }
     }
 
     // If the callback is queued on the current thread, don't self-signal.
@@ -925,7 +1092,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
     }
   }
 
-  bool DispatchQueuedUserCallbacks() {
+  void SetAlertWaiter(Waiter* waiter) override {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    alert_waiter_ = waiter;
+  }
+
+  bool DispatchQueuedUserCallbacks() override {
     if (!has_pending_user_callbacks_.load(std::memory_order_acquire)) {
       return false;
     }
@@ -1012,12 +1184,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
       std::unique_lock<std::mutex> lock(state_mutex_);
       if (state_ == State::kFinished) {
         if (is_current_thread) {
-          // This is really bad. Some thread must have called Terminate() on us
-          // just before we decided to terminate ourselves
-          assert_always();
-          for (;;) {
-            // Wait for pthread_cancel() to actually happen.
-          }
+          // Another thread's Terminate() raced ours and already marked us
+          // finished. Its pthread_cancel is not guaranteed to arrive, and
+          // spinning for it burned a core. Leave under our own power instead.
+          REXLOG_WARN("PosixThread::Terminate: thread was already finished");
+          lock.unlock();
+          pthread_exit(reinterpret_cast<void*>(exit_code));
         }
         return;
       }
@@ -1053,10 +1225,20 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   /// Uses sem_wait because it may be called from signal handler context.
   void WaitSuspended() {
-    int ret;
-    do {
-      ret = sem_wait(suspend_sem_ptr());
-    } while (ret == -1 && errno == EINTR);
+    // The suspend signal does not queue, and a Resume() whose sem_post lands
+    // before the signal is delivered leaves a token behind. Re-check the count
+    // rather than trusting one token, or that stale post releases the next
+    // suspend at once.
+    while (suspend_count_.load(std::memory_order_acquire) > 0) {
+      int ret;
+      do {
+        ret = sem_wait(suspend_sem_ptr());
+      } while (ret == -1 && errno == EINTR);
+      if (ret == -1) {
+        // The semaphore is gone (the thread has been joined). Do not spin.
+        break;
+      }
+    }
   }
 
   void* native_handle() const override { return reinterpret_cast<void*>(thread_); }
@@ -1065,9 +1247,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
   static void* ThreadStartRoutine(void* parameter);
   inline bool signaled() const override { return signaled_; }
   inline void post_execution() override {
-    if (thread_) {
-      pthread_join(thread_, nullptr);
+    // Every wait a thread handle satisfies lands here, so a handle waited on
+    // twice joined the same thread twice (undefined once the id can be
+    // reused) and tore down the suspend semaphore each time instead of once
+    // after the join.
+    bool expected = false;
+    if (!thread_ || !joined_.compare_exchange_strong(expected, true)) {
+      return;
     }
+    pthread_join(thread_, nullptr);
 #if defined(__APPLE__)
     if (suspend_sem_ != SEM_FAILED) {
       sem_close(suspend_sem_);
@@ -1078,10 +1266,19 @@ class PosixCondition<Thread> : public PosixConditionBase {
 #endif
   }
   pthread_t thread_;
+#if !defined(__APPLE__)
+  // Kernel thread id for the setpriority() fallback, and whether SCHED_FIFO
+  // was refused (no CAP_SYS_NICE), after which priorities are nice values.
+  // macOS has no per-thread setpriority(), so it keeps SCHED_FIFO only.
+  pid_t tid_ = 0;
+  std::atomic<bool> fifo_failed_{false};  // set_priority may race between threads
+#endif
   bool signaled_;
   int exit_code_;
   State state_;             // Protected by state_mutex_
-  uint32_t suspend_count_;  // Protected by state_mutex_
+  // Written under state_mutex_, but read from the suspend signal handler.
+  std::atomic<uint32_t> suspend_count_;
+  std::atomic<bool> joined_{false};  // Prevents a second pthread_join
 #if defined(__APPLE__)
   sem_t* suspend_sem_ = SEM_FAILED;
   sem_t* suspend_sem_ptr() { return suspend_sem_; }
@@ -1094,6 +1291,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
   mutable std::condition_variable state_signal_;
   std::deque<std::function<void()>> user_callbacks_;
   std::atomic<bool> has_pending_user_callbacks_{false};
+  Waiter* alert_waiter_ = nullptr;  // protected by callback_mutex_
 #if REX_PLATFORM_ANDROID
   // Name accessible via name() on Android before API 26 which added
   // pthread_getname_np.
@@ -1119,9 +1317,50 @@ bool DispatchCurrentThreadUserCallback() {
   return current_thread_condition_ && current_thread_condition_->DispatchQueuedUserCallbacks();
 }
 
-namespace {
+// The current thread as the alert source of its alertable waits.
+static AlertSource* CurrentAlertSource() {
+  if (!current_thread_condition_) {
+    Thread::GetCurrentThread();
+  }
+  return current_thread_condition_;
+}
 
-constexpr auto kAlertablePollSlice = std::chrono::milliseconds(1);
+SleepResult AlertableSleepUntil(std::chrono::steady_clock::time_point deadline) {
+  AlertSource* alert = CurrentAlertSource();
+  if (!alert) {  // not expected: every thread gets a Thread object
+    auto now = std::chrono::steady_clock::now();
+    if (deadline > now) {
+      Sleep(std::chrono::duration_cast<std::chrono::microseconds>(deadline - now));
+    }
+    return SleepResult::kSuccess;
+  }
+  alertable_state_ = true;
+  // No handles: only the deadline or a queued user callback ends it. Sub-millisecond sleeps
+  // keep their precision (WaitMultiple counts whole milliseconds).
+  SleepResult result = SleepResult::kSuccess;
+  while (true) {
+    auto now = std::chrono::steady_clock::now();
+    if (deadline - now < std::chrono::milliseconds(1)) {
+      if (alert->DispatchQueuedUserCallbacks()) {
+        result = SleepResult::kAlerted;
+      } else if (deadline > now) {
+        Sleep(std::chrono::duration_cast<std::chrono::microseconds>(deadline - now));
+        if (alert->DispatchQueuedUserCallbacks()) result = SleepResult::kAlerted;
+      }
+      break;
+    }
+    auto waited = PosixConditionBase::WaitMultiple(
+        {}, false, std::chrono::floor<std::chrono::milliseconds>(deadline - now), alert);
+    if (waited.first == WaitResult::kUserCallback) {
+      result = SleepResult::kAlerted;
+      break;
+    }
+  }
+  alertable_state_ = false;
+  return result;
+}
+
+namespace {
 
 class ScopedAlertableState {
  public:
@@ -1139,31 +1378,6 @@ class ScopedAlertableState {
  private:
   bool alertable_;
 };
-
-std::chrono::steady_clock::time_point ComputeAlertableDeadline(std::chrono::milliseconds timeout) {
-  if (timeout == std::chrono::milliseconds::max()) {
-    return std::chrono::steady_clock::time_point::max();
-  }
-  return std::chrono::steady_clock::now() + timeout;
-}
-
-bool HasAlertableTimeoutElapsed(std::chrono::steady_clock::time_point deadline) {
-  return deadline != std::chrono::steady_clock::time_point::max() &&
-         std::chrono::steady_clock::now() >= deadline;
-}
-
-std::chrono::milliseconds ComputeAlertableWaitTimeout(
-    std::chrono::steady_clock::time_point deadline) {
-  if (deadline == std::chrono::steady_clock::time_point::max()) {
-    return kAlertablePollSlice;
-  }
-  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-      deadline - std::chrono::steady_clock::now());
-  if (remaining <= std::chrono::milliseconds::zero()) {
-    return std::chrono::milliseconds::zero();
-  }
-  return std::min(remaining, kAlertablePollSlice);
-}
 
 }  // namespace
 
@@ -1215,25 +1429,13 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
   }
 
   ScopedAlertableState alertable_state_guard(true);
-  auto deadline = ComputeAlertableDeadline(timeout);
-
-  while (true) {
-    if (DispatchCurrentThreadUserCallback()) {
-      return WaitResult::kUserCallback;
-    }
-    if (HasAlertableTimeoutElapsed(deadline)) {
-      return WaitResult::kTimeout;
-    }
-    auto result = posix_wait_handle->condition().Wait(ComputeAlertableWaitTimeout(deadline));
-    if (result != WaitResult::kTimeout) {
-      return result;
-    }
-  }
+  return PosixConditionBase::WaitMultiple({&posix_wait_handle->condition()}, false, timeout,
+                                          CurrentAlertSource())
+      .first;
 }
 
 WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_handle_to_wait_on,
                          bool is_alertable, std::chrono::milliseconds timeout) {
-  auto result = WaitResult::kFailed;
   auto posix_wait_handle_to_signal = dynamic_cast<PosixWaitHandle*>(wait_handle_to_signal);
   auto posix_wait_handle_to_wait_on = dynamic_cast<PosixWaitHandle*>(wait_handle_to_wait_on);
   if (posix_wait_handle_to_signal == nullptr || posix_wait_handle_to_wait_on == nullptr) {
@@ -1248,19 +1450,9 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
   }
 
   ScopedAlertableState alertable_state_guard(true);
-  auto deadline = ComputeAlertableDeadline(timeout);
-  while (true) {
-    if (DispatchCurrentThreadUserCallback()) {
-      return WaitResult::kUserCallback;
-    }
-    if (HasAlertableTimeoutElapsed(deadline)) {
-      return WaitResult::kTimeout;
-    }
-    result = posix_wait_handle_to_wait_on->condition().Wait(ComputeAlertableWaitTimeout(deadline));
-    if (result != WaitResult::kTimeout) {
-      return result;
-    }
-  }
+  return PosixConditionBase::WaitMultiple({&posix_wait_handle_to_wait_on->condition()}, false,
+                                          timeout, CurrentAlertSource())
+      .first;
 }
 
 std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wait_handle_count,
@@ -1280,20 +1472,8 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
   }
 
   ScopedAlertableState alertable_state_guard(true);
-  auto deadline = ComputeAlertableDeadline(timeout);
-  while (true) {
-    if (DispatchCurrentThreadUserCallback()) {
-      return std::make_pair(WaitResult::kUserCallback, 0);
-    }
-    if (HasAlertableTimeoutElapsed(deadline)) {
-      return std::make_pair(WaitResult::kTimeout, 0);
-    }
-    auto result = PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions),
-                                                   wait_all, ComputeAlertableWaitTimeout(deadline));
-    if (result.first != WaitResult::kTimeout) {
-      return result;
-    }
-  }
+  return PosixConditionBase::WaitMultiple(std::move(conditions), wait_all, timeout,
+                                          CurrentAlertSource());
 }
 
 class PosixEvent : public PosixConditionHandle<Event> {
@@ -1303,13 +1483,7 @@ class PosixEvent : public PosixConditionHandle<Event> {
   ~PosixEvent() override = default;
   void Set() override { handle_.Signal(); }
   void Reset() override { handle_.Reset(); }
-  void Pulse() override {
-    using namespace std::chrono_literals;
-    handle_.Signal();
-    MaybeYield();
-    Sleep(10us);
-    handle_.Reset();
-  }
+  void Pulse() override { handle_.Pulse(); }
 };
 
 std::unique_ptr<Event> Event::CreateManualResetEvent(bool initial_state) {
@@ -1468,6 +1642,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 
   current_thread_ = thread;
   current_thread_condition_ = &thread->handle_;
+#if !defined(__APPLE__)
+  thread->handle_.tid_ = static_cast<pid_t>(syscall(SYS_gettid));
+#endif
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;

@@ -27,6 +27,12 @@ const rex::PPCImageInfo PPCImageConfig = {
         .non_argument_as_local = {{ config_flags.non_argument_as_local }},
         .non_volatile_as_local = {{ config_flags.non_volatile_as_local }},
     },
+    .image_identity = {
+        .fingerprint = {{ image_identity.fingerprint }},
+        .page_count = {{ image_identity.page_count }},
+        .title_id = {{ image_identity.title_id }},
+        .media_id = {{ image_identity.media_id }},
+    },
 };
 
 PPCFuncMapping PPCFuncMappings[] = {

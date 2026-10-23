@@ -4,6 +4,7 @@ add_executable(unit_tests
     test_memory.cpp
     memory/heap_allocation_test.cpp
     memory/unwatched_invalidation_test.cpp
+    memory/read_watch_test.cpp
     kernel/object_table_test.cpp
     kernel/bignum_rsa_test.cpp
     kernel/xecrypt_md5_test.cpp
@@ -18,6 +19,9 @@ add_executable(unit_tests
     core/vfs_mount_path_test.cpp
     core/vfs_open_status_test.cpp
     core/vfs_entry_update_test.cpp
+    core/vfs_delete_on_close_test.cpp
+    core/vfs_host_errors_test.cpp
+    core/vfs_overlay_test.cpp
     core/vfs_package_thumbnail_test.cpp
     core/hash_test.cpp
     core/stream_test.cpp
@@ -29,18 +33,25 @@ add_executable(unit_tests
     core/dynlib_attach_test.cpp
     core/bit_scan_test.cpp
     core/sleep_duration_test.cpp
+    core/event_pulse_test.cpp
     core/logging_file_sink_test.cpp
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
     ppc/fpscr_test.cpp
+    ppc/fp_fma_test.cpp
     system/guest_path_test.cpp
     system/xsocket_accept_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
+    system/content_name_test.cpp
+    system/xex_identity_test.cpp
     audio/conversion_test.cpp
     audio/nop_audio_driver_test.cpp
     audio/xma_packet_test.cpp
+    audio/audio_output_fallback_test.cpp
     input/input_assignment_test.cpp
+    input/mnk_stick_test.cpp
+    input/split_screen_test.cpp
     codegen/analysis_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
@@ -61,8 +72,15 @@ add_executable(unit_tests
     graphics/gpu_completion_timeline_test.cpp
     graphics/float_constant_runs_test.cpp
     graphics/texture_replacement_test.cpp
+    graphics/scaled_resolve_coverage_test.cpp
+    graphics/half_pixel_offset_test.cpp
+    graphics/texture_swizzle_swap_test.cpp
+    graphics/pipeline_wait_test.cpp
+    graphics/render_target_trim_test.cpp
+    graphics/gpu_time_test.cpp
     graphics/display_transfer_test.cpp
     ui/presenter_paint_config_test.cpp
+    ui/keybind_names_test.cpp
 )
 
 target_sources(unit_tests PRIVATE

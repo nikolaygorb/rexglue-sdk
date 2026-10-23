@@ -220,6 +220,13 @@ class D3D12CommandProcessor : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
 
+  bool CanReadBackResolvesNow() const override { return true; }
+  void ReadBackResolvesNow(const ResolveFetch* fetches, size_t count,
+                           std::vector<const uint8_t*>& data_out) override;
+  bool CanDeferResolveReadbacks() const override { return true; }
+  void CompleteDeferredReadbacks(const ResolveFetch* fetches, size_t count,
+                                 std::vector<const uint8_t*>& data_out) override;
+
  private:
   static constexpr uint32_t kQueueFrames = 3;
 
@@ -396,8 +403,26 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t written_size[2] = {0, 0};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
+    // The slot holds only some pieces of the destination (a full readback
+    // copied in pieces): never read as a whole by a delayed readback.
+    bool partial[2] = {false, false};
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
+  // Makes sure a slot of a resolve readback buffer exists, mapped, with at
+  // least `size` bytes.
+  bool EnsureReadbackBufferSlot(ReadbackBuffer& rb, uint32_t index, uint32_t size);
+  // Records the copy of a resolve destination from the GPU's memory into a
+  // readback buffer, ready for the host to read once the submission
+  // completes. `length` is GetResolveReadbackLength's; at a draw resolution
+  // scale the copy goes through a downscale of the scaled resolve buffer, with
+  // texels of 1 << pixel_size_log2 bytes. `pieces` (offset, length within
+  // the destination), when not null and the copy is unscaled: copy only
+  // those, each to its own offset.
+  bool RecordResolveReadbackCopy(
+      uint32_t address, uint32_t length, uint32_t pixel_size_log2, bool is_scaled,
+      ID3D12Resource* target, const std::vector<std::pair<uint32_t, uint32_t>>* pieces = nullptr);
+  // The pieces of the current full readback (IssueCopy_ReadbackResolvePath).
+  std::vector<std::pair<uint32_t, uint32_t>> readback_pieces_;
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
   static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
@@ -744,6 +769,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12Resource* readback_buffer_ = nullptr;
   uint32_t readback_buffer_size_ = 0;
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+  // readback_resolve_full_deferred: where each destination's last deferred
+  // copy back went, by (physical address << 32 | length): its
+  // readback_buffers_ key and slot.
+  struct DeferredReadbackSlot {
+    uint64_t buffer_key;
+    uint32_t index;
+  };
+  std::unordered_map<uint64_t, DeferredReadbackSlot> deferred_readback_slots_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
   // Resolve downscale compute shader for scaled resolution readback,

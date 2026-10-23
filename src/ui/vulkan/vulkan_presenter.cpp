@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -59,6 +60,13 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
+
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_latest_ready, false, "UI/Vulkan",
+                    "Use FIFO latest ready (VK_EXT_present_mode_fifo_latest_ready) instead of "
+                    "plain FIFO when the device and the surface support it: vsync without "
+                    "tearing, but a frame queued while an older one waits for the vblank "
+                    "replaces it instead of being shown after it. Only when immediate, mailbox "
+                    "and FIFO relaxed are not used");
 
 REXCVAR_DEFINE_BOOL(vulkan_semaphore_reuse_workaround, false, "UI/Vulkan",
                     "Wait for presentation queue idle before each frame to prevent semaphore "
@@ -110,6 +118,23 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FfxVkGetDeviceProcAddrCompat(VkDevice d
 
 }  // namespace
 #endif  // defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+
+namespace {
+
+// vkAcquireNextImageKHR waits without a timeout, and vkQueuePresentKHR runs
+// holding the queue the command processor submits to: either blocking this
+// long stalls the game, so it is logged.
+void LogBlockingPresentationCall(const char* call, std::chrono::steady_clock::time_point start,
+                                 VkResult result) {
+  const int64_t ms = int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count());
+  if (ms >= 1000) {
+    REXLOG_WARN("VulkanPresenter: {} blocked for {} ms (VkResult {})", call, ms, int(result));
+  }
+}
+
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -1476,6 +1501,16 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     // Limiting the frame rate, but lets too long frames cause tearing not to
     // make the latency even worse.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_latest_ready) &&
+             vulkan_device->properties().presentModeFifoLatestReady &&
+             std::find(present_modes.cbegin(), present_modes.cend(),
+                       VK_PRESENT_MODE_FIFO_LATEST_READY_KHR) != present_modes.cend()) {
+    // Still limited to the refresh rate and without tearing, but when frames
+    // come faster than the display shows them, the vblank takes the newest
+    // finished one instead of the oldest queued: plain FIFO shows every frame,
+    // so a game drawing at a rate that is not a divisor of the refresh rate
+    // gets a queue that delays and drops frames irregularly.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
   } else {
     // Highest latency (but always guaranteed to be available).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
@@ -1498,7 +1533,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   image_format_out = swapchain_create_info.imageFormat;
   image_extent_out = swapchain_create_info.imageExtent;
   is_fifo_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
-                swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+                swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR ||
+                swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
   return swapchain;
 }
 
@@ -1668,9 +1704,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   }
 
   uint32_t swapchain_image_index;
+  const auto acquire_start = std::chrono::steady_clock::now();
   VkResult acquire_result =
       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
                                 VK_NULL_HANDLE, &swapchain_image_index);
+  LogBlockingPresentationCall("vkAcquireNextImageKHR", acquire_start, acquire_result);
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -2341,7 +2379,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+    const auto present_start = std::chrono::steady_clock::now();
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+    LogBlockingPresentationCall("vkQueuePresentKHR", present_start, present_result);
   }
   switch (present_result) {
     case VK_SUCCESS:

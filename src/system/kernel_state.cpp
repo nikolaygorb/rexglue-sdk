@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -1161,10 +1162,20 @@ void KernelState::CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result) {
 
 void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        uint32_t extended_error, uint32_t length) {
+  // A host thread has no guest thread to run a completion routine on.
+  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length,
+                       XThread::IsInThread() ? XThread::GetCurrentThreadHandle() : 0);
+}
+
+void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
+                                       uint32_t extended_error, uint32_t length,
+                                       X_HANDLE thread_handle) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
-  XOverlappedSetResult(ptr, result);
+  // Result last, so a caller polling it for completion reads a valid length.
   XOverlappedSetExtendedError(ptr, extended_error);
   XOverlappedSetLength(ptr, length);
+  std::atomic_thread_fence(std::memory_order_release);
+  XOverlappedSetResult(ptr, result);
   X_HANDLE event_handle = XOverlappedGetEvent(ptr);
   if (event_handle) {
     auto ev = object_table()->LookupObject<XEvent>(event_handle);
@@ -1174,7 +1185,7 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
     }
   }
   if (XOverlappedGetCompletionRoutine(ptr)) {
-    X_HANDLE thread_handle = XOverlappedGetContext(ptr);
+    // The thread comes from the caller: InternalContext belongs to the title.
     auto thread = object_table()->LookupObject<XThread>(thread_handle);
     if (thread) {
       // Queue APC on the thread that requested the overlapped operation.
@@ -1194,9 +1205,8 @@ void KernelState::CompleteOverlappedImmediate(uint32_t overlapped_ptr, X_RESULT 
 
 void KernelState::CompleteOverlappedImmediateEx(uint32_t overlapped_ptr, X_RESULT result,
                                                 uint32_t extended_error, uint32_t length) {
-  auto ptr = memory()->TranslateVirtual(overlapped_ptr);
-  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
-  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+  CompleteOverlappedEx(overlapped_ptr, result, extended_error, length,
+                       XThread::GetCurrentThreadHandle());
 }
 
 void KernelState::CompleteOverlappedDeferred(std::function<void()> completion_callback,
@@ -1243,10 +1253,10 @@ void KernelState::CompleteOverlappedDeferredEx(
   REXSYS_DEBUG("CompleteOverlappedDeferredEx: queuing for overlapped {:08X}", overlapped_ptr);
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
-  XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  const X_HANDLE thread_handle = XThread::GetCurrentThreadHandle();
   auto global_lock = global_critical_region_.Acquire();
   dispatch_queue_.push_back(
-      [this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
+      [this, completion_callback, overlapped_ptr, thread_handle, pre_callback, post_callback]() {
         REXSYS_DEBUG("Deferred overlapped {:08X}: running pre_callback", overlapped_ptr);
         if (pre_callback) {
           pre_callback();
@@ -1259,7 +1269,7 @@ void KernelState::CompleteOverlappedDeferredEx(
         auto result = completion_callback(extended_error, length);
         REXSYS_DEBUG("Deferred overlapped {:08X}: completing with result {:08X}", overlapped_ptr,
                      result);
-        CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+        CompleteOverlappedEx(overlapped_ptr, result, extended_error, length, thread_handle);
         if (post_callback) {
           REXSYS_DEBUG("Deferred overlapped {:08X}: running post_callback", overlapped_ptr);
           post_callback();

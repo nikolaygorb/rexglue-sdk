@@ -13,11 +13,13 @@
 #include <rex/cvar.h>
 #include <rex/input/input.h>
 #include <rex/logging.h>
+#include <rex/input/mnk/mnk_stick.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
 #include <rex/ui/window.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +31,19 @@ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
                     "from the keybind_rstick_* keys only");
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
+REXCVAR_DEFINE_BOOL(mnk_mouse_to_stick, true, "Input",
+                    "Turn mouse movement into the right stick. Off when the title reads the mouse "
+                    "itself (native mouse aim); mnk_mouse still captures the cursor");
+REXCVAR_DEFINE_BOOL(mnk_mouse_speed, false, "Input",
+                    "The mouse pushes the right stick by its speed, smoothed over the game's "
+                    "polls (1000 pixels a second is half the stick at mnk_sensitivity 1), "
+                    "instead of by the motion since the last poll. Steadier for games that poll "
+                    "more than once a frame or turn slowly with small stick values");
+REXCVAR_DEFINE_DOUBLE(mnk_stick_ramp, 0.0, "Input",
+                      "Seconds the keys take to push the left stick from its first deflection "
+                      "(60%) to full, and half that to let it go, so steering with keys is not "
+                      "all or nothing. 0: the keys push it to full at once")
+    .range(0.0, 2.0);
 
 REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
 REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
@@ -75,14 +90,10 @@ constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x
 constexpr size_t kMaxQueuedKeystrokes = 256;
 
 // Bind values are a comma-separated list of alternatives, each optionally
-// carrying modifier prefixes: "Q,I" or "Shift+W". Modifier matching is exact,
-// so "Up" stays silent while Shift is held and "Shift+Up" stays silent without
-// it. That is what lets the D-pad share the arrow keys. A consequence is
-// that binding a bare modifier name ("Shift") can never fire, since holding it
-// makes the live mask non-zero while the bind wants zero.
-constexpr uint8_t kModShift = 1u << 0;
-constexpr uint8_t kModCtrl = 1u << 1;
-constexpr uint8_t kModAlt = 1u << 2;
+// carrying modifier prefixes: "Q,I" or "Shift+W". A plain bind fires whatever
+// modifiers are held (Shift to sprint, W to move); a held combination claims
+// its key from the plain binds ("Up" stays silent while Shift+Up is held), so
+// the D-pad can share the arrow keys (BindClaims).
 
 uint8_t LiveModifiers(const bool (&key_down)[256]) {
   uint8_t mods = 0;
@@ -131,17 +142,28 @@ std::string_view TrimSpaces(std::string_view s) {
   return s;
 }
 
-bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t live_mods) {
-  uint8_t want = TakeModifiers(token);
-  if (want != live_mods) {
-    return false;
+// Calls fn(BindToken) for each alternative of a bind value that names a key.
+template <typename Fn>
+void ForEachBindToken(std::string_view rest, Fn&& fn) {
+  while (!rest.empty()) {
+    size_t comma = rest.find(',');
+    std::string_view token = rest.substr(0, comma);
+    if (comma == std::string_view::npos) {
+      rest = std::string_view();
+    } else {
+      rest.remove_prefix(comma + 1);
+    }
+    token = TrimSpaces(token);
+    if (token.empty()) {
+      continue;
+    }
+    const uint8_t mods = TakeModifiers(token);
+    const rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(token);
+    const uint16_t key = static_cast<uint16_t>(vk);
+    if (vk != rex::ui::VirtualKey::kNone && key < 256) {
+      fn(BindToken{key, mods});
+    }
   }
-  rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(token);
-  if (vk == rex::ui::VirtualKey::kNone) {
-    return false;
-  }
-  uint16_t idx = static_cast<uint16_t>(vk);
-  return idx < 256 && key_down[idx];
 }
 
 std::atomic<bool> mouse_look_active{true};
@@ -370,24 +392,30 @@ static bool IsPassthroughEnabled() {
   return REXCVAR_GET(mnk_passthrough);
 }
 
-static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_val) {
-  const uint8_t live_mods = LiveModifiers(key_down);
-  std::string_view rest(cvar_val);
-  while (!rest.empty()) {
-    size_t comma = rest.find(',');
-    std::string_view token = rest.substr(0, comma);
-    if (comma == std::string_view::npos) {
-      rest = std::string_view();
-    } else {
-      rest.remove_prefix(comma + 1);
+namespace {
+
+// The held keys matched against every controller bind at once, so a held
+// combination can claim its key from the plain binds of it (BindClaims).
+class BindMatcher {
+ public:
+  explicit BindMatcher(const bool (&key_down)[256]) : claims_(key_down, LiveModifiers(key_down)) {
+    for (const PadBind& bind : PadBinds()) {
+      ForEachBindToken(bind.keys, [this](BindToken t) { claims_.Claim(t); });
     }
-    token = TrimSpaces(token);
-    if (!token.empty() && TokenPressed(key_down, token, live_mods)) {
-      return true;
-    }
+    ForEachBindToken(REXCVAR_GET(keybind_guide), [this](BindToken t) { claims_.Claim(t); });
   }
-  return false;
-}
+
+  bool Pressed(const std::string& bind) const {
+    bool pressed = false;
+    ForEachBindToken(bind, [&](BindToken t) { pressed = pressed || claims_.Fires(t); });
+    return pressed;
+  }
+
+ private:
+  BindClaims claims_;
+};
+
+}  // namespace
 
 void MnkInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
   // Disabled means no device at all, so it never occupies a guest user slot.
@@ -456,75 +484,106 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   }
 
   std::lock_guard lock(state_mutex_);
+  const BindMatcher binds_held(key_down_);
 
   uint16_t buttons = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_a)))
     buttons |= X_INPUT_GAMEPAD_A;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_b)))
     buttons |= X_INPUT_GAMEPAD_B;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_x)))
     buttons |= X_INPUT_GAMEPAD_X;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_y)))
     buttons |= X_INPUT_GAMEPAD_Y;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_left_shoulder)))
     buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_right_shoulder)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_lstick_press)))
     buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_rstick_press)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_back)))
     buttons |= X_INPUT_GAMEPAD_BACK;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_start)))
     buttons |= X_INPUT_GAMEPAD_START;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_guide)))
     buttons |= X_INPUT_GAMEPAD_GUIDE;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_dpad_up)))
     buttons |= X_INPUT_GAMEPAD_DPAD_UP;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_dpad_down)))
     buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_dpad_left)))
     buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_dpad_right)))
     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
 
-  uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
-  uint8_t rt = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+  uint8_t lt = binds_held.Pressed(REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+  uint8_t rt = binds_held.Pressed(REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
 
-  int32_t lx = 0;
-  int32_t ly = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)))
-    lx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)))
-    lx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)))
-    ly += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
-    ly -= INT16_MAX;
+  // The game polls at its own rate (several times a frame at times), so the
+  // ramp and the mouse speed go by the time between polls.
+  const auto now = std::chrono::steady_clock::now();
+  float dt = last_poll_.time_since_epoch().count() == 0
+                 ? 0.0f
+                 : std::chrono::duration<float>(now - last_poll_).count();
+  last_poll_ = now;
+  dt = std::clamp(dt, 0.0f, 0.1f);
+
+  float lx_target = 0.0f;
+  float ly_target = 0.0f;
+  if (binds_held.Pressed(REXCVAR_GET(keybind_lstick_left)))
+    lx_target -= 1.0f;
+  if (binds_held.Pressed(REXCVAR_GET(keybind_lstick_right)))
+    lx_target += 1.0f;
+  if (binds_held.Pressed(REXCVAR_GET(keybind_lstick_up)))
+    ly_target += 1.0f;
+  if (binds_held.Pressed(REXCVAR_GET(keybind_lstick_down)))
+    ly_target -= 1.0f;
+  const float ramp = static_cast<float>(REXCVAR_GET(mnk_stick_ramp));
+  int32_t lx = static_cast<int32_t>(RampStickAxis(left_stick_x_, lx_target, dt, ramp) * INT16_MAX);
+  int32_t ly = static_cast<int32_t>(RampStickAxis(left_stick_y_, ly_target, dt, ramp) * INT16_MAX);
 
   int32_t rx = 0;
   int32_t ry = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_rstick_left)))
     rx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_rstick_right)))
     rx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_rstick_up)))
     ry += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
+  if (binds_held.Pressed(REXCVAR_GET(keybind_rstick_down)))
     ry -= INT16_MAX;
 
-  if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
+  // The cursor stays captured without mnk_mouse_to_stick (the title reads the
+  // mouse itself); only the stick emulation is off then.
+  const bool mouse_look =
+      REXCVAR_GET(mnk_mouse) && REXCVAR_GET(mnk_mouse_to_stick) && IsMouseLookActive();
+  const bool mouse_speed = mouse_look && REXCVAR_GET(mnk_mouse_speed);
+  if (mouse_speed) {
+    UpdateMouseRate(mouse_rate_x_, mouse_dx_, dt);
+    UpdateMouseRate(mouse_rate_y_, mouse_dy_, dt);
     double sensitivity = REXCVAR_GET(mnk_sensitivity);
-    constexpr double kBaseScale = 200.0;
-    rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
-    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
+    rx += static_cast<int32_t>(double(mouse_rate_x_) * sensitivity * kMouseRateScale);
+    ry += static_cast<int32_t>(double(-mouse_rate_y_) * sensitivity * kMouseRateScale);
+  } else {
+    mouse_rate_x_ = 0.0f;
+    mouse_rate_y_ = 0.0f;
+    if (mouse_look) {
+      double sensitivity = REXCVAR_GET(mnk_sensitivity);
+      constexpr double kBaseScale = 200.0;
+      rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
+      ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
+    }
   }
   // Drained unconditionally: deltas keep accumulating in OnMouseMove while the
   // mouse is off, and toggling it on would otherwise dump the whole backlog
-  // into one frame as a camera snap.
-  mouse_dx_ = 0.0f;
-  mouse_dy_ = 0.0f;
+  // into one frame as a camera snap. By speed, a poll at the same instant as
+  // the last one keeps them for the next.
+  if (!mouse_speed || dt > 0.0f) {
+    mouse_dx_ = 0.0f;
+    mouse_dy_ = 0.0f;
+  }
 
   auto clamp16 = [](int32_t v) -> int16_t {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
@@ -613,9 +672,10 @@ void MnkInputDriver::EnqueueRawKeystroke(const rex::ui::KeyEvent& e, bool down) 
 
 void MnkInputDriver::RefreshBoundKeystrokesLocked() {
   const auto binds = PadBinds();
+  const BindMatcher binds_held(key_down_);
   uint32_t pressed = 0;
   for (size_t i = 0; i < binds.size(); i++) {
-    if (IsBindPressed(key_down_, binds[i].keys)) {
+    if (binds_held.Pressed(binds[i].keys)) {
       pressed |= uint32_t(1) << i;
     }
   }
@@ -777,6 +837,12 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
       break;
+    case rex::ui::MouseEvent::Button::kX1:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), true);
+      break;
+    case rex::ui::MouseEvent::Button::kX2:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), true);
+      break;
     default:
       break;
   }
@@ -796,6 +862,12 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
       break;
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
+      break;
+    case rex::ui::MouseEvent::Button::kX1:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), false);
+      break;
+    case rex::ui::MouseEvent::Button::kX2:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), false);
       break;
     default:
       break;

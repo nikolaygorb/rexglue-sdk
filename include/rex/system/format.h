@@ -119,8 +119,8 @@ inline std::string format_double(double value, int32_t precision, uint16_t c, ui
 // StackArgList — reads variadic args from PPC registers/stack
 //=============================================================================
 // For sprintf, _snprintf, DbgPrint, etc. where varargs follow fixed params.
-// Xbox 360 PPC has 64-bit GPRs. Variadic args in r3-r10, then stack at
-// r1+0x54 in 8-byte slots.
+// Xbox 360 PPC has 64-bit GPRs. Variadic args in r3-r10, then one big-endian
+// doubleword each from r1+0x50; narrower values sit in its low bytes.
 class StackArgList {
  public:
   StackArgList(PPCContext& ctx, uint8_t* base, int32_t start_index)
@@ -161,8 +161,8 @@ class StackArgList {
           break;
       }
     } else {
-      // Stack arguments: 8-byte big-endian values at r1 + 0x54 + ((index - 8) * 8)
-      uint32_t stack_addr = ctx_.r1.u32 + 0x54 + ((index_ - 8) * 8);
+      // Stack arguments: 8-byte big-endian values at r1 + 0x50 + ((index - 8) * 8)
+      uint32_t stack_addr = ctx_.r1.u32 + 0x50 + ((index_ - 8) * 8);
       value = static_cast<u64>(*rex::memory::GuestPtr<rex::be<u64>*>(base_, stack_addr));
     }
     ++index_;

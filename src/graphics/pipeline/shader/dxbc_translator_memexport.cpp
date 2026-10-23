@@ -31,13 +31,15 @@ void DxbcShaderTranslator::ExportToMemory(uint8_t export_eM) {
   a_.OpIf(true, dxbc::Src::R(system_temp_memexport_enabled_and_eM_written_, dxbc::Src::kXXXX));
 
   // Check if the address with the correct sign and exponent was written, and
-  // that the index doesn't overflow the mantissa bits.
+  // that the index doesn't overflow the mantissa bits. Z takes all 12 bits of
+  // const_0x4b0 rather than the top 9, so the constants the shader accepts
+  // match the ones draw_util::AddMemExportRanges derives ranges from.
   {
     uint32_t address_check_temp = PushSystemTemp();
     a_.OpUShR(dxbc::Dest::R(address_check_temp), dxbc::Src::R(system_temp_memexport_address_),
-              dxbc::Src::LU(30, 23, 23, 23));
+              dxbc::Src::LU(30, 23, 20, 23));
     a_.OpIEq(dxbc::Dest::R(address_check_temp), dxbc::Src::R(address_check_temp),
-             dxbc::Src::LU(0x1, 0x96, 0x96, 0x96));
+             dxbc::Src::LU(0x1, 0x96, 0x4B0, 0x96));
     a_.OpAnd(dxbc::Dest::R(address_check_temp, 0b0011), dxbc::Src::R(address_check_temp),
              dxbc::Src::R(address_check_temp, 0b1110));
     a_.OpAnd(dxbc::Dest::R(address_check_temp, 0b0001),

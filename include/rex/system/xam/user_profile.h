@@ -217,6 +217,9 @@ class UserProfile {
   };
 
   UserProfile();
+  // A local player other than the first (split-screen): its own XUID, name and
+  // title settings, so it never overwrites the first player's.
+  explicit UserProfile(uint32_t user_index);
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }

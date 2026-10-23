@@ -236,3 +236,29 @@ TEST_CASE("Shader storage discards pipelines of another version", "[graphics][sh
   CHECK(pipelines.empty());
   CHECK(fs::file_size(pipeline_path) == sizeof(PipelineStorageFileHeader));
 }
+
+// ForzaHorizon1-ReImagined SDK patch 0064 (drain part).
+TEST_CASE("Shader storage writes what is queued before shutting down",
+          "[graphics][shader_storage]") {
+  Scratch scratch("shutdown_drain");
+  constexpr uint64_t kPipelineCount = 2000;
+  {
+    ShaderStorageWriter<TestPipelineStoredDescription> writer;
+    std::vector<TestPipelineStoredDescription> pipelines;
+    REQUIRE(writer.InitializeShaderStorage(
+        scratch.root, kTestTitleId, TestConfig(),
+        [](xenos::ShaderType, const uint32_t*, uint32_t, uint64_t) { return true; }, nullptr,
+        pipelines));
+    for (uint64_t i = 0; i < kPipelineCount; ++i) {
+      writer.QueuePipelineWrite(MakePipeline(i + 1, 0, 0, 0));
+    }
+    // Right away: most of the queue is still waiting for the write thread.
+    writer.ShutdownShaderStorage();
+  }
+
+  LoadResult loaded = Load(scratch.root);
+  REQUIRE(loaded.initialized);
+  REQUIRE(loaded.pipelines.size() == kPipelineCount);
+  CHECK(loaded.pipelines.front().description.vertex_shader_hash == 1);
+  CHECK(loaded.pipelines.back().description.vertex_shader_hash == kPipelineCount);
+}

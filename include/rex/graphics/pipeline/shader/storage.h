@@ -463,7 +463,11 @@ class ShaderStorageWriter {
       bool write_pipeline = false;
       {
         std::unique_lock<std::mutex> lock(storage_write_request_lock_);
-        if (storage_write_thread_shutdown_) {
+        // At shutdown, what is still queued is written first: the queues are
+        // cleared after the thread ends, which lost the session's last shaders
+        // and pipelines (the files are closed, and so flushed, after it).
+        if (storage_write_thread_shutdown_ && storage_write_shader_queue_.empty() &&
+            storage_write_pipeline_queue_.empty()) {
           return;
         }
         if (!storage_write_shader_queue_.empty()) {

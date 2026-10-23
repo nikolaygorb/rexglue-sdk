@@ -28,6 +28,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/gpu_time.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
@@ -134,6 +135,28 @@ class VulkanCommandProcessor : public CommandProcessor {
   ~VulkanCommandProcessor();
 
   void ClearCaches() override;
+  // The graphics card's time by kind (vulkan_gpu_time): the work recorded from
+  // now on is of this kind. Returns the kind it replaced. A timestamp is written
+  // only where the kind changes after commands were recorded.
+  GpuSection SetGpuSection(GpuSection section);
+  // A section for the lifetime of the object, then back to the one before.
+  class ScopedGpuSection {
+   public:
+    ScopedGpuSection(VulkanCommandProcessor& command_processor, GpuSection section)
+        : command_processor_(command_processor),
+          previous_(command_processor.SetGpuSection(section)) {}
+    ~ScopedGpuSection() { command_processor_.SetGpuSection(previous_); }
+    ScopedGpuSection(const ScopedGpuSection&) = delete;
+    ScopedGpuSection& operator=(const ScopedGpuSection&) = delete;
+
+   private:
+    VulkanCommandProcessor& command_processor_;
+    GpuSection previous_;
+  };
+
+  // A device-local allocation failed: free unused render targets at the frame
+  // end (vulkan_render_target_trim_percent).
+  void RequestRenderTargetTrim() { render_target_trim_requested_ = true; }
   void InvalidateGpuMemory() override;
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking,
@@ -212,6 +235,30 @@ class VulkanCommandProcessor : public CommandProcessor {
   // scope. Submission must be open.
   void EndRenderPass();
 
+  // Shared memory upload hoisting (VulkanSharedMemory::UploadRanges): in a
+  // render pass begun for guest draws, an upload of pages that no draw in the
+  // render pass has read yet is recorded before the render pass (after the
+  // barriers preceding it) instead of ending it. Without this, every vertex or
+  // index upload in a render pass ends it, copies between two barriers and
+  // begins it again.
+  // Whether an upload of these shared memory pages (first, count) can be
+  // hoisted now.
+  bool CanHoistSharedMemoryUpload(
+      const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) const;
+  // A new value for every render pass that hoisted commands can go before.
+  uint64_t hoist_render_pass_serial() const { return hoist_render_pass_serial_; }
+  // Between these, the deferred command buffer's commands go before the
+  // current render pass.
+  void BeginHoistedCommands() { deferred_command_buffer_.SetWritingHoisted(true); }
+  void EndHoistedCommands() {
+    deferred_command_buffer_.SetWritingHoisted(false);
+    deferred_command_buffer_.ExtendHoistPoint(hoist_point_);
+  }
+  // Records that the GPU reads (or will read, for the upload itself) these
+  // bytes of the shared memory in the current render pass, so they are not
+  // uploaded before it any more.
+  void MarkSharedMemoryReadInRenderPass(uint32_t start, uint32_t length);
+
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
     return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
@@ -272,6 +319,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+
+  bool CanReadBackResolvesNow() const override { return true; }
+  void ReadBackResolvesNow(const ResolveFetch* fetches, size_t count,
+                           std::vector<const uint8_t*>& data_out) override;
+  bool CanDeferResolveReadbacks() const override { return true; }
+  void CompleteDeferredReadbacks(const ResolveFetch* fetches, size_t count,
+                                 std::vector<const uint8_t*>& data_out) override;
 
  private:
   struct CommandBuffer {
@@ -538,8 +592,26 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t written_size[2] = {0, 0};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
+    // The slot holds only some pieces of the destination (a full readback
+    // copied in pieces): never read as a whole by a delayed readback.
+    bool partial[2] = {false, false};
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
+  // Makes sure a slot of a resolve readback buffer exists, mapped, with at
+  // least `size` bytes.
+  bool EnsureReadbackBufferSlot(ReadbackBuffer& readback, uint32_t index, uint32_t size);
+  // Records the copy of a resolve destination from the GPU's memory into a
+  // readback buffer, ready for the host to read once the submission
+  // completes. `length` is GetResolveReadbackLength's; at a draw resolution
+  // scale the copy goes through a downscale of the scaled resolve buffer, with
+  // texels of 1 << pixel_size_log2 bytes. `pieces` (offset, length within
+  // the destination), when not null and the copy is unscaled: copy only
+  // those, each to its own offset.
+  bool RecordResolveReadbackCopy(
+      uint32_t address, uint32_t length, uint32_t pixel_size_log2, bool is_scaled,
+      VkBuffer target, const std::vector<std::pair<uint32_t, uint32_t>>* pieces = nullptr);
+  // The pieces of the current full readback (IssueCopy_ReadbackResolvePath).
+  std::vector<std::pair<uint32_t, uint32_t>> readback_pieces_;
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
   static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
@@ -610,6 +682,52 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool device_lost_ = false;
 
   bool cache_clear_requested_ = false;
+
+  // The graphics card's time by kind (vulkan_gpu_time, perf counter builds):
+  // a ring of timestamp queries, used in submission order and freed in
+  // completion order. Each submission has a start and an end timestamp, and
+  // one where the section changed after commands of the old one were
+  // recorded; the time up to each belongs to the section it ended.
+  void InitializeGpuTime();
+  void ShutdownGpuTime();
+  bool AllocateGpuTimeQuery(uint32_t& query_out);
+  void BeginGpuTimeSubmission();
+  void ReadGpuTimes();
+  static constexpr uint32_t kGpuTimeQueries = 4096;
+  VkQueryPool gpu_time_query_pool_ = VK_NULL_HANDLE;
+  double gpu_time_ns_per_tick_ = 0.0;
+  uint64_t gpu_time_valid_mask_ = 0;
+  GpuSection gpu_section_ = GpuSection::kOther;
+  // deferred_command_buffer_ main stream size at the last timestamp.
+  size_t gpu_section_stream_mark_ = 0;
+  uint32_t gpu_time_ring_next_ = 0;
+  uint32_t gpu_time_ring_used_ = 0;
+  struct GpuTimeMark {
+    uint32_t query;
+    GpuSection ended;
+  };
+  struct GpuTimeSubmission {
+    uint64_t submission = 0;
+    uint32_t first_query = 0;  // the ring range this submission took
+    uint32_t query_count = 0;
+    uint32_t start_query = 0, end_query = 0;
+    GpuSection last = GpuSection::kOther;  // the section the end timestamp ends
+    std::vector<GpuTimeMark> marks;
+  };
+  // gpu_time_current_ belongs to the open submission.
+  bool gpu_time_recording_ = false;
+  GpuTimeSubmission gpu_time_current_;
+  std::deque<GpuTimeSubmission> gpu_time_submitted_;
+  std::vector<uint64_t> gpu_time_stamps_;  // reused by ReadGpuTimes
+
+  // Render targets are cached for the whole session, one per EDRAM layout, and
+  // at a high resolution scale they fill device memory. Frees those holding no
+  // EDRAM data at a frame end when memory is nearly full
+  // (vulkan_render_target_trim_percent).
+  void TrimRenderTargetsIfNeeded();
+  bool render_target_trim_requested_ = false;
+  uint64_t render_target_trim_next_check_frame_ = 0;
+  uint64_t render_target_trim_next_allowed_frame_ = 0;
 
   // Host shader types that guest shaders can be translated into - they can
   // access the shared memory (via vertex fetch, memory export, or manual index
@@ -904,6 +1022,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool scratch_buffer_used_ = false;
 
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+  // readback_resolve_full_deferred: where each destination's last deferred
+  // copy back went, by (physical address << 32 | length): its
+  // readback_buffers_ key and slot.
+  struct DeferredReadbackSlot {
+    uint64_t buffer_key;
+    uint32_t index;
+  };
+  std::unordered_map<uint64_t, DeferredReadbackSlot> deferred_readback_slots_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
   // Persistently mapped buffer for the synchronous memexport readback, grown on
@@ -960,6 +1086,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+
+  // Upload hoisting (CanHoistSharedMemoryUpload): whether the current render
+  // pass takes hoisted commands, its hoist point in the deferred command
+  // buffer, and the shared memory pages its draws read (a bit per page, in
+  // 64-page words that only count if their serial is the render pass's, so
+  // nothing needs clearing between render passes).
+  bool hoist_render_pass_ = false;
+  size_t hoist_point_ = 0;
+  uint64_t hoist_render_pass_serial_ = 0;
+  std::vector<uint64_t> hoist_read_pages_;
+  std::vector<uint64_t> hoist_read_pages_serial_;
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is

@@ -49,6 +49,21 @@ enum class CounterId : uint16_t {
   kPipelineCacheHits,
   kPipelineCacheMisses,
 
+  // Graphics card time a frame (Vulkan, vulkan_gpu_time), in microseconds, in
+  // total and by kind of work; added when the submissions complete.
+  kGpuTimeUs,
+  kGpuDrawUs,
+  kGpuTransferUs,
+  kGpuResolveUs,
+  kGpuTextureLoadUs,
+  kGpuUploadUs,
+  kGpuSwapUs,
+  kGpuOtherUs,
+
+  // Textures loaded from guest memory, and the guest bytes they read.
+  kTextureLoads,
+  kTextureLoadBytes,
+
   kCount  // sentinel -- must be last
 };
 
@@ -159,6 +174,8 @@ class Profiler {
 #define PROFILE_TEXTURE_CACHE_MISS() PERF_counter_inc(kTextureCacheMisses)
 #define PROFILE_PIPELINE_CACHE_HIT() PERF_counter_inc(kPipelineCacheHits)
 #define PROFILE_PIPELINE_CACHE_MISS() PERF_counter_inc(kPipelineCacheMisses)
+#define PROFILE_TEXTURE_LOAD(bytes) \
+  (PERF_counter_inc(kTextureLoads), PERF_counter_add(kTextureLoadBytes, (bytes)))
 
 #else
 
@@ -184,5 +201,6 @@ class Profiler {
 #define PROFILE_TEXTURE_CACHE_MISS()
 #define PROFILE_PIPELINE_CACHE_HIT()
 #define PROFILE_PIPELINE_CACHE_MISS()
+#define PROFILE_TEXTURE_LOAD(bytes)
 
 #endif

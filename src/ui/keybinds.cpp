@@ -141,6 +141,8 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     {"LMB", VirtualKey::kLButton},
     {"RMB", VirtualKey::kRButton},
     {"MMB", VirtualKey::kMButton},
+    {"MB4", VirtualKey::kXButton1},
+    {"MB5", VirtualKey::kXButton2},
 };
 
 VirtualKey ParseVirtualKey(std::string_view name) {

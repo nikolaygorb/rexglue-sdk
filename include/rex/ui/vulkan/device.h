@@ -195,6 +195,10 @@ class VulkanDevice {
     bool depthBiasControl = false;
     bool leastRepresentableValueForceUnormRepresentation = false;
     bool depthBiasExact = false;
+
+    // VK_EXT_present_mode_fifo_latest_ready / VK_KHR_present_mode_fifo_latest_ready (#362)
+
+    bool presentModeFifoLatestReady = false;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.

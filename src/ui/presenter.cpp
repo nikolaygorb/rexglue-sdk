@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <utility>
 
 #include <rex/assert.h>
@@ -1627,6 +1628,8 @@ void Presenter::WaitForUITickFromUIThread() {
   }
   std::unique_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   uint64_t last_vblank_before_wait = dxgi_ui_tick_last_vblank_;
+  // A display mode change or a sleeping output may stop the vblank ticks for a while.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
   while (true) {
     // Guest output present requests should interrupt the wait as quickly as
     // possible as they should be fulfilled as early as possible.
@@ -1644,7 +1647,10 @@ void Presenter::WaitForUITickFromUIThread() {
           std::min(last_vblank_before_wait + uint64_t(1), dxgi_ui_tick_last_vblank_);
       return;
     }
-    dxgi_ui_tick_signal_condition_.wait(dxgi_ui_tick_lock);
+    if (dxgi_ui_tick_signal_condition_.wait_until(dxgi_ui_tick_lock, deadline) ==
+        std::cv_status::timeout) {
+      return;
+    }
   }
 #endif  // XE_PLATFORM
 }
@@ -1698,7 +1704,7 @@ void Presenter::DXGIUITickThread() {
     {
       Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
       dxgi_ui_tick_lock.unlock();
-      wait_succeeded = SUCCEEDED(dxgi_ui_tick_output_->WaitForVBlank());
+      wait_succeeded = SUCCEEDED(dxgi_output->WaitForVBlank());
     }
     dxgi_ui_tick_lock.lock();
     if (wait_succeeded) {

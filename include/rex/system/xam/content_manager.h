@@ -154,6 +154,15 @@ class ContentManager {
   std::unique_ptr<ContentPackage> ResolvePackage(const std::string_view root_name, uint64_t xuid,
                                                  const XCONTENT_AGGREGATE_DATA& data);
 
+  // What any request for the content fails with because of its file name:
+  // X_ERROR_INVALID_NAME for a name FATX refuses, X_ERROR_PATH_NOT_FOUND for
+  // one that names no package.
+  X_RESULT CheckPackageName(const XCONTENT_AGGREGATE_DATA& data) const;
+  // X_ERROR_INVALID_NAME for a root name (the "save" of "save:\\") that is
+  // empty or has a byte past ASCII, a control character or a separator. Checked
+  // before the name reaches the UTF-8 helpers, which throw on bytes that are not
+  // UTF-8.
+  static X_RESULT CheckRootName(std::string_view root_name);
   bool ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT CreateContent(const std::string_view root_name, uint64_t xuid,
                          const XCONTENT_AGGREGATE_DATA& data);
@@ -174,7 +183,11 @@ class ContentManager {
                                  XContentType content_type, XCONTENT_AGGREGATE_DATA& data) const;
 
   std::filesystem::path ResolveGameUserContentPath();
+  // The same for a local player's profile name (split-screen).
+  std::filesystem::path ResolveGameUserContentPath(const std::string& user_name);
   bool IsContentOpen(const XCONTENT_AGGREGATE_DATA& data) const;
+  // Whether an open package lives in the host folder package_path.
+  bool IsContentOpen(const std::filesystem::path& package_path) const;
   void CloseOpenedFilesFromContent(const ContentPackage& package);
 
   // Returns the host filesystem path for an open content package, or empty.

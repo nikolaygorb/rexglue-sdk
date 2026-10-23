@@ -215,7 +215,7 @@ static void emit_fp_madd(BuilderContext& ctx, bool subtract, bool negate, bool s
   const auto c = ctx.f(ctx.insn.operands[2]);
   const auto b = ctx.f(ctx.insn.operands[3]);
   const auto result = fmt::format(
-      "rex::ppc::fp_madd_result(std::fma({0}.f64, {1}.f64, {2}{3}.f64), {0}.f64, "
+      "rex::ppc::fp_madd_result(rex::ppc::fp_fma({0}.f64, {1}.f64, {2}{3}.f64), {0}.f64, "
       "{3}.f64, {1}.f64, {4})",
       a, c, subtract ? "-" : "", b, negate ? "true" : "false");
   if (single) {

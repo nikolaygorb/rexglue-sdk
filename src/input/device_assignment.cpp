@@ -9,24 +9,125 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <atomic>
+#include <string>
+#include <string_view>
+
+#include <rex/cvar.h>
 #include <rex/input/device_assignment.h>
 
+REXCVAR_DEFINE_BOOL(keyboard_own_player, false, "Input",
+                    "Keyboard and mouse are player 1 on their own, gamepads start at player 2 "
+                    "(split-screen with one pad)");
+REXCVAR_DEFINE_STRING(input_player1, "auto", "Input",
+                      "Devices of player 1, comma-separated: keyboard, pad1-pad4 (gamepads in the "
+                      "order they were connected), pads (every gamepad no other player names), "
+                      "none. auto: pad 1 and the keyboard are player 1, pad N is player N (see "
+                      "keyboard_own_player)");
+REXCVAR_DEFINE_STRING(input_player2, "auto", "Input",
+                      "Devices of player 2 (split-screen), as input_player1");
+
 namespace rex::input {
+
+namespace {
+
+std::atomic<uint32_t> g_keyboard_user{0};
+
+// The keyboard and mouse driver's device (also "Keyboard" in passthrough);
+// the NOP stand-in is the other synthetic one.
+bool IsKeyboardDevice(const DeviceInfo& device) {
+  return device.synthetic && std::string_view(device.name).starts_with("Keyboard");
+}
+
+}  // namespace
+
+PlayerDevices ParsePlayerDevices(std::string_view text, bool first_player) {
+  PlayerDevices devices;
+  while (!text.empty()) {
+    const size_t comma = text.find(',');
+    std::string_view token = text.substr(0, comma);
+    text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
+    while (!token.empty() && token.front() == ' ') {
+      token.remove_prefix(1);
+    }
+    while (!token.empty() && token.back() == ' ') {
+      token.remove_suffix(1);
+    }
+    if (token == "keyboard") {
+      devices.keyboard = true;
+    } else if (token == "pads") {
+      devices.pads = true;
+    } else if (token.size() == 4 && token.substr(0, 3) == "pad" && token[3] >= '1' &&
+               token[3] <= '4') {
+      devices.pad_mask |= 1u << (token[3] - '1');
+    } else if (token == "auto") {
+      // Next to an explicit choice of the other player: player 1 keeps
+      // everything left over, the others get nothing.
+      if (first_player) {
+        devices.keyboard = true;
+        devices.pads = true;
+      }
+    }
+  }
+  return devices;
+}
+
+uint32_t KeyboardUser() {
+  return g_keyboard_user.load(std::memory_order_relaxed);
+}
 
 void SlotAssignment::OnDevicesChanged(const std::vector<DeviceInfo>& devices) {
   for (auto& user : users_) {
     user.clear();
   }
 
+  const std::string p1 = REXCVAR_GET(input_player1);
+  const std::string p2 = REXCVAR_GET(input_player2);
+  if (p1 != "auto" || p2 != "auto") {
+    // Chosen devices. A pad named by both players is the first one's.
+    PlayerDevices players[2] = {ParsePlayerDevices(p1, true), ParsePlayerDevices(p2, false)};
+    const uint32_t named = players[0].pad_mask | players[1].pad_mask;
+    players[1].pad_mask &= ~players[0].pad_mask;
+    uint32_t keyboard_user = kNoUser;
+    for (uint32_t i = 0; i < 2 && keyboard_user == kNoUser; ++i) {
+      if (players[i].keyboard) {
+        keyboard_user = i;
+      }
+    }
+    for (const auto& device : devices) {
+      if (device.synthetic) {
+        // The NOP stand-in keeps player 1 connected whatever pad they use.
+        const uint32_t user = IsKeyboardDevice(device) ? keyboard_user : 0;
+        if (user != kNoUser) {
+          users_[user].push_back(device.id);
+        }
+        continue;
+      }
+      // Pads are named by their connection order (pad1 = the first).
+      const uint32_t bit = device.ordinal < 32 ? 1u << device.ordinal : 0;
+      for (uint32_t i = 0; i < 2; ++i) {
+        if ((players[i].pad_mask & bit) || (players[i].pads && !(named & bit))) {
+          users_[i].push_back(device.id);
+          break;
+        }
+      }
+    }
+    g_keyboard_user.store(keyboard_user, std::memory_order_relaxed);
+    return;
+  }
+
   // Key off the ordinal rather than list position, so unplugging pad one does
-  // not promote pad two to player one.
+  // not promote pad two to player one. With keyboard_own_player the first pad
+  // is player 2.
+  const uint32_t first_pad_user = REXCVAR_GET(keyboard_own_player) ? 1 : 0;
   for (const auto& device : devices) {
     if (device.synthetic) {
       users_[0].push_back(device.id);
-    } else if (device.ordinal < kMaxGuestUsers) {
-      users_[device.ordinal].push_back(device.id);
+    } else if (device.ordinal + first_pad_user < kMaxGuestUsers) {
+      users_[device.ordinal + first_pad_user].push_back(device.id);
     }
   }
+  g_keyboard_user.store(0, std::memory_order_relaxed);
 }
 
 void SlotAssignment::DevicesForUser(uint32_t user_index, std::vector<DeviceId>& out) const {
@@ -43,6 +144,7 @@ void SharedAssignment::OnDevicesChanged(const std::vector<DeviceInfo>& devices) 
   for (const auto& device : devices) {
     user0_.push_back(device.id);
   }
+  g_keyboard_user.store(0, std::memory_order_relaxed);
 }
 
 void SharedAssignment::DevicesForUser(uint32_t user_index, std::vector<DeviceId>& out) const {

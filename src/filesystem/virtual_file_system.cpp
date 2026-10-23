@@ -259,6 +259,16 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
 
     auto file_name = rex::string::utf8_find_name_from_guest_path(path);
     entry = parent_entry->GetChild(file_name);
+  } else if (path.empty() && root_entry) {
+    // An empty relative path is the root entry itself. Replacing it would
+    // delete what the root handle still refers to.
+    if (creation_disposition == FileDisposition::kSuperscede ||
+        creation_disposition == FileDisposition::kOverwrite ||
+        creation_disposition == FileDisposition::kOverwriteIf) {
+      *out_action = FileAction::kDoesNotExist;
+      return X_STATUS_ACCESS_DENIED;
+    }
+    entry = root_entry;
   } else {
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }
@@ -273,7 +283,8 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       const auto* host_path_entry = dynamic_cast<const HostPathEntry*>(parent_entry);
       if (host_path_entry) {
         const auto file_path = host_path_entry->host_path() / rex::to_path(entry->name());
-        if (!std::filesystem::exists(file_path)) {
+        std::error_code ec;  // a failed check keeps the entry rather than throwing
+        if (!std::filesystem::exists(file_path, ec) && !ec) {
           entry->Delete();
           entry = nullptr;
         }

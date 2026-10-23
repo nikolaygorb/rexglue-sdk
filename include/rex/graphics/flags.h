@@ -18,6 +18,7 @@ REXCVAR_DECLARE(bool, vsync);
 REXCVAR_DECLARE(bool, clear_memory_page_state);
 REXCVAR_DECLARE(bool, half_pixel_offset);
 REXCVAR_DECLARE(bool, async_shader_compilation);
+REXCVAR_DECLARE(int32_t, async_pipeline_wait_ms);
 
 // GPU Resolution / Readback / Queries
 REXCVAR_DECLARE(int32_t, resolution_scale);
@@ -28,6 +29,11 @@ REXCVAR_DECLARE(bool, draw_resolution_scaled_texture_offsets);
 REXCVAR_DECLARE(bool, tiled_shared_memory);
 REXCVAR_DECLARE(std::string, readback_resolve);
 REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
+REXCVAR_DECLARE(bool, readback_resolve_log);
+REXCVAR_DECLARE(bool, readback_resolve_cpu_reads_only);
+REXCVAR_DECLARE(bool, readback_resolve_cpu_pages_only);
+REXCVAR_DECLARE(bool, readback_resolve_full_deferred);
+REXCVAR_DECLARE(int32_t, readback_resolve_cpu_wait_limit_ms);
 REXCVAR_DECLARE(bool, readback_memexport);
 REXCVAR_DECLARE(bool, readback_memexport_fast);
 REXCVAR_DECLARE(std::string, occlusion_query);

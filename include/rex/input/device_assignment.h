@@ -11,11 +11,26 @@
  */
 
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 #include <rex/input/device.h>
 
 namespace rex::input {
+
+// What one player's input_playerN value names (split-screen).
+struct PlayerDevices {
+  bool keyboard = false;
+  bool pads = false;      // every gamepad no other player names
+  uint32_t pad_mask = 0;  // pad N (connection order) = bit N-1
+};
+PlayerDevices ParsePlayerDevices(std::string_view text, bool first_player);
+
+// No guest user (KeyboardUser when no player has the keyboard).
+constexpr uint32_t kNoUser = 0xFFFFFFFF;
+// The guest user the keyboard and mouse belong to (input_player1/2), or
+// kNoUser.
+uint32_t KeyboardUser();
 
 class DeviceAssignment {
  public:

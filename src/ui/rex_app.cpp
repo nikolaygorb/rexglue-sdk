@@ -34,8 +34,12 @@
 #include <rex/string/numeric.h>
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
+#include <rex/system/flags.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/user_module.h>
+#include <rex/system/xex_identity.h>
+#include <rex/system/xex_module.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
@@ -52,6 +56,62 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(xex_image_check, true, "Runtime",
+                    "Show a warning at startup when default.xex is not the build the game "
+                    "was recompiled from (the log gets it either way)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+namespace {
+
+// Recompiled code and title patches assume the exact XEX codegen saw. A
+// different build loads fine and then crashes or misbehaves much later, so
+// say so up front. Never blocks the launch.
+void CheckXexImage(const rex::PPCImageInfo& ppc_info, rex::system::KernelState* kernel_state,
+                   std::string_view app_name) {
+  rex::system::object_ref<rex::system::UserModule> module;
+  if (kernel_state) {
+    module = kernel_state->GetExecutableModule();
+  }
+  const auto* xex = module ? module->xex_module() : nullptr;
+  if (!xex) {
+    return;
+  }
+
+  const auto& expected = ppc_info.image_identity;
+  const auto loaded = rex::runtime::ReadXexImageIdentity(*xex);
+  REXLOG_INFO("XEX image: {}", rex::runtime::FormatXexImageIdentity(loaded));
+
+  switch (rex::runtime::CompareXexImageIdentity(expected, loaded)) {
+    case rex::runtime::XexImageMatch::kMatch:
+      return;
+    case rex::runtime::XexImageMatch::kNotRecorded:
+      REXLOG_INFO("XEX image check skipped: the generated code does not record its XEX "
+                  "(regenerate to enable it)");
+      return;
+    case rex::runtime::XexImageMatch::kMismatch:
+      break;
+  }
+
+  REXLOG_WARN("XEX image mismatch: found {}; recompiled from {}",
+              rex::runtime::FormatXexImageIdentity(loaded),
+              rex::runtime::FormatXexImageIdentity(expected));
+  if (!REXCVAR_GET(xex_image_check) || REXCVAR_GET(headless)) {
+    return;
+  }
+  auto msg = fmt::format(
+      "This default.xex is not the build {} was recompiled from. The game will try to "
+      "start, but it may crash or misbehave.\n\n"
+      "Found: {}\n"
+      "Expected: {}\n\n"
+      "If it works anyway, please report the found values to the project. "
+      "Set xex_image_check = false to hide this warning.",
+      app_name, rex::runtime::FormatXexImageIdentity(loaded),
+      rex::runtime::FormatXexImageIdentity(expected));
+  rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Warning, msg);
+}
+
+}  // namespace
 
 namespace rex {
 
@@ -300,6 +360,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     return false;
   }
 
+  CheckXexImage(ppc_info_, runtime_->kernel_state(), GetName());
   OnPostLoadXexImage();
 
   if (ppc_info_.rexcrt_heap) {

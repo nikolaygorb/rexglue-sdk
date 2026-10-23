@@ -126,9 +126,10 @@ struct ArgTranslator {
           break;
       }
     }
-    // Stack arguments at r1 + 0x54 + ((arg - 8) * 8)
-    return __builtin_bswap32(
-        *rex::memory::GuestPtr<uint32_t*>(base, ctx.r1.u32 + 0x54 + ((arg - 8) * 8)));
+    // Stack arguments: one big-endian doubleword each from r1 + 0x50; narrower
+    // values sit in its low bytes, so callers truncate to their own size.
+    return __builtin_bswap64(
+        *rex::memory::GuestPtr<uint64_t*>(base, ctx.r1.u32 + 0x50 + ((arg - 8) * 8)));
   }
 
   // Get float/double argument value from FPR
@@ -201,8 +202,8 @@ struct ArgTranslator {
       }
     }
     // Stack-passed arguments (mirrors GetIntegerArgumentValue layout)
-    *rex::memory::GuestPtr<uint32_t*>(base, ctx.r1.u32 + 0x54 + ((arg - 8) * 8)) =
-        __builtin_bswap32(static_cast<uint32_t>(value));
+    *rex::memory::GuestPtr<uint64_t*>(base, ctx.r1.u32 + 0x50 + ((arg - 8) * 8)) =
+        __builtin_bswap64(value);
   }
 
   // Set float/double argument value
@@ -265,11 +266,10 @@ struct ArgTranslator {
   template <MappedPtrType T>
   static T GetValue(PPCContext& ctx, uint8_t* base, size_t idx) noexcept {
     using inner_t = typename mapped_ptr_inner_type<T>::type;
-    const auto v = GetIntegerArgumentValue(ctx, base, idx);
-    if (!v) {
+    const uint32_t guest_addr = static_cast<uint32_t>(GetIntegerArgumentValue(ctx, base, idx));
+    if (!guest_addr) {
       return T(nullptr);
     }
-    uint32_t guest_addr = static_cast<uint32_t>(v);
     inner_t* host_ptr = rex::memory::GuestPtr<inner_t*>(base, guest_addr);
     return T(host_ptr, guest_addr);
   }
@@ -279,6 +279,9 @@ struct ArgTranslator {
   static constexpr T GetValue(PPCContext& ctx, uint8_t* base, size_t idx) noexcept {
     if constexpr (is_precise_v<T>) {
       return static_cast<T>(GetPrecisionArgumentValue(ctx, base, idx));
+    } else if constexpr (sizeof(T) <= 4) {
+      // Only the low word of the register or stack slot belongs to the value.
+      return static_cast<T>(static_cast<uint32_t>(GetIntegerArgumentValue(ctx, base, idx)));
     } else {
       return static_cast<T>(GetIntegerArgumentValue(ctx, base, idx));
     }
@@ -288,11 +291,10 @@ struct ArgTranslator {
   template <typename T>
     requires std::is_pointer_v<T>
   static constexpr T GetValue(PPCContext& ctx, uint8_t* base, size_t idx) noexcept {
-    const auto v = GetIntegerArgumentValue(ctx, base, idx);
-    if (!v) {
+    const uint32_t guest_addr = static_cast<uint32_t>(GetIntegerArgumentValue(ctx, base, idx));
+    if (!guest_addr) {
       return nullptr;
     }
-    uint32_t guest_addr = static_cast<uint32_t>(v);
     return rex::memory::GuestPtr<T>(base, guest_addr);
   }
 

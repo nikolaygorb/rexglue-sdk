@@ -16,6 +16,7 @@
 #include <bit>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 
@@ -402,13 +403,116 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
 // when DAZ is set (the VMX flush mode), so a denormal is rebuilt from its
 // integer mantissa instead: the value is a normal double, exact whatever the
 // MXCSR. The result never depends on the flush mode, so lfs needs no switch.
+// A NaN is widened bit for bit: cvtss2sd would quiet a signalling one, which
+// lfs does not, so a 32-bit value copied through a float register changed.
 inline double fp_load_single(uint32_t bits) {
-  if ((bits & 0x7F800000u) == 0 && (bits & 0x007FFFFFu) != 0) [[unlikely]] {
-    double v = double(bits & 0x007FFFFFu) * 0x1p-149;
+  const uint32_t exponent = bits & 0x7F800000u;
+  const uint32_t mantissa = bits & 0x007FFFFFu;
+  if ((exponent == 0 || exponent == 0x7F800000u) && mantissa != 0) [[unlikely]] {
+    if (exponent) {
+      return std::bit_cast<double>((uint64_t(bits & 0x80000000u) << 32) |
+                                   UINT64_C(0x7FF0000000000000) | (uint64_t(mantissa) << 29));
+    }
+    double v = double(mantissa) * 0x1p-149;
     return (bits & 0x80000000u) ? -v : v;
   }
   return double(std::bit_cast<float>(bits));
 }
+
+//=============================================================================
+// Double -> single store
+//=============================================================================
+// stfs narrows a double to a single. A NaN keeps its sign and the high 23 bits
+// of its fraction, as the hardware does: cvtsd2ss would quiet a signalling one.
+// Callers use the scalar flush mode (off) for denormal results.
+inline uint32_t fp_store_single(double value) {
+  const uint64_t bits = std::bit_cast<uint64_t>(value);
+  if ((bits & UINT64_C(0x7FF0000000000000)) == UINT64_C(0x7FF0000000000000) &&
+      (bits & UINT64_C(0x000FFFFFFFFFFFFF)) != 0) [[unlikely]] {
+    return (uint32_t(bits >> 32) & 0x80000000u) | 0x7F800000u |
+           (uint32_t(bits >> 29) & 0x007FFFFFu);
+  }
+  return std::bit_cast<uint32_t>(float(value));
+}
+
+//=============================================================================
+// Scalar multiply-add
+//=============================================================================
+// fmadd, fmsub, fnmadd, fnmsub and their single forms call fp_fma. Built with
+// FMA (-mfma, ARM64) it is the fused instruction, inline. Otherwise std::fma is
+// a library call: a few nanoseconds on a CPU with FMA, but on one without
+// (Intel before Haswell, AMD before Piledriver) a software emulation of the
+// single rounding, about 30 ns a call in the Windows CRT, and games make tens
+// of millions of these calls a second (slowed sound, stalled frames). On such
+// CPUs fp_fma multiplies, rounds and adds instead: the result may differ from
+// the fused one in the last bit. The environment variable REX_PPC_FMA=0 forces
+// the multiply-add, REX_PPC_FMA=1 std::fma (read once at startup).
+
+// Two roundings. The empty asm makes the rounded product an opaque value, so
+// the compiler can't contract a * b + c into an fma, not even under
+// -ffp-contract=fast.
+inline double fp_mul_add(double a, double b, double c) {
+  double product = a * b;
+#if defined(__x86_64__) || defined(_M_X64)
+  __asm__("" : "+x"(product));
+#endif
+  return product + c;
+}
+
+#if defined(__FMA__) || defined(__aarch64__) || defined(_M_ARM64)
+
+inline double fp_fma(double a, double b, double c) { return __builtin_fma(a, b, c); }
+
+#else
+
+// CPUID leaf 1: FMA (ECX bit 12), and OSXSAVE (bit 27) for XGETBV, whose XCR0
+// bits 1-2 say the OS saves the SSE and AVX registers.
+inline bool fp_detect_host_fma() {
+#if defined(__x86_64__) || defined(_M_X64)
+  unsigned int eax, ebx, ecx, edx;
+  __asm__("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1u), "c"(0u));
+  if ((ecx & (1u << 12)) == 0 || (ecx & (1u << 27)) == 0) {
+    return false;
+  }
+  unsigned int xcr0_low, xcr0_high;
+  __asm__("xgetbv" : "=a"(xcr0_low), "=d"(xcr0_high) : "c"(0u));
+  return (xcr0_low & 6u) == 6u;
+#else
+  return true;
+#endif
+}
+
+inline bool fp_init_host_fma() {
+  char value[8] = {};
+#if defined(_WIN32)
+  size_t length = 0;
+  if (getenv_s(&length, value, sizeof(value), "REX_PPC_FMA") != 0) {
+    value[0] = '\0';
+  }
+#else
+  if (const char* env = std::getenv("REX_PPC_FMA")) {
+    value[0] = env[0];
+  }
+#endif
+  if (value[0] == '0') {
+    return false;
+  }
+  if (value[0] == '1') {
+    return true;
+  }
+  return fp_detect_host_fma();
+}
+
+inline const bool fp_host_has_fma = fp_init_host_fma();
+
+inline double fp_fma(double a, double b, double c) {
+  if (fp_host_has_fma) [[likely]] {
+    return std::fma(a, b, c);
+  }
+  return fp_mul_add(a, b, c);
+}
+
+#endif
 
 //=============================================================================
 // Multiply-add NaN rules

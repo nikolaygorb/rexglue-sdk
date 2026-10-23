@@ -71,6 +71,33 @@ class TextureCache {
   // buffer binding (counted as R32 for a byte address buffer).
   static constexpr uint32_t kMaxDrawResolutionScaleAlongAxis = 7;
 
+  // Whether resolves covering resolved_pages of a texture's total_pages make it
+  // a scaled resolve texture. 0% means any resolved page does (canary).
+  static constexpr bool IsScaledResolveCoverageEnough(uint32_t resolved_pages,
+                                                      uint32_t total_pages,
+                                                      uint32_t min_coverage_percent) {
+    if (!resolved_pages) {
+      return false;
+    }
+    return !min_coverage_percent ||
+           uint64_t(resolved_pages) * 100 >= uint64_t(total_pages) * min_coverage_percent;
+  }
+
+  // A host swizzle reading blue where it read red and red where it read blue.
+  static constexpr uint32_t SwapRedAndBlueSources(uint32_t host_swizzle) {
+    uint32_t swapped = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+      uint32_t source = (host_swizzle >> (3 * i)) & 0b111;
+      if (source == xenos::XE_GPU_TEXTURE_SWIZZLE_R) {
+        source = xenos::XE_GPU_TEXTURE_SWIZZLE_B;
+      } else if (source == xenos::XE_GPU_TEXTURE_SWIZZLE_B) {
+        source = xenos::XE_GPU_TEXTURE_SWIZZLE_R;
+      }
+      swapped |= source << (3 * i);
+    }
+    return swapped;
+  }
+
   TextureCache(const TextureCache& texture_cache) = delete;
   TextureCache& operator=(const TextureCache& texture_cache) = delete;
   virtual ~TextureCache();
@@ -616,6 +643,20 @@ class TextureCache {
   // create the texture - if it's nullptr, occasionally a recreation attempt
   // should be made.
   Texture* FindOrCreateTexture(TextureKey key);
+  // The texture made for exactly this key, or nullptr (none is created).
+  Texture* FindExistingTexture(const TextureKey& key) const {
+    auto it = textures_.find(key);
+    return it != textures_.end() ? it->second.get() : nullptr;
+  }
+  // How many textures have been created so far, so a search that found none
+  // can tell whether trying again could find one.
+  uint64_t textures_created() const { return textures_created_; }
+  // The texture's data was written another way than by loading it, and is
+  // what loading its guest memory would give: up to date (and watched again)
+  // until that memory changes.
+  bool MarkTextureUpToDate(Texture& texture) {
+    return texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  }
 
   static const LoadShaderInfo& GetLoadShaderInfo(LoadShaderIndex load_shader_index) {
     assert_true(load_shader_index < kLoadShaderCount);
@@ -776,8 +817,10 @@ class TextureCache {
                             void* context, void* data, uint64_t argument, bool invalidated_by_gpu);
 
   // Checks if there are any pages that contain scaled resolve data within the
-  // range.
-  bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // range. With min_coverage_percent above 0, only if resolves wrote at least
+  // that percentage of the range's pages.
+  bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                             uint32_t min_coverage_percent = 0);
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(
@@ -811,6 +854,7 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  uint64_t textures_created_ = 0;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

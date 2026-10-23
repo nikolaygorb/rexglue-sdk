@@ -62,6 +62,10 @@ u32 XNotifyGetNext_entry(u32 handle, u32 match_id, mapped_u32 id_ptr, mapped_u32
   }
   *id_ptr = 0;
 
+  // A title may learn of a second player only from XN_SYS_SIGNINCHANGED, which
+  // otherwise goes out only when something asks who is signed in.
+  RefreshLocalUserSignins();
+
   // Grab listener.
   auto listener = REX_KERNEL_OBJECTS()->LookupObject<XNotifyListener>(handle);
   if (!listener) {

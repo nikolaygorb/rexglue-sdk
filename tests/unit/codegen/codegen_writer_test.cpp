@@ -252,3 +252,46 @@ TEST_CASE("Every name a recomp file calls is declared in its header", "[codegen_
     }
   }
 }
+
+TEST_CASE("The XEX identity is written into PPCImageConfig", "[codegen_writer]") {
+  WriterFixture fx("image_identity");
+  fx.ctx->setImageIdentity({0xA360A2573C02F664ull, 317, 0x4D5307D3, 0x750FF1D9});
+
+  CodegenWriter writer(*fx.ctx);
+  REQUIRE(writer.write(false));
+
+  std::string init = ReadAll(fx.outputDir() / "testproj_init.cpp");
+  CHECK(init.find(".fingerprint = 0xA360A2573C02F664ull,") != std::string::npos);
+  CHECK(init.find(".page_count = 317,") != std::string::npos);
+  CHECK(init.find(".title_id = 0x4D5307D3,") != std::string::npos);
+  CHECK(init.find(".media_id = 0x750FF1D9,") != std::string::npos);
+}
+
+TEST_CASE("A binary without a XEX writes an empty identity", "[codegen_writer]") {
+  WriterFixture fx("no_image_identity");
+
+  CodegenWriter writer(*fx.ctx);
+  REQUIRE(writer.write(false));
+
+  std::string init = ReadAll(fx.outputDir() / "testproj_init.cpp");
+  CHECK(init.find(".fingerprint = 0x0000000000000000ull,") != std::string::npos);
+  CHECK(init.find(".page_count = 0,") != std::string::npos);
+}
+
+TEST_CASE("Registration iterates the function mapping table", "[codegen_writer]") {
+  WriterFixture fx("register_table");
+
+  CodegenWriter writer(*fx.ctx);
+  REQUIRE(writer.write(false));
+
+  // One loop over PPCFuncMappings instead of a call per function, which made a
+  // huge straight-line function for large titles.
+  std::string reg = ReadAll(fx.outputDir() / "testproj_register.cpp");
+  CHECK(reg.find("mapping = PPCFuncMappings; mapping->host; ++mapping") != std::string::npos);
+  CHECK(reg.find("registrar->SetFunction(0x") == std::string::npos);
+  // The table still lists every function.
+  std::string init = ReadAll(fx.outputDir() / "testproj_init.cpp");
+  for (uint32_t i = 0; i < kFunctionCount; ++i) {
+    CHECK(init.find(fmt::format("0x{:X}", kBaseAddress + i * 4)) != std::string::npos);
+  }
+}

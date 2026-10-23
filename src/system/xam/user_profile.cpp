@@ -93,6 +93,13 @@ UserProfile::UserProfile() {
   AddSetting(std::make_unique<BinarySetting>(0x63E83FFD));
 }
 
+UserProfile::UserProfile(uint32_t user_index) : UserProfile() {
+  if (user_index) {
+    xuid_ = 0xB13EBABEBABE0000ull | user_index;
+    name_ = fmt::format("User{}", user_index + 1);
+  }
+}
+
 void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
   Setting* previous_setting = setting.get();
   std::swap(settings_[setting->setting_id], previous_setting);
@@ -133,7 +140,7 @@ UserProfile::Setting* UserProfile::GetSetting(uint32_t setting_id) {
 
 void UserProfile::LoadSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath(name_);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "rb");
@@ -158,11 +165,18 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
 void UserProfile::SaveSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
     auto serialized_setting = setting->Serialize();
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
-    std::filesystem::create_directories(content_dir);
+    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath(name_);
+    // A folder the user can't write to (Controlled Folder Access, a read-only
+    // or synced Documents) keeps the setting in memory only.
+    std::error_code ec;
+    std::filesystem::create_directories(content_dir, ec);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "wb");
+    if (!file) {
+      REXSYS_ERROR("Can't save profile setting {} to {}", setting_id, rex::path_to_utf8(file_path));
+      return;
+    }
     fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
     fclose(file);
   } else {

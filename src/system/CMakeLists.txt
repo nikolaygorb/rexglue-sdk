@@ -46,6 +46,7 @@ set(REXSYSTEM_SOURCES
     thread.cpp
     thread_state.cpp
     xex_module.cpp
+    xex_identity.cpp
 )
 
 add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})

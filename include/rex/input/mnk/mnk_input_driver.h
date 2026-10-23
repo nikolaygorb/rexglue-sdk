@@ -15,6 +15,7 @@
 #include <rex/ui/window_listener.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <queue>
@@ -92,6 +93,15 @@ class MnkInputDriver final : public InputDriver,
   // Filled on the UI thread, drained on the guest thread, hence the lock.
   float mouse_dx_ = 0.0f;
   float mouse_dy_ = 0.0f;
+
+  // Guest thread, under state_mutex_: the left stick's ramped axes
+  // (mnk_stick_ramp), the low-passed mouse speed in pixels a second
+  // (mnk_mouse_speed) and when GetDeviceState was last polled.
+  float left_stick_x_ = 0.0f;
+  float left_stick_y_ = 0.0f;
+  float mouse_rate_x_ = 0.0f;
+  float mouse_rate_y_ = 0.0f;
+  std::chrono::steady_clock::time_point last_poll_{};
 
   // UI thread only.
   int32_t prev_mouse_x_ = 0;

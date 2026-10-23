@@ -153,7 +153,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   virtual void OnPostInitLogging() {}
 
   /// Called after Runtime::LoadXexImage() succeeds. The XEX is loaded and
-  /// mapped into guest memory but the module has not launched.
+  /// mapped into guest memory but the module has not launched, and it has
+  /// been checked against the XEX codegen saw (warning only, see
+  /// xex_image_check).
   /// Use this for data patches and recomp-specific achievement registration.
   virtual void OnPostLoadXexImage() {}
 

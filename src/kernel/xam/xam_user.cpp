@@ -12,9 +12,16 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
 
 #include <rex/cvar.h>
+#include <rex/input/input_system.h>
+#include <rex/runtime.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -29,6 +36,13 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+REXCVAR_DEFINE_UINT32(max_local_users, 1, "Kernel",
+                      "Local players that can be signed in (split-screen), 1 to 4: users past the "
+                      "first are signed in while a controller is assigned to them (input_player2, "
+                      "or pad N for player N). 1: only the first");
+REXCVAR_DEFINE_STRING(user_gamertag_2, "", "Kernel",
+                      "Gamertag of the second local player (split-screen); empty: the first "
+                      "player's with (2) after it");
 // Defined in xam_locale.cpp.
 REXCVAR_DECLARE(uint32_t, user_country);
 
@@ -37,6 +51,99 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+namespace {
+
+constexpr uint32_t kXNotificationSigninChanged = 0x0000000A;  // XN_SYS_SIGNINCHANGED
+
+std::mutex g_local_users_mutex;
+std::unique_ptr<UserProfile> g_local_profiles[4];
+uint32_t g_signed_in_mask = 1;
+std::chrono::steady_clock::time_point g_signins_polled;
+
+// Users 1-3 are signed in while a controller is assigned to them, like a
+// guest signing in with their own pad. Polled at most every 250 ms (titles
+// ask many times a frame); a change goes to the title as XN_SYS_SIGNINCHANGED.
+uint32_t SignedInMask() {
+  const uint32_t users = std::clamp<uint32_t>(REXCVAR_GET(max_local_users), 1, 4);
+  if (users == 1) {
+    return 1;
+  }
+  std::unique_lock<std::mutex> lock(g_local_users_mutex);
+  const auto now = std::chrono::steady_clock::now();
+  if (now - g_signins_polled < std::chrono::milliseconds(250)) {
+    return g_signed_in_mask;
+  }
+  g_signins_polled = now;
+  uint32_t mask = 1;
+  auto* input = static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
+  for (uint32_t i = 1; i < users && input; ++i) {
+    rex::input::X_INPUT_CAPABILITIES caps = {};
+    if (input->GetCapabilities(i, 0, &caps) == X_ERROR_SUCCESS) {
+      mask |= 1u << i;
+    }
+  }
+  if (mask != g_signed_in_mask) {
+    REXKRNL_INFO("XAM: local users signed in: {:X} -> {:X}", g_signed_in_mask, mask);
+    g_signed_in_mask = mask;
+    lock.unlock();
+    REX_KERNEL_STATE()->BroadcastNotification(kXNotificationSigninChanged, mask);
+  }
+  return mask;
+}
+
+}  // namespace
+
+bool IsLocalUserSignedIn(uint32_t user_index) {
+  return user_index < 4 && (SignedInMask() >> user_index) & 1;
+}
+
+void RefreshLocalUserSignins() {
+  SignedInMask();
+}
+
+UserProfile* ProfileForUser(uint32_t user_index) {
+  if (!user_index) {
+    return REX_KERNEL_STATE()->user_profile();
+  }
+  if (user_index >= 4) {
+    return nullptr;
+  }
+  std::lock_guard<std::mutex> lock(g_local_users_mutex);
+  auto& profile = g_local_profiles[user_index];
+  if (!profile) {
+    profile = std::make_unique<UserProfile>(user_index);
+    profile->set_kernel_state(REX_KERNEL_STATE());
+  }
+  return profile.get();
+}
+
+int LocalUserOfXuid(uint64_t xuid) {
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (xuid == ProfileForUser(i)->xuid()) {
+      return int(i);
+    }
+  }
+  return -1;
+}
+
+namespace {
+
+// A local user's name: user 0's profile name; for the others the first one's
+// with "(n)" after it (user_gamertag_2 for the second), at most 15 bytes.
+std::string LocalUserName(uint32_t user_index) {
+  if (user_index == 1 && !REXCVAR_GET(user_gamertag_2).empty()) {
+    return std::string(REXCVAR_GET(user_gamertag_2)).substr(0, 15);
+  }
+  std::string name = REX_KERNEL_STATE()->user_profile()->name();
+  if (user_index) {
+    const std::string suffix = fmt::format("({})", user_index + 1);
+    name = name.substr(0, 15 - suffix.size()) + suffix;
+  }
+  return name;
+}
+
+}  // namespace
 
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
@@ -47,8 +154,8 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   uint32_t result = X_E_NO_SUCH_USER;
   uint64_t xuid = 0;
   if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    if (IsLocalUserSignedIn(user_index)) {
+      const auto& user_profile = ProfileForUser(user_index);
       auto type = user_profile->type() & type_mask;
       if (type & (2 | 4)) {
         // maybe online profile?
@@ -69,11 +176,8 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
 
 uint32_t xeXamUserGetSigninState(uint32_t user_index) {
   uint32_t signin_state = 0;
-  if (user_index < 4) {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-      signin_state = user_profile->signin_state();
-    }
+  if (IsLocalUserSignedIn(user_index)) {
+    signin_state = ProfileForUser(user_index)->signin_state();
   }
   return signin_state;
 }
@@ -98,14 +202,14 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
-  if (user_index) {
+  if (!IsLocalUserSignedIn(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  const auto& user_profile = ProfileForUser(user_index);
   info->xuid = user_profile->xuid();
   info->signin_state = user_profile->signin_state();
-  rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+  rex::string::copy_truncating(info->name, LocalUserName(user_index), rex::countof(info->name));
   return X_E_SUCCESS;
 }
 
@@ -118,16 +222,18 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  if (!IsLocalUserSignedIn(user_index)) {
     if (buffer) {
       *buffer = '\0';
     }
     return X_E_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  const auto& user_name = user_profile->name();
-  rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+  const std::string user_name = LocalUserName(user_index);
+  // buffer_len counts the null terminator; 0 takes the whole name.
+  const uint32_t name_bytes = std::min(uint32_t(user_name.size()) + 1, uint32_t(16));
+  rex::string::copy_truncating(buffer, user_name,
+                               buffer_len ? std::min(buffer_len, name_bytes) : name_bytes);
   return X_E_SUCCESS;
 }
 
@@ -136,7 +242,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  if (!IsLocalUserSignedIn(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -144,8 +250,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  auto user_name = rex::string::to_utf16(user_profile->name());
+  auto user_name = rex::string::to_utf16(LocalUserName(user_index));
   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
@@ -167,9 +272,9 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   } else {
     assert_true(xuid_count == 1);
     assert_not_null(xuids);
-    // TODO(gibbed): allow proper lookup of arbitrary XUIDs
-    const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
+    // Local users only: the XUID of another one of them reads its profile.
+    const int local_user = LocalUserOfXuid(static_cast<uint64_t>(xuids[0]));
+    user_index = local_user > 0 ? uint32_t(local_user) : 0;
     // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
     // until it's implemented for release builds...
     xuid_count = 1;
@@ -223,8 +328,8 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   // Title ID = 0 means us.
   // 0xfffe07d1 = profile?
 
-  if (!xuids && user_index) {
-    // Only support user 0.
+  if (!xuids && !IsLocalUserSignedIn(user_index)) {
+    // Only signed-in local users.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(
           REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
@@ -233,7 +338,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     return X_ERROR_NO_SUCH_USER;
   }
 
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  const auto& user_profile = ProfileForUser(user_index);
 
   // First call asks for size (fill buffer_size_ptr).
   // Second call asks for buffer contents with that size.
@@ -323,8 +428,8 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (user_index) {
-    // Only support user 0.
+  if (!IsLocalUserSignedIn(user_index)) {
+    // Only signed-in local users.
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
                                                       X_ERROR_NO_SUCH_USER);
@@ -334,7 +439,7 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
   }
 
   // Update and save settings.
-  const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  const auto& user_profile = ProfileForUser(user_index);
 
   for (uint32_t n = 0; n < setting_count; ++n) {
     const X_USER_PROFILE_SETTING& setting = settings[n];
@@ -391,7 +496,7 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
       return X_ERROR_INVALID_PARAMETER;
     }
 
-    if (user_index) {
+    if (!IsLocalUserSignedIn(user_index)) {
       return X_ERROR_NO_SUCH_USER;
     }
   }
@@ -402,7 +507,7 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
 }
 
 u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags) {
-  if (user_index) {
+  if (!IsLocalUserSignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -413,7 +518,7 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
 
 u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2,
                                              mapped_u32 out_unk3) {
-  if (user_index) {
+  if (!IsLocalUserSignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
 
@@ -444,7 +549,7 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
   if (user_index >= 4) {
     return X_ERROR_INVALID_PARAMETER;
   }
-  if (user_index) {
+  if (!IsLocalUserSignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
   return 6 /* 6 appears to be Gold */;
@@ -458,8 +563,8 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
   if (user_index >= 4) {
     result = X_ERROR_INVALID_PARAMETER;
   } else {
-    if (user_index == 0) {
-      const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+    if (IsLocalUserSignedIn(user_index)) {
+      const auto& user_profile = ProfileForUser(user_index);
       if (user_profile->signin_state() == 0) {
         result = X_ERROR_NOT_LOGGED_ON;
       } else {
@@ -782,11 +887,15 @@ namespace {
 constexpr uint32_t kSubscriptionTierGold = 6;
 
 bool IsSignedInUser(uint32_t user_index) {
-  return user_index == 0;
+  return IsLocalUserSignedIn(user_index);
 }
 
 bool IsSignedInXuid(uint64_t xuid) {
-  return xuid && xuid == REX_KERNEL_STATE()->user_profile()->xuid();
+  if (!xuid) {
+    return false;
+  }
+  const int local_user = LocalUserOfXuid(xuid);
+  return local_user >= 0 && IsLocalUserSignedIn(uint32_t(local_user));
 }
 
 // X_XAMACCOUNTINFO::cached_user_flags of the profile: country in bits 8..15,

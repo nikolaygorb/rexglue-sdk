@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -17,6 +18,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/perf/counter.h>
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -90,6 +92,13 @@ REXCVAR_DEFINE_BOOL(tiled_shared_memory, true, "GPU",
                     "Enable tiled/sparse resources for efficient large address space "
                     "support. Disable for graphics debugger compatibility.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(scaled_resolve_min_coverage_percent, 0, "GPU",
+                     "With resolution scaling, load a texture from the scaled resolve buffer "
+                     "(zero where nothing was resolved) only if resolves wrote at least this "
+                     "percentage of its memory. 0: any overlap does (canary). Try 50 for "
+                     "textures that turn black at a scale above 1.")
+    .range(0, 100);
 
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
@@ -508,6 +517,13 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
+
+  // Counted here, where every load from guest memory passes (RequestTextures
+  // loads its batch through this without LoadTextureData).
+  if (!texture.is_replacement()) {
+    PROFILE_TEXTURE_LOAD((pending_load.load_base ? texture.GetGuestBaseSize() : 0) +
+                         (pending_load.load_mips ? texture.GetGuestMipsSize() : 0));
+  }
 
   if (texture.is_replacement()) {
     // Guest data is never loaded into a replacement texture. Its ranges have
@@ -1004,10 +1020,12 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
     if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
          IsRangeScaledResolved(key.base_page << 12,
-                               scaled_resolve_guest_layout.base.level_data_extent_bytes)) ||
+                               scaled_resolve_guest_layout.base.level_data_extent_bytes,
+                               uint32_t(REXCVAR_GET(scaled_resolve_min_coverage_percent)))) ||
         (scaled_resolve_guest_layout.mips_total_extent_bytes &&
          IsRangeScaledResolved(key.mip_page << 12,
-                               scaled_resolve_guest_layout.mips_total_extent_bytes))) {
+                               scaled_resolve_guest_layout.mips_total_extent_bytes,
+                               uint32_t(REXCVAR_GET(scaled_resolve_min_coverage_percent))))) {
       key.scaled_resolve = 1;
     }
   }
@@ -1142,6 +1160,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     new_texture->set_replacement_policy_generation(policy_generation);
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    ++textures_created_;
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
@@ -1605,7 +1624,8 @@ void TextureCache::UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t sub
       uint32_t((textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20));
 }
 
-bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                                         uint32_t min_coverage_percent) {
   if (!IsDrawResolutionScaled()) {
     return false;
   }
@@ -1626,6 +1646,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   uint32_t block_last = page_last >> 5;
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
+  uint32_t resolved_pages = 0;
   auto global_lock = global_critical_region_.Acquire();
   for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
     uint64_t l2_block = scaled_resolve_pages_l2_[i];
@@ -1646,12 +1667,17 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
       if (block_index == block_last && (page_last & 31) != 31) {
         check_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      if (scaled_resolve_pages_[block_index] & check_bits) {
-        return true;
+      uint32_t resolved_bits = scaled_resolve_pages_[block_index] & check_bits;
+      if (resolved_bits) {
+        if (!min_coverage_percent) {
+          return true;
+        }
+        resolved_pages += uint32_t(std::popcount(resolved_bits));
       }
     }
   }
-  return false;
+  return IsScaledResolveCoverageEnough(resolved_pages, page_last - page_first + 1,
+                                       min_coverage_percent);
 }
 
 void TextureCache::ScaledResolveGlobalWatchCallbackThunk(

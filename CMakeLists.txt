@@ -249,11 +249,16 @@ endif()
 # Third-party dependencies (vendored sources only)
 add_subdirectory(thirdparty)
 
-# Enable warnings after thirdparty
-add_compile_options(
-    -Wall
-    -Wextra
-)
+# Enable warnings after thirdparty. clang-cl reads -Wall as MSVC's /Wall
+# (-Weverything), so it gets the clang flags through /clang:.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    add_compile_options(/clang:-Wall /clang:-Wextra)
+else()
+    add_compile_options(
+        -Wall
+        -Wextra
+    )
+endif()
 
 include_directories(${REXGLUE_ROOT}/include)
 

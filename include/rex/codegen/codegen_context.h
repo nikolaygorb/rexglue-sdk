@@ -21,6 +21,7 @@
 #include <rex/codegen/code_region.h>
 #include <rex/codegen/config.h>
 #include <rex/codegen/function_graph.h>
+#include <rex/image_info.h>
 #include <rex/result.h>
 
 namespace rex {
@@ -163,6 +164,10 @@ class CodegenContext {
   void setHasDllModules(bool has) { has_dll_modules_ = has; }
   bool hasDllModules() const { return has_dll_modules_; }
 
+  /// The loaded XEX, written to PPCImageConfig for the startup check
+  const PPCImageIdentity& imageIdentity() const { return image_identity_; }
+  void setImageIdentity(const PPCImageIdentity& identity) { image_identity_ = identity; }
+
  private:
   CodegenContext() = default;
 
@@ -174,6 +179,7 @@ class CodegenContext {
   std::filesystem::path configDir_;  ///< Directory containing config file (for relative paths)
   bool is_dll_module_ = false;       ///< True if this module is a DLL (shared library output)
   bool has_dll_modules_ = false;     ///< True if the project has DLL modules (multi-binary)
+  PPCImageIdentity image_identity_;  ///< Zero when the binary did not come from a XEX
 };
 
 }  // namespace rex::codegen

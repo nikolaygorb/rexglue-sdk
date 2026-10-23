@@ -19,6 +19,7 @@
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+#include <rex/system/xex_identity.h>
 #include <rex/system/xex_module.h>
 
 namespace rex::codegen {
@@ -68,9 +69,11 @@ Result<CodegenContext> CodegenContext::Create(const std::filesystem::path& confi
 
   ctx.binary_ = BinaryView::fromModule(*module);
   ctx.resolver_ = runtime.export_resolver();
+  ctx.image_identity_ = rex::runtime::ReadXexImageIdentity(*module);
 
   REXCODEGEN_TRACE("Loaded XEX: base=0x{:08X}, size=0x{:X}, entry=0x{:08X}",
                    ctx.binary_.baseAddress(), ctx.binary_.imageSize(), ctx.binary_.entryPoint());
+  REXCODEGEN_TRACE("XEX image: {}", rex::runtime::FormatXexImageIdentity(ctx.image_identity_));
 
   // Initialize AnalysisState from binary
   ctx.analysisState_.format = "xex";

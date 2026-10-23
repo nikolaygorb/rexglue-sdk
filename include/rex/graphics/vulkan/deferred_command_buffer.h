@@ -31,6 +31,30 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
+  // Hoisting: commands recorded later but executed earlier, at a hoist point
+  // written into the stream before (the shared memory uploads that
+  // VulkanSharedMemory moves before the current render pass instead of ending
+  // it). The hoisted commands go to a second stream; a hoist point covers a
+  // contiguous range of it, which Execute replays where the hoist point is.
+  // Writes a hoist point covering nothing yet, and returns its handle.
+  size_t CmdHoistPoint();
+  // Directs the commands written from now on to the hoisted stream (true) or
+  // the main one.
+  void SetWritingHoisted(bool hoisted) { write_stream_ = hoisted ? &hoisted_stream_ : &command_stream_; }
+  size_t hoisted_stream_size() const { return hoisted_stream_.size(); }
+  bool is_writing_hoisted() const { return write_stream_ == &hoisted_stream_; }
+  // How much has been recorded in the main stream since Reset.
+  size_t stream_size() const { return command_stream_.size(); }
+  // Drops the hoisted commands from `size` on (only those of the latest hoist
+  // point).
+  void TruncateHoistedStream(size_t size) {
+    assert_true(size <= hoisted_stream_.size());
+    hoisted_stream_.resize(size);
+  }
+  // Makes the hoist point cover the hoisted stream from where it was at
+  // CmdHoistPoint to its current end.
+  void ExtendHoistPoint(size_t hoist_point);
+
   // render_pass_begin->pNext must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
                             VkSubpassContents contents,
@@ -226,6 +250,30 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  VkImageCopy* CmdCopyImageEmplace(VkImage src_image, VkImageLayout src_image_layout,
+                                   VkImage dst_image, VkImageLayout dst_image_layout,
+                                   uint32_t region_count) {
+    const size_t header_size = rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkCopyImage, header_size + sizeof(VkImageCopy) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region_count = region_count;
+    return reinterpret_cast<VkImageCopy*>(args_ptr + header_size);
+  }
+
+  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage, VkQueryPool query_pool,
+                           uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
+        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
+    args.pipeline_stage = pipeline_stage;
+    args.query_pool = query_pool;
+    args.query = query;
+  }
+
   void CmdVkCopyQueryPoolResults(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count,
                                  VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize stride,
                                  VkQueryResultFlags flags) {
@@ -416,6 +464,7 @@ class DeferredCommandBuffer {
     kVkClearColorImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
+    kVkCopyImage,
     kVkCopyQueryPoolResults,
     kVkDispatch,
     kVkDraw,
@@ -438,6 +487,8 @@ class DeferredCommandBuffer {
     kVkSetStencilReference,
     kVkSetStencilWriteMask,
     kVkSetViewport,
+    kVkWriteTimestamp,
+    kHoistedCommands,
   };
 
   struct CommandHeader {
@@ -535,6 +586,16 @@ class DeferredCommandBuffer {
     uint32_t region_count;
     // Followed by aligned VkBufferCopy[].
     static_assert(alignof(VkBufferCopy) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkCopyImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    uint32_t region_count;
+    // Followed by aligned VkImageCopy[].
+    static_assert(alignof(VkImageCopy) <= alignof(uintmax_t));
   };
 
   struct ArgsVkCopyBufferToImage {
@@ -663,6 +724,18 @@ class DeferredCommandBuffer {
     uint32_t mask_reference;
   };
 
+  struct ArgsVkWriteTimestamp {
+    VkPipelineStageFlagBits pipeline_stage;
+    VkQueryPool query_pool;
+    uint32_t query;
+  };
+
+  struct ArgsHoistedCommands {
+    // Range of hoisted_stream_, in elements.
+    size_t begin;
+    size_t end;
+  };
+
   struct ArgsVkSetViewport {
     uint32_t first_viewport;
     uint32_t viewport_count;
@@ -671,11 +744,15 @@ class DeferredCommandBuffer {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+  void ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                     size_t stream_remaining);
 
   const VulkanCommandProcessor& command_processor_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  std::vector<uintmax_t> hoisted_stream_;
+  std::vector<uintmax_t>* write_stream_ = &command_stream_;
   // For rebuilding pNext chains of barriers with sample locations.
   std::vector<VkImageMemoryBarrier> image_barriers_with_sample_locations_;
   std::vector<VkSampleLocationsInfoEXT> barrier_sample_locations_;

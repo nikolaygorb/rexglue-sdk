@@ -11,7 +11,9 @@
 
 #pragma once
 
+#include <filesystem>
 #include <string>
+#include <vector>
 
 #include <rex/filesystem/device.h>
 
@@ -41,6 +43,13 @@ class HostPathDevice : public Device {
   // and read-only devices leave it off (see a5c3a963 ghost-file fix).
   bool allow_share_delete() const { return allow_share_delete_; }
   const std::filesystem::path& host_path() const { return host_path_; }
+  // Files under `overlay_path` at the same relative path stand in for the
+  // device's own when it populates (Initialize): a translated copy of a
+  // package's text without touching the package. Set before Initialize; empty
+  // for none.
+  void set_overlay_path(const std::filesystem::path& overlay_path) {
+    overlay_path_ = overlay_path;
+  }
 
   const std::string& name() const override { return name_; }
   uint32_t attributes() const override { return 0; }
@@ -52,10 +61,14 @@ class HostPathDevice : public Device {
   uint32_t bytes_per_sector() const override { return 0x200; }
 
  private:
-  void PopulateEntry(HostPathEntry* parent_entry);
+  // Walks one directory, with the canonical path of every directory already
+  // on this branch, so a symlink (or junction) into one of them is not
+  // followed again.
+  void PopulateEntry(HostPathEntry* parent_entry, std::vector<std::filesystem::path>& ancestors);
 
   std::string name_;
   std::filesystem::path host_path_;
+  std::filesystem::path overlay_path_;
   std::unique_ptr<Entry> root_entry_;
   bool read_only_;
   bool allow_share_delete_;

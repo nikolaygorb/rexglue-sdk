@@ -26,6 +26,7 @@ void XTimer::Initialize(uint32_t timer_type) {
   switch (timer_type) {
     case 0:  // NotificationTimer
       timer_ = rex::thread::Timer::CreateManualResetTimer();
+      manual_reset_ = true;
       break;
     case 1:  // SynchronizationTimer
       timer_ = rex::thread::Timer::CreateSynchronizationTimer();
@@ -101,6 +102,14 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
 
 X_STATUS XTimer::Cancel() {
   return timer_->Cancel() ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+}
+
+bool XTimer::IsSignaled() {
+  // A zero wait on the host timer would consume a synchronization timer's
+  // signal, so only a notification timer can be read.
+  return manual_reset_ &&
+         rex::thread::Wait(timer_.get(), false, std::chrono::milliseconds(0)) ==
+             rex::thread::WaitResult::kSuccess;
 }
 
 }  // namespace rex::system

@@ -164,6 +164,18 @@ void KernelState::SetProcessTLSVars(X_KPROCESS* process, uint32_t num_slots, uin
 KernelState::~KernelState() {
   app_manager_.reset();
 
+  // Stop the file I/O worker: requests still queued are dropped, nothing waits
+  // for them now.
+  {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    io_thread_stop_ = true;
+    io_queue_.clear();
+  }
+  io_cond_.notify_all();
+  if (io_thread_.joinable()) {
+    io_thread_.join();
+  }
+
   // Stop the dispatch thread before touching the object table
   if (dispatch_thread_running_) {
     dispatch_thread_running_ = false;
@@ -1176,22 +1188,25 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
   XOverlappedSetLength(ptr, length);
   std::atomic_thread_fence(std::memory_order_release);
   XOverlappedSetResult(ptr, result);
+  // The thread comes from the caller: InternalContext belongs to the title.
+  const uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
+  object_ref<XThread> thread;
+  if (routine) {
+    thread = object_table()->LookupObject<XThread>(thread_handle);
+  }
+  // The event is left unsignaled when the completion routine is queued. A
+  // completion with no guest thread to queue it on still signals it.
   X_HANDLE event_handle = XOverlappedGetEvent(ptr);
-  if (event_handle) {
+  if (event_handle && !thread) {
     auto ev = object_table()->LookupObject<XEvent>(event_handle);
     assert_not_null(ev);
     if (ev) {
       ev->Set(0, false);
     }
   }
-  if (XOverlappedGetCompletionRoutine(ptr)) {
-    // The thread comes from the caller: InternalContext belongs to the title.
-    auto thread = object_table()->LookupObject<XThread>(thread_handle);
-    if (thread) {
-      // Queue APC on the thread that requested the overlapped operation.
-      uint32_t routine = XOverlappedGetCompletionRoutine(ptr);
-      thread->EnqueueApc(routine, result, length, overlapped_ptr);
-    }
+  if (thread) {
+    // Queue APC on the thread that requested the overlapped operation.
+    thread->EnqueueApc(routine, result, length, overlapped_ptr);
   }
 }
 
@@ -1278,6 +1293,34 @@ void KernelState::CompleteOverlappedDeferredEx(
   dispatch_cond_.notify_all();
 }
 
+void KernelState::PostIo(std::function<void()> fn) {
+  {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (io_thread_stop_) {
+      return;
+    }
+    io_queue_.push_back(std::move(fn));
+    if (!io_thread_.joinable()) {
+      io_thread_ = std::thread([this]() {
+        rex::thread::set_current_thread_name("Kernel File I/O");
+        std::unique_lock<std::mutex> lock(io_mutex_);
+        while (true) {
+          io_cond_.wait(lock, [this]() { return io_thread_stop_ || !io_queue_.empty(); });
+          if (io_thread_stop_) {
+            return;
+          }
+          auto request = std::move(io_queue_.front());
+          io_queue_.pop_front();
+          lock.unlock();
+          request();
+          lock.lock();
+        }
+      });
+    }
+  }
+  io_cond_.notify_one();
+}
+
 DPCImpersonationScope KernelState::BeginDPCImpersonation() {
   auto* thread = XThread::GetCurrentThread();
   auto* ctx = thread->thread_state()->context();
@@ -1340,7 +1383,12 @@ bool KernelState::Save(stream::ByteStream* stream) {
   for (auto object : objects) {
     auto prev_offset = stream->offset();
 
-    if (object->is_host_object() || object->type() == XObject::Type::Thread) {
+    // A user module is a host object only to stay out of the title's handle
+    // numbering, so it still saves.
+    const bool user_module =
+        object->type() == XObject::Type::Module &&
+        static_cast<XModule*>(object.get())->module_type() == XModule::ModuleType::kUserModule;
+    if ((object->is_host_object() && !user_module) || object->type() == XObject::Type::Thread) {
       // Don't save host objects or save XThreads again
       num_objects--;
       continue;

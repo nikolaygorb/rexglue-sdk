@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <cstddef>
 #include <vector>
 
 #include <rex/chrono/clock.h>
@@ -33,8 +35,9 @@ XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), typ
   handles_.reserve(10);
 }
 
-XObject::XObject(KernelState* kernel_state, Type type)
+XObject::XObject(KernelState* kernel_state, Type type, bool host_object)
     : kernel_state_(kernel_state),
+      host_object_(host_object),
       type_(type),
       pointer_ref_count_(1),
       guest_object_ptr_(0),
@@ -56,8 +59,8 @@ XObject::~XObject() {
     uint32_t ptr = guest_object_ptr_ - sizeof(X_OBJECT_HEADER);
     auto header = memory()->TranslateVirtual<X_OBJECT_HEADER*>(ptr);
 
-    // Free the object creation info
-    if (header->object_type_ptr) {
+    // Free the placeholder type; a kernel type stays.
+    if (allocated_object_type_ && header->object_type_ptr) {
       memory()->SystemHeapFree(header->object_type_ptr);
     }
 
@@ -200,6 +203,39 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
   }
 }
 
+namespace {
+
+// The rest of a host wait's timeout after it was woken for a kernel APC.
+class WaitTimeout {
+ public:
+  explicit WaitTimeout(std::chrono::milliseconds timeout)
+      : timeout_(timeout), start_(std::chrono::steady_clock::now()) {}
+  std::chrono::milliseconds Remaining() const {
+    if (timeout_ == std::chrono::milliseconds::max()) {
+      return timeout_;
+    }
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_);
+    return elapsed < timeout_ ? timeout_ - elapsed : std::chrono::milliseconds(0);
+  }
+
+ private:
+  std::chrono::milliseconds timeout_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+// An alertable host wait was woken by a queued APC. A kernel APC runs and the
+// wait goes on for the rest of its timeout; only a pending user APC ends it
+// (edge 7598c1779). A host thread keeps the old behaviour.
+bool ApcEndsWait() {
+  if (!XThread::IsInThread()) {
+    return true;
+  }
+  return XThread::GetCurrentThread()->OnAlertableWaitWoken();
+}
+
+}  // namespace
+
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                        uint64_t* opt_timeout) {
   auto wait_handle = GetWaitHandle();
@@ -213,8 +249,12 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                                 : std::chrono::milliseconds::max();
 
   XThread::CheckTitleTermination();
-  auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
-  XThread::CheckTitleTermination();
+  WaitTimeout timeout(timeout_ms);
+  rex::thread::WaitResult result;
+  do {
+    result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout.Remaining());
+    XThread::CheckTitleTermination();
+  } while (result == rex::thread::WaitResult::kUserCallback && !ApcEndsWait());
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
       WaitCallback();
@@ -239,9 +279,14 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
+  WaitTimeout timeout(timeout_ms);
   auto result =
       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
                                  alertable ? true : false, timeout_ms);
+  // Woken for a kernel APC: the signal is done, the wait goes on.
+  while (result == rex::thread::WaitResult::kUserCallback && !ApcEndsWait()) {
+    result = rex::thread::Wait(wait_object->GetWaitHandle(), true, timeout.Remaining());
+  }
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
       wait_object->WaitCallback();
@@ -273,10 +318,14 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
                                 : std::chrono::milliseconds::max();
 
   XThread::CheckTitleTermination();
+  WaitTimeout timeout(timeout_ms);
   if (wait_type) {
-    auto result =
-        rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
-    XThread::CheckTitleTermination();
+    std::pair<rex::thread::WaitResult, size_t> result;
+    do {
+      result = rex::thread::WaitAny(wait_handles.data(), wait_handles.size(),
+                                   alertable ? true : false, timeout.Remaining());
+      XThread::CheckTitleTermination();
+    } while (result.first == rex::thread::WaitResult::kUserCallback && !ApcEndsWait());
     switch (result.first) {
       case rex::thread::WaitResult::kSuccess:
         objects[result.second]->WaitCallback();
@@ -295,9 +344,12 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
         return X_STATUS_UNSUCCESSFUL;
     }
   } else {
-    auto result =
-        rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
-    XThread::CheckTitleTermination();
+    rex::thread::WaitResult result;
+    do {
+      result = rex::thread::WaitAll(wait_handles.data(), wait_handles.size(),
+                                   alertable ? true : false, timeout.Remaining());
+      XThread::CheckTitleTermination();
+    } while (result == rex::thread::WaitResult::kUserCallback && !ApcEndsWait());
     switch (result) {
       case rex::thread::WaitResult::kSuccess:
         for (uint32_t i = 0; i < count; i++) {
@@ -335,17 +387,19 @@ uint8_t* XObject::CreateNative(uint32_t size) {
   SetNativePointer(mem + sizeof(X_OBJECT_HEADER), true);
 
   auto header = memory()->TranslateVirtual<X_OBJECT_HEADER*>(mem);
-  // Objects without a dispatch header (enumerators) have no room in their body for the
-  // handle; ObDereferenceObject finds them through this.
-  header->unk_04 = handle();
-
-  auto object_type = memory()->SystemHeapAlloc(sizeof(X_OBJECT_TYPE));
-  if (object_type) {
-    // Set it up in the header.
-    // Some kernel method is accessing this struct and dereferencing a member
-    // @ offset 0x14
-    header->object_type_ptr = object_type;
+  header->pointer_count = 1;
+  header->handle_count = 1;
+  // The kernel's type for the object, as on the console; a placeholder for
+  // the kinds that have none (some kernel method reads a member at 0x14).
+  uint32_t object_type = KernelObjectType();
+  if (!object_type) {
+    object_type = memory()->SystemHeapAlloc(sizeof(X_OBJECT_TYPE));
+    allocated_object_type_ = object_type != 0;
   }
+  header->object_type_ptr = object_type;
+  // Objects without a dispatch header (enumerators) have no room in their body
+  // for the handle; ObDereferenceObject finds them through this.
+  kernel_state_->object_table()->AddNativeHandle(guest_object_ptr_, handle());
 
   return memory()->TranslateVirtual(guest_object_ptr_);
 }
@@ -368,6 +422,78 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
   StashHandle(header, handle());
 
   guest_object_ptr_ = native_ptr;
+}
+
+void XObject::SetNativeType() {
+  if (allocated_guest_object_) {
+    return;
+  }
+  // ObOpenObjectByPointer takes an Object Manager object, whose body follows an
+  // X_OBJECT_HEADER. Generic dispatch lookups must not inspect this prefix.
+  if (guest_object_ptr_ < sizeof(X_OBJECT_HEADER)) {
+    return;
+  }
+  const uint32_t header_ptr = guest_object_ptr_ - sizeof(X_OBJECT_HEADER);
+  if (memory()->QueryRangeAccess(header_ptr, sizeof(X_OBJECT_HEADER)) ==
+      rex::memory::PageAccess::kNoAccess) {
+    return;
+  }
+  guest_object_type_ptr_.store(
+      memory()->TranslateVirtual<X_OBJECT_HEADER*>(header_ptr)->object_type_ptr);
+}
+
+uint32_t XObject::KernelObjectType() const {
+  size_t offset;
+  switch (type_) {
+    case Type::Thread:
+      offset = offsetof(KernelGuestGlobals, ExThreadObjectType);
+      break;
+    case Type::Event:
+      offset = offsetof(KernelGuestGlobals, ExEventObjectType);
+      break;
+    case Type::Mutant:
+      offset = offsetof(KernelGuestGlobals, ExMutantObjectType);
+      break;
+    case Type::Semaphore:
+      offset = offsetof(KernelGuestGlobals, ExSemaphoreObjectType);
+      break;
+    case Type::Timer:
+      offset = offsetof(KernelGuestGlobals, ExTimerObjectType);
+      break;
+    case Type::IOCompletion:
+      offset = offsetof(KernelGuestGlobals, IoCompletionObjectType);
+      break;
+    case Type::File:
+      offset = offsetof(KernelGuestGlobals, IoFileObjectType);
+      break;
+    case Type::SymbolicLink:
+      offset = offsetof(KernelGuestGlobals, ObSymbolicLinkObjectType);
+      break;
+    default:
+      return 0;
+  }
+  const uint32_t globals = kernel_state_->GetKernelGuestGlobals();
+  return globals ? globals + uint32_t(offset) : 0;
+}
+
+void XObject::UpdateNativeHandle(X_HANDLE removed_handle) {
+  if (!guest_object_ptr_ ||
+      memory()->QueryRangeAccess(guest_object_ptr_, sizeof(X_DISPATCH_HEADER)) !=
+          rex::memory::PageAccess::kReadWrite) {
+    return;
+  }
+  auto* header = memory()->TranslateVirtual<X_DISPATCH_HEADER*>(guest_object_ptr_);
+  if (header->wait_list_flink != kXObjSignature || header->wait_list_blink != removed_handle) {
+    return;
+  }
+  if (!handles_.empty()) {
+    StashHandle(header, handles_.front());
+  } else {
+    const uint32_t wait_list =
+        guest_object_ptr_ + uint32_t(offsetof(X_DISPATCH_HEADER, wait_list_flink));
+    header->wait_list_flink = wait_list;
+    header->wait_list_blink = wait_list;
+  }
 }
 
 object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,
@@ -394,8 +520,16 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
   if (header->wait_list_flink == kXObjSignature) {
     // Already initialized.
     // TODO: assert if the type of the object != as_type
+    // Only the object still at this address: the stashed slot may have been
+    // freed and reused (canary 291f0c9be).
     uint32_t handle = header->wait_list_blink;
-    auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
+    auto object = object_ref<XObject>(kernel_state->object_table()->LookupNativeObject(
+        handle, kernel_state->memory()->HostToGuestVirtual(native_ptr)));
+    if (object) {
+      // The only place the guest hands us a raw dispatch header, so the only
+      // place a direct write to it can be picked up.
+      object->SyncFromGuest();
+    }
 
     // TODO(benvanik): assert nothing has been changed in the struct.
     return object;
@@ -407,19 +541,22 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
       case 0:  // EventNotificationObject
       case 1:  // EventSynchronizationObject
       {
-        auto ev = new XEvent(kernel_state);
+        // Host objects: an inlined KeInitializeEvent gets no handle on the
+        // console, so a guest slot spent here would shift every later handle
+        // the title sees (xenia-edge 672bc8b81).
+        auto ev = new XEvent(kernel_state, true);
         ev->InitializeNative(native_ptr, header);
         object = ev;
       } break;
       case 2:  // MutantObject
       {
-        auto mutant = new XMutant(kernel_state);
+        auto mutant = new XMutant(kernel_state, true);
         mutant->InitializeNative(native_ptr, header);
         object = mutant;
       } break;
       case 5:  // SemaphoreObject
       {
-        auto sem = new XSemaphore(kernel_state);
+        auto sem = new XSemaphore(kernel_state, true);
         auto success = sem->InitializeNative(native_ptr, header);
         // Can't report failure to the guest at late initialization:
         assert_true(success);
@@ -443,9 +580,11 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
         return NULL;
     }
 
-    // Stash pointer in struct.
+    // Keep the guest address and stash the handle in the struct. The address
+    // is what later lookups check the stashed slot against (canary sets it in
+    // InitializeNative).
     // FIXME: This assumes the object contains a dispatch header (some don't!)
-    StashHandle(header, object->handle());
+    object->SetNativePointer(kernel_state->memory()->HostToGuestVirtual(native_ptr), true);
 
     return object_ref<XObject>(object);
   }

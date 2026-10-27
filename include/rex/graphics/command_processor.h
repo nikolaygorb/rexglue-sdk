@@ -202,6 +202,15 @@ class CommandProcessor {
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
                                           uint32_t num_registers);
+  // Whether a write to the register only stores its value: a known register
+  // outside the shader constant blocks that WriteRegister does nothing else for
+  // (not the scratch registers, COHER_STATUS_HOST or the gamma ramp). Backend
+  // WriteRegister overrides handle only the constant blocks; one that handles
+  // another register must take it out of this set.
+  static bool IsPlainRegister(uint32_t index);
+  // Stores a range made only of plain registers straight from the ring, if it
+  // does not reach the ring's end. Returns false, reading nothing, otherwise.
+  bool WritePlainRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t count);
   void WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
   void WriteFetchRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
   void WriteBoolRangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
@@ -674,6 +683,8 @@ class CommandProcessor {
   // packets. Preserve these values so dependent packet logic can still observe
   // them instead of dropping the write entirely.
   std::unordered_map<uint32_t, uint32_t> extended_register_values_;
+  // gpu_plain_register_ranges, read at the start of each primary buffer burst.
+  bool plain_register_ranges_ = false;
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;

@@ -32,6 +32,7 @@
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/registers.h>
@@ -193,7 +194,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   // target sample count, or the default pattern at 1x. Submits pending
   // barriers under the old pattern first.
   void UpdateSamplePositions(xenos::MsaaSamples msaa_samples);
-  bool xenos_sample_positions_used() const { return xenos_sample_positions_used_; }
+  bool xenos_sample_positions_used() const {
+    // ROV always uses Xenos' MSAA sample positions.
+    // xenos_sample_positions targets host RTs with programmable position
+    // support. Read on use, so a per-title config or a runtime change applies.
+    return xenos_sample_positions_supported_ &&
+           (render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock ||
+            REXCVAR_GET(xenos_sample_positions));
+  }
 
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
@@ -564,7 +572,7 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // SetSamplePositions and ResolveSubresourceRegion remove the device
   // without tier 1 support.
-  bool xenos_sample_positions_used_ = false;
+  bool xenos_sample_positions_supported_ = false;
 
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 

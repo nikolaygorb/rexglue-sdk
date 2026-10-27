@@ -35,7 +35,9 @@
 #include <rex/graphics/util/pipeline_wait.h>
 #include <rex/perf/counter.h>
 
+#include "device_memory.h"
 #include "render_target_trim.h"
+#include "submission_watch.h"
 #include <rex/graphics/util/smaa_textures.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -95,6 +97,13 @@ REXCVAR_DEFINE_INT32(vulkan_render_target_trim_percent, 0, "GPU/Vulkan",
                      "resolution scales")
     .range(0, 100)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_submission_draw_limit, -1, "GPU/Vulkan",
+                     "End a GPU submission after this many draws (a frame then reaches the GPU in "
+                     "several parts, so no single part can run into the Windows 2 s GPU timeout): "
+                     "-1 = 1000 on integrated GPUs with a small carve-out, else none; 0 = none")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
 
 REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 0, "GPU/Vulkan",
                      "How many frames the CPU may queue ahead of the GPU, 1 to 3; 0: 3 (canary). "
@@ -599,6 +608,18 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
   return true;
 }
 
+// The submissions' draws and the slow waits for them (submission_watch.h). One
+// command processor per process; its thread alone touches these.
+submission_watch::Watch submission_watch_state;
+uint32_t draws_in_submission = 0;
+uint64_t submission_splits = 0;
+
+int64_t SteadyNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 }  // namespace
 
 // Generated with `xb buildshaders`.
@@ -652,6 +673,8 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
           kDescriptorPoolSizeTextures, uint32_t(rex::countof(kDescriptorPoolSizeTextures)),
           kLinkedTypeDescriptorPoolSetCount) {
   legacy_readback_memexport_cvar_name_ = "vulkan_readback_memexport";
+  vulkan_device_ =
+      static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())->vulkan_device();
 }
 
 VulkanCommandProcessor::~VulkanCommandProcessor() = default;
@@ -831,6 +854,8 @@ void VulkanCommandProcessor::ReadGpuTimes() {
 
 void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
   namespace trim = render_target_trim;
+  device_memory::State& memory_state = device_memory::Get();
+  memory_state.EndFrame();
   const uint32_t percent = uint32_t(REXCVAR_GET(vulkan_render_target_trim_percent));
   if (!render_target_cache_ || !percent) {
     render_target_trim_requested_ = false;
@@ -848,24 +873,24 @@ void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
                          render_target_trim_next_allowed_frame_, percent, failed, have_budget)) {
     return;
   }
-  uint64_t usage = 0, budget = 0;
-  if (have_budget) {
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_properties = {};
-    budget_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-    VkPhysicalDeviceMemoryProperties2 memory_properties = {};
-    memory_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
-    memory_properties.pNext = &budget_properties;
-    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties2(
-        vulkan_device->physical_device(), &memory_properties);
-    const VkPhysicalDeviceMemoryProperties& properties = memory_properties.memoryProperties;
-    for (uint32_t i = 0; i < properties.memoryHeapCount; ++i) {
-      if (properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-        usage += budget_properties.heapUsage[i];
-        budget += budget_properties.heapBudget[i];
-      }
-    }
-  }
-  if (!failed && !trim::OverBudget(usage, budget, percent)) {
+  // The device-local use and budget (and the test cap,
+  // vulkan_device_local_budget_mb).
+  const device_memory::State::Budget memory = memory_state.Query();
+  const uint64_t usage = memory.usage, budget = memory.budget;
+  // Where new memory goes to system memory (integrated GPUs with a small
+  // carve-out), a nearly full device-local heap is no reason to free render
+  // targets; render targets that went to system memory past their limit are.
+  const bool integrated = memory_state.active();
+  trim::Memory trim_memory;
+  trim_memory.usage = usage;
+  trim_memory.budget = budget;
+  trim_memory.heap_over_budget = integrated && memory_state.HeapOverBudget(memory);
+  trim_memory.system_usage = memory.system_usage;
+  trim_memory.system_budget = memory.system_budget;
+  trim_memory.render_targets_in_system =
+      memory_state.SystemBytes(device_memory::Use::kRenderTarget);
+  const trim::Reason reason = trim::ShouldTrim(integrated, failed, trim_memory, percent);
+  if (reason == trim::Reason::kNone) {
     return;
   }
   if (!AwaitAllQueueOperationsCompletion()) {
@@ -879,10 +904,21 @@ void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
   const uint32_t count_after = render_target_cache_->render_target_count();
   render_target_trim_next_allowed_frame_ =
       trim::NextAllowedFrame(frame_current_, failed, before - after);
+  // The next placements see the memory the trim freed.
+  if (integrated) {
+    memory_state.Refresh();
+  }
   REXGPU_INFO(
-      "Render targets trimmed ({}): {} -> {} ({} -> {} MB); device-local memory {} of {} MB",
-      failed ? "an allocation failed" : "memory nearly full", count_before, count_after,
-      before >> 20, after >> 20, usage >> 20, budget >> 20);
+      "Render targets trimmed ({}): {} -> {} ({} -> {} MB); device-local memory {} of {} MB{}",
+      reason == trim::Reason::kAllocationFailed ? std::string("an allocation failed")
+      : reason == trim::Reason::kRenderTargetsInSystemMemory
+          ? fmt::format("{} MB of them in system memory",
+                        trim_memory.render_targets_in_system >> 20)
+          : std::string("memory nearly full"),
+      count_before, count_after, before >> 20, after >> 20, usage >> 20, budget >> 20,
+      integrated ? fmt::format(", system memory {} of {} MB", memory.system_usage >> 20,
+                               memory.system_budget >> 20)
+                 : std::string());
 }
 
 void VulkanCommandProcessor::ClearCaches() {
@@ -1080,6 +1116,9 @@ bool VulkanCommandProcessor::SetupContext() {
         "buffers bound to the compute shader");
     return false;
   }
+
+  // The memory layout, before the first allocation it places.
+  device_memory::Get().Initialize(vulkan_device);
 
   shared_memory_ =
       std::make_unique<VulkanSharedMemory>(*this, *memory_, guest_shader_pipeline_stages_);
@@ -2543,13 +2582,14 @@ void VulkanCommandProcessor::ShutdownContext() {
   semaphores_free_.clear();
 
   device_lost_ = false;
+  device_memory::Get().Shutdown();
 
   CommandProcessor::ShutdownContext();
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
-  // Only the shader constant blocks are handled here (WriteRegistersFromMem
-  // relies on that for the other registers).
+  // Only the shader constant blocks are handled here (WriteRegistersFromMem and
+  // CommandProcessor::IsPlainRegister rely on that for the other registers).
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2721,7 +2761,14 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
       VulkanCommandProcessor::WriteRegistersFromMem(index, part_base, part_end - index);
     } else {
       for (uint32_t i = index; i < part_end; ++i) {
-        CommandProcessor::WriteRegister(i, memory::load_and_swap<uint32_t>(part_base + (i - index)));
+        const uint32_t value = memory::load_and_swap<uint32_t>(part_base + (i - index));
+        if (IsPlainRegister(i)) {
+          // Most of these (render state) only store the value: do that here, as
+          // CommandProcessor::WriteRegister would (volatile for WAIT_REG_MEM).
+          const_cast<volatile uint32_t&>(register_file_->values[i]) = value;
+        } else {
+          CommandProcessor::WriteRegister(i, value);
+        }
       }
     }
     index = part_end;
@@ -4305,6 +4352,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+
+  // On integrated GPUs, at most so many draws in one submission
+  // (vulkan_submission_draw_limit). Not inside an occlusion query segment,
+  // which would have to be split, nor while the scratch buffer is in use.
+  if (submission_open_ && frame_open_ && !active_segment_.segment_active &&
+      CanEndSubmissionImmediately() &&
+      submission_watch::ShouldSplit(
+          draws_in_submission,
+          submission_watch::DrawLimit(REXCVAR_GET(vulkan_submission_draw_limit),
+                                      device_memory::Get().integrated()))) {
+    if (EndSubmission(false)) {
+      ++submission_splits;
+    }
+  }
+  ++draws_in_submission;
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
@@ -6367,6 +6429,7 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(uint64_t awa
   // A host wait for the GPU this long is logged: the queue made no progress
   // for that long (presentation holding it, for instance).
   constexpr int64_t kSlowSubmissionWaitMs = 2000;
+  const uint64_t completed_before_wait = GetCompletedSubmission();
   const auto wait_start = std::chrono::steady_clock::now();
   completion_timeline_.AwaitSubmissionAndUpdateCompleted(await_submission);
   const int64_t waited_ms = int64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -6397,9 +6460,35 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(uint64_t awa
     return;
   }
 
-  if (waited_ms >= kSlowSubmissionWaitMs) {
-    REXGPU_WARN("Vulkan: waited {} ms for submission {} to finish on the GPU", waited_ms,
-                await_submission);
+  // Test hook: REX_TEST_SLOW_WAIT_MS=<n> logs waits from n ms (at most one
+  // every 10 s), to see the submissions' draws on a fast GPU.
+  static const bool slow_wait_test_hook = [] {
+    const char* value = std::getenv("REX_TEST_SLOW_WAIT_MS");
+    if (value && *value) {
+      submission_watch_state.SetSlowWaitMs(std::max<int64_t>(0, std::atoll(value)));
+    }
+    return true;
+  }();
+  (void)slow_wait_test_hook;
+  // What the submissions waited for held, and how full the device-local memory
+  // was (a slow submission on an integrated GPU with a full carve-out).
+  if (waited_ms >= kSlowSubmissionWaitMs ||
+      submission_watch_state.ShouldLogWait(waited_ms, SteadyNowMs())) {
+    std::string held;
+    const int64_t now_ms = SteadyNowMs();
+    for (uint64_t s = completed_before_wait + 1; s <= await_submission; ++s) {
+      if (const auto* record = submission_watch_state.Find(s)) {
+        held += fmt::format("{}{}: {} draws, submitted {} ms ago", held.empty() ? "" : "; ", s,
+                            record->draws, now_ms - record->submitted_ms);
+      }
+    }
+    const device_memory::State::Budget memory = device_memory::Get().Query();
+    REXGPU_WARN(
+        "Vulkan: waited {} ms for submission {} to finish on the GPU ({}; device-local {} of "
+        "{} MB, system {} of {} MB; {} slow waits since the last report, {} submissions split)",
+        waited_ms, await_submission, held.empty() ? std::string("no record") : held,
+        memory.usage >> 20, memory.budget >> 20, memory.system_usage >> 20,
+        memory.system_budget >> 20, submission_watch_state.TakeSlowWaits(), submission_splits);
   }
 
   ReadGpuTimes();
@@ -6540,6 +6629,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (!submission_open_) {
     submission_open_ = true;
+    draws_in_submission = 0;
 
     // Start a new deferred command buffer - will submit it to the real one in
     // the end of the submission (when async pipeline object creation requests
@@ -6764,6 +6854,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     RecordVIZPredicateCopies();
 
     SubmitBarriers(true);
+
+    submission_watch_state.Submitted(GetCurrentSubmission(), draws_in_submission, SteadyNowMs());
 
     assert_false(command_buffers_writable_.empty());
     CommandBuffer command_buffer = command_buffers_writable_.back();
@@ -7728,7 +7820,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       normalized_depth_control.stencil_enable || normalized_depth_control.z_enable;
   if (edram_fragment_shader_interlock && depth_stencil_enabled) {
     for (uint32_t i = 0; i < 4; ++i) {
-      if (rb_depth_info.depth_base == color_infos[i].color_base &&
+      if (render_target_cache_->WrapEdramBase(rb_depth_info.depth_base) ==
+              render_target_cache_->WrapEdramBase(color_infos[i].color_base) &&
           RenderTargetCache::ColorOverlapsDepthStencil(color_infos[i].color_format,
                                                        rt_keep_masks[i][0], rt_keep_masks[i][1],
                                                        normalized_depth_control)) {
@@ -8074,18 +8167,19 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     reg::RB_COLOR_INFO color_info = color_infos[i];
     // Exponent bias is in bits 20:25 of RB_COLOR_INFO.
     int32_t color_exp_bias = color_info.color_exp_bias;
+    float color_exp_bias_scale;
+    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
+        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
         (color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 &&
              !render_target_cache_->IsFixedRG16TruncatedToMinus1To1() ||
          color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16 &&
              !render_target_cache_->IsFixedRGBA16TruncatedToMinus1To1())) {
-      // Remap from -32...32 to -1...1 by dividing the output values by 32,
-      // losing blending correctness, but getting the full range.
-      color_exp_bias -= 5;
+      // Remap to -1...1 by scaling the output values by 1024/32767, losing
+      // blending correctness, but getting the full range apart from -32,
+      // which SNORM folds into -32767/1024.
+      color_exp_bias_scale *= 1024.0f / 32767.0f;
     }
-    float color_exp_bias_scale;
-    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
-        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     dirty |= system_constants_.color_exp_bias[i] != color_exp_bias_scale;
     system_constants_.color_exp_bias[i] = color_exp_bias_scale;
     if (edram_fragment_shader_interlock) {
@@ -8097,7 +8191,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         uint32_t rt_base_dwords_scaled =
             draw_util::AddWindowOffsetToEdramBase(
                 color_info.color_base, window_offset_tiles,
-                xenos::IsColorRenderTargetFormat64bpp(color_info.color_format)) *
+                xenos::IsColorRenderTargetFormat64bpp(color_info.color_format),
+                render_target_cache_->edram_tile_count()) *
             edram_tile_dwords_scaled;
         dirty |= system_constants_.edram_rt_base_dwords_scaled[i] != rt_base_dwords_scaled;
         system_constants_.edram_rt_base_dwords_scaled[i] = rt_base_dwords_scaled;
@@ -8134,9 +8229,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
 
   if (edram_fragment_shader_interlock) {
-    uint32_t depth_base_dwords_scaled = draw_util::AddWindowOffsetToEdramBase(
-                                            rb_depth_info.depth_base, window_offset_tiles, false) *
-                                        edram_tile_dwords_scaled;
+    uint32_t depth_base_dwords_scaled =
+        draw_util::AddWindowOffsetToEdramBase(rb_depth_info.depth_base, window_offset_tiles, false,
+                                              render_target_cache_->edram_tile_count()) *
+        edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled != depth_base_dwords_scaled;
     system_constants_.edram_depth_base_dwords_scaled = depth_base_dwords_scaled;
 

@@ -528,6 +528,17 @@ const BaseHeap* Memory::LookupHeap(uint32_t address) const {
   }
 }
 
+rex::memory::PageAccess Memory::QueryRangeAccess(uint32_t address, uint32_t length) {
+  if (!length || length - 1 > UINT32_MAX - address) {
+    return rex::memory::PageAccess::kNoAccess;
+  }
+  auto* heap = LookupHeap(address);
+  if (!heap) {
+    return rex::memory::PageAccess::kNoAccess;
+  }
+  return heap->QueryRangeAccess(address, address + length - 1);
+}
+
 BaseHeap* Memory::LookupHeapByType(bool physical, uint32_t page_size) {
   if (physical) {
     if (page_size <= 4096) {
@@ -2053,6 +2064,10 @@ rex::memory::PageAccess BaseHeap::QueryRangeAccess(uint32_t low_address, uint32_
   {
     std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
     for (uint32_t i = low_page_number; i <= high_page_number; ++i) {
+      // Decommit and a reserve without commit leave the protection set.
+      if (!(page_table_[i].state & memory::kMemoryAllocationCommit)) {
+        return rex::memory::PageAccess::kNoAccess;
+      }
       uint32_t page_protect = page_table_[i].current_protect;
       if (!(page_protect & memory::kMemoryProtectRead)) {
         all_readable = false;

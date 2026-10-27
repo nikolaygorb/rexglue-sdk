@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <rex/chrono/clock.h>
@@ -373,9 +374,19 @@ u32 KeQueryPerformanceFrequency_entry() {
   return static_cast<uint32_t>(result);
 }
 
+// Kernel APCs run at the next wait, delay or yield, alertable or not (edge
+// 256cc3a90). No-op above PASSIVE_LEVEL, in a critical region or inside another
+// kernel APC.
+static void DeliverKernelApcsAtShim() {
+  if (XThread::IsInThread()) {
+    XThread::GetCurrentThread()->DeliverKernelAPCs();
+  }
+}
+
 u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
   XThread* thread = XThread::GetCurrentThread();
 
+  thread->DeliverKernelAPCs();
   if (alertable) {
     thread->DeliverAPCs();
   }
@@ -383,6 +394,8 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
   // TODO(Ecredes): Verify whether a null interval should be treated as zero.
   uint64_t interval = interval_ptr ? static_cast<uint64_t>(*interval_ptr) : 0u;
   X_STATUS result = thread->Delay(processor_mode, alertable, interval);
+  // One queued as the delay ended runs on the way out.
+  thread->DeliverKernelAPCs();
 
   if (alertable && result == X_STATUS_USER_APC) {
     thread->DeliverAPCs();
@@ -392,6 +405,7 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
 }
 
 u32 NtYieldExecution_entry() {
+  DeliverKernelApcsAtShim();
   rex::thread::MaybeYield();
   return X_STATUS_SUCCESS;
 }
@@ -803,24 +817,21 @@ u32 NtSetTimerEx_entry(u32 timer_handle, mapped_u64 due_time_ptr,
   return result;
 }
 
-u32 NtCancelTimer_entry(u32 timer_handle, mapped_u32 current_state_ptr) {
-  X_STATUS result = X_STATUS_SUCCESS;
-
+u32 NtCancelTimer_entry(u32 timer_handle, mapped_u8 current_state_ptr) {
   auto timer = REX_KERNEL_OBJECTS()->LookupObject<XTimer>(timer_handle);
-  if (timer) {
-    result = timer->Cancel();
-  } else {
-    result = X_STATUS_INVALID_HANDLE;
+  if (!timer) {
+    return X_STATUS_INVALID_HANDLE;
   }
+  // The BOOLEAN signal state, which cancelling leaves as it is.
   if (current_state_ptr) {
-    *current_state_ptr = 0;
+    *current_state_ptr = timer->IsSignaled() ? 1 : 0;
   }
-
-  return result;
+  return timer->Cancel();
 }
 
 uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_t processor_mode,
                                  uint32_t alertable, uint64_t* timeout_ptr) {
+  DeliverKernelApcsAtShim();
   auto object = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
 
   if (!object) {
@@ -855,6 +866,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
 u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
                                   mapped_u64 timeout_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
+  DeliverKernelApcsAtShim();
 
   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
   if (object) {
@@ -874,6 +886,7 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
                                    u32 wait_reason, u32 processor_mode, u32 alertable,
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
   assert_true(wait_type <= 1);
+  DeliverKernelApcsAtShim();
 
   std::vector<object_ref<XObject>> objects;
   for (uint32_t n = 0; n < count; n++) {
@@ -900,6 +913,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
                                       uint32_t wait_type, uint32_t wait_mode, uint32_t alertable,
                                       uint64_t* timeout_ptr) {
   assert_true(wait_type <= 1);
+  DeliverKernelApcsAtShim();
 
   std::vector<object_ref<XObject>> objects;
   for (uint32_t n = 0; n < count; n++) {
@@ -929,6 +943,7 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
 u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 wait_mode,
                                            u32 alertable, mapped_u64 timeout_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
+  DeliverKernelApcsAtShim();
 
   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);
   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
@@ -1087,7 +1102,10 @@ void KeEnterCriticalRegion_entry() {
 }
 
 void KeLeaveCriticalRegion_entry() {
-  XThread::GetCurrentThread()->LeaveCriticalRegion();
+  XThread* thread = XThread::GetCurrentThread();
+  thread->LeaveCriticalRegion();
+  // Kernel APCs the region held off run as it ends (edge 7598c1779).
+  thread->DeliverKernelAPCs();
 }
 
 u32 KeRaiseIrqlToDpcLevel_entry() {
@@ -1148,8 +1166,18 @@ void KeInitializeApc_entry(ppc_ptr_t<XAPC> apc, mapped_void thread_ptr, mapped_v
 
 u32 KeInsertQueueApc_entry(ppc_ptr_t<XAPC> apc, mapped_void arg1, mapped_void arg2,
                            u32 priority_increment) {
-  return xeKeInsertQueueApc(apc.host_address(), arg1.guest_address(), arg2.guest_address(),
-                            priority_increment, current_ppc_context());
+  XThread* current_thread = XThread::IsInThread() ? XThread::GetCurrentThread() : nullptr;
+  const bool kernel_apc_to_self = current_thread && apc->apc_mode == 0 &&
+                                  apc->thread_ptr == current_thread->guest_object();
+  uint32_t result = xeKeInsertQueueApc(apc.host_address(), arg1.guest_address(),
+                                       arg2.guest_address(), priority_increment,
+                                       current_ppc_context());
+  // Lowering IRQL as the APC lock is released runs a kernel APC queued to this
+  // thread (edge 96f98e1b1).
+  if (result && kernel_apc_to_self) {
+    current_thread->DeliverKernelAPCs();
+  }
+  return result;
 }
 
 u32 KeRemoveQueueApc_entry(ppc_ptr_t<XAPC> apc) {
@@ -1181,26 +1209,89 @@ void KeInitializeDpc_entry(ppc_ptr_t<XDPC> dpc, mapped_void routine, mapped_void
   dpc->Initialize(routine.guest_address(), context.guest_address());
 }
 
+// DPCs queued while a DPC routine runs, as {guest thread id, DPC}. They run
+// after it returns, before the CPU leaves DISPATCH_LEVEL, as the console drains
+// its DPC queue, instead of nesting (xenia-edge 0e7e29aae). Guarded with the
+// global lock.
+static std::vector<std::pair<uint32_t, uint32_t>> deferred_dpcs;
+
+static bool IsDeferredDpc(uint32_t dpc_ptr) {
+  return std::find_if(deferred_dpcs.begin(), deferred_dpcs.end(), [dpc_ptr](const auto& deferred) {
+           return deferred.second == dpc_ptr;
+         }) != deferred_dpcs.end();
+}
+
+// Runs a DPC routine on the calling thread. One targeted at another processor
+// (desired_cpu_number n + 1 runs on CPU n) sees that processor's number.
+static void RunDpc(XThread* thread, uint32_t dpc_ptr) {
+  auto dpc = REX_KERNEL_MEMORY()->TranslateVirtual<XDPC*>(dpc_ptr);
+  const uint32_t routine = dpc->routine;
+  if (!routine) {
+    return;
+  }
+  auto* ctx = thread->thread_state()->context();
+  auto kpcr = REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
+  const uint8_t own_cpu = kpcr->prcb_data.current_cpu;
+  if (dpc->desired_cpu_number && dpc->desired_cpu_number <= 6) {
+    kpcr->prcb_data.current_cpu = uint8_t(dpc->desired_cpu_number - 1);
+  }
+  uint64_t args[] = {dpc_ptr, uint32_t(dpc->context), uint32_t(dpc->arg1), uint32_t(dpc->arg2)};
+  REX_KERNEL_STATE()->function_dispatcher()->Execute(thread->thread_state(), routine, args,
+                                                     rex::countof(args));
+  kpcr->prcb_data.current_cpu = own_cpu;
+}
+
+// A DPC runs at once on the calling thread at DISPATCH_LEVEL, standing in for
+// the console's DPC interrupt on this processor (canary inline dispatch; edge
+// cdb88d0b3, 0e7e29aae). It is not linked into a list: it has run when this
+// returns, unless a DPC routine queued it, then it waits for that one.
 u32 KeInsertQueueDpc_entry(ppc_ptr_t<XDPC> dpc, u32 arg1, u32 arg2) {
-  assert_always("DPC does not dispatch yet; going to hang!");
-
-  uint32_t list_entry_ptr = dpc.guest_address() + 4;
-
-  // Lock dispatcher.
-  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
-  auto dpc_list = REX_KERNEL_STATE()->dpc_list();
-
-  // If already in a queue, abort.
-  if (dpc_list->IsQueued(list_entry_ptr)) {
-    return 0;
+  const uint32_t dpc_ptr = dpc.guest_address();
+  XThread* thread = XThread::IsInThread() ? XThread::GetCurrentThread() : nullptr;
+  {
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    // A DPC still waiting to run is not queued again.
+    if (IsDeferredDpc(dpc_ptr)) {
+      return 0;
+    }
+    dpc->arg1 = (uint32_t)arg1;
+    dpc->arg2 = (uint32_t)arg2;
+    if (!dpc->routine || !thread) {
+      return 1;
+    }
+    auto* ctx = thread->thread_state()->context();
+    auto kpcr =
+        REX_KERNEL_MEMORY()->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(ctx->r13.u64));
+    // Inside a DPC routine it waits for the running one to return. A routine
+    // that queues itself again would otherwise recurse until the host stack
+    // overflows.
+    if (kpcr->prcb_data.dpc_active) {
+      deferred_dpcs.emplace_back(thread->thread_id(), dpc_ptr);
+      return 1;
+    }
   }
 
-  // Prep DPC.
-  dpc->arg1 = (uint32_t)arg1;
-  dpc->arg2 = (uint32_t)arg2;
-
-  dpc_list->Insert(list_entry_ptr);
-
+  // Guest code runs without the global lock.
+  auto dpc_scope = REX_KERNEL_STATE()->BeginDPCImpersonation();
+  RunDpc(thread, dpc_ptr);
+  // DPCs the routine queued run before the CPU leaves DISPATCH_LEVEL.
+  while (true) {
+    uint32_t deferred_ptr;
+    {
+      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+      auto it = std::find_if(deferred_dpcs.begin(), deferred_dpcs.end(),
+                             [thread](const auto& deferred) {
+                               return deferred.first == thread->thread_id();
+                             });
+      if (it == deferred_dpcs.end()) {
+        break;
+      }
+      deferred_ptr = it->second;
+      deferred_dpcs.erase(it);
+    }
+    RunDpc(thread, deferred_ptr);
+  }
+  REX_KERNEL_STATE()->EndDPCImpersonation(dpc_scope);
   return 1;
 }
 
@@ -1214,6 +1305,14 @@ u32 KeRemoveQueueDpc_entry(ppc_ptr_t<XDPC> dpc) {
   if (dpc_list->IsQueued(list_entry_ptr)) {
     dpc_list->Remove(list_entry_ptr);
     result = true;
+  }
+  // One waiting for the running DPC is taken back.
+  for (auto it = deferred_dpcs.begin(); it != deferred_dpcs.end(); ++it) {
+    if (it->second == dpc.guest_address()) {
+      deferred_dpcs.erase(it);
+      result = true;
+      break;
+    }
   }
 
   return result ? 1 : 0;

@@ -211,3 +211,44 @@ TEST_CASE("Signed view is bound for signed bindings and fully signed textures",
   CHECK_FALSE(texture_util::IsSignedViewBound(kMixed, false));
   CHECK(texture_util::IsSignedViewBound(kMixed, true));
 }
+
+// xenia-canary 832265867: k_8_A and k_8_B are aliases of k_8, and k_8_8_8_8_A of k_8_8_8_8
+// (hardware tests of fetch, resolve and memexport).
+TEST_CASE("8 bit alias formats share their base format", "[graphics][texture]") {
+  CHECK(GetBaseFormat(xenos::TextureFormat::k_8_A) == xenos::TextureFormat::k_8);
+  CHECK(GetBaseFormat(xenos::TextureFormat::k_8_B) == xenos::TextureFormat::k_8);
+  CHECK(GetBaseFormat(xenos::TextureFormat::k_8_8_8_8_A) == xenos::TextureFormat::k_8_8_8_8);
+  CHECK(GetBaseFormat(xenos::TextureFormat::k_8) == xenos::TextureFormat::k_8);
+}
+
+// xenia-canary 344fca758: when level 0 is packed, the whole tail is at base_address even if the
+// fetch constant has a separate nonzero mip_address.
+TEST_CASE("Level 0 packed tail ignores a nonzero mip address", "[graphics][texture]") {
+  xenos::xe_gpu_texture_fetch_t fetch = {};
+  fetch.type = xenos::FetchConstantType::kTexture;
+  fetch.dimension = xenos::DataDimension::k2DOrStacked;
+  fetch.size_2d.width = 16 - 1;
+  fetch.size_2d.height = 16 - 1;
+  fetch.tiled = 1;
+  fetch.packed_mips = 1;
+  fetch.base_address = 0x100;
+  fetch.mip_address = 0x200;
+  fetch.mip_max_level = 4;
+  uint32_t base_page, mip_page, mip_min_level, mip_max_level;
+  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, &base_page,
+                                                 &mip_page, &mip_min_level, &mip_max_level);
+  CHECK(base_page == 0x100);
+  CHECK(mip_page == 0x100);
+}
+
+// xenia-canary 344fca758: a 2x1 texture is packed along X like a square one (hardware tests);
+// 4x1 is still wide.
+TEST_CASE("2x1 packed mips use the square layout", "[graphics][texture]") {
+  uint32_t x, y, z;
+  REQUIRE(texture_util::GetPackedMipOffset(2, 1, 1, xenos::TextureFormat::k_8_8_8_8, 0, x, y, z));
+  CHECK(x == 16);
+  CHECK(y == 0);
+  REQUIRE(texture_util::GetPackedMipOffset(4, 1, 1, xenos::TextureFormat::k_8_8_8_8, 0, x, y, z));
+  CHECK(x == 0);
+  CHECK(y == 16);
+}

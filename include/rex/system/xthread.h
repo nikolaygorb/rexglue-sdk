@@ -350,10 +350,24 @@ class XThread : public XObject {
   void EnterCriticalRegion();
   void LeaveCriticalRegion();
 
+  // Runs the queued user APCs (outside a critical region).
   void DeliverAPCs();
+  // Runs the queued kernel APCs if this thread can now: below APC_LEVEL,
+  // outside a critical region and not inside another kernel APC, as the console
+  // does at the next wait, delay or yield, alertable or not. Returns true if
+  // any ran.
+  bool DeliverKernelAPCs();
+  bool HasDeliverableKernelApc();
+  bool HasPendingUserApc();
+  // An alertable wait was woken by a queued APC: runs the kernel APCs it may
+  // and returns true if a user APC is pending, which ends the wait; otherwise
+  // the wait goes on.
+  bool OnAlertableWaitWoken();
   void LockApc();
   void UnlockApc(bool queue_delivery);
-  void EnqueueApc(uint32_t normal_routine, uint32_t normal_context, uint32_t arg1, uint32_t arg2);
+  // |apc_mode| 1 queues a user APC, 0 a kernel APC.
+  void EnqueueApc(uint32_t normal_routine, uint32_t normal_context, uint32_t arg1, uint32_t arg2,
+                  uint32_t apc_mode = 1);
 
   int32_t priority() const { return priority_; }
   int32_t QueryPriority();
@@ -399,6 +413,9 @@ class XThread : public XObject {
   void InitializeGuestObject();
 
   void RundownAPCs();
+  // Runs the queued APCs of |mode| (1 = user, 0 = kernel) outside a critical
+  // region. Returns true if any ran.
+  bool DeliverApcList(uint32_t mode);
 
   rex::thread::WaitHandle* GetWaitHandle() override { return thread_.get(); }
 

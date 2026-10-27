@@ -46,6 +46,10 @@ class InputDriver {
 
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
 
+  // Drops queued keystrokes made while UI held the input so the title doesn't
+  // get them once it closes. Releases of presses the title received are kept.
+  virtual void DiscardKeystrokes() {}
+
   void set_is_active_callback(std::function<bool()> is_active_callback) {
     is_active_callback_ = is_active_callback;
   }

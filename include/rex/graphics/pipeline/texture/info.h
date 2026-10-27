@@ -20,8 +20,13 @@
 namespace rex::graphics {
 
 inline xenos::TextureFormat GetBaseFormat(xenos::TextureFormat texture_format) {
-  // These formats are used for resampling textures / gamma control.
+  // These formats are used for resampling, aliasing, and gamma control.
   switch (texture_format) {
+    case xenos::TextureFormat::k_8_A:
+    case xenos::TextureFormat::k_8_B:
+      return xenos::TextureFormat::k_8;
+    case xenos::TextureFormat::k_8_8_8_8_A:
+      return xenos::TextureFormat::k_8_8_8_8;
     case xenos::TextureFormat::k_16_EXPAND:
       return xenos::TextureFormat::k_16_FLOAT;
     case xenos::TextureFormat::k_16_16_EXPAND:

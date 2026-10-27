@@ -17,7 +17,8 @@
 
 namespace rex::system {
 
-XMutant::XMutant(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
+XMutant::XMutant(KernelState* kernel_state, bool host_object)
+    : XObject(kernel_state, kObjectType, host_object) {}
 
 XMutant::XMutant() : XObject(kObjectType) {}
 

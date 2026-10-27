@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/ob.h>
 #include <rex/kernel/xboxkrnl/private.h>
@@ -53,9 +55,9 @@ static X_STATUS ResolveByteOffset(XFile* file, const mapped_u64& byte_offset_ptr
                                   uint64_t* out_byte_offset) {
   *out_byte_offset = uint64_t(-1);
   if (!byte_offset_ptr) {
-    // TODO: edge fails an async handle without an offset with
-    // X_STATUS_INVALID_PARAMETER (edge 90f47ed85); it still uses the position here.
-    return X_STATUS_SUCCESS;
+    // Without a byte offset only a synchronous handle uses its file position;
+    // an asynchronous one fails, as on NT (xenia-edge 90f47ed85).
+    return file->is_synchronous() ? X_STATUS_SUCCESS : X_STATUS_INVALID_PARAMETER;
   }
   int64_t byte_offset = int64_t(static_cast<uint64_t>(*byte_offset_ptr));
   if (byte_offset == -2 && file->is_synchronous()) {
@@ -128,11 +130,18 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
   return true;
 }
 
-u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+// IoCreateFile option that opens the directory holding the path's last
+// component.
+constexpr uint32_t kIoOpenTargetDirectory = 0x4;
+
+// NtCreateFile is IoCreateFile without options. Option 4 opens the directory
+// holding the path's last component and reports in the status block whether
+// that component exists, which a rename uses to open its target.
+u32 IoCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
                        ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
                        u32 file_attributes, u32 share_access, u32 creation_disposition,
-                       u32 create_options) {
+                       u32 create_options, u32 options) {
   // note used. maybe later
   // uint64_t allocation_size = 0;  // is this correct???
   // if (allocation_size_ptr) {
@@ -182,13 +191,30 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   // Attempt open (or create).
   rex::filesystem::File* vfs_file;
   rex::filesystem::FileAction file_action;
-  X_STATUS result = REX_KERNEL_FS()->OpenFile(
-      root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
-      desired_access, (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
-      (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file, &file_action);
+  X_STATUS result;
+  if (options & kIoOpenTargetDirectory) {
+    result = REX_KERNEL_FS()->OpenFile(root_entry, rex::string::utf8_find_base_guest_path(target_path),
+                                       rex::filesystem::FileDisposition::kOpen, desired_access,
+                                       true, false, &vfs_file, &file_action);
+    if (result == X_STATUS_OBJECT_NAME_NOT_FOUND) {
+      result = X_STATUS_OBJECT_PATH_NOT_FOUND;
+    }
+    if (XSUCCEEDED(result)) {
+      file_action =
+          vfs_file->entry()->GetChild(rex::string::utf8_find_name_from_guest_path(target_path))
+              ? rex::filesystem::FileAction::kExists
+              : rex::filesystem::FileAction::kDoesNotExist;
+    }
+  } else {
+    result = REX_KERNEL_FS()->OpenFile(
+        root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
+        desired_access, (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+        (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file, &file_action);
+  }
   object_ref<XFile> file = nullptr;
 
-  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+  // A failed open leaves the handle and the information 0.
+  X_HANDLE handle = 0;
   if (XSUCCEEDED(result)) {
     // If true, desired_access SYNCHRONIZE flag must be set.
     bool synchronous = (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_ALERT) ||
@@ -203,7 +229,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   if (io_status_block) {
     io_status_block->status = result;
-    io_status_block->information = (uint32_t)file_action;
+    io_status_block->information = XSUCCEEDED(result) ? uint32_t(file_action) : 0;
   }
 
   *handle_out = handle;
@@ -213,6 +239,16 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
   }
   return result;
+}
+
+u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+                       ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
+                       ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
+                       u32 file_attributes, u32 share_access, u32 creation_disposition,
+                       u32 create_options) {
+  return IoCreateFile_entry(handle_out, desired_access, object_attrs, io_status_block,
+                            allocation_size_ptr, file_attributes, share_access,
+                            creation_disposition, create_options, 0);
 }
 
 u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
@@ -225,11 +261,83 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
                             open_options);
 }
 
+// The console queues an I/O completion routine as a kernel APC, which runs
+// before the service returns on an inline completion. Bit 0 asks for a user APC
+// instead, as XAPI's ReadFileEx completion trampoline does (edge 7598c1779).
+static void QueueIoApc(XThread* thread, uint32_t apc_routine, uint32_t apc_context,
+                       uint32_t status_block_address) {
+  thread->EnqueueApc(apc_routine & ~1u, apc_context, status_block_address, 0, apc_routine & 1);
+}
+
+// A kernel APC the completion queued runs before the service returns.
+static void DeliverIoKernelApcs() {
+  XThread::GetCurrentThread()->DeliverKernelAPCs();
+}
+
+// Low bit only picks the APC mode, see QueueIoApc.
+static bool QueuesApc(uint32_t apc_routine, uint32_t apc_context) {
+  return (apc_routine & ~1u) && apc_context;
+}
+
+// Status last, so a caller polling it for completion reads a valid count.
+static void WriteIoStatus(X_IO_STATUS_BLOCK* status_block, X_STATUS status, uint32_t information) {
+  status_block->information = information;
+  std::atomic_thread_fence(std::memory_order_release);
+  status_block->status = status;
+}
+
+// A read on an asynchronous handle that does not complete inline is told
+// STATUS_PENDING and finishes on the file I/O worker, which writes the status
+// block, queues the APC and signals the event and completion ports (xenia-edge
+// c6cc76167, e60b90ac0, beb3230fe, af615b322). A failure the caller was not told
+// PENDING for completes nothing.
+template <typename ReadFn>
+static X_STATUS CompleteRead(object_ref<XFile> file, object_ref<XEvent> ev, uint32_t length,
+                             uint64_t byte_offset, uint32_t apc_routine, uint32_t apc_context,
+                             X_IO_STATUS_BLOCK* status_block, uint32_t status_block_address,
+                             ReadFn read) {
+  auto thread = retain_object(XThread::GetCurrentThread());
+  auto complete = [file, ev, thread, apc_routine, apc_context, status_block,
+                   status_block_address, read](bool posted) -> X_STATUS {
+    uint32_t bytes_read = 0;
+    X_STATUS status = read(file.get(), &bytes_read);
+    if (!posted && XFAILED(status)) {
+      return status;
+    }
+    if (status_block) {
+      WriteIoStatus(status_block, status, bytes_read);
+    }
+    // A caller told PENDING always gets its APC, as on NT.
+    if (QueuesApc(apc_routine, apc_context)) {
+      QueueIoApc(thread.get(), apc_routine, apc_context, status_block_address);
+    }
+    file->NotifyCompletion(status, bytes_read, apc_context);
+    if (ev) {
+      ev->Set(0, false);
+    }
+    return status;
+  };
+  if (file->CompletesAsync(length, byte_offset)) {
+    if (ev) {
+      ev->Reset();
+    }
+    file->BeginAsyncIo();
+    if (status_block) {
+      status_block->status = X_STATUS_PENDING;
+      status_block->information = 0;
+    }
+    REX_KERNEL_STATE()->PostIo([complete]() { complete(true); });
+    return X_STATUS_PENDING;
+  }
+  X_STATUS result = complete(false);
+  DeliverIoKernelApcs();
+  return result;
+}
+
 u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
                      mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
   uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
-  const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
   REXKRNL_IMPORT_TRACE(
       "NtReadFile",
       "handle={:#x} event={:#x} apc={:#x} apc_ctx={:#x} iosb={:#x} buf={:#x} len={:#x} offset={}",
@@ -237,10 +345,7 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       apc_context.guest_address(), io_status_block.guest_address(), buffer.guest_address(),
       (uint32_t)buffer_length, byte_offset_ptr ? (int64_t)byte_offset : -1);
   X_STATUS result = X_STATUS_SUCCESS;
-  bool apc_queued = false;
 
-  bool signal_event = false;
-  bool pending = false;
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
   if (event_handle && !ev) {
     result = X_STATUS_INVALID_HANDLE;
@@ -255,86 +360,21 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
   }
 
   if (XSUCCEEDED(result)) {
-    if (true || file->is_synchronous()) {
-      // Synchronous.
-      uint32_t bytes_read = 0;
-      result = file->Read(buffer.guest_address(), buffer_length, file_offset, &bytes_read,
-                          apc_context.guest_address(), true, &pending);
-
-      if (io_status_block) {
-        io_status_block->status = result;
-        io_status_block->information = bytes_read;
-      }
-
-      // Queue the APC callback. It must be delivered via the APC mechanism even
-      // though were are completing immediately.
-      // Low bit probably means do not queue to IO ports.
-      if ((uint32_t)apc_routine_ptr & ~1) {
-        if (apc_context && result == X_STATUS_SUCCESS) {
-          auto thread = XThread::GetCurrentThread();
-          uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr) & ~1u;
-          uint32_t apc_ctx = apc_context.guest_address();
-          uint32_t apc_arg1 = io_status_block.guest_address();
-          REXKRNL_IMPORT_TRACE("NtReadFile",
-                               "queue_apc thid={} normal={:#x} ctx={:#x} arg1={:#x} arg2=0",
-                               thread ? thread->thread_id() : 0, apc_routine, apc_ctx, apc_arg1);
-          thread->EnqueueApc(apc_routine, apc_ctx, apc_arg1, 0);
-          apc_queued = true;
-        } else {
-          REXKRNL_IMPORT_TRACE("NtReadFile", "skip_apc_queue (apc_ctx={:#x}, status={:#x})",
-                               apc_context.guest_address(), result);
-        }
-      }
-
-      // Mark that we should signal the event now. We do this after
-      // we have written the info out.
-      signal_event = true;
-    } else {
-      // TODO(benvanik): async.
-
-      // X_STATUS_PENDING if not returning immediately.
-      // XFile is waitable and signalled after each async req completes.
-      // reset the input event (->Reset())
-      /*xeNtReadFileState* call_state = new xeNtReadFileState();
-      XAsyncRequest* request = new XAsyncRequest(
-      state, file,
-      (XAsyncRequest::CompletionCallback)xeNtReadFileCompleted,
-      call_state);*/
-      // result = file->Read(buffer.guest_address(), buffer_length, byte_offset,
-      //                     request);
-      if (io_status_block) {
-        io_status_block->status = X_STATUS_PENDING;
-        io_status_block->information = 0;
-      }
-
-      result = X_STATUS_PENDING;
-    }
+    const uint32_t buffer_address = buffer.guest_address();
+    const uint32_t length = buffer_length;
+    const uint32_t apc_context_address = apc_context.guest_address();
+    result = CompleteRead(
+        file, ev, length, file_offset, static_cast<uint32_t>(apc_routine_ptr),
+        apc_context_address, io_status_block.host_address(), io_status_block.guest_address(),
+        [buffer_address, length, file_offset, apc_context_address](XFile* read_file,
+                                                                   uint32_t* bytes_read) {
+          return read_file->Read(buffer_address, length, file_offset, bytes_read,
+                                 apc_context_address, false);
+        });
   }
 
-  if (XFAILED(result) && io_status_block) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
-  }
-
-  if (ev && signal_event) {
-    ev->Set(0, false);
-  }
-
-  // Log detailed completion info for debugging async IO issues
-  if (file) {
-    REXKRNL_IMPORT_RESULT(
-        "NtReadFile",
-        "{:#x} (sync={}, iosb_status={:#x}, iosb_info={}, ev_signaled={}, apc_requested={}, "
-        "apc_queued={})",
-        result, file->is_synchronous(),
-        io_status_block ? (uint32_t)io_status_block->status : 0xDEAD,
-        io_status_block ? (uint32_t)io_status_block->information : 0, ev && signal_event,
-        apc_requested, apc_queued);
-  } else {
-    REXKRNL_IMPORT_RESULT("NtReadFile", "{:#x} (apc_requested={}, apc_queued={})", result,
-                          apc_requested, apc_queued);
-  }
-  return pending ? X_STATUS_PENDING : result;
+  REXKRNL_IMPORT_RESULT("NtReadFile", "{:#x}", result);
+  return result;
 }
 
 u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
@@ -342,8 +382,6 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
                             mapped_u32 segment_array, u32 length, mapped_u64 byte_offset_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
 
-  bool signal_event = false;
-  bool pending = false;
   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
   if (event_handle && !ev) {
     result = X_STATUS_INVALID_HANDLE;
@@ -358,73 +396,27 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
   }
 
   if (XSUCCEEDED(result)) {
-    if (true || file->is_synchronous()) {
-      // Synchronous.
-      uint32_t bytes_read = 0;
-      result = file->ReadScatter(segment_array.guest_address(), length, file_offset, &bytes_read,
-                                 apc_context.guest_address(), &pending);
-      if (io_status_block) {
-        io_status_block->status = result;
-        io_status_block->information = bytes_read;
-      }
-
-      // Queue the APC callback. It must be delivered via the APC mechanism even
-      // though were are completing immediately.
-      // Low bit probably means do not queue to IO ports.
-      if ((uint32_t)apc_routine_ptr & ~1) {
-        // Only for a read that succeeded, as NtReadFile (the handle is always
-        // completed synchronously here, never told PENDING).
-        if (apc_context && result == X_STATUS_SUCCESS) {
-          auto thread = XThread::GetCurrentThread();
-          thread->EnqueueApc(static_cast<uint32_t>(apc_routine_ptr) & ~1u,
-                             apc_context.guest_address(), io_status_block.guest_address(), 0);
-        }
-      }
-
-      // Mark that we should signal the event now. We do this after
-      // we have written the info out.
-      signal_event = true;
-    } else {
-      // TODO(benvanik): async.
-
-      // TODO: On Windows it might be worth trying to use Win32 ReadFileScatter
-      // here instead of handling it ourselves
-
-      // X_STATUS_PENDING if not returning immediately.
-      // XFile is waitable and signalled after each async req completes.
-      // reset the input event (->Reset())
-      /*xeNtReadFileState* call_state = new xeNtReadFileState();
-      XAsyncRequest* request = new XAsyncRequest(
-      state, file,
-      (XAsyncRequest::CompletionCallback)xeNtReadFileCompleted,
-      call_state);*/
-      // result = file->Read(buffer.guest_address(), buffer_length, byte_offset,
-      //                     request);
-      if (io_status_block) {
-        io_status_block->status = X_STATUS_PENDING;
-        io_status_block->information = 0;
-      }
-
-      result = X_STATUS_PENDING;
-    }
+    const uint32_t segments_address = segment_array.guest_address();
+    const uint32_t read_length = length;
+    const uint32_t apc_context_address = apc_context.guest_address();
+    result = CompleteRead(
+        file, ev, read_length, file_offset, static_cast<uint32_t>(apc_routine_ptr),
+        apc_context_address, io_status_block.host_address(), io_status_block.guest_address(),
+        [segments_address, read_length, file_offset, apc_context_address](XFile* read_file,
+                                                                         uint32_t* bytes_read) {
+          return read_file->ReadScatter(segments_address, read_length, file_offset, bytes_read,
+                                        apc_context_address, nullptr, false);
+        });
   }
 
-  if (XFAILED(result) && io_status_block && !signal_event) {
-    io_status_block->status = result;
-    io_status_block->information = 0;
-  }
-
-  if (ev && signal_event) {
-    ev->Set(0, false);
-  }
-
-  return pending ? X_STATUS_PENDING : result;
+  return result;
 }
 
 u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped_void apc_context,
                       ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_void buffer,
                       u32 buffer_length, mapped_u64 byte_offset_ptr) {
   X_STATUS result = X_STATUS_SUCCESS;
+  bool apc_queued = false;
 
   // Grab event to signal.
   bool signal_event = false;
@@ -462,9 +454,9 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
       // Low bit probably means do not queue to IO ports.
       if ((uint32_t)apc_routine & ~1) {
         if (apc_context) {
-          auto thread = XThread::GetCurrentThread();
-          thread->EnqueueApc(static_cast<uint32_t>(apc_routine) & ~1u, apc_context.guest_address(),
-                             io_status_block.guest_address(), 0);
+          QueueIoApc(XThread::GetCurrentThread(), apc_routine, apc_context.guest_address(),
+                     io_status_block.guest_address());
+          apc_queued = true;
         }
       }
 
@@ -491,6 +483,9 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
     ev->Set(0, false);
   }
 
+  if (apc_queued) {
+    DeliverIoKernelApcs();
+  }
   return pending ? X_STATUS_PENDING : result;
 }
 
@@ -792,15 +787,22 @@ u32 IoSynchronousDeviceIoControlRequest_entry(u32 ioctl, mapped_void device_obje
   return X_STATUS_SUCCESS;
 }
 
-u32 StfsCreateDevice_entry(mapped_void device_object, u32 flags, mapped_u32 out_device) {
+// Titles mount their utility drive (an STFS volume over a cache partition)
+// through these. No such volume is made: both check their arguments and
+// succeed, and the caller's device object stays as it was.
+u32 StfsCreateDevice_entry(mapped_void params, u32 params_size) {
+  if (params_size != 0x58) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
   REXKRNL_WARN("StfsCreateDevice - stub");
-  // if (out_device) *out_device = 0;
   return X_STATUS_SUCCESS;
 }
 
-u32 StfsControlDevice_entry(mapped_void device_object, u32 ioctl, mapped_void input_buffer,
-                            u32 input_length, mapped_void output_buffer, u32 output_length) {
-  REXKRNL_WARN("StfsControlDevice({:#x}) - stub", (uint32_t)ioctl);
+u32 StfsControlDevice_entry(mapped_void device, u32 control_code, mapped_void buffer) {
+  if (control_code > 4) {
+    return X_STATUS_INVALID_DEVICE_REQUEST;
+  }
+  REXKRNL_WARN("StfsControlDevice({:#x}) - stub", (uint32_t)control_code);
   return X_STATUS_SUCCESS;
 }
 
@@ -818,6 +820,7 @@ u32 NtCancelIoFile_entry(u32 handle) {
 
 }  // namespace rex::kernel::xboxkrnl
 
+REX_EXPORT(__imp__IoCreateFile, rex::kernel::xboxkrnl::IoCreateFile_entry)
 REX_EXPORT(__imp__NtCreateFile, rex::kernel::xboxkrnl::NtCreateFile_entry)
 REX_EXPORT(__imp__NtOpenFile, rex::kernel::xboxkrnl::NtOpenFile_entry)
 REX_EXPORT(__imp__NtReadFile, rex::kernel::xboxkrnl::NtReadFile_entry)
@@ -853,7 +856,6 @@ REX_EXPORT_STUB(__imp__IoBuildSynchronousFsdRequest);
 REX_EXPORT_STUB(__imp__IoCallDriver);
 REX_EXPORT_STUB(__imp__IoCheckShareAccess);
 REX_EXPORT_STUB(__imp__IoCompleteRequest);
-REX_EXPORT_STUB(__imp__IoCreateFile);
 REX_EXPORT_STUB(__imp__IoDismountVolume);
 REX_EXPORT_STUB(__imp__IoFreeIrp);
 REX_EXPORT_STUB(__imp__IoInitializeIrp);

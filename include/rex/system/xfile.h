@@ -97,7 +97,18 @@ class XFile : public XObject {
 
   X_STATUS ReadScatter(uint32_t segments_guest_address, uint32_t length, uint64_t byte_offset,
                        uint32_t* out_bytes_read, uint32_t apc_context,
-                       bool* out_pending = nullptr);
+                       bool* out_pending = nullptr, bool notify_completion = true);
+
+  // Whether a read on this handle is told STATUS_PENDING and completes on the
+  // I/O worker: on an asynchronous handle, every read of a driver that queues
+  // all reads (STFS, raw partitions); otherwise an unbuffered read of some
+  // bytes before EOF (xenia-edge c6cc76167, af615b322).
+  bool CompletesAsync(uint32_t length, uint64_t byte_offset) const;
+  // A posted request clears the handle's wait state when it is issued, so a
+  // wait cannot return on an earlier completion.
+  void BeginAsyncIo() { async_event_->Reset(); }
+  // Signals the completion ports and the handle's wait state.
+  void NotifyCompletion(X_STATUS status, uint32_t num_bytes, uint32_t apc_context);
 
   // Write() appends when given this offset.
   static constexpr uint64_t kEndOfFile = uint64_t(1) << 63;

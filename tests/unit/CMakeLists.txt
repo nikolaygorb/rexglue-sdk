@@ -5,6 +5,7 @@ add_executable(unit_tests
     memory/heap_allocation_test.cpp
     memory/unwatched_invalidation_test.cpp
     memory/read_watch_test.cpp
+    memory/range_access_test.cpp
     kernel/object_table_test.cpp
     kernel/bignum_rsa_test.cpp
     kernel/xecrypt_md5_test.cpp
@@ -67,6 +68,7 @@ add_executable(unit_tests
     graphics/pipeline_priority_test.cpp
     graphics/shader_storage_test.cpp
     graphics/resolve_clear_value_test.cpp
+    graphics/edram_tile_count_test.cpp
     graphics/gamma_midpoint_test.cpp
     graphics/zpd_report_test.cpp
     graphics/gpu_completion_timeline_test.cpp
@@ -77,7 +79,9 @@ add_executable(unit_tests
     graphics/texture_swizzle_swap_test.cpp
     graphics/pipeline_wait_test.cpp
     graphics/render_target_trim_test.cpp
+    graphics/memory_placement_test.cpp
     graphics/gpu_time_test.cpp
+    graphics/shader_translation_memo_test.cpp
     graphics/display_transfer_test.cpp
     ui/presenter_paint_config_test.cpp
     ui/keybind_names_test.cpp

@@ -25,8 +25,10 @@
 
 namespace rex::system {
 
+// Host object: the loader owns module handles, not the title's numbering
+// (xenia-edge 672bc8b81).
 UserModule::UserModule(KernelState* kernel_state)
-    : XModule(kernel_state, ModuleType::kUserModule) {}
+    : XModule(kernel_state, ModuleType::kUserModule, true) {}
 
 UserModule::~UserModule() {
   Unload();

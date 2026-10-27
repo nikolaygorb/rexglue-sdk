@@ -1071,6 +1071,9 @@ class Shader {
 
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;
+  // The translation GetOrCreateTranslation returned last, and for which modification.
+  Translation* memo_translation_ = nullptr;
+  uint64_t memo_modification_ = 0;
 
   std::atomic<uint32_t> ucode_storage_index_{UINT32_MAX};
 

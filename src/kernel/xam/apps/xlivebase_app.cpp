@@ -77,6 +77,19 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
+    case 0x0005800E: {
+      // XUserMuteListQuery. The buffer ends in the result code and
+      // buffer_length holds the address of the BOOL result. No mute list is
+      // kept so nobody is muted. Gears of War 2 asks this for every player when
+      // a System Link Horde match starts and crashed on the failure.
+      if (buffer_ptr) {
+        memory::store_and_swap<uint32_t>(buffer + 0x10, X_ERROR_SUCCESS);
+      }
+      if (buffer_length) {
+        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(buffer_length), 0);
+      }
+      return X_E_SUCCESS;
+    }
   }
   REXKRNL_ERROR(
       "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "

@@ -387,6 +387,54 @@ TEST_CASE("cvar precedence holds for flags registered after startup", "[cvar]") 
   rex::cvar::testing::ResetAllForTesting();
 }
 
+TEST_CASE("cvar runtime value set before registration becomes the default", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto config_path = std::filesystem::temp_directory_path() / "test_late_runtime.toml";
+  {
+    std::ofstream file(config_path);
+    file << "test_late_config_wins = \"from config\"\n";
+  }
+  rex::cvar::LoadConfig(config_path);
+  char argv0[] = "cvar_test";
+  char* argv[] = {argv0};
+  rex::cvar::Init(1, argv);
+
+  CHECK(rex::cvar::GetFlagSource("test_late_config_wins") == rex::cvar::Source::kConfig);
+  CHECK(rex::cvar::GetFlagSource("test_late_runtime") == rex::cvar::Source::kDefault);
+  CHECK(rex::cvar::SetFlagByName("test_late_runtime", "from app"));
+  CHECK(rex::cvar::SetFlagByName("test_late_config_wins", "from app"));
+
+  auto make_flag = [](const char* name, std::string& value) {
+    return rex::cvar::FlagEntry{
+        .name = name,
+        .type = rex::cvar::FlagType::String,
+        .category = "Test",
+        .description = "Late registered flag",
+        .setter =
+            [&value](std::string_view new_value) {
+              value = new_value;
+              return true;
+            },
+        .getter = [&value]() { return value; },
+        .default_value = "default",
+    };
+  };
+  std::string runtime_value = "default";
+  std::string config_value = "default";
+  {
+    rex::cvar::FlagRegistrar runtime_flag(make_flag("test_late_runtime", runtime_value));
+    rex::cvar::FlagRegistrar config_flag(make_flag("test_late_config_wins", config_value));
+
+    CHECK(runtime_value == "from app");
+    CHECK(rex::cvar::GetFlagSource("test_late_runtime") == rex::cvar::Source::kDefault);
+    CHECK(config_value == "from config");
+  }
+
+  std::filesystem::remove(config_path);
+  rex::cvar::testing::ResetAllForTesting();
+}
+
 TEST_CASE("cvar range validation", "[cvar]") {
   SECTION("Value within range succeeds") {
     REQUIRE(rex::cvar::SetFlagByName("test_ranged_flag", "5"));

@@ -165,6 +165,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   void PollCompletedSubmission() override;
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
+    // The provider creates the device before this processor and destroys it
+    // after, so the constructor keeps the pointer: the virtual provider() call,
+    // several times a draw, was about 1% of the command processor (FH1 0361).
+    if (vulkan_device_) [[likely]] {
+      return vulkan_device_;
+    }
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
         ->vulkan_device();
   }
@@ -177,6 +183,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   DeferredCommandBuffer& deferred_command_buffer() {
     assert_true(submission_open_);
     return deferred_command_buffer_;
+  }
+  // Barriers pushed and not submitted yet (render target update reuse checks).
+  size_t GetPendingBarrierCount() const {
+    return pending_barriers_buffer_memory_barriers_.size() +
+           pending_barriers_image_memory_barriers_.size() + pending_barriers_.size();
   }
 
   bool submission_open() const { return submission_open_; }
@@ -328,6 +339,10 @@ class VulkanCommandProcessor : public CommandProcessor {
                                  std::vector<const uint8_t*>& data_out) override;
 
  private:
+  // GetVulkanDevice's pointer, set in the constructor body (null while the
+  // members are constructed).
+  ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;
+
   struct CommandBuffer {
     VkCommandPool pool;
     VkCommandBuffer buffer;

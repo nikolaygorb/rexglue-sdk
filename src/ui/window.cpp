@@ -672,6 +672,14 @@ void Window::OnRestored(WindowDestructionReceiver& destruction_receiver) {
     return;
   }
   REXLOG_INFO("Window restored");
+  // Paint now, before the listeners, as for a resize. A minimized Win32
+  // window's client area is 0x0, so a present while minimized finds the
+  // swapchain outdated and the reconnection finds no area; SDL reports no size
+  // change for a minimize or a restore, so only a forced paint reconnects (the
+  // picture stayed frozen while the game ran on).
+  if (presenter_surface_) {
+    OnPaint(true);
+  }
   UIEvent e(this);
   SendEventToListeners([&e](auto listener) { listener->OnRestored(e); }, destruction_receiver);
 }

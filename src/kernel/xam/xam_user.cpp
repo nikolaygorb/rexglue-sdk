@@ -202,6 +202,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
+  if (user_index >= 4) {
+    return X_E_INVALIDARG;
+  }
   if (!IsLocalUserSignedIn(user_index)) {
     return X_E_NO_SUCH_USER;
   }
@@ -267,9 +270,10 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
                                       be<uint32_t>* setting_ids, uint32_t /*unused*/,
                                       be<uint32_t>* buffer_size_ptr, uint8_t* buffer,
                                       XAM_OVERLAPPED* overlapped) {
-  if (!xuid_count) {
-    assert_null(xuids);
-  } else {
+  // An XUID array with no XUIDs or more than 16 fails after the buffer size
+  // check.
+  const bool invalid_xuid_array = xuids && (!xuid_count || xuid_count > 16);
+  if (xuids && !invalid_xuid_array) {
     assert_true(xuid_count == 1);
     assert_not_null(xuids);
     // Local users only: the XUID of another one of them reads its profile.
@@ -323,6 +327,16 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
       *buffer_size_ptr = needed_size;
     }
     return X_ERROR_INSUFFICIENT_BUFFER;
+  }
+
+  if (invalid_xuid_array) {
+    if (overlapped) {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
+          REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_FUNCTION_FAILED,
+          X_E_INVALIDARG, 0);
+      return X_ERROR_IO_PENDING;
+    }
+    return X_ERROR_FUNCTION_FAILED;
   }
 
   // Title ID = 0 means us.
@@ -507,6 +521,10 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
 }
 
 u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags) {
+  if (user_index >= 4 && user_index != 0xFF) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
   if (!IsLocalUserSignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
@@ -516,8 +534,13 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
   return X_ERROR_SUCCESS;
 }
 
-u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2,
-                                             mapped_u32 out_unk3) {
+u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 content_type,
+                                             mapped_u32 out_unk2, mapped_u32 out_unk3) {
+  // Content type 0 has no rating, even for an empty slot.
+  if (!content_type) {
+    return X_ERROR_NOT_FOUND;
+  }
+
   if (!IsLocalUserSignedIn(user_index)) {
     return X_ERROR_NO_SUCH_USER;
   }
@@ -529,11 +552,14 @@ u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u3
   return X_ERROR_SUCCESS;
 }
 
-u32 XamUserContentRestrictionCheckAccess_entry(u32 user_index, u32 unk1, u32 unk2, u32 unk3,
-                                               u32 unk4, mapped_u32 out_unk5, u32 overlapped_ptr) {
+u32 XamUserContentRestrictionCheckAccess_entry(u32 user_index, u32 unk1, u32 content_type,
+                                               u32 unk3, u32 unk4, mapped_u32 out_unk5,
+                                               u32 overlapped_ptr) {
   *out_unk5 = 1;
 
-  if (overlapped_ptr) {
+  // Content type 0 completes synchronously even with an overlapped, which is
+  // left untouched.
+  if (overlapped_ptr && content_type) {
     // TODO(benvanik): does this need the access arg on it?
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
   }
@@ -856,7 +882,12 @@ u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_
   return X_ERROR_SUCCESS;
 }
 
-u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u32 overlapped_ptr) {
+u32 XamWriteGamerTile_entry(u32 user_index, u32 title_id, u32 big_tile_id, u32 small_tile_id,
+                            u32 for_enumerate, u32 overlapped_ptr) {
+  if (user_index >= 4) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
@@ -945,10 +976,10 @@ u32 XamUserGetOnlineLanguageFromXUID_entry(u64 xuid) {
 u32 XamUserGetSubscriptionType_entry(u32 user_index, mapped_u32 subscription_length_ptr,
                                      mapped_u32 subscription_payment_ptr) {
   if (user_index >= 4 || !subscription_length_ptr || !subscription_payment_ptr) {
-    return X_ERROR_INVALID_PARAMETER;
+    return X_E_INVALIDARG;
   }
   if (!IsSignedInUser(user_index)) {
-    return X_ERROR_FUNCTION_FAILED;
+    return X_E_NO_SUCH_USER;
   }
   // No subscription history is tracked.
   *subscription_length_ptr = 0;

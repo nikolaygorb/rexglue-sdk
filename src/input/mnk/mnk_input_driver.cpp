@@ -478,7 +478,8 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   if (!is_active() || !has_focus_) {
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
-      out_state->packet_number = packet_number_;
+      std::lock_guard lock(state_mutex_);
+      out_state->packet_number = PacketNumberForLocked(out_state->gamepad);
     }
     return X_ERROR_SUCCESS;
   }
@@ -589,19 +590,30 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
   };
 
-  packet_number_++;
+  X_INPUT_GAMEPAD gamepad = {};
+  gamepad.buttons = buttons;
+  gamepad.left_trigger = lt;
+  gamepad.right_trigger = rt;
+  gamepad.thumb_lx = clamp16(lx);
+  gamepad.thumb_ly = clamp16(ly);
+  gamepad.thumb_rx = clamp16(rx);
+  gamepad.thumb_ry = clamp16(ry);
+  const uint32_t packet_number = PacketNumberForLocked(gamepad);
 
   if (out_state) {
-    out_state->packet_number = packet_number_;
-    out_state->gamepad.buttons = buttons;
-    out_state->gamepad.left_trigger = lt;
-    out_state->gamepad.right_trigger = rt;
-    out_state->gamepad.thumb_lx = clamp16(lx);
-    out_state->gamepad.thumb_ly = clamp16(ly);
-    out_state->gamepad.thumb_rx = clamp16(rx);
-    out_state->gamepad.thumb_ry = clamp16(ry);
+    out_state->packet_number = packet_number;
+    out_state->gamepad = gamepad;
   }
   return X_ERROR_SUCCESS;
+}
+
+uint32_t MnkInputDriver::PacketNumberForLocked(const X_INPUT_GAMEPAD& gamepad) {
+  // Titles compare packet numbers to tell whether the state changed.
+  if (std::memcmp(&gamepad, &last_gamepad_, sizeof(last_gamepad_)) != 0) {
+    last_gamepad_ = gamepad;
+    ++packet_number_;
+  }
+  return packet_number_;
 }
 
 X_RESULT MnkInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) {
@@ -617,14 +629,47 @@ X_RESULT MnkInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   std::lock_guard lock(state_mutex_);
-  if (keystroke_queue_.empty()) {
-    return X_ERROR_EMPTY;
+  // A release reaches the title only for a press it received, and repeats of a
+  // press it didn't receive aren't a new press.
+  X_INPUT_KEYSTROKE ks;
+  for (;;) {
+    if (keystroke_queue_.empty()) {
+      return X_ERROR_EMPTY;
+    }
+    ks = keystroke_queue_.front();
+    keystroke_queue_.pop();
+    const uint16_t vk = ks.virtual_key;
+    const uint16_t flags = ks.flags;
+    if (flags & X_INPUT_KEYSTROKE_KEYUP) {
+      if (delivered_.erase(vk)) {
+        break;
+      }
+    } else if (flags & X_INPUT_KEYSTROKE_REPEAT) {
+      if (delivered_.count(vk)) {
+        break;
+      }
+    } else {
+      delivered_.insert(vk);
+      break;
+    }
   }
   if (out_keystroke) {
-    *out_keystroke = keystroke_queue_.front();
+    *out_keystroke = ks;
   }
-  keystroke_queue_.pop();
   return X_ERROR_SUCCESS;
+}
+
+void MnkInputDriver::DiscardKeystrokes() {
+  std::lock_guard lock(state_mutex_);
+  // Releases of presses the title received are kept so they still pair.
+  std::queue<X_INPUT_KEYSTROKE> releases;
+  for (; !keystroke_queue_.empty(); keystroke_queue_.pop()) {
+    const X_INPUT_KEYSTROKE& ks = keystroke_queue_.front();
+    if ((ks.flags & X_INPUT_KEYSTROKE_KEYUP) && delivered_.count(ks.virtual_key)) {
+      releases.push(ks);
+    }
+  }
+  keystroke_queue_.swap(releases);
 }
 
 void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
@@ -784,6 +829,7 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
     return;
   std::lock_guard lock(state_mutex_);
   if (IsPassthroughEnabled()) {
+    raw_keys_down_.insert(static_cast<uint16_t>(e.virtual_key()));
     EnqueueRawKeystroke(e, true);
     return;
   }
@@ -797,6 +843,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
     return;
   std::lock_guard lock(state_mutex_);
   if (IsPassthroughEnabled()) {
+    raw_keys_down_.erase(static_cast<uint16_t>(e.virtual_key()));
     EnqueueRawKeystroke(e, false);
     return;
   }
@@ -909,6 +956,14 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
     std::memset(key_down_, 0, sizeof(key_down_));
     // Releases landing on another window never arrive here as key-ups.
     RefreshBoundKeystrokesLocked();
+    for (uint16_t vk : raw_keys_down_) {
+      X_INPUT_KEYSTROKE ks = {};
+      ks.virtual_key = vk;
+      ks.flags = X_INPUT_KEYSTROKE_KEYUP;
+      ks.hid_code = VirtualKeyToHIDUsage(static_cast<VirtualKey>(vk));
+      PushKeystroke(ks);
+    }
+    raw_keys_down_.clear();
     mouse_dx_ = 0.0f;
     mouse_dy_ = 0.0f;
   }

@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <list>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -306,6 +308,9 @@ class KernelState {
 
   util::NativeList* dpc_list() { return &dpc_list_; }
 
+  // Runs |fn| on the file I/O worker without waiting (xenia-edge c6cc76167).
+  void PostIo(std::function<void()> fn);
+
   void CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result);
   // The completion routine runs on the calling guest thread, if any.
   void CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result, uint32_t extended_error,
@@ -404,6 +409,14 @@ class KernelState {
   AchievementManager achievement_manager_;
 
   std::atomic<bool> dispatch_thread_running_;
+
+  // Posted file I/O (XFile reads told STATUS_PENDING), run in order on one
+  // host thread, as a disk serves them.
+  std::thread io_thread_;
+  std::mutex io_mutex_;
+  std::condition_variable io_cond_;
+  std::deque<std::function<void()>> io_queue_;
+  bool io_thread_stop_ = false;
   std::atomic<bool> terminating_title_{false};
   object_ref<XHostThread> dispatch_thread_;
   // Must be guarded by the global critical region.

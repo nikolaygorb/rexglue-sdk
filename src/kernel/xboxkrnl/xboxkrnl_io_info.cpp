@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/filesystem/device.h>
+#include <rex/kernel/xboxkrnl/ob.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -189,6 +190,11 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
       out_length = sizeof(*info);
       break;
     }
+    case XFileBasicInformation:
+      // The file system takes it to set but not to query.
+      status = X_STATUS_INVALID_PARAMETER;
+      out_length = 0;
+      break;
     default: {
       // Unsupported, for now.
       assert_always();
@@ -198,7 +204,8 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
     }
   }
 
-  if (io_status_block_ptr) {
+  // A failed request leaves the status block alone.
+  if (io_status_block_ptr && XSUCCEEDED(status)) {
     io_status_block_ptr->status = status;
     io_status_block_ptr->information = out_length;
   }
@@ -254,11 +261,17 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
   }
 
   X_STATUS result = X_STATUS_SUCCESS;
-  uint32_t out_length;
 
   switch (info_class) {
     case XFileBasicInformation: {
       auto info = info_ptr.as<X_FILE_BASIC_INFORMATION*>();
+      // Of the attributes only the directory bit is kept, which a file can't
+      // take.
+      if ((info->attributes & rex::filesystem::kFileAttributeDirectory) &&
+          !(file->entry()->attributes() & rex::filesystem::kFileAttributeDirectory)) {
+        result = X_STATUS_INVALID_PARAMETER;
+        break;
+      }
 
       bool basic_result = true;
       if (info->creation_time) {
@@ -273,19 +286,15 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
         basic_result &= file->entry()->SetWriteTimestamp(info->last_write_time);
       }
 
-      basic_result &= file->entry()->SetAttributes(info->attributes);
       if (!basic_result) {
         result = X_STATUS_UNSUCCESSFUL;
       }
-
-      out_length = sizeof(*info);
       break;
     }
     case XFileDispositionInformation: {
       auto info = info_ptr.as<X_FILE_DISPOSITION_INFORMATION*>();
       bool delete_on_close = info->delete_file ? true : false;
       file->entry()->SetForDeletion(delete_on_close);
-      out_length = 0;
       REXKRNL_WARN("NtSetInformationFile set deleting flag for {} on close to: {}", file->name(),
                    delete_on_close);
       break;
@@ -293,12 +302,13 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     case XFilePositionInformation: {
       auto info = info_ptr.as<X_FILE_POSITION_INFORMATION*>();
       file->set_position(info->current_byte_offset);
-      out_length = sizeof(*info);
       break;
     }
     case XFileRenameInformation: {
       auto info = info_ptr.as<X_FILE_RENAME_INFORMATION*>();
       auto target_path = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), &info->ansi_string);
+      // The new name is resolved on the file's device, which has no \??\.
+      xeObStripDosDevicesPrefix(target_path);
       if (!IsValidPath(target_path, false)) {
         return X_STATUS_OBJECT_NAME_INVALID;
       }
@@ -309,12 +319,10 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
       }
 
       result = file->Rename(target_file_path, info->replace_existing != 0);
-      out_length = sizeof(*info);
       break;
     }
     case XFileAllocationInformation: {
       auto info = info_ptr.as<X_FILE_ALLOCATION_INFORMATION*>();
-      out_length = sizeof(*info);
       if (!(file->file_access() & (rex::filesystem::FileAccess::kGenericWrite |
                                    rex::filesystem::FileAccess::kFileWriteData))) {
         result = X_STATUS_ACCESS_DENIED;
@@ -336,7 +344,6 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     case XFileEndOfFileInformation: {
       auto info = info_ptr.as<X_FILE_END_OF_FILE_INFORMATION*>();
       result = file->SetLength(info->end_of_file);
-      out_length = sizeof(*info);
 
       // Update the files rex::filesystem::Entry information
       file->entry()->update();
@@ -347,7 +354,6 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
       auto info = info_ptr.as<X_FILE_COMPLETION_INFORMATION*>();
       auto handle = uint32_t(info->handle);
       auto key = uint32_t(info->key);
-      out_length = sizeof(*info);
       auto port = REX_KERNEL_OBJECTS()->LookupObject<XIOCompletion>(handle);
       if (!port) {
         result = X_STATUS_INVALID_HANDLE;
@@ -359,13 +365,13 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     default:
       // Unsupported, for now.
       assert_always();
-      out_length = 0;
       break;
   }
 
-  if (io_status_block) {
+  // A failed request leaves the status block alone.
+  if (io_status_block && XSUCCEEDED(result)) {
     io_status_block->status = result;
-    io_status_block->information = out_length;
+    io_status_block->information = 0;
   }
 
   return result;

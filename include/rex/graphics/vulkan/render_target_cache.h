@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -81,6 +82,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkExtent2D host_extent{};
     RenderPassKey render_pass_key;
+    // The views it was made with, to drop it when one of their render targets
+    // is replaced.
+    std::array<VkImageView, 1 + xenos::kMaxColorRenderTargets> attachments{};
     Framebuffer() = default;
     Framebuffer(VkFramebuffer framebuffer, const VkExtent2D& host_extent,
                 RenderPassKey render_pass_key)
@@ -206,7 +210,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint32_t GetMaxRenderTargetWidth() const override;
   uint32_t GetMaxRenderTargetHeight() const override;
 
-  RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
+  RenderTarget* CreateRenderTarget(RenderTargetKey key, uint32_t height) override;
+  RenderTarget* GrowRenderTarget(RenderTarget* source, uint32_t height,
+                                 const std::vector<Transfer>& transfers) override;
 
   bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const override;
 
@@ -326,6 +332,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       last_update_framebuffer_attachments_[1 + xenos::kMaxColorRenderTargets] = {};
   const Framebuffer* last_update_framebuffer_ = VK_NULL_HANDLE;
 
+  // Render target update reuse (vulkan_render_target_update_reuse): the inputs
+  // of the last full Update and the state generation after it.
+  bool UpdateFull(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+                  uint32_t normalized_color_mask, const Shader& vertex_shader,
+                  int32_t window_offset_tiles);
+  bool AccumulatedRenderTargetsInDrawUsage() const;
+  UpdateInputs update_reuse_inputs_;
+  uint64_t update_reuse_generation_ = 0;
+  bool update_reuse_valid_ = false;
+  uint64_t update_reuse_mismatches_ = 0;
+
   // For host render targets.
 
   // Can only be destroyed when framebuffers referencing it are destroyed!
@@ -344,12 +361,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
         VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     // Takes ownership of the Vulkan objects passed to the constructor.
-    VulkanRenderTarget(RenderTargetKey key, VulkanRenderTargetCache& render_target_cache,
-                       VkImage image, VkDeviceMemory memory, VkImageView view_depth_color,
+    VulkanRenderTarget(RenderTargetKey key, uint32_t height,
+                       VulkanRenderTargetCache& render_target_cache, VkImage image,
+                       VkDeviceMemory memory, VkImageView view_depth_color,
                        VkImageView view_depth_stencil, VkImageView view_stencil,
                        VkImageView view_srgb, VkImageView view_color_transfer_separate,
                        size_t descriptor_set_index_transfer_source)
-        : RenderTarget(key),
+        : RenderTarget(key, height),
           render_target_cache_(render_target_cache),
           image_(image),
           memory_(memory),
@@ -446,14 +464,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // Same as RenderTargetKey::pitch_tiles_at_32bpp.
     uint32_t pitch_tiles_at_32bpp : 8;  // 8
-    // [0, 2047].
-    uint32_t depth_base_tiles : xenos::kEdramBaseTilesBits;    // 19
-    uint32_t color_0_base_tiles : xenos::kEdramBaseTilesBits;  // 30
+    // Below the EDRAM tile count.
+    uint32_t depth_base_tiles : xenos::kEdramBaseTilesBits;  // 21
 
-    uint32_t color_1_base_tiles : xenos::kEdramBaseTilesBits;  // 43
-    uint32_t color_2_base_tiles : xenos::kEdramBaseTilesBits;  // 54
+    uint32_t color_0_base_tiles : xenos::kEdramBaseTilesBits;  // 45
+    uint32_t color_1_base_tiles : xenos::kEdramBaseTilesBits;  // 58
 
-    uint32_t color_3_base_tiles : xenos::kEdramBaseTilesBits;  // 75
+    uint32_t color_2_base_tiles : xenos::kEdramBaseTilesBits;  // 77
+    uint32_t color_3_base_tiles : xenos::kEdramBaseTilesBits;  // 90
 
     // Including all the padding, for a stable hash.
     FramebufferKey() { Reset(); }
@@ -639,9 +657,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   union TransferAddressConstant {
     uint32_t constant;
     struct {
-      // All in tiles.
-      uint32_t dest_pitch : xenos::kEdramPitchTilesBits;
-      uint32_t source_pitch : xenos::kEdramPitchTilesBits;
+      // All in tiles, the pitches of render target keys.
+      uint32_t dest_pitch : RenderTargetKey::kPitchTilesBits;
+      uint32_t source_pitch : RenderTargetKey::kPitchTilesBits;
       // Destination base in tiles minus source base in tiles (not vice versa
       // because this is a transform of the coordinate system, not addresses
       // themselves), wrapped, the shader wraps the sum anyway.
@@ -860,7 +878,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // resolve_clear_rectangle is expected to be provided by
   // PrepareHostRenderTargetsResolveClear which should do all the needed size
   // bound checks.
-  void PerformTransfersAndResolveClears(
+  // Returns false if any transfer or clear could not be recorded.
+  bool PerformTransfersAndResolveClears(
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,
       const uint64_t* render_target_resolve_clear_values = nullptr,
@@ -909,6 +928,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   std::unordered_map<RenderPassKey, VkRenderPass, RenderPassKey::Hasher> render_passes_;
 
   std::unordered_map<FramebufferKey, Framebuffer, FramebufferKey::Hasher> framebuffers_;
+  // Allocations replaced by taller ones and the framebuffers made with them,
+  // with the submission that last uses them.
+  std::deque<std::pair<uint64_t, std::unique_ptr<RenderTarget>>> retired_render_targets_;
+  std::deque<std::pair<uint64_t, VkFramebuffer>> retired_framebuffers_;
+  // Retires the framebuffers made with the render target's views.
+  void InvalidateRenderTargetFramebuffers(const VulkanRenderTarget& render_target);
 
   uint64_t render_target_memory_bytes_ = 0;
   uint32_t render_target_count_ = 0;

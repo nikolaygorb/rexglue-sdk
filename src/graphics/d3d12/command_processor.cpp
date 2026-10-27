@@ -815,14 +815,9 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
 
-  // ROV always uses Xenos' MSAA sample positions.
-  // xenos_sample_positions targets host RTs with programmable position support.
-  xenos_sample_positions_used_ =
-      command_list_1_ != nullptr &&
-      provider.GetProgrammableSamplePositionsTier() !=
-          D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED &&
-      (render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock ||
-       REXCVAR_GET(xenos_sample_positions));
+  xenos_sample_positions_supported_ =
+      command_list_1_ != nullptr && provider.GetProgrammableSamplePositionsTier() !=
+                                        D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
 
   // Hybrid RTV queries count pre-test coverage in the pixel shader and clear
   // their counter slot with WriteBufferImmediate, so they need CommandList2.
@@ -1698,6 +1693,8 @@ void D3D12CommandProcessor::ShutdownContext() {
 }
 
 void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // Only the shader constant blocks are handled here
+  // (CommandProcessor::IsPlainRegister relies on that for the other registers).
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2683,7 +2680,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   bool ps_writes_depth = pixel_shader && pixel_shader->writes_depth();
 
   // Programmed Xenos sample positions don't scale, see GetHostViewportInfo.
-  bool xenos_sample_positions_viewport = !host_render_targets_used || xenos_sample_positions_used_;
+  bool xenos_sample_positions_viewport =
+      !host_render_targets_used || xenos_sample_positions_used();
 
   // Build a cache key from all viewport-affecting state to skip redundant
   // recalculation when the viewport registers haven't changed between draws.
@@ -4176,7 +4174,7 @@ void D3D12CommandProcessor::ClearCommandAllocatorCache() {
 }
 
 void D3D12CommandProcessor::UpdateSamplePositions(xenos::MsaaSamples msaa_samples) {
-  if (!xenos_sample_positions_used_ || current_sample_positions_ == msaa_samples) {
+  if (!xenos_sample_positions_used() || current_sample_positions_ == msaa_samples) {
     return;
   }
 
@@ -4377,7 +4375,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       normalized_depth_control.stencil_enable || normalized_depth_control.z_enable;
   if (edram_rov_used && depth_stencil_enabled) {
     for (uint32_t i = 0; i < 4; ++i) {
-      if (rb_depth_info.depth_base == color_infos[i].color_base &&
+      if (render_target_cache_->WrapEdramBase(rb_depth_info.depth_base) ==
+              render_target_cache_->WrapEdramBase(color_infos[i].color_base) &&
           RenderTargetCache::ColorOverlapsDepthStencil(color_infos[i].color_format,
                                                        rt_keep_masks[i][0], rt_keep_masks[i][1],
                                                        normalized_depth_control)) {
@@ -4630,17 +4629,18 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     reg::RB_COLOR_INFO color_info = color_infos[i];
     // Exponent bias is in bits 20:25 of RB_COLOR_INFO.
     int32_t color_exp_bias = color_info.color_exp_bias;
+    auto color_exp_bias_scale =
+        rex::memory::Reinterpret<float>(int32_t(0x3F800000 + (color_exp_bias << 23)));
     if (color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
         color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16) {
       if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
           !render_target_cache_->IsFixed16TruncatedToMinus1To1()) {
-        // Remap from -32...32 to -1...1 by dividing the output values by 32,
-        // losing blending correctness, but getting the full range.
-        color_exp_bias -= 5;
+        // Remap to -1...1 by scaling the output values by 1024/32767, losing
+        // blending correctness, but getting the full range apart from -32,
+        // which SNORM folds into -32767/1024.
+        color_exp_bias_scale *= 1024.0f / 32767.0f;
       }
     }
-    auto color_exp_bias_scale =
-        rex::memory::Reinterpret<float>(int32_t(0x3F800000 + (color_exp_bias << 23)));
     dirty |= system_constants_.color_exp_bias[i] != color_exp_bias_scale;
     system_constants_.color_exp_bias[i] = color_exp_bias_scale;
     if (edram_rov_used) {
@@ -4652,7 +4652,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
         uint32_t rt_base_dwords_scaled =
             draw_util::AddWindowOffsetToEdramBase(
                 color_info.color_base, window_offset_tiles,
-                xenos::IsColorRenderTargetFormat64bpp(color_info.color_format)) *
+                xenos::IsColorRenderTargetFormat64bpp(color_info.color_format),
+                render_target_cache_->edram_tile_count()) *
             edram_tile_dwords_scaled;
         dirty |= system_constants_.edram_rt_base_dwords_scaled[i] != rt_base_dwords_scaled;
         system_constants_.edram_rt_base_dwords_scaled[i] = rt_base_dwords_scaled;
@@ -4696,9 +4697,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   dirty |= system_constants_.zpd_counter_index != zpd_counter_index;
   system_constants_.zpd_counter_index = zpd_counter_index;
   if (edram_rov_used) {
-    uint32_t depth_base_dwords_scaled = draw_util::AddWindowOffsetToEdramBase(
-                                            rb_depth_info.depth_base, window_offset_tiles, false) *
-                                        edram_tile_dwords_scaled;
+    uint32_t depth_base_dwords_scaled =
+        draw_util::AddWindowOffsetToEdramBase(rb_depth_info.depth_base, window_offset_tiles, false,
+                                              render_target_cache_->edram_tile_count()) *
+        edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled != depth_base_dwords_scaled;
     system_constants_.edram_depth_base_dwords_scaled = depth_base_dwords_scaled;
 

@@ -47,6 +47,7 @@ set(REXGPU_XENOS_SPIRV_SOURCES
 set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
+    vulkan/device_memory.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp

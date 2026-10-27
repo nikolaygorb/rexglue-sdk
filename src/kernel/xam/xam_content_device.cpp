@@ -88,7 +88,8 @@ u32 XamContentGetDeviceState_entry(u32 device_id, mapped_void overlapped_ptr) {
   if (device_info == nullptr) {
     if (overlapped_ptr) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
-          overlapped_ptr.guest_address(), X_ERROR_FUNCTION_FAILED, X_ERROR_DEVICE_NOT_CONNECTED, 0);
+          overlapped_ptr.guest_address(), X_ERROR_FUNCTION_FAILED,
+          X_HRESULT_FROM_WIN32(X_ERROR_DEVICE_NOT_CONNECTED), 0);
       return X_ERROR_IO_PENDING;
     } else {
       return X_ERROR_DEVICE_NOT_CONNECTED;

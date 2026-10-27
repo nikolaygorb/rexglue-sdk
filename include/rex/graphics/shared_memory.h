@@ -225,12 +225,20 @@ class SharedMemory {
         // Links to nodes belonging to other watched ranges in the bucket.
         WatchNode* bucket_node_previous;
         WatchNode* bucket_node_next;
+        // The range's pages, so a write tests each node of a bucket without
+        // loading its range (one cache line per node instead of two).
+        uint32_t page_first;
+        uint32_t page_last;
       };
       WatchNode* next_free;
     };
   };
-  static constexpr uint32_t kWatchBucketSizeLog2 = 22;
-  static constexpr uint32_t kWatchBucketCount = 1 << (kBufferSizeLog2 - kWatchBucketSizeLog2);
+  // The bucket size is gpu_memory_watch_bucket_log2 (log2 of bytes; 22, 4 MB,
+  // was the fixed size), the array is sized for the smallest.
+  static constexpr uint32_t kWatchBucketSizeLog2Min = 18;
+  static constexpr uint32_t kWatchBucketSizeLog2Max = 22;
+  static constexpr uint32_t kWatchBucketCount = 1 << (kBufferSizeLog2 - kWatchBucketSizeLog2Min);
+  uint32_t watch_bucket_size_log2_ = kWatchBucketSizeLog2Max;
   WatchNode* watch_buckets_[kWatchBucketCount] = {};
   // Allocation from pools - taking new WatchRanges and WatchNodes from the free
   // list, and if there are none, creating a pool if the current one is fully

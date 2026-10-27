@@ -30,6 +30,15 @@
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
 
+// vsync paces the title; this one waits for the host display, which a screen
+// without variable refresh rate needs to show frames without tearing.
+REXCVAR_DEFINE_BOOL(present_vsync, false, "UI/Presenter",
+                    "Show frames on the host display's refresh, without tearing (Direct3D 12: "
+                    "sync interval 1; Vulkan: no immediate or FIFO relaxed present mode). Adds up "
+                    "to one display refresh of latency. Off: frames are shown at once, with "
+                    "tearing where variable refresh rate is not available")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // Graphics card selection, read by the Vulkan and the Direct3D 12 providers
 // (defined here because either backend may be left out of the build).
 REXCVAR_DEFINE_STRING(
@@ -497,8 +506,14 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
     }
     // Try to recover from the connection becoming outdated in the previous
-    // paint.
-    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+    // paint. A forced paint (the window has been exposed or restored) also
+    // retries a connection that the surface's earlier state didn't allow: a
+    // minimized Win32 window has a 0x0 client area, but SDL reports no size
+    // change for a minimize or a restore, so no resize would ever retry it
+    // (the picture stayed frozen after a restore).
+    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated ||
+        (force_paint && surface_paint_connection_state_ ==
+                            SurfacePaintConnectionState::kUnconnectedRetryAtStateChange)) {
       UpdateSurfacePaintConnectionFromUIThread(nullptr, false);
     }
     // If still paintable or recovered successfully, paint.
@@ -1430,7 +1445,7 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
           surface_width_in_paint_connection_ = surface_width;
           surface_height_in_paint_connection_ = surface_height;
-          if (!is_reconnect) {
+          if (!is_reconnect && repaint_needed_out) {
             *repaint_needed_out = true;
           }
           break;

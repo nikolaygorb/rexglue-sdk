@@ -42,6 +42,8 @@ class DeferredCommandBuffer {
   // the main one.
   void SetWritingHoisted(bool hoisted) { write_stream_ = hoisted ? &hoisted_stream_ : &command_stream_; }
   size_t hoisted_stream_size() const { return hoisted_stream_.size(); }
+  // The size of the stream commands are written to now.
+  size_t write_stream_size() const { return write_stream_->size(); }
   bool is_writing_hoisted() const { return write_stream_ == &hoisted_stream_; }
   // How much has been recorded in the main stream since Reset.
   size_t stream_size() const { return command_stream_.size(); }

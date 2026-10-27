@@ -188,14 +188,6 @@ void HostPathEntry::update() {
   }
 }
 
-bool HostPathEntry::SetAttributes(uint64_t attributes) {
-  if (device_->is_read_only()) {
-    return false;
-  }
-  attributes_ = static_cast<uint32_t>(attributes);
-  return true;
-}
-
 bool HostPathEntry::SetCreateTimestamp(uint64_t timestamp) {
   if (device_->is_read_only()) {
     return false;

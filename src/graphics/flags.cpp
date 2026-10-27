@@ -66,6 +66,11 @@ REXCVAR_DEFINE_INT32(occlusion_query_fake_upper_threshold, 100, "GPU",
                      "Ignored if occlusion_query_fake_lower_threshold is -1.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_shader_translation_memo, true, "GPU",
+                    "Each shader answers a lookup of the same translation (modification) as its "
+                    "last one without searching its translations (performance; off to compare)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(xenos_sample_positions, false, "GPU",
                     "Rasterize 2x and 4x MSAA render targets at the Xenos sample positions, like "
                     "real hardware, if the GPU and driver support it.\n"

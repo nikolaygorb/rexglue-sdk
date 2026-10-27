@@ -61,7 +61,9 @@ XThread::XThread(KernelState* kernel_state)
 XThread::XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_thread_startup,
                  uint32_t start_address, uint32_t start_context, uint32_t creation_flags,
                  bool guest_thread, bool main_thread, uint32_t guest_process)
-    : XObject(kernel_state, kObjectType),
+    // The main thread is the loader's, so its handle is not the title's
+    // (xenia-edge 672bc8b81).
+    : XObject(kernel_state, kObjectType, !guest_thread || main_thread),
       thread_id_(++next_xthread_id_),
       guest_thread_(guest_thread),
       main_thread_(main_thread),
@@ -79,10 +81,6 @@ XThread::XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_t
   // Adjust stack size - min of 16k.
   if (creation_params_.stack_size < 16 * 1024) {
     creation_params_.stack_size = 16 * 1024;
-  }
-
-  if (!guest_thread_) {
-    host_object_ = true;
   }
 
   // The kernel does not take a reference. We must unregister in the dtor.
@@ -731,7 +729,7 @@ void XThread::UnlockApc(bool queue_delivery) {
 }
 
 void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context, uint32_t arg1,
-                         uint32_t arg2) {
+                         uint32_t arg2, uint32_t apc_mode) {
   uint32_t apc_ptr = memory()->SystemHeapAlloc(XAPC::kSize);
   if (!apc_ptr) {
     REXSYS_WARN("EnqueueApc: allocation failed (thid={}, normal={:08X})", thread_id_,
@@ -740,8 +738,8 @@ void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context, uint3
   }
   auto apc = memory()->TranslateVirtual<XAPC*>(apc_ptr);
   kernel::xboxkrnl::xeKeInitializeApc(apc, guest_object(), XAPC::kDummyKernelRoutine,
-                                      XAPC::kDummyRundownRoutine, normal_routine,
-                                      1 /* user apc mode */, normal_context);
+                                      XAPC::kDummyRundownRoutine, normal_routine, apc_mode,
+                                      normal_context);
 
   // Important: use the caller PPC context when queuing to another thread.
   // Using the target thread context here can corrupt APC lock/IRQL bookkeeping.
@@ -762,19 +760,55 @@ void XThread::EnqueueApc(uint32_t normal_routine, uint32_t normal_context, uint3
 }
 
 void XThread::DeliverAPCs() {
+  DeliverApcList(1);
+}
+
+bool XThread::HasPendingUserApc() {
+  return !guest_object<X_KTHREAD>()->apc_lists[1].empty(memory());
+}
+
+bool XThread::HasDeliverableKernelApc() {
+  auto kthread = guest_object<X_KTHREAD>();
+  if (kthread->apc_disable_count || kthread->executing_kernel_apc) {
+    return false;
+  }
+  if (memory()->TranslateVirtual<X_KPCR*>(pcr_address_)->current_irql >= 1) {
+    return false;
+  }
+  return !kthread->apc_lists[0].empty(memory());
+}
+
+bool XThread::DeliverKernelAPCs() {
+  if (!HasDeliverableKernelApc()) {
+    return false;
+  }
+  auto kthread = guest_object<X_KTHREAD>();
+  kthread->executing_kernel_apc = 1;
+  bool delivered = DeliverApcList(0);
+  kthread->executing_kernel_apc = 0;
+  return delivered;
+}
+
+bool XThread::OnAlertableWaitWoken() {
+  DeliverKernelAPCs();
+  return HasPendingUserApc();
+}
+
+bool XThread::DeliverApcList(uint32_t mode) {
   auto mem = memory();
   auto* ctx = thread_state_->context();
   auto kthread = guest_object<X_KTHREAD>();
   auto* dispatcher = kernel_state_->function_dispatcher();
+  bool delivered = false;
 
   auto old_irql = kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kthread->apc_lock);
-  auto& user_apc_queue = kthread->apc_lists[1];
+  auto& apc_queue = kthread->apc_lists[mode];
 
-  while (!user_apc_queue.empty(mem) && kthread->apc_disable_count == 0) {
+  while (!apc_queue.empty(mem) && kthread->apc_disable_count == 0) {
     PERF_counter_inc(kApcQueueDepth);
-    XAPC* apc = user_apc_queue.HeadObject(mem);
+    delivered = true;
+    XAPC* apc = apc_queue.HeadObject(mem);
     uint32_t apc_ptr = mem->HostToGuestVirtual(apc);
-    bool needs_freeing = apc->kernel_routine != XAPC::kDummyKernelRoutine;
 
     util::XeRemoveEntryList(&apc->list_entry, mem);
     apc->enqueued = 0;
@@ -797,8 +831,9 @@ void XThread::DeliverAPCs() {
         REXSYS_ERROR("DeliverAPCs: kernel_routine {:08X} not found", uint32_t(apc->kernel_routine));
       }
     } else {
+      // Ours (EnqueueApc, NtQueueApcThread): freed here. A guest KAPC belongs to
+      // the guest, whose kernel routine frees it, as canary leaves it.
       mem->SystemHeapFree(apc_ptr);
-      needs_freeing = false;
     }
 
     uint32_t normal_routine = memory::load_and_swap<uint32_t>(scratch_ptr + 0);
@@ -819,14 +854,11 @@ void XThread::DeliverAPCs() {
     REXSYS_DEBUG("Completed delivery of APC to {:08X} ({:08X}, {:08X}, {:08X})", normal_routine,
                  normal_context, arg1, arg2);
 
-    if (needs_freeing) {
-      mem->SystemHeapFree(apc_ptr);
-    }
-
     old_irql = kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kthread->apc_lock);
   }
 
   kernel::xboxkrnl::xeKeKfReleaseSpinLock(ctx, &kthread->apc_lock, old_irql);
+  return delivered;
 }
 
 void XThread::RundownAPCs() {
@@ -1064,14 +1096,23 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
   timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
   CheckTitleTermination();
   if (alertable) {
-    auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
-    CheckTitleTermination();
-    switch (result) {
-      default:
-      case rex::thread::SleepResult::kSuccess:
+    // Woken for a kernel APC, which runs before the delay goes on for the rest
+    // of its time. Only a user APC ends it (edge 7598c1779).
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true) {
+      const auto now = std::chrono::steady_clock::now();
+      auto remaining = deadline > now ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            deadline - now)
+                                      : std::chrono::milliseconds(0);
+      auto result = rex::thread::AlertableSleep(remaining);
+      CheckTitleTermination();
+      if (result != rex::thread::SleepResult::kAlerted) {
         return X_STATUS_SUCCESS;
-      case rex::thread::SleepResult::kAlerted:
+      }
+      if (OnAlertableWaitWoken()) {
         return X_STATUS_USER_APC;
+      }
     }
   } else {
     if (timeout_ms == 0) {

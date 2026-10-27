@@ -113,7 +113,8 @@ void PipelineCache::CreateTranslatorAndInternalShaders() {
       provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
       !render_target_cache_.gamma_render_target_as_unorm16(),
       render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
-      render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
+      render_target_cache_.draw_resolution_scale_y(), render_target_cache_.edram_tile_count(),
+      provider.GetGraphicsAnalysis() != nullptr);
 
   depth_only_pixel_shader_.clear();
   viz_survey_depth_only_pixel_shader_.clear();
@@ -845,17 +846,22 @@ bool PipelineCache::ConfigurePipeline(
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
 
-  // Check if we should use async pipeline creation.
-  // When enabled, defer shader translation and pipeline creation to background.
-  // Only use async when there's a pixel shader - VS-only pipelines are fast
-  // to compile and don't benefit from async (vertex shaders are small).
-  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
-                   pixel_shader != nullptr;
-
-  // Ensure VS ucode is analyzed (needed for description hash).
+  // Ensure VS ucode is analyzed (needed for description hash and the memexport
+  // check below).
   if (!vertex_shader->shader().is_ucode_analyzed()) {
     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
   }
+
+  // Check if we should use async pipeline creation.
+  // When enabled, defer shader translation and pipeline creation to background.
+  // Pipelines without a pixel shader are usually fast to create, and skipping
+  // their draws leaves holes in later passes, so they're async only with
+  // async_depth_only_pipelines. A skipped memexport-only draw would lose its
+  // data, so those are never async.
+  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
+                   (pixel_shader != nullptr ||
+                    (REXCVAR_GET(async_depth_only_pipelines) &&
+                     !vertex_shader->shader().memexport_eM_written()));
 
   // For async mode, defer VS translation to background thread.
   // For sync mode, translate VS now on main thread.
@@ -921,9 +927,11 @@ bool PipelineCache::ConfigurePipeline(
     // Calculate priority based on whether shader writes to visible RTs.
     uint32_t bound_rts =
         pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask);
-    new_pipeline->priority = pipeline_util::CalculatePipelinePriority(
-        bound_rts, pixel_shader->shader().writes_color_targets(),
-        pixel_shader->shader().writes_depth());
+    new_pipeline->priority =
+        pixel_shader ? pipeline_util::CalculatePipelinePriority(
+                           bound_rts, pixel_shader->shader().writes_color_targets(),
+                           pixel_shader->shader().writes_depth())
+                     : pipeline_util::kPriorityDepthOnly;
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       new_pipeline->creation_pending.store(true, std::memory_order_relaxed);
@@ -1158,7 +1166,8 @@ void PipelineCache::TranslateShadersForStorage(
         provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
         !render_target_cache_.gamma_render_target_as_unorm16(),
         render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
-        render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
+        render_target_cache_.draw_resolution_scale_y(), render_target_cache_.edram_tile_count(),
+        provider.GetGraphicsAnalysis() != nullptr);
     // DXIL conversion objects.
     IDxbcConverter* dxbc_converter = nullptr;
     IDxcUtils* dxc_utils = nullptr;
@@ -3373,7 +3382,8 @@ void PipelineCache::CreationThread(size_t thread_index) {
       provider.GetAdapterVendorID(), bindless_resources_used_, edram_rov_used,
       !render_target_cache_.gamma_render_target_as_unorm16(),
       render_target_cache_.msaa_2x_supported(), render_target_cache_.draw_resolution_scale_x(),
-      render_target_cache_.draw_resolution_scale_y(), provider.GetGraphicsAnalysis() != nullptr);
+      render_target_cache_.draw_resolution_scale_y(), render_target_cache_.edram_tile_count(),
+      provider.GetGraphicsAnalysis() != nullptr);
   // Create thread-local DXIL conversion objects if needed.
   IDxbcConverter* dxbc_converter = nullptr;
   IDxcUtils* dxc_utils = nullptr;

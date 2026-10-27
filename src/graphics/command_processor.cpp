@@ -45,6 +45,11 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(gpu_plain_register_ranges, true, "GPU",
+                    "Store a range of registers that only keep their value (render state, no side "
+                    "effect, outside the shader constants) in the command processor's packet loop, "
+                    "without the backend's register write calls (read at each ring buffer burst)");
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end, so the "
                     "CPU and GPU see data the GPU wrote (fixes missing character models in "
@@ -183,6 +188,14 @@ REXCVAR_DEFINE_INT32(async_pipeline_wait_ms, 0, "GPU",
                      "never waits. A few milliseconds keep fast pipelines from popping in at the "
                      "cost of short pauses while new ones are made")
     .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(async_depth_only_pipelines, false, "GPU",
+                    "With async_shader_compilation, also create pipelines without a pixel "
+                    "shader (shadow maps, depth pre-passes) in the background. Removes rare long "
+                    "pauses when one is new to the driver, but shadows and objects drawn after a "
+                    "depth pre-pass can be missing until it is ready. Draws that only export to "
+                    "memory always wait for their pipeline")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(gpu_idle_spin_count, -1, "GPU",
@@ -646,7 +659,42 @@ class KnownRegisters {
   uint64_t bits_[(RegisterFile::kRegisterCount + 63) / 64] = {};
 };
 const KnownRegisters known_registers;
+
+// The registers a write only stores (CommandProcessor::IsPlainRegister).
+class PlainRegisters {
+ public:
+  PlainRegisters() {
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+      // Keep in sync with CommandProcessor::WriteRegister.
+      const bool side_effect = (i >= XE_GPU_REG_SCRATCH_REG0 && i <= XE_GPU_REG_SCRATCH_REG7) ||
+                               i == XE_GPU_REG_COHER_STATUS_HOST ||
+                               i == XE_GPU_REG_DC_LUT_RW_INDEX ||
+                               i == XE_GPU_REG_DC_LUT_SEQ_COLOR ||
+                               i == XE_GPU_REG_DC_LUT_PWL_DATA || i == XE_GPU_REG_DC_LUT_30_COLOR;
+      // The backends' WriteRegister and WriteRegistersFromMem handle these.
+      const bool constant =
+          (i >= XE_GPU_REG_SHADER_CONSTANT_000_X && i <= XE_GPU_REG_SHADER_CONSTANT_511_W) ||
+          (i >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+           i <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+          (i >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 && i <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
+      if (!side_effect && !constant && known_registers.IsKnown(i)) {
+        bits_[i >> 6] |= uint64_t(1) << (i & 63);
+      }
+    }
+  }
+  bool IsPlain(uint32_t index) const {
+    return index < RegisterFile::kRegisterCount && ((bits_[index >> 6] >> (index & 63)) & 1);
+  }
+
+ private:
+  uint64_t bits_[(RegisterFile::kRegisterCount + 63) / 64] = {};
+};
+const PlainRegisters plain_registers;
 }  // namespace
+
+bool CommandProcessor::IsPlainRegister(uint32_t index) {
+  return plain_registers.IsPlain(index);
+}
 
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
@@ -803,13 +851,31 @@ void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* bas
                                              uint32_t num_registers) {
   for (uint32_t i = 0; i < num_registers; ++i) {
     uint32_t data = memory::load_and_swap<uint32_t>(base + i);
-    WriteRegister(start_index + i, data);
+    const uint32_t index = start_index + i;
+    if (plain_registers.IsPlain(index)) {
+      // All WriteRegister would do: store it (volatile for WAIT_REG_MEM), without
+      // a virtual call for each register of the range.
+      const_cast<volatile uint32_t&>(register_file_->values[index]) = data;
+    } else {
+      WriteRegister(index, data);
+    }
   }
 }
 
 void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
                                                   uint32_t num_registers) {
   if (!num_registers) {
+    return;
+  }
+  // Nearly every range is contiguous in the ring: write it and advance the read
+  // offset here, as BeginRead and EndRead would (their no-wrap case), without
+  // two calls into the runtime for each range.
+  const size_t range_bytes = size_t(num_registers) * sizeof(uint32_t);
+  const size_t read_offset = ring->read_offset();
+  if (read_offset + range_bytes < ring->capacity()) {
+    WriteRegistersFromMem(base, reinterpret_cast<uint32_t*>(ring->buffer() + read_offset),
+                          num_registers);
+    ring->set_read_offset_within(read_offset + range_bytes);
     return;
   }
   memory::RingBuffer::ReadRange range = ring->BeginRead(size_t(num_registers) * sizeof(uint32_t));
@@ -824,6 +890,32 @@ void CommandProcessor::WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint
                           uint32_t(range.second_length / sizeof(uint32_t)));
   }
   ring->EndRead(range);
+}
+
+bool CommandProcessor::WritePlainRangeFromRing(memory::RingBuffer* ring, uint32_t base,
+                                               uint32_t count) {
+  const uint32_t end = base + count;
+  if (!count || end > RegisterFile::kRegisterCount) {
+    return false;
+  }
+  const size_t range_bytes = size_t(count) * sizeof(uint32_t);
+  const size_t read_offset = ring->read_offset();
+  if (read_offset + range_bytes >= ring->capacity()) {
+    return false;
+  }
+  for (uint32_t i = base; i < end; ++i) {
+    if (!plain_registers.IsPlain(i)) {
+      return false;
+    }
+  }
+  const uint32_t* source = reinterpret_cast<const uint32_t*>(ring->buffer() + read_offset);
+  uint32_t* values = register_file_->values;
+  for (uint32_t i = 0; i < count; ++i) {
+    // Volatile like the store in WriteRegister (WAIT_REG_MEM polls).
+    const_cast<volatile uint32_t&>(values[base + i]) = memory::load_and_swap<uint32_t>(source + i);
+  }
+  ring->set_read_offset_within(read_offset + range_bytes);
+  return true;
 }
 
 void CommandProcessor::WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base,
@@ -1545,6 +1637,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+  plain_register_ranges_ = REXCVAR_GET(gpu_plain_register_ranges);
 
   // The guest polls the read pointer write-back to see how much ring space it
   // has, and hardware advances it as the ring drains. Publishing only once the
@@ -1616,29 +1709,41 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   } while (reader.read_count());
 }
 
+namespace {
+// Out of line, so the packet function below needs no stack frame for the log
+// call.
+#if defined(_MSC_VER) && !defined(__clang__)
+__declspec(noinline) void WarnUninitializedPacket() {
+#else
+__attribute__((noinline, cold)) void WarnUninitializedPacket() {
+#endif
+  REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+}
+}  // namespace
+
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
-  const uint32_t packet = reader->ReadAndSwap<uint32_t>();
-  const uint32_t packet_type = packet >> 30;
-  if (packet == 0) {
-    return true;
+  uint32_t packet = reader->ReadAndSwap<uint32_t>();
+  // Zero words and type-2 packets do nothing. The D3D library pads its command
+  // buffers with type-2 packets (millions a second in some titles): skip a
+  // whole run of them here instead of returning to the caller's loop for each.
+  while (packet == 0 || (packet >> 30) == 0x02) {
+    if (!reader->read_count()) {
+      return true;
+    }
+    packet = reader->ReadAndSwap<uint32_t>();
   }
 
-  if (packet == 0xCDCDCDCD) {
-    REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+  if (packet == 0xCDCDCDCD) [[unlikely]] {
+    WarnUninitializedPacket();
   }
 
-  switch (packet_type) {
-    case 0x00:
-      return ExecutePacketType0(reader, packet);
-    case 0x01:
-      return ExecutePacketType1(reader, packet);
-    case 0x02:
-      return ExecutePacketType2(reader, packet);
+  switch (packet >> 30) {
     case 0x03:
       return ExecutePacketType3(reader, packet);
+    case 0x00:
+      return ExecutePacketType0(reader, packet);
     default:
-      assert_unhandled_case(packet_type);
-      return false;
+      return ExecutePacketType1(reader, packet);
   }
 }
 
@@ -1657,10 +1762,23 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
   if (!write_one_reg) {
+    // Render state the backend only stores, straight from the ring.
+    if (plain_register_ranges_ && WritePlainRangeFromRing(reader, base_index, count)) {
+      return true;
+    }
     // Consecutive registers: as a range, so the backend can take the constant
     // blocks (most of these packets) in one go rather than one virtual
     // WriteRegister call per register.
     WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
+  // Every word to one register that is only stored (the last one stays),
+  // without a virtual call for each.
+  if (plain_register_ranges_ && plain_registers.IsPlain(base_index)) {
+    volatile uint32_t& value = const_cast<volatile uint32_t&>(register_file_->values[base_index]);
+    for (uint32_t m = 0; m < count; m++) {
+      value = reader->ReadAndSwap<uint32_t>();
+    }
     return true;
   }
   for (uint32_t m = 0; m < count; m++) {
@@ -2488,6 +2606,11 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reade
       WriteLoopRangeFromRing(reader, index, count_registers);
       break;
     case 4:  // REGISTERS
+      // As in ExecutePacketType0.
+      if (plain_register_ranges_ &&
+          WritePlainRangeFromRing(reader, index + 0x2000, count_registers)) {
+        break;
+      }
       WriteREGISTERSRangeFromRing(reader, index, count_registers);
       break;
     default:
@@ -2502,6 +2625,10 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
                                                         uint32_t count) {
   uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
   uint32_t index = offset_type & 0xFFFF;
+  // As in ExecutePacketType0.
+  if (plain_register_ranges_ && WritePlainRangeFromRing(reader, index, count - 1)) {
+    return true;
+  }
   WriteRegisterRangeFromRing(reader, index, count - 1);
   return true;
 }

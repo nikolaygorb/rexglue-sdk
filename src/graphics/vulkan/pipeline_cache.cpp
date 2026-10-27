@@ -334,7 +334,7 @@ bool VulkanPipelineCache::CreateTranslatorAndInternalShaders() {
       render_target_cache_.msaa_2x_attachments_supported(),
       render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
       render_target_cache_.draw_resolution_scale_x(),
-      render_target_cache_.draw_resolution_scale_y());
+      render_target_cache_.draw_resolution_scale_y(), render_target_cache_.edram_tile_count());
 
   {
     std::vector<uint8_t> depth_only_fragment_shader_code =
@@ -1160,17 +1160,21 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   // With async compilation, the pipeline is created on a creation thread, and
-  // draws with it are skipped until it's ready (like on Direct3D 12). Only
-  // when there's a pixel shader - pipelines without one are fast to create.
-  bool use_async =
-      REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() && pixel_shader;
+  // draws with it are skipped until it's ready (like on Direct3D 12). Without a
+  // pixel shader only with async_depth_only_pipelines, and never for
+  // memexport-only draws (see the Direct3D 12 pipeline cache).
+  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
+                   (pixel_shader || (REXCVAR_GET(async_depth_only_pipelines) &&
+                                     !vertex_shader->shader().memexport_eM_written()));
   if (use_async) {
     // Calculate priority based on whether shader writes to visible RTs.
     uint32_t bound_rts =
         pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask);
-    creation_arguments.priority = pipeline_util::CalculatePipelinePriority(
-        bound_rts, pixel_shader->shader().writes_color_targets(),
-        pixel_shader->shader().writes_depth());
+    creation_arguments.priority =
+        pixel_shader ? pipeline_util::CalculatePipelinePriority(
+                           bound_rts, pixel_shader->shader().writes_color_targets(),
+                           pixel_shader->shader().writes_depth())
+                     : pipeline_util::kPriorityDepthOnly;
     pipeline.second.creation_pending.store(true, std::memory_order_release);
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
@@ -1324,14 +1328,16 @@ void VulkanPipelineCache::TranslateShadersForStorage(
   bool msaa_2x_no_attachments = render_target_cache_.msaa_2x_no_attachments_supported();
   uint32_t draw_res_x = render_target_cache_.draw_resolution_scale_x();
   uint32_t draw_res_y = render_target_cache_.draw_resolution_scale_y();
+  uint32_t edram_tile_count = render_target_cache_.edram_tile_count();
 
   auto translate_function = [this, &translations_needed, &shaders_to_translate, &translation_index,
                              &translations_completed, vulkan_device, msaa_2x_attachments,
-                             msaa_2x_no_attachments, edram_fsi_used, draw_res_x, draw_res_y]() {
+                             msaa_2x_no_attachments, edram_fsi_used, draw_res_x, draw_res_y,
+                             edram_tile_count]() {
     // Each thread needs its own translator.
     SpirvShaderTranslator translator(SpirvShaderTranslator::Features(vulkan_device),
                                      msaa_2x_attachments, msaa_2x_no_attachments, edram_fsi_used,
-                                     draw_res_x, draw_res_y);
+                                     draw_res_x, draw_res_y, edram_tile_count);
 
     string::StringBuffer ucode_disasm_buffer;
     while (true) {

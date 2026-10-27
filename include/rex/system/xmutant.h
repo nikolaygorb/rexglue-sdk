@@ -22,7 +22,7 @@ class XMutant : public XObject {
  public:
   static const XObject::Type kObjectType = XObject::Type::Mutant;
 
-  explicit XMutant(KernelState* kernel_state);
+  explicit XMutant(KernelState* kernel_state, bool host_object = false);
   ~XMutant() override;
 
   void Initialize(bool initial_owner);

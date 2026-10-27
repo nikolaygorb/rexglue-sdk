@@ -68,52 +68,36 @@ typedef struct {
 } X_DISPATCH_HEADER;
 static_assert_size(X_DISPATCH_HEADER, 0x10);
 
-// https://www.nirsoft.net/kernel_struct/vista/OBJECT_HEADER.html
+// The console's Object Manager header in front of an object body (canary
+// 889d93e13, fe40c0d68).
 struct X_OBJECT_HEADER {
-  rex::be<uint32_t> pointer_count;
-  union {
-    rex::be<uint32_t> handle_count;
-    rex::be<uint32_t> next_to_free;
-  };
-  uint8_t name_info_offset;
-  uint8_t handle_info_offset;
-  uint8_t quota_info_offset;
-  uint8_t flags;
-  union {
-    rex::be<uint32_t> object_create_info;  // X_OBJECT_CREATE_INFORMATION
-    rex::be<uint32_t> quota_block_charged;
-  };
-  rex::be<uint32_t> object_type_ptr;  // -0x8 POBJECT_TYPE
-  rex::be<uint32_t> unk_04;           // -0x4
-
+  rex::be<int32_t> pointer_count;
+  rex::be<int32_t> handle_count;
+  rex::be<uint32_t> object_type_ptr;  // X_OBJECT_TYPE*
+  rex::be<uint16_t> flags;            // kObjectHeader*
+  uint8_t hash_index;
+  uint8_t padding;
   // Object lives after this header.
-  // (There's actually a body field here which is the object itself)
 };
+static_assert_size(X_OBJECT_HEADER, 0x10);
 
-// https://www.nirsoft.net/kernel_struct/vista/OBJECT_CREATE_INFORMATION.html
-struct X_OBJECT_CREATE_INFORMATION {
-  rex::be<uint32_t> attributes;                  // 0x0
-  rex::be<uint32_t> root_directory_ptr;          // 0x4
-  rex::be<uint32_t> parse_context_ptr;           // 0x8
-  rex::be<uint32_t> probe_mode;                  // 0xC
-  rex::be<uint32_t> paged_pool_charge;           // 0x10
-  rex::be<uint32_t> non_paged_pool_charge;       // 0x14
-  rex::be<uint32_t> security_descriptor_charge;  // 0x18
-  rex::be<uint32_t> security_descriptor;         // 0x1C
-  rex::be<uint32_t> security_qos_ptr;            // 0x20
-
-  // Security QoS here (SECURITY_QUALITY_OF_SERVICE) too!
-};
+// X_OBJECT_HEADER::flags.
+constexpr uint16_t kObjectHeaderNamedObject = 0x1;  // X_OBJECT_HEADER_NAME_INFO in front
+constexpr uint16_t kObjectHeaderTitleObject = 0x10;
 
 struct X_OBJECT_TYPE {
-  rex::be<uint32_t> constructor;  // 0x0
-  rex::be<uint32_t> destructor;   // 0x4
-  rex::be<uint32_t> unk_08;       // 0x8
-  rex::be<uint32_t> unk_0C;       // 0xC
+  rex::be<uint32_t> constructor;  // 0x0 allocate procedure (size, pool tag, pool)
+  rex::be<uint32_t> destructor;   // 0x4 free procedure
+  rex::be<uint32_t> unk_08;       // 0x8 close procedure (object, open count)
+  rex::be<uint32_t> unk_0C;       // 0xC delete procedure
   rex::be<uint32_t> unk_10;       // 0x10
   rex::be<uint32_t> unk_14;       // 0x14 probably offset from ntobject to keobject
   rex::be<uint32_t> pool_tag;     // 0x18
 };
+
+namespace util {
+class ObjectTable;
+}  // namespace util
 
 class XObject {
  public:
@@ -123,6 +107,13 @@ class XObject {
   // Instead of receiving address that starts with 0x82... we're receiving
   // one with 0x8A... which causes crash
   static constexpr uint32_t kHandleBase = 0xF8000000;
+  // Handles of host objects (the loader's, the runtime's, wrappers of guest
+  // dispatch objects) live in a table of their own below kHandleBase, so they
+  // never shift the title's handle numbering (xenia-edge 672bc8b81).
+  static constexpr uint32_t kHandleHostBase = 0x01000000;
+  static constexpr bool is_handle_host_object(X_HANDLE handle) {
+    return handle >= kHandleHostBase && handle < kHandleBase;
+  }
 
   enum class Type : uint32_t {
     Undefined,
@@ -142,7 +133,7 @@ class XObject {
   };
 
   XObject(Type type);
-  XObject(KernelState* kernel_state, Type type);
+  XObject(KernelState* kernel_state, Type type, bool host_object = false);
   virtual ~XObject();
 
   rex::Runtime* emulator() const;
@@ -160,6 +151,8 @@ class XObject {
 
   const std::string& name() const { return name_; }
   uint32_t guest_object() const { return guest_object_ptr_; }
+  // The guest X_OBJECT_TYPE recorded by ObOpenObjectByPointer, or 0.
+  uint32_t guest_object_type() const { return guest_object_type_ptr_.load(); }
 
   // Has this object been created for use by the host?
   // Host objects are persisted through reloads/etc.
@@ -189,6 +182,12 @@ class XObject {
 
   void SetAttributes(uint32_t obj_attributes_ptr);
 
+  // Records the type from the Object Manager header in front of a guest object
+  // (ObOpenObjectByPointer). Not for objects the host allocated.
+  void SetNativeType();
+  // The kernel's X_OBJECT_TYPE for this kind of object, or 0.
+  uint32_t KernelObjectType() const;
+
   X_STATUS Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                 uint64_t* opt_timeout);
   static X_STATUS SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
@@ -209,6 +208,9 @@ class XObject {
 
   // Called on successful wait.
   virtual void WaitCallback() {}
+  // The guest wrote the object's dispatch header directly (an inlined
+  // initialize or signal): take its state (canary dcf2994ea).
+  virtual void SyncFromGuest() {}
   virtual rex::thread::WaitHandle* GetWaitHandle() { return nullptr; }
 
   // Creates the kernel object for guest code to use. Typically not needed.
@@ -218,6 +220,13 @@ class XObject {
   template <typename T>
   T* CreateNative() {
     return reinterpret_cast<T*>(CreateNative(sizeof(T)));
+  }
+
+  // A body the guest allocated without a dispatch header (ObInsertObject): no
+  // handle is stashed in it.
+  void SetGuestBody(uint32_t body, uint32_t type_ptr) {
+    guest_object_ptr_ = body;
+    guest_object_type_ptr_.store(type_ptr);
   }
 
   // Stash native pointer into X_DISPATCH_HEADER
@@ -234,6 +243,11 @@ class XObject {
   bool host_object_ = false;
 
  private:
+  friend class util::ObjectTable;
+  // Called under the object table lock after a slot lost its last reference:
+  // a dispatch header that stashed that handle gets another one, or none.
+  void UpdateNativeHandle(X_HANDLE removed_handle);
+
   std::atomic<int32_t> pointer_ref_count_;
 
   Type type_;
@@ -244,6 +258,10 @@ class XObject {
   // if we allocated it!
   uint32_t guest_object_ptr_ = 0;
   bool allocated_guest_object_ = false;
+  // CreateNative allocated a placeholder X_OBJECT_TYPE (no kernel type).
+  bool allocated_object_type_ = false;
+  // Guest type recorded by ObOpenObjectByPointer.
+  std::atomic<uint32_t> guest_object_type_ptr_{0};
 };
 
 template <typename T>

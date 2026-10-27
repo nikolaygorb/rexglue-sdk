@@ -604,3 +604,131 @@ TEST_CASE("ObjectTable RemoveHandle while another thread grows the table",
 // TODO: Test GetObjectsByType<T>() with real typed objects
 // TODO: Test GetObjectByName with existing object - requires kernel_state for RetainHandle
 // TODO: Test case-insensitive name lookup via GetObjectByName
+
+// =============================================================================
+// ObjectTable guest opens of title-typed objects (canary 291f0c9be)
+// =============================================================================
+
+TEST_CASE("ObjectTable untracked opens keep reference-based closing", "[kernel][object_table]") {
+  InitTestLogging();
+
+  ObjectTable table;
+  auto* obj = new TestObject();
+  X_HANDLE handle = 0;
+  table.AddHandle(obj, &handle);
+
+  REQUIRE(table.OpenGuestHandle(handle, obj, false) == X_STATUS_SUCCESS);
+  int32_t count = 0;
+  uint64_t generation = 0;
+  REQUIRE(table.ClaimGuestClose(handle, obj, &count, &generation) == X_STATUS_SUCCESS);
+  CHECK(count == -1);
+  CHECK(table.ReleaseHandleOf(handle, obj, generation) == X_STATUS_SUCCESS);
+  // The table's own reference is left.
+  CHECK(table.LookupObject<XObject>(handle).get() == obj);
+
+  table.Reset();
+}
+
+TEST_CASE("ObjectTable counts guest opens for the close procedure", "[kernel][object_table]") {
+  InitTestLogging();
+
+  ObjectTable table;
+  auto* obj = new TestObject();
+  X_HANDLE handle = 0;
+  table.AddHandle(obj, &handle);
+
+  REQUIRE(table.OpenGuestHandle(handle, obj) == X_STATUS_SUCCESS);
+  REQUIRE(table.OpenGuestHandle(handle, obj) == X_STATUS_SUCCESS);
+
+  int32_t count = 0;
+  uint64_t generation = 0;
+  REQUIRE(table.ClaimGuestClose(handle, obj, &count, &generation) == X_STATUS_SUCCESS);
+  CHECK(count == 2);
+  // A release with another generation is refused.
+  CHECK(table.ReleaseHandleOf(handle, obj, generation + 1) == X_STATUS_INVALID_HANDLE);
+  CHECK(table.ReleaseHandleOf(handle, obj, generation) == X_STATUS_SUCCESS);
+
+  REQUIRE(table.ClaimGuestClose(handle, obj, &count, &generation) == X_STATUS_SUCCESS);
+  CHECK(count == 1);
+  CHECK(table.ReleaseHandleOf(handle, obj, generation) == X_STATUS_SUCCESS);
+
+  // Every guest open is closed: the handle is gone for the guest, although
+  // the table's reference still holds the slot.
+  CHECK(table.LookupObject<XObject>(handle).get() == nullptr);
+  CHECK(table.ClaimGuestClose(handle, obj, &count, &generation) == X_STATUS_INVALID_HANDLE);
+
+  table.Reset();
+}
+
+TEST_CASE("ObjectTable duplicate of a tracked handle adds one open", "[kernel][object_table]") {
+  InitTestLogging();
+
+  ObjectTable table;
+  auto* obj = new TestObject();
+  X_HANDLE handle = 0, duplicate = 0;
+  table.AddHandle(obj, &handle);
+  REQUIRE(table.OpenGuestHandle(handle, obj) == X_STATUS_SUCCESS);
+  REQUIRE(table.DuplicateHandle(handle, &duplicate) == X_STATUS_SUCCESS);
+  CHECK(duplicate != handle);
+
+  int32_t count = 0;
+  uint64_t generation = 0;
+  REQUIRE(table.ClaimGuestClose(duplicate, obj, &count, &generation) == X_STATUS_SUCCESS);
+  CHECK(count == 2);  // both slots' opens
+  CHECK(table.ReleaseHandleOf(duplicate, obj, generation) == X_STATUS_SUCCESS);
+  CHECK(table.LookupObject<XObject>(duplicate).get() == nullptr);
+  CHECK(table.LookupObject<XObject>(handle).get() == obj);
+
+  table.Reset();
+}
+
+TEST_CASE("ObjectTable native handles follow the object's handles", "[kernel][object_table]") {
+  InitTestLogging();
+
+  ObjectTable table;
+  auto* obj = new TestObject();
+  X_HANDLE first = 0, second = 0;
+  table.AddHandle(obj, &first);
+  table.AddNativeHandle(obj->guest_object(), first);
+  CHECK(table.LookupNativeHandle(obj->guest_object()) == first);
+
+  table.DuplicateHandle(first, &second);
+  // The first handle goes: the native lookup moves to the one left.
+  CHECK(table.ReleaseHandle(first) == X_STATUS_SUCCESS);
+  CHECK(table.LookupNativeHandle(obj->guest_object()) == second);
+  // The last one goes: nothing is left to find.
+  CHECK(table.ReleaseHandle(second) == X_STATUS_SUCCESS);
+  CHECK(table.LookupNativeHandle(obj->guest_object()) == 0);
+
+  table.Reset();
+}
+
+// A host object: the loader's or the runtime's (xenia-edge 672bc8b81).
+class HostTestObject : public XObject {
+ public:
+  static constexpr Type kObjectType = Type::Undefined;
+  HostTestObject() : XObject(Type::Undefined) { host_object_ = true; }
+};
+
+TEST_CASE("ObjectTable host objects stay out of the guest numbering", "[kernel][object_table]") {
+  InitTestLogging();
+
+  ObjectTable table;
+  auto* host = new HostTestObject();
+  auto* guest = new TestObject();
+  X_HANDLE host_handle = 0, guest_handle = 0, duplicate = 0;
+  table.AddHandle(host, &host_handle);
+  table.AddHandle(guest, &guest_handle);
+
+  CHECK(XObject::is_handle_host_object(host_handle));
+  // The title's first handle is still the first guest slot.
+  CHECK(guest_handle == XObject::kHandleBase + 4);
+  CHECK(table.LookupObject<XObject>(host_handle).get() == host);
+
+  // A handle handed to the guest is a guest one.
+  REQUIRE(table.DuplicateHandle(host_handle, &duplicate) == X_STATUS_SUCCESS);
+  CHECK_FALSE(XObject::is_handle_host_object(duplicate));
+  CHECK(table.LookupObject<XObject>(duplicate).get() == host);
+
+  table.Reset();
+}

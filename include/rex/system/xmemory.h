@@ -222,8 +222,8 @@ class BaseHeap {
   // (false for a range outside the heap).
   bool IsRangeUnallocated(uint32_t address, uint32_t size);
 
-  // Queries the currently strictest readability and writability for the entire
-  // range.
+  // Queries access across committed pages in the inclusive address range. A
+  // page that is only reserved, or decommitted, has no access.
   rex::memory::PageAccess QueryRangeAccess(uint32_t low_address, uint32_t high_address);
 
   bool Save(stream::ByteStream* stream);
@@ -534,6 +534,12 @@ class Memory {
   inline BaseHeap* LookupHeap(uint32_t address) {
     return const_cast<BaseHeap*>(const_cast<const memory::Memory*>(this)->LookupHeap(address));
   }
+
+  // Queries access across committed pages in a guest virtual address range.
+  // Empty, overflowing, unmapped, or cross-heap ranges return kNoAccess.
+  // Returns kReadWrite if all pages are readable and writable, kReadOnly if
+  // all are readable, and kNoAccess otherwise.
+  rex::memory::PageAccess QueryRangeAccess(uint32_t address, uint32_t length);
 
   // Gets the heap with the given properties.
   BaseHeap* LookupHeapByType(bool physical, uint32_t page_size);

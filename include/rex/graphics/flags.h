@@ -19,6 +19,8 @@ REXCVAR_DECLARE(bool, clear_memory_page_state);
 REXCVAR_DECLARE(bool, half_pixel_offset);
 REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DECLARE(int32_t, async_pipeline_wait_ms);
+REXCVAR_DECLARE(bool, async_depth_only_pipelines);
+REXCVAR_DECLARE(bool, gpu_shader_translation_memo);
 
 // GPU Resolution / Readback / Queries
 REXCVAR_DECLARE(int32_t, resolution_scale);

@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+
 #include <rex/kernel/xam/apps/xgi_app.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
@@ -329,6 +331,35 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       REXKRNL_DEBUG("XUserReadStats({}, {}, {:08X}, {}, {:08X}, {}, {:08X})", title_id, xuids_count,
                     xuids_ptr, specs_count, specs_ptr, results_size, results_ptr);
+
+      // No stats are kept: one empty view per requested spec. Titles read
+      // pViews[i] for every spec they asked for, so a null pViews crashes them
+      // (Gears of War 2 Horde reading its high scores).
+      // XUSER_STATS_SPEC is dwViewId, dwNumColumnIds and 64 WORD column ids.
+      constexpr uint32_t kStatsSpecSize = 136;
+      // XUSER_STATS_READ_RESULTS {dwNumViews, pViews}, then XUSER_STATS_VIEW
+      // {dwViewId, dwTotalViewRows, dwNumRows, pRows} each.
+      constexpr uint32_t kResultsHeaderSize = 8;
+      constexpr uint32_t kViewSize = 16;
+      if (results_ptr && results_size >= kResultsHeaderSize) {
+        const uint32_t views =
+            std::min(specs_count, (results_size - kResultsHeaderSize) / kViewSize);
+        const uint32_t views_ptr = results_ptr + kResultsHeaderSize;
+        uint8_t* results = memory_->TranslateVirtual(results_ptr);
+        memory::store_and_swap<uint32_t>(results + 0, views);
+        memory::store_and_swap<uint32_t>(results + 4, views ? views_ptr : 0);
+        for (uint32_t i = 0; i < views; ++i) {
+          const uint32_t view_id =
+              specs_ptr ? memory::load_and_swap<uint32_t>(
+                              memory_->TranslateVirtual(specs_ptr + i * kStatsSpecSize))
+                        : 0;
+          uint8_t* view = memory_->TranslateVirtual(views_ptr + i * kViewSize);
+          memory::store_and_swap<uint32_t>(view + 0, view_id);
+          memory::store_and_swap<uint32_t>(view + 4, 0);
+          memory::store_and_swap<uint32_t>(view + 8, 0);
+          memory::store_and_swap<uint32_t>(view + 12, 0);
+        }
+      }
 
       return X_E_SUCCESS;
     }

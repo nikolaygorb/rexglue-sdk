@@ -39,6 +39,18 @@ u32 XamPartyGetUserList_entry(u32 player_count, mapped_u32 party_list) {
   return 0x807D0003;
 }
 
+// The internal list has the same count and 32 users of 0x80 bytes.
+constexpr size_t kPartyUserListInternalSize = 0x1008;
+
+u32 XamPartyGetUserListInternal_entry(mapped_void party_list) {
+  // An empty list rather than whatever the buffer held (the Metro dashboard
+  // crashed on it).
+  if (party_list) {
+    std::memset(party_list.host_address(), 0, kPartyUserListInternalSize);
+  }
+  return 0x807D0003;  // X_PARTY_E_NOT_IN_PARTY
+}
+
 u32 XamPartySendGameInvites_entry(u32 r3, u32 r4, u32 r5) {
   return X_ERROR_FUNCTION_FAILED;
 }
@@ -56,6 +68,8 @@ u32 XamPartyGetBandwidth_entry(u32 r3, u32 r4) {
 }  // namespace rex
 
 REX_EXPORT(__imp__XamPartyGetUserList, rex::kernel::xam::XamPartyGetUserList_entry)
+REX_EXPORT(__imp__XamPartyGetUserListInternal,
+           rex::kernel::xam::XamPartyGetUserListInternal_entry)
 REX_EXPORT(__imp__XamPartySendGameInvites, rex::kernel::xam::XamPartySendGameInvites_entry)
 REX_EXPORT(__imp__XamPartySetCustomData, rex::kernel::xam::XamPartySetCustomData_entry)
 REX_EXPORT(__imp__XamPartyGetBandwidth, rex::kernel::xam::XamPartyGetBandwidth_entry)
@@ -71,7 +85,6 @@ REX_EXPORT_STUB(__imp__XamPartyGetJoinable);
 REX_EXPORT_STUB(__imp__XamPartyGetNetworkCounters);
 REX_EXPORT_STUB(__imp__XamPartyGetRoutingTable);
 REX_EXPORT_STUB(__imp__XamPartyGetState);
-REX_EXPORT_STUB(__imp__XamPartyGetUserListInternal);
 REX_EXPORT_STUB(__imp__XamPartyIsCoordinator);
 REX_EXPORT_STUB(__imp__XamPartyJoin);
 REX_EXPORT_STUB(__imp__XamPartyJoinEx);

@@ -213,10 +213,33 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
   return result;
 }
 
+bool XFile::CompletesAsync(uint32_t length, uint64_t byte_offset) const {
+  if (is_synchronous_) {
+    return false;
+  }
+  if (device()->is_io_queued()) {
+    return true;
+  }
+  return !allow_buffering_ && length && byte_offset != uint64_t(-1) &&
+         byte_offset < file_->entry()->size();
+}
+
+void XFile::NotifyCompletion(X_STATUS status, uint32_t num_bytes, uint32_t apc_context) {
+  XIOCompletion::IONotification notify;
+  notify.apc_context = apc_context;
+  notify.num_bytes = num_bytes;
+  notify.status = status;
+  NotifyIOCompletionPorts(notify);
+  async_event_->Set();
+}
+
 X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, uint64_t byte_offset,
-                            uint32_t* out_bytes_read, uint32_t apc_context, bool* out_pending) {
+                            uint32_t* out_bytes_read, uint32_t apc_context, bool* out_pending,
+                            bool notify_completion) {
   std::lock_guard<std::mutex> lock(file_lock_);
-  async_event_->Reset();
+  if (notify_completion) {
+    async_event_->Reset();
+  }
   if (out_pending) {
     *out_pending = false;
   }
@@ -224,7 +247,8 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
     *out_bytes_read = 0;
   }
   if (!length) {
-    return ReadInternal(0, 0, byte_offset, out_bytes_read, apc_context, true, out_pending);
+    return ReadInternal(0, 0, byte_offset, out_bytes_read, apc_context, notify_completion,
+                        out_pending);
   }
   X_STATUS result = X_STATUS_SUCCESS;
 
@@ -265,14 +289,9 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
     *out_bytes_read = uint32_t(read_total);
   }
 
-  XIOCompletion::IONotification notify;
-  notify.apc_context = apc_context;
-  notify.num_bytes = uint32_t(read_total);
-  notify.status = result;
-
-  NotifyIOCompletionPorts(notify);
-
-  async_event_->Set();
+  if (notify_completion) {
+    NotifyCompletion(result, uint32_t(read_total), apc_context);
+  }
 
   return result;
 }

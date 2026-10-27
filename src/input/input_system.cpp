@@ -359,6 +359,10 @@ void InputSystem::RemoveUIInputBlocker() {
     }
   }
 
+  // Discarded before unblocking so the title gets no keystrokes made in the UI.
+  for (auto& driver : drivers_) {
+    driver->DiscardKeystrokes();
+  }
   ui_input_blockers_.fetch_sub(1);
 }
 
@@ -479,11 +483,18 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);
 
+  // A dialog owns the keyboard: what is typed there never reaches the title.
+  // Releases of presses it already received still do.
+  const bool ui_blocked = ui_input_blockers_.load() > 0;
+
   bool any_connected = false;
   for (DeviceId id : ids) {
     auto* driver = DriverForDevice(id);
     if (!driver) {
       continue;
+    }
+    if (ui_blocked) {
+      driver->DiscardKeystrokes();
     }
     X_RESULT result = driver->GetDeviceKeystroke(id, flags, out_keystroke);
     if (result == X_ERROR_SUCCESS) {

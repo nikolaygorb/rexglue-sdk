@@ -20,6 +20,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_set>
 
 namespace rex::input::mnk {
 
@@ -42,6 +43,7 @@ class MnkInputDriver final : public InputDriver,
   X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) override;
   X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags,
                               X_INPUT_KEYSTROKE* out_keystroke) override;
+  void DiscardKeystrokes() override;
 
   void OnWindowAvailable(rex::ui::Window* window) override;
 
@@ -72,6 +74,9 @@ class MnkInputDriver final : public InputDriver,
   /// keystroke for each pad button that changed. Call with state_mutex_ held
   /// after any key or mouse button moves.
   void RefreshBoundKeystrokesLocked();
+  /// The packet number for a polled state: it advances only when the state
+  /// differs from the last one polled. Call with state_mutex_ held.
+  uint32_t PacketNumberForLocked(const X_INPUT_GAMEPAD& gamepad);
 
   // Called from the guest thread. The rest of the capture path stays on the UI
   // thread, since every Window call in it reaches SDL.
@@ -126,8 +131,15 @@ class MnkInputDriver final : public InputDriver,
   // Which binds were pressed at the last evaluation, to diff against. One bit
   // per entry of the bind table.
   uint32_t bound_pressed_ = 0;
+  // Under state_mutex_: raw keys held in passthrough, released for the title
+  // when the focus is lost, and keys whose press the title received and whose
+  // release it hasn't, so every release it gets pairs with a press.
+  std::unordered_set<uint16_t> raw_keys_down_;
+  std::unordered_set<uint16_t> delivered_;
 
-  // Packet number incremented on state change
+  // Under state_mutex_: the last polled state and its packet number, which
+  // advances only when the state changes.
+  X_INPUT_GAMEPAD last_gamepad_ = {};
   uint32_t packet_number_ = 0;
 };
 

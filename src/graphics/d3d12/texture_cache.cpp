@@ -123,7 +123,7 @@ const D3D12TextureCache::HostFormat D3D12TextureCache::host_formats_[64] = {
      kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
      xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR},
     // k_8_B
-    {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown, DXGI_FORMAT_UNKNOWN,
+    {DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_UNORM, kLoadShaderIndex8bpb, DXGI_FORMAT_R8_SNORM,
      kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
      xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR},
     // k_8_8
@@ -152,9 +152,9 @@ const D3D12TextureCache::HostFormat D3D12TextureCache::host_formats_[64] = {
      kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
      xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG},
     // k_8_8_8_8_A
-    {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown, DXGI_FORMAT_UNKNOWN,
-     kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN, kLoadShaderIndexUnknown,
-     xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA},
+    {DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, kLoadShaderIndex32bpb,
+     DXGI_FORMAT_R8G8B8A8_SNORM, kLoadShaderIndexUnknown, false, DXGI_FORMAT_UNKNOWN,
+     kLoadShaderIndexUnknown, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA},
     // k_4_4_4_4
     // Red and blue swapped in the load shader for simplicity.
     {DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM, kLoadShaderIndexRGBA4ToBGRA4,
@@ -1737,8 +1737,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
-  // both the base and the mips would be on "level 0", but stored in separate
-  // places.
+  // both the base and the mips would be on "level 0", but loaded using separate
+  // layouts.
   uint32_t loop_level_first, loop_level_last;
   if (level_packed == 0) {
     // Packed mip tail is the level 0 - may need to load mip tails for the base,

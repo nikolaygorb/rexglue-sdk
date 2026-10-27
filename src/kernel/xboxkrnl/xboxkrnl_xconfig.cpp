@@ -12,6 +12,10 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <array>
+#include <cstring>
+#include <random>
+
 #include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -24,10 +28,29 @@
 
 namespace rex::kernel::xboxkrnl {
 
+namespace {
+
+// The console's network adapter. A Microsoft block from while the 360 was
+// made, as XLink Kai only forwards frames from console vendors; the rest is
+// new for every process so instances on one machine never share it.
+const std::array<uint8_t, 6>& ConsoleMacAddress() {
+  static const std::array<uint8_t, 6> mac = [] {
+    std::array<uint8_t, 6> mac = {0x00, 0x1D, 0xD8};
+    std::random_device random;
+    for (size_t i = 3; i < mac.size(); ++i) {
+      mac[i] = static_cast<uint8_t>(random());
+    }
+    return mac;
+  }();
+  return mac;
+}
+
+}  // namespace
+
 X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer,
                                uint16_t buffer_size, uint16_t* required_size) {
   uint16_t setting_size = 0;
-  alignas(uint32_t) uint8_t value[4];
+  alignas(uint32_t) uint8_t value[8];
 
   // TODO(benvanik): have real structs here that just get copied from.
   // https://free60project.github.io/wiki/XConfig.html
@@ -36,6 +59,10 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer
     case 0x0002:
       // XCONFIG_SECURED_CATEGORY
       switch (setting) {
+        case 0x0001:  // XCONFIG_SECURED_MAC_ADDRESS
+          setting_size = uint16_t(ConsoleMacAddress().size());
+          std::memcpy(value, ConsoleMacAddress().data(), setting_size);
+          break;
         case 0x0002:  // XCONFIG_SECURED_AV_REGION
           setting_size = 4;
           memory::store_and_swap<uint32_t>(value, 0x00001000);  // USA/Canada

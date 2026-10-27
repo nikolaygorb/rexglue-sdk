@@ -10,8 +10,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <unordered_map>
@@ -164,6 +166,15 @@ class RenderTargetCache {
   // to be discarded.
   uint32_t draw_resolution_scale_x() const { return draw_resolution_scale_x_; }
   uint32_t draw_resolution_scale_y() const { return draw_resolution_scale_y_; }
+
+  // 2048 on real hardware.
+  // kEdramTileCountMax with the extended edram_tile_count.
+  uint32_t edram_tile_count() const { return edram_tile_count_; }
+  uint32_t edram_size_bytes() const { return edram_tile_count_ * xenos::kEdramTileSizeBytes; }
+  // Register bases wrap at the tile count.
+  // Real hardware only reads 11 bits.
+  uint32_t WrapEdramBase(uint32_t base_tiles) const { return base_tiles & (edram_tile_count_ - 1); }
+
   bool IsDrawResolutionScaled() const {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
   }
@@ -218,7 +229,8 @@ class RenderTargetCache {
       : register_file_(register_file),
         draw_extent_estimator_(register_file, memory),
         draw_resolution_scale_x_(draw_resolution_scale_x),
-        draw_resolution_scale_y_(draw_resolution_scale_y) {
+        draw_resolution_scale_y_(draw_resolution_scale_y),
+        edram_tile_count_(EdramTileCountFromCvar()) {
     assert_not_zero(draw_resolution_scale_x);
     assert_not_zero(draw_resolution_scale_y);
   }
@@ -257,24 +269,24 @@ class RenderTargetCache {
   union RenderTargetKey {
     uint32_t key;
     struct {
-      uint32_t base_tiles : xenos::kEdramBaseTilesBits;  // 11
+      uint32_t base_tiles : xenos::kEdramBaseTilesBits;  // 13
       // At 4x MSAA (2 horizontal samples), max. align(8192 * 2, 80) / 80 = 205.
       // For pitch at 64bpp, multiply by 2 (or use GetPitchTiles).
-      uint32_t pitch_tiles_at_32bpp : 8;                          // 19
-      xenos::MsaaSamples msaa_samples : xenos::kMsaaSamplesBits;  // 21
-      uint32_t is_depth : 1;                                      // 22
+      uint32_t pitch_tiles_at_32bpp : 8;                          // 21
+      xenos::MsaaSamples msaa_samples : xenos::kMsaaSamplesBits;  // 23
+      uint32_t is_depth : 1;                                      // 24
       // Ignoring the blending precision and sRGB.
-      uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 26
+      uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 28
       // 1 if this render target is kept at native guest resolution because of
       // draw_resolution_scale_threshold. Native and scaled targets at the same
       // base are distinct objects and ownership can be transferred. One bit is
       // enough. The only classes are the global scale and 1x1. Keys never
       // carry arbitrary scales.
-      uint32_t scale_native : 1;  // 27
+      uint32_t scale_native : 1;  // 29
       // The render target's rows are in the next EDRAM addressing period past
       // its base, 64bpp color rows span two. The rows in the first period at
       // the same base are another render target.
-      uint32_t next_period : 1;  // 28
+      uint32_t next_period : 1;  // 30
     };
 
     RenderTargetKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -312,13 +324,15 @@ class RenderTargetCache {
                       : xenos::GetColorRenderTargetFormatName(GetColorFormat());
     }
 
+    // GetPitchTiles fits in this: 8 bits of pitch_tiles_at_32bpp, doubled at 64bpp.
+    static constexpr uint32_t kPitchTilesBits = 9;
     uint32_t GetPitchTiles() const { return pitch_tiles_at_32bpp << uint32_t(Is64bpp()); }
     // The tile index, past the tile count for the tail wrapped around the end
     // of EDRAM and again for the next period, minus the base it's the offset
     // into the render target's rows.
-    uint32_t GetNonWrappedTileIndex(uint32_t tile_index) const {
-      return tile_index + (tile_index < base_tiles ? xenos::kEdramTileCount : 0) +
-             (uint32_t(next_period) << xenos::kEdramBaseTilesBits);
+    uint32_t GetNonWrappedTileIndex(uint32_t tile_index, uint32_t edram_tile_count) const {
+      return tile_index + (tile_index < base_tiles ? edram_tile_count : 0) +
+             uint32_t(next_period) * edram_tile_count;
     }
     static constexpr uint32_t GetWidth(uint32_t pitch_tiles_at_32bpp,
                                        xenos::MsaaSamples msaa_samples) {
@@ -351,12 +365,16 @@ class RenderTargetCache {
     RenderTarget(RenderTarget&& render_target) = delete;
     RenderTarget& operator=(RenderTarget&& render_target) = delete;
     RenderTargetKey key() const { return key_; }
+    // In pixels at 1x (the key's scale applies on top), a multiple of the tile
+    // height, at most GetRenderTargetHeight.
+    uint32_t height() const { return height_; }
 
    protected:
-    RenderTarget(RenderTargetKey key) : key_(key) {}
+    RenderTarget(RenderTargetKey key, uint32_t height) : key_(key), height_(height) {}
 
    private:
     RenderTargetKey key_;
+    uint32_t height_;
   };
 
   struct Transfer {
@@ -385,11 +403,13 @@ class RenderTargetCache {
     // Cutout can be specified for resolve clears - not to transfer areas that
     // will be cleared to a single value anyway.
     static uint32_t GetRangeRectangles(uint32_t start_tiles, uint32_t end_tiles,
-                                       RenderTargetKey key, Rectangle* rectangles_out,
+                                       RenderTargetKey key, uint32_t edram_tile_count,
+                                       Rectangle* rectangles_out,
                                        const Rectangle* cutout = nullptr);
-    uint32_t GetRectangles(RenderTargetKey key, Rectangle* rectangles_out,
-                           const Rectangle* cutout = nullptr) const {
-      return GetRangeRectangles(start_tiles, end_tiles, key, rectangles_out, cutout);
+    uint32_t GetRectangles(RenderTargetKey key, uint32_t edram_tile_count,
+                           Rectangle* rectangles_out, const Rectangle* cutout = nullptr) const {
+      return GetRangeRectangles(start_tiles, end_tiles, key, edram_tile_count, rectangles_out,
+                                cutout);
     }
     bool AreSourcesSame(const Transfer& other_transfer) const {
       return source == other_transfer.source &&
@@ -517,18 +537,25 @@ class RenderTargetCache {
   virtual uint32_t GetMaxRenderTargetWidth() const = 0;
   virtual uint32_t GetMaxRenderTargetHeight() const = 0;
 
-  // Returns the height of a render target that's needed and can be created,
+  // Returns the maximum height of a render target that can be created,
   // taking guest and host limits into account. EDRAM base and 32bpp/64bpp are
-  // not taken into account, the same height is used for all render targets even
-  // if the implementation supports mixed-size render targets, so the
-  // implementation can freely disable individual render targets and let the
+  // not taken into account, the same height limit is used for all render
+  // targets even if the implementation supports mixed size render targets, so
+  // the implementation can freely disable individual render targets and let the
   // other ones use the newly available space without restarting the whole
-  // render pass (on Vulkan, the actually used height is specified in
-  // VkFramebuffer).
+  // render pass, as long as the bound render targets are tall enough for the
+  // draw (on Vulkan, the actually used height is specified in VkFramebuffer).
   uint32_t GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
                                  xenos::MsaaSamples msaa_samples) const;
 
-  virtual RenderTarget* CreateRenderTarget(RenderTargetKey key) = 0;
+  // Host render targets start at the height the draw or clear needs and grow
+  // as needed (GetOrCreateRenderTarget).
+  virtual RenderTarget* CreateRenderTarget(RenderTargetKey key, uint32_t height) = 0;
+  // A taller copy of the source with the transfers done into it. Keeps the
+  // source alive until its last submission completes. The source stays in the
+  // cache if this fails.
+  virtual RenderTarget* GrowRenderTarget(RenderTarget* source, uint32_t height,
+                                         const std::vector<Transfer>& transfers) = 0;
 
   // Whether depth buffer is encoded differently on the host, thus after
   // aliasing naively, precision may be lost - host depth must only be
@@ -541,7 +568,54 @@ class RenderTargetCache {
   // false).
   virtual bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const = 0;
 
-  void ResetAccumulatedRenderTargets() { are_accumulated_render_targets_valid_ = false; }
+  void ResetAccumulatedRenderTargets() {
+    are_accumulated_render_targets_valid_ = false;
+    ++update_state_generation_;
+  }
+
+  // What Update's result depends on besides the cache's own state: the
+  // registers and cvars it reads, its arguments and the height the draw may
+  // cover. Two Updates with equal inputs and no change to the cache between
+  // them (update_state_generation) bind, own and transfer the same, so an
+  // implementation may keep the first one's result
+  // (vulkan_render_target_update_reuse, ForzaHorizon1-ReImagined 0340). Host
+  // render targets only.
+  struct UpdateInputs {
+    uint32_t values[10] = {};
+    bool operator==(const UpdateInputs& other) const {
+      return std::memcmp(values, other.values, sizeof(values)) == 0;
+    }
+  };
+  // False if the draw's inputs aren't covered (the window offset in the bases:
+  // the ranges then also depend on the scissor), then it can't be reused.
+  bool GetUpdateInputs(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+                       uint32_t normalized_color_mask, const Shader& vertex_shader,
+                       int32_t window_offset_tiles, UpdateInputs& inputs_out);
+  // Changed by everything that may change what Update does for the same
+  // inputs: ownership changes, render targets created, the accumulated
+  // bindings reset, cache clears.
+  uint64_t update_state_generation() const { return update_state_generation_; }
+  // A reused Update: no transfers (the ranges are owned already), as the full
+  // one would leave.
+  void ClearLastUpdateTransfers() {
+    for (std::vector<Transfer>& transfers : last_update_transfers_) {
+      transfers.clear();
+    }
+  }
+  // Verification of a reused Update (vulkan_render_target_update_reuse_verify):
+  // the common state it would change, before and after the full Update.
+  struct UpdateStateSnapshot {
+    // Start, end, owner, depth bits owner and the two host depth owners (keys)
+    // of each range.
+    std::vector<std::array<uint32_t, 6>> ownership;
+    RenderTarget* used[1 + xenos::kMaxColorRenderTargets];
+    RenderTarget* accumulated[1 + xenos::kMaxColorRenderTargets];
+    bool accumulated_valid;
+  };
+  void SnapshotUpdateState(UpdateStateSnapshot& snapshot_out) const;
+  // Empty if the state is as in the snapshot and no transfers are pending,
+  // otherwise what differs.
+  const char* CompareUpdateState(const UpdateStateSnapshot& snapshot) const;
   RenderTarget* const* last_update_accumulated_render_targets() const {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_accumulated_render_targets_;
@@ -611,9 +685,13 @@ class RenderTargetCache {
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
  private:
+  // edram_tile_count: xenos::kEdramTileCount, or kEdramTileCountMax for "extended".
+  static uint32_t EdramTileCountFromCvar();
+
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  uint32_t edram_tile_count_;
 
   DrawExtentEstimator draw_extent_estimator_;
 
@@ -699,7 +777,7 @@ class RenderTargetCache {
     return xenos::GetStorageColorFormat(format);
   }
 
-  RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key);
+  RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key, uint32_t minimum_height);
 
   // Checks if changing ownership of the range to the specified render target
   // would require transferring data - primarily for barrier placement on the
@@ -768,6 +846,9 @@ class RenderTargetCache {
   // render targets. They are reordered so for one source, all transfers are
   // consecutive in the array.
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+
+  // See update_state_generation().
+  uint64_t update_state_generation_ = 0;
 };
 
 }  // namespace rex::graphics

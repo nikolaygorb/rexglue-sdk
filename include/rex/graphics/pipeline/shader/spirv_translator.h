@@ -449,7 +449,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
-                        uint32_t draw_resolution_scale_x = 1, uint32_t draw_resolution_scale_y = 1)
+                        uint32_t draw_resolution_scale_x = 1, uint32_t draw_resolution_scale_y = 1,
+                        uint32_t edram_tile_count = xenos::kEdramTileCount)
       : features_(features),
         native_2x_msaa_with_attachments_(native_2x_msaa_with_attachments),
         native_2x_msaa_no_attachments_(native_2x_msaa_no_attachments),
@@ -457,7 +458,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
         zpd_full_counters_(REXCVAR_GET(occlusion_query_full_counters)),
         precise_interpolation_(REXCVAR_GET(precise_interpolation)),
         draw_resolution_scale_x_(draw_resolution_scale_x ? draw_resolution_scale_x : 1),
-        draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1) {}
+        draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1),
+        edram_tile_count_(edram_tile_count) {}
 
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
@@ -873,6 +875,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool precise_interpolation_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  uint32_t edram_tile_count_;
 
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.

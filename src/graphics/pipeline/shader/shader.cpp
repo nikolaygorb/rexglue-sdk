@@ -16,6 +16,7 @@
 #include <fmt/format.h>
 
 #include <rex/filesystem.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/math.h>
@@ -95,18 +96,33 @@ std::pair<std::filesystem::path, std::filesystem::path> Shader::Translation::Dum
 }
 
 Shader::Translation* Shader::GetOrCreateTranslation(uint64_t modification, bool* is_new) {
+  // Every draw asks the vertex and the pixel shader for their translation, nearly always the same
+  // one as the draw before: answer that from the memo without the map lookup (ForzaHorizon1-
+  // ReImagined 0362: the two lookups were about 1% of the command processor). The memo is
+  // emptied when its translation is destroyed.
+  if (memo_translation_ && memo_modification_ == modification &&
+      REXCVAR_GET(gpu_shader_translation_memo)) {
+    if (is_new) {
+      *is_new = false;
+    }
+    return memo_translation_;
+  }
+  Translation* translation;
   auto it = translations_.find(modification);
   if (it != translations_.end()) {
     if (is_new) {
       *is_new = false;
     }
-    return it->second;
+    translation = it->second;
+  } else {
+    translation = CreateTranslationInstance(modification);
+    translations_.emplace(modification, translation);
+    if (is_new) {
+      *is_new = true;
+    }
   }
-  Translation* translation = CreateTranslationInstance(modification);
-  translations_.emplace(modification, translation);
-  if (is_new) {
-    *is_new = true;
-  }
+  memo_translation_ = translation;
+  memo_modification_ = modification;
   return translation;
 }
 
@@ -114,6 +130,9 @@ void Shader::DestroyTranslation(uint64_t modification) {
   auto it = translations_.find(modification);
   if (it == translations_.end()) {
     return;
+  }
+  if (memo_translation_ == it->second) {
+    memo_translation_ = nullptr;
   }
   delete it->second;
   translations_.erase(it);

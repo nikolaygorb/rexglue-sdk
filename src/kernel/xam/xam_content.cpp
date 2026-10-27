@@ -305,7 +305,8 @@ u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
 
   if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
+    REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(overlapped_ptr.guest_address(), result,
+                                                      X_HRESULT_FROM_WIN32(result), 0);
     return X_ERROR_IO_PENDING;
   } else {
     return result;

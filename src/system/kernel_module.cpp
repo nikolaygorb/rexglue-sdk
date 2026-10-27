@@ -20,16 +20,14 @@
 namespace rex::system {
 
 KernelModule::KernelModule(KernelState* kernel_state, const std::string_view path)
-    : XModule(kernel_state, ModuleType::kKernelModule) {
+    // Persists through reloads.
+    : XModule(kernel_state, ModuleType::kKernelModule, true) {
   emulator_ = kernel_state->emulator();
   memory_ = emulator_->memory();
   export_resolver_ = kernel_state->emulator()->export_resolver();
 
   path_ = path;
   name_ = rex::string::utf8_find_base_name_from_guest_path(path);
-
-  // Persist this object through reloads.
-  host_object_ = true;
 
   OnLoad();
 }

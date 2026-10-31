@@ -318,8 +318,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     input_sys->SetActiveCallback([this]() {
       if (window_ && !window_->HasFocus())
         return false;
-      if (!imgui_drawer_ ||
-          (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_))
+      // A captured pointer can't reach an overlay, so WantCaptureMouse alone
+      // would never free it.
+      if (HasInteractiveOverlay())
+        return false;
+      if (!imgui_drawer_ || !debug_overlay_)
         return true;
       return !imgui_drawer_->GetIO().WantCaptureMouse;
     });

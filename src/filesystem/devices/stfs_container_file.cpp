@@ -50,7 +50,12 @@ X_STATUS StfsContainerFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offs
     size_t read_offset = (byte_offset > src_offset) ? byte_offset - src_offset : 0;
     size_t read_length = std::min(record.length - read_offset, remaining_length);
 
-    auto& file = entry_->files()->at(record.file);
+    // A block number in damaged content can point past the last fragment.
+    auto file_it = entry_->files()->find(record.file);
+    if (file_it == entry_->files()->end()) {
+      break;
+    }
+    FILE* file = file_it->second;
     rex::filesystem::Seek(file, record.offset + read_offset, SEEK_SET);
     auto num_read = fread(p, 1, read_length, file);
 

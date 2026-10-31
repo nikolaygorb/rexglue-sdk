@@ -49,7 +49,7 @@ enum class CounterId : uint16_t {
   kPipelineCacheHits,
   kPipelineCacheMisses,
 
-  // Graphics card time a frame (Vulkan, vulkan_gpu_time), in microseconds, in
+  // Graphics card time a frame (vulkan_gpu_time, d3d11_gpu_time), in microseconds, in
   // total and by kind of work; added when the submissions complete.
   kGpuTimeUs,
   kGpuDrawUs,

@@ -230,6 +230,12 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
         while (!successor_stack.empty()) {
           uint32_t successor_cf_index = successor_stack.back();
           successor_stack.pop_back();
+          // Past the last control flow instruction (falling through it, or a
+          // jump, call or loop target of malformed microcode): the end.
+          if (successor_cf_index >= (cf_pair_index_bound_ << 1)) {
+            memexport_eM_potentially_written_before_end_ |= eM_written_by_cf_instr;
+            continue;
+          }
 
           ControlFlowMemExportInfo& successor_memexport_info =
               cf_memexport_info_[successor_cf_index];
@@ -299,11 +305,7 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
               break;
           }
           if (next_instr_is_new_successor) {
-            if (successor_cf_index < (cf_pair_index_bound_ << 1)) {
-              successor_stack.push_back(successor_cf_index + 1);
-            } else {
-              memexport_eM_potentially_written_before_end_ |= eM_written_by_cf_instr;
-            }
+            successor_stack.push_back(successor_cf_index + 1);
           }
         }
       }
@@ -343,9 +345,11 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
                                    uint32_t& unique_texture_bindings,
                                    string::StringBuffer& ucode_disasm_buffer) {
   instr.Disassemble(&ucode_disasm_buffer);
+  // Malformed microcode may point an exec past the end of the program.
+  uint32_t instr_end = std::min(instr.instruction_address + instr.instruction_count,
+                                uint32_t(ucode_data_.size() / 3));
   uint32_t sequence = instr.sequence;
-  for (uint32_t instr_offset = instr.instruction_address;
-       instr_offset < instr.instruction_address + instr.instruction_count;
+  for (uint32_t instr_offset = instr.instruction_address; instr_offset < instr_end;
        ++instr_offset, sequence >>= 2) {
     ucode_disasm_buffer.AppendFormat("/* {:4d}   */ ", instr_offset);
     if (sequence & 0b10) {
@@ -881,10 +885,15 @@ void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& in
           ? cf_memexport_info[instr.dword_index].eM_potentially_written_before
           : 0;
 
-  const uint32_t* ucode_dwords = current_shader().ucode_data().data();
+  const std::vector<uint32_t>& ucode_data = current_shader().ucode_data();
+  const uint32_t* ucode_dwords = ucode_data.data();
+  uint32_t instr_end = instr.instruction_address + instr.instruction_count;
+  if (instr_end > ucode_data.size() / 3) {
+    EmitTranslationError("Exec refers to instructions past the end of the microcode");
+    instr_end = uint32_t(ucode_data.size() / 3);
+  }
   uint32_t sequence = instr.sequence;
-  for (uint32_t instr_offset = instr.instruction_address;
-       instr_offset < instr.instruction_address + instr.instruction_count;
+  for (uint32_t instr_offset = instr.instruction_address; instr_offset < instr_end;
        ++instr_offset, sequence >>= 2) {
     const uint32_t* op_ptr = ucode_dwords + instr_offset * 3;
     if (sequence & 0b01) {
@@ -1050,6 +1059,10 @@ void ParseTextureFetchInstruction(const TextureFetchInstruction& op,
       break;
     default:
       assert_unhandled_case(fetch_opcode);
+      // Set for the disassembly and the translators, which reject the
+      // unknown opcode.
+      instr.opcode = op.opcode();
+      instr.opcode_name = "tfetch_unknown";
       return;
   }
 

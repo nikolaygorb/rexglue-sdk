@@ -122,3 +122,48 @@ TEST_CASE("VFS overwrite of a file held open by a reader keeps the file", "[file
 
   CHECK(std::filesystem::exists(store.host_path()));
 }
+
+TEST_CASE("VFS overwrite keeps the old bytes for a new size", "[filesystem][vfs]") {
+  ScopedStore store;
+
+  rex::filesystem::File* file = nullptr;
+  FileAction action = FileAction::kDoesNotExist;
+  REQUIRE(store.vfs().OpenFile(nullptr, kGuestPath, FileDisposition::kOverwriteIf,
+                               FileAccess::kGenericRead | FileAccess::kGenericWrite, false, true,
+                               &file, &action) == X_STATUS_SUCCESS);
+  CHECK(action == FileAction::kOverwritten);
+
+  // Empty to the guest.
+  std::array<uint8_t, 8> buffer{};
+  size_t read = 0;
+  CHECK(file->ReadSync(std::span<uint8_t>(buffer), 0, &read) == X_STATUS_SUCCESS);
+  CHECK(read == 0);
+
+  // A new size brings the old bytes back below it, and only those.
+  REQUIRE(file->SetLength(2) == X_STATUS_SUCCESS);
+  CHECK(file->ReadSync(std::span<uint8_t>(buffer), 0, &read) == X_STATUS_SUCCESS);
+  CHECK(read == 2);
+  CHECK(buffer[0] == 'A');
+  CHECK(buffer[1] == 'A');
+
+  file->Destroy();
+  CHECK(std::filesystem::file_size(store.host_path()) == 2);
+}
+
+TEST_CASE("VFS overwrite trims the old bytes when the last handle closes", "[filesystem][vfs]") {
+  ScopedStore store;
+
+  rex::filesystem::File* file = nullptr;
+  FileAction action = FileAction::kDoesNotExist;
+  REQUIRE(store.vfs().OpenFile(nullptr, kGuestPath, FileDisposition::kOverwriteIf,
+                               FileAccess::kGenericWrite, false, true, &file,
+                               &action) == X_STATUS_SUCCESS);
+
+  const std::array<uint8_t, 1> payload{'B'};
+  size_t written = 0;
+  REQUIRE(file->WriteSync(std::span<const uint8_t>(payload), 0, &written) == X_STATUS_SUCCESS);
+  CHECK(std::filesystem::file_size(store.host_path()) == kOriginal.size());
+
+  file->Destroy();
+  CHECK(std::filesystem::file_size(store.host_path()) == payload.size());
+}

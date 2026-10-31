@@ -22,6 +22,14 @@
 
 namespace rex::filesystem {
 
+namespace {
+
+// SVOD directory trees are balanced, so this is far above any real one, and low
+// enough for the stack.
+constexpr uint32_t kMaxSvodEntryDepth = 256;
+
+}  // namespace
+
 StfsContainerDevice::StfsContainerDevice(const std::string_view mount_path,
                                          const std::filesystem::path& host_path)
     : Device(mount_path),
@@ -342,11 +350,17 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSVOD() {
   root_entry_ = std::unique_ptr<Entry>(root_entry);
 
   // Traverse all child entries
-  return ReadEntrySVOD(root_data.block, 0, root_entry);
+  return ReadEntrySVOD(root_data.block, 0, root_entry, 0);
 }
 
 StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, uint32_t ordinal,
-                                                              StfsContainerEntry* parent) {
+                                                              StfsContainerEntry* parent,
+                                                              uint32_t depth) {
+  if (depth > kMaxSvodEntryDepth) {
+    REXFS_ERROR("ReadEntrySVOD directory tree is deeper than {}", kMaxSvodEntryDepth);
+    return Error::kErrorDamagedFile;
+  }
+
   // For games with a large amount of files, the ordinal offset can overrun
   // the current block and potentially hit a hash block.
   size_t ordinal_offset = ordinal * 0x4;
@@ -359,7 +373,15 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
   entry_address += true_ordinal_offset;
 
   // Read directory entry
-  auto& file = files_.at(entry_file);
+  auto file_it = files_.find(entry_file);
+  if (file_it == files_.end()) {
+    REXFS_ERROR("ReadEntrySVOD directory entry is in missing data file {}", entry_file);
+    return Error::kErrorReadError;
+  }
+  if (!svod_read_entries_.insert((uint64_t(entry_file) << 40) | entry_address).second) {
+    return Error::kSuccess;
+  }
+  FILE* file = file_it->second;
   rex::filesystem::Seek(file, entry_address, SEEK_SET);
 
 #pragma pack(push, 1)
@@ -386,10 +408,14 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
   }
 
   auto name = std::string(name_buffer.get(), dir_entry.name_length);
+  if (!rex::string::utf8_is_valid(name)) {
+    REXFS_ERROR("ReadEntrySVOD directory entry name at 0x{:X} isn't UTF-8", entry_address);
+    return Error::kErrorDamagedFile;
+  }
 
   // Read the left node
   if (dir_entry.node_l) {
-    auto node_result = ReadEntrySVOD(block, dir_entry.node_l, parent);
+    auto node_result = ReadEntrySVOD(block, dir_entry.node_l, parent, depth + 1);
     if (node_result != Error::kSuccess) {
       return node_result;
     }
@@ -416,7 +442,7 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
 
     if (dir_entry.length) {
       // If length is greater than 0, traverse the directory's children
-      auto directory_result = ReadEntrySVOD(dir_entry.data_block, 0, entry.get());
+      auto directory_result = ReadEntrySVOD(dir_entry.data_block, 0, entry.get(), depth + 1);
       if (directory_result != Error::kSuccess) {
         return directory_result;
       }
@@ -445,6 +471,10 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
 
         size_t offset, file_index;
         BlockToOffsetSVOD(block_index, &offset, &file_index);
+        if (!files_.count(file_index)) {
+          // Past the last fragment: there is nothing more to read.
+          break;
+        }
 
         block_index++;
         remaining_size -= BLOCK_SIZE;
@@ -467,7 +497,7 @@ StfsContainerDevice::Error StfsContainerDevice::ReadEntrySVOD(uint32_t block, ui
 
   // Read the right node.
   if (dir_entry.node_r) {
-    auto node_result = ReadEntrySVOD(block, dir_entry.node_r, parent);
+    auto node_result = ReadEntrySVOD(block, dir_entry.node_r, parent, depth + 1);
     if (node_result != Error::kSuccess) {
       return node_result;
     }
@@ -571,12 +601,20 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
       StfsContainerEntry* parent_entry = nullptr;
       if (dir_entry.directory_index == 0xFFFF) {
         parent_entry = root_entry;
-      } else {
+      } else if (dir_entry.directory_index < all_entries.size()) {
         parent_entry = all_entries[dir_entry.directory_index];
+      } else {
+        REXFS_ERROR("ReadSTFS directory entry has parent {} of {} entries",
+                    dir_entry.directory_index.get(), all_entries.size());
+        return Error::kErrorDamagedFile;
       }
 
       std::string name(reinterpret_cast<const char*>(dir_entry.name),
-                       dir_entry.flags.name_length & 0x3F);
+                       std::min<size_t>(dir_entry.flags.name_length, sizeof(dir_entry.name)));
+      if (!rex::string::utf8_is_valid(name)) {
+        REXFS_ERROR("ReadSTFS directory entry name in block {} isn't UTF-8", table_block_index);
+        return Error::kErrorDamagedFile;
+      }
       auto entry = StfsContainerEntry::Create(this, parent_entry, name, &files_);
 
       if (dir_entry.flags.directory) {
@@ -609,6 +647,9 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
           entry->block_list_.push_back({0, offset, block_size});
           remaining_size -= block_size;
           auto block_hash = GetBlockHash(block_index);
+          if (!block_hash) {
+            break;
+          }
           block_index = block_hash->level0_next_block();
         }
 
@@ -637,6 +678,9 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
     }
 
     auto block_hash = GetBlockHash(table_block_index);
+    if (!block_hash) {
+      return Error::kErrorReadError;
+    }
     table_block_index = block_hash->level0_next_block();
     if (table_block_index == kEndOfChain) {
       break;
@@ -789,6 +833,9 @@ const StfsHashEntry* StfsContainerDevice::GetBlockHash(uint32_t block_index) {
 
 XContentPackageType StfsContainerDevice::ReadMagic(const std::filesystem::path& path) {
   auto map = memory::MappedMemory::Open(path, memory::MappedMemory::Mode::kRead, 0, 4);
+  if (!map || map->size() < sizeof(uint32_t)) {
+    return XContentPackageType(0);
+  }
   return XContentPackageType(memory::load_and_swap<uint32_t>(map->data()));
 }
 

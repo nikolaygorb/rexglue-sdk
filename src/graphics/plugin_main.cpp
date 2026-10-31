@@ -20,6 +20,9 @@
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
 #endif
+#if REX_HAS_D3D11
+#include <rex/graphics/d3d11/graphics_system.h>
+#endif
 
 extern "C" REX_GPU_PLUGIN_EXPORT uint32_t rex_gpu_abi_version(void) {
   return rex::system::kGpuPluginAbiVersion;
@@ -38,6 +41,12 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
   }
 
   std::string_view backend = info->backend ? info->backend : "any";
+#if REX_HAS_D3D11
+  // Experimental: only when asked for by name, never for "any".
+  if (backend == "d3d11") {
+    return new rex::graphics::d3d11::D3D11GraphicsSystem();
+  }
+#endif
 #if REX_HAS_D3D12
   if (backend == "any" || backend == "d3d12") {
     return new rex::graphics::d3d12::D3D12GraphicsSystem();

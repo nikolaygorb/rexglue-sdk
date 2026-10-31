@@ -71,6 +71,10 @@ size_t utf8_count(const std::string_view view) {
   return size_t(utfcpp::distance(view.cbegin(), view.cend()));
 }
 
+bool utf8_is_valid(const std::string_view view) {
+  return utfcpp::is_valid(view.cbegin(), view.cend());
+}
+
 std::string utf8_lower_ascii(const std::string_view view) {
   auto [begin, end] = make_citer(view);
   std::string result;

@@ -243,9 +243,19 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
 
     REXSYS_NOISY_DEBUG("Removed handle:{:08X} for {}", handle, typeid(*object).name());
 
-    // Remove object name from mapping to prevent naming collision.
+    // The name moves to another of the object's guest handles and goes with its last.
     if (!object->name().empty()) {
-      RemoveNameMapping(object->name());
+      std::lock_guard<std::mutex> name_lock(name_mutex_);
+      auto it = name_table_.find(string::string_key_case(object->name()));
+      if (it != name_table_.end() && it->second == handle) {
+        auto next = std::find_if(object->handles().begin(), object->handles().end(),
+                                 [](X_HANDLE h) { return !XObject::is_handle_host_object(h); });
+        if (next != object->handles().end()) {
+          it->second = *next;
+        } else {
+          name_table_.erase(it);
+        }
+      }
     }
     // Release now that the object has been removed from the table.
     object->Release();
@@ -488,7 +498,8 @@ X_STATUS ObjectTable::GetObjectByName(const std::string_view name, X_HANDLE* out
   // acquiring global lock -- LookupObject returns nullptr in that case.
   auto obj = LookupObject(handle, false);
   if (obj) {
-    obj->RetainHandle();
+    // The name's handle, which may not be the object's first.
+    RetainHandle(handle);
     obj->Release();
   }
 

@@ -48,7 +48,8 @@ void aes_decrypt_buffer(const uint8_t* session_key, const uint8_t* input_buffer,
   int32_t Nr = rijndaelKeySetupDec(rk, session_key, 128);
   const uint8_t* ct = input_buffer;
   uint8_t* pt = output_buffer;
-  for (size_t n = 0; n < input_size; n += 16, ct += 16, pt += 16) {
+  const size_t size = std::min(input_size, output_size);
+  for (size_t n = 0; n + 16 <= size; n += 16, ct += 16, pt += 16) {
     // Decrypt 16 uint8_ts from input -> output.
     rijndaelDecrypt(rk, Nr, ct, pt);
     for (size_t i = 0; i < 16; i++) {
@@ -63,6 +64,56 @@ void aes_decrypt_buffer(const uint8_t* session_key, const uint8_t* input_buffer,
 namespace rex::runtime {
 
 using rex::system::KernelState;
+
+namespace {
+
+// Everything Load and the accessors of XexModule read from the header is
+// reached through these offsets and counts, so they are checked before the
+// header is used. Holds for every retail file: a damaged one is refused here
+// instead of reading outside the header.
+bool ValidateXexHeader(const xex2_header* header, size_t xex_length, bool is_xex1) {
+  const uint64_t header_size = header->header_size;
+  const uint64_t table_end =
+      offsetof(xex2_header, headers) + uint64_t(header->header_count) * sizeof(xex2_opt_header);
+  if (header_size > xex_length || table_end > header_size) {
+    return false;
+  }
+  const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(header);
+  for (uint32_t i = 0; i < header->header_count; i++) {
+    const xex2_opt_header& opt_header = header->headers[i];
+    const uint32_t size_code = uint32_t(opt_header.key) & 0xFF;
+    if (size_code == 0x00 || size_code == 0x01) {
+      // The value is in the table.
+      continue;
+    }
+    const uint64_t offset = opt_header.offset;
+    uint64_t size = uint64_t(size_code) * sizeof(uint32_t);
+    if (size_code == 0xFF) {
+      // Starts with its own size.
+      if (offset + sizeof(uint32_t) > header_size) {
+        return false;
+      }
+      size = memory::load_and_swap<uint32_t>(header_bytes + offset);
+    }
+    if (offset + size > header_size) {
+      return false;
+    }
+  }
+  const uint64_t security_offset = header->security_offset;
+  const uint64_t count_offset =
+      security_offset + (is_xex1 ? offsetof(xex1_security_info, page_descriptor_count)
+                                 : offsetof(xex2_security_info, page_descriptor_count));
+  if (count_offset + sizeof(uint32_t) > header_size) {
+    return false;
+  }
+  const uint64_t page_descriptors_end =
+      count_offset + sizeof(uint32_t) +
+      uint64_t(memory::load_and_swap<uint32_t>(header_bytes + count_offset)) *
+          sizeof(xex2_page_descriptor);
+  return page_descriptors_end <= header_size;
+}
+
+}  // namespace
 
 XexModule::XexModule(FunctionDispatcher* function_dispatcher, KernelState* kernel_state)
     : Module(function_dispatcher), kernel_state_(kernel_state) {}
@@ -458,7 +509,8 @@ int XexModule::ApplyPatch(XexModule* module) {
 }
 
 int XexModule::ReadImage(const void* xex_addr, size_t xex_length, bool use_dev_key) {
-  if (!opt_file_format_info()) {
+  if (!opt_file_format_info() ||
+      opt_file_format_info()->info_size < offsetof(xex2_opt_file_format_info, compression_info)) {
     return 1;
   }
 
@@ -678,18 +730,33 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
   }
 
   const auto* compression_info = &opt_file_format_info()->compression_info;
+  if (opt_file_format_info()->info_size <
+      offsetof(xex2_opt_file_format_info, compression_info) +
+          sizeof(xex2_file_normal_compression_info)) {
+    if (free_input) {
+      free((void*)input_buffer);
+    }
+    return 1;
+  }
   const xex2_compressed_block_info* cur_block = &compression_info->normal.first_block;
 
   compress_buffer = (uint8_t*)calloc(1, exe_length);
 
   p = input_buffer;
   d = compress_buffer;
+  const uint8_t* const input_end = input_buffer + input_size;
+  const uint8_t* const compress_end = compress_buffer + exe_length;
 
   // De-block.
   int result_code = 0;
 
   uint8_t block_calced_digest[0x14];
   while (cur_block->block_size) {
+    if (cur_block->block_size > size_t(input_end - p) ||
+        cur_block->block_size < sizeof(xex2_compressed_block_info)) {
+      result_code = 2;
+      break;
+    }
     const uint8_t* pnext = p + cur_block->block_size;
     const auto* next_block = (const xex2_compressed_block_info*)p;
 
@@ -706,16 +773,23 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
     p += 4;
     p += 20;
 
-    while (true) {
+    while (pnext - p >= 2) {
       const size_t chunk_size = (p[0] << 8) | p[1];
       p += 2;
       if (!chunk_size) {
+        break;
+      }
+      if (chunk_size > size_t(pnext - p) || chunk_size > size_t(compress_end - d)) {
+        result_code = 2;
         break;
       }
 
       memcpy(d, p, chunk_size);
       p += chunk_size;
       d += chunk_size;
+    }
+    if (result_code) {
+      break;
     }
 
     p = pnext;
@@ -887,11 +961,20 @@ bool XexModule::Load(const std::string_view name, const std::string_view path, c
                      size_t xex_length) {
   auto src_header = reinterpret_cast<const xex2_header*>(xex_addr);
 
+  if (xex_length < offsetof(xex2_header, headers)) {
+    return false;
+  }
+
   if (src_header->magic == kXEX1Signature) {
     xex_format_ = kFormatXex1;
   } else if (src_header->magic == kXEX2Signature) {
     xex_format_ = kFormatXex2;
   } else {
+    return false;
+  }
+
+  if (!ValidateXexHeader(src_header, xex_length, xex_format_ == kFormatXex1)) {
+    REXLOG_ERROR("XEX header of {} is damaged", name);
     return false;
   }
 
@@ -913,6 +996,10 @@ bool XexModule::Load(const std::string_view name, const std::string_view path, c
   rex::be<uint32_t>* base_addr_opt = nullptr;
   if (GetOptHeader(XEX_HEADER_IMAGE_BASE_ADDRESS, &base_addr_opt))
     base_address_ = *base_addr_opt;
+  if (!memory()->LookupHeap(base_address_)) {
+    REXLOG_ERROR("XEX base address {:08X} is not in a heap", base_address_);
+    return false;
+  }
 
   // Setup debug info.
   name_ = name;

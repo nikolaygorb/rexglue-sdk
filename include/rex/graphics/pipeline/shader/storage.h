@@ -139,11 +139,24 @@ inline uint64_t ReadShaderEntries(FILE* file, Callback&& callback) {
   std::vector<uint32_t> ucode_dwords;
   ucode_dwords.reserve(0xFFFF);
 
+  // A damaged entry header may claim up to 2^31 dwords: never allocate more
+  // than the file still holds (an 8 GB allocation would fail at every start of
+  // the title until the storage is deleted).
+  int64_t file_offset = rex::filesystem::Tell(file);
+  rex::filesystem::Seek(file, 0, SEEK_END);
+  int64_t file_end = rex::filesystem::Tell(file);
+  rex::filesystem::Seek(file, file_offset, SEEK_SET);
+
   while (true) {
     if (!fread(&shader_header, sizeof(shader_header), 1, file)) {
       break;
     }
+    file_offset += sizeof(shader_header);
     size_t ucode_byte_count = shader_header.ucode_dword_count * sizeof(uint32_t);
+    if (int64_t(ucode_byte_count) > file_end - file_offset) {
+      break;
+    }
+    file_offset += ucode_byte_count;
     ucode_dwords.resize(shader_header.ucode_dword_count);
     if (shader_header.ucode_dword_count && !fread(ucode_dwords.data(), ucode_byte_count, 1, file)) {
       break;

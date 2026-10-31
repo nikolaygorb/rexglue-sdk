@@ -125,6 +125,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   RenderTarget* GrowRenderTarget(RenderTarget* source, uint32_t height,
                                  const std::vector<Transfer>& transfers) override;
 
+  void RenderTargetReused(RenderTarget& render_target) override;
+
   bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const override;
 
   bool IsGammaFormatHostStorageSeparate() const override;

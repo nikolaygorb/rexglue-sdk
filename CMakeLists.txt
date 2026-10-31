@@ -19,7 +19,9 @@ project(ReXGlue
 # Build Options
 #==========================================================
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
-option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer (same as REXGLUE_SANITIZERS=undefined)" OFF)
+set(REXGLUE_SANITIZERS "" CACHE STRING "Comma-separated clang sanitizers: address, undefined")
+option(REXGLUE_BUILD_FUZZERS     "Build libFuzzer targets (tests/fuzz); best with REXGLUE_SANITIZERS=address" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
@@ -45,6 +47,18 @@ endif()
 
 if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
     message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
+endif()
+
+# D3D11: experimental, Windows only, OFF by default. A third backend of
+# rexgpu-xenos, chosen only explicitly (backend "d3d11"), never by "any". It
+# reuses the DXBC shader translator of the D3D12 backend, so it needs D3D12.
+if(WIN32)
+    option(REXGLUE_USE_D3D11 "Enable the experimental D3D11 graphics backend" OFF)
+else()
+    set(REXGLUE_USE_D3D11 OFF)
+endif()
+if(REXGLUE_USE_D3D11 AND NOT REXGLUE_USE_D3D12)
+    message(FATAL_ERROR "REXGLUE_USE_D3D11 requires REXGLUE_USE_D3D12")
 endif()
 
 if (REXGLUE_ENABLE_FIDELITYFX AND
@@ -228,17 +242,86 @@ configure_file(
     @ONLY
 )
 
-# Output directories (multi-config appends /<Config>/ automatically)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+# Sanitizers for debugging memory corruption and undefined behavior.
+# REXGLUE_ENABLE_SANITIZERS is the old switch and means "undefined".
+if(REXGLUE_ENABLE_SANITIZERS AND NOT REXGLUE_SANITIZERS)
+    set(REXGLUE_SANITIZERS "undefined")
+endif()
+set(REXGLUE_OUTPUT_SUFFIX "")
+if(REXGLUE_SANITIZERS)
+    string(REPLACE "," ";" _rex_sanitizer_list "${REXGLUE_SANITIZERS}")
+    foreach(_rex_sanitizer IN LISTS _rex_sanitizer_list)
+        if(_rex_sanitizer STREQUAL "address")
+            string(APPEND REXGLUE_OUTPUT_SUFFIX "-asan")
+        elseif(_rex_sanitizer STREQUAL "undefined")
+            string(APPEND REXGLUE_OUTPUT_SUFFIX "-ubsan")
+        else()
+            message(FATAL_ERROR "REXGLUE_SANITIZERS: unsupported sanitizer '${_rex_sanitizer}' (use address, undefined)")
+        endif()
+    endforeach()
+    message(STATUS "Enabling sanitizers: ${REXGLUE_SANITIZERS}")
+    # Guest memory is mapped at the first free 1 << n base (see Memory::Initialize),
+    # so it does not collide with the ASan shadow.
+    add_compile_options(-fsanitize=${REXGLUE_SANITIZERS} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${REXGLUE_SANITIZERS})
+    if(WIN32 AND "address" IN_LIST _rex_sanitizer_list)
+        # The Windows ASan runtime is a DLL and does not support the debug CRT.
+        # Fuzzer builds switch to the static CRT below.
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+        add_link_options(-shared-libsan)
+    endif()
+endif()
+if(REXGLUE_BUILD_FUZZERS)
+    # Coverage for libFuzzer everywhere, third-party code included (libmspack is
+    # the LZX decoder). The fuzzer executables add -fsanitize=fuzzer for main().
+    # No indirect call coverage: its callback has no funclet bundle, so LLVM makes
+    # an indirect call in a catch or cleanup funclet unreachable (int3 on Windows,
+    # which ends the process with no report and no artifact).
+    add_compile_options(-fsanitize=fuzzer-no-link -fno-sanitize-coverage=indirect-calls)
+    if(WIN32)
+        # clang_rt.fuzzer is built with the static CRT and without the MSVC STL
+        # ASan container annotations, and lld-link rejects mixing either
+        # (/failifmismatch). Each module then has its own CRT; with ASan the
+        # static runtime thunk sends every module's heap to the ASan DLL, so
+        # memory still crosses the rexruntime boundary safely.
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+        add_compile_definitions(_DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
+    endif()
+    string(APPEND REXGLUE_OUTPUT_SUFFIX "-fuzz")
+endif()
 
-# Sanitizer support for debugging memory corruption and undefined behavior
-if(REXGLUE_ENABLE_SANITIZERS)
-    message(STATUS "Enabling UndefinedBehaviorSanitizer (UBSan only - ASan conflicts with custom memory mapping)")
-    # Note: ASan doesn't work well with the custom mmap at 0x100000000, so we only use UBSan
-    add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer -g)
-    add_link_options(-fsanitize=undefined)
+# Output directories (multi-config appends /<Config>/ automatically). Sanitizer
+# builds get their own directory so they never replace the normal binaries.
+set(REXGLUE_OUTPUT_DIR "${REXGLUE_ROOT}/out/${REX_PLATFORM}${REXGLUE_OUTPUT_SUFFIX}")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+
+# The Windows ASan runtime DLL has to sit next to the executables.
+if(WIN32 AND REXGLUE_SANITIZERS MATCHES "address")
+    execute_process(
+        COMMAND "${CMAKE_CXX_COMPILER}" -print-file-name=clang_rt.asan_dynamic-x86_64.dll
+        OUTPUT_VARIABLE _rex_asan_dll
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(NOT EXISTS "${_rex_asan_dll}")
+        execute_process(
+            COMMAND "${CMAKE_CXX_COMPILER}" -print-resource-dir
+            OUTPUT_VARIABLE _rex_clang_resource_dir
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        set(_rex_asan_dll "${_rex_clang_resource_dir}/lib/windows/clang_rt.asan_dynamic-x86_64.dll")
+    endif()
+    if(NOT EXISTS "${_rex_asan_dll}")
+        message(FATAL_ERROR "ASan runtime DLL not found: ${_rex_asan_dll}")
+    endif()
+    if(CMAKE_CONFIGURATION_TYPES)
+        foreach(_rex_config IN LISTS CMAKE_CONFIGURATION_TYPES)
+            file(COPY "${_rex_asan_dll}" DESTINATION "${REXGLUE_OUTPUT_DIR}/${_rex_config}")
+        endforeach()
+    else()
+        file(COPY "${_rex_asan_dll}" DESTINATION "${REXGLUE_OUTPUT_DIR}")
+    endif()
 endif()
 
 if(REXGLUE_BUILD_TESTS)
@@ -325,6 +408,9 @@ if(REXGLUE_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+if(REXGLUE_BUILD_FUZZERS)
+    add_subdirectory(tests/fuzz)
+endif()
 
 include(cmake/rexglue_link_audit.cmake)
 
@@ -337,7 +423,7 @@ message(STATUS "  Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSIO
 message(STATUS "  Configurations: ${CMAKE_CONFIGURATION_TYPES}")
 message(STATUS "  Output Dir: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 message(STATUS "  C++ Standard: C++${CMAKE_CXX_STANDARD}")
-message(STATUS "  Graphics: D3D12=${REXGLUE_USE_D3D12} Vulkan=${REXGLUE_USE_VULKAN}")
+message(STATUS "  Graphics: D3D12=${REXGLUE_USE_D3D12} Vulkan=${REXGLUE_USE_VULKAN} D3D11=${REXGLUE_USE_D3D11}")
 message(STATUS "  FidelityFX: ${REXGLUE_ENABLE_FIDELITYFX}")
 message(STATUS "  Tracy: ${REXGLUE_ENABLE_TRACY}")
 message(STATUS "  Perf Counters: ${REXGLUE_ENABLE_PERF_COUNTERS}")

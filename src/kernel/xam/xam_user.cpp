@@ -987,6 +987,10 @@ u32 XamUserGetSubscriptionType_entry(u32 user_index, mapped_u32 subscription_len
   return X_ERROR_SUCCESS;
 }
 
+u32 XamUserIsGuest_entry(u32 user_index) {
+  return 0;
+}
+
 u32 XamUserIsParentalControlled_entry(u32 user_index) {
   return 0;
 }
@@ -1107,6 +1111,7 @@ REX_EXPORT(__imp__XamUserGetOnlineLanguageFromXUID,
            rex::kernel::xam::XamUserGetOnlineLanguageFromXUID_entry)
 REX_EXPORT(__imp__XamUserGetSubscriptionType, rex::kernel::xam::XamUserGetSubscriptionType_entry)
 REX_EXPORT(__imp__XamUserIsParentalControlled, rex::kernel::xam::XamUserIsParentalControlled_entry)
+REX_EXPORT(__imp__XamUserIsGuest, rex::kernel::xam::XamUserIsGuest_entry)
 REX_EXPORT(__imp__XamUserIsUnsafeProgrammingAllowed,
            rex::kernel::xam::XamUserIsUnsafeProgrammingAllowed_entry)
 REX_EXPORT(__imp__XamUserNuiGetUserIndexForSignin,
@@ -1138,7 +1143,6 @@ REX_EXPORT_STUB(__imp__XamUserGetUserTenure);
 REX_EXPORT_STUB(__imp__XamUserGetUsersMissingAvatars);
 REX_EXPORT_STUB(__imp__XamUserGetXUIDForTFA);
 REX_EXPORT_STUB(__imp__XamUserInvalidateProfileSetting);
-REX_EXPORT_STUB(__imp__XamUserIsGuest);
 REX_EXPORT_STUB(__imp__XamUserIsLogonPreviewModeEnabled);
 REX_EXPORT_STUB(__imp__XamUserIsPartial);
 REX_EXPORT_STUB(__imp__XamUserIsPartialProfile);

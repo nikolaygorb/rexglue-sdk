@@ -16,6 +16,7 @@
 #include <cstring>
 #include <iterator>
 #include <string>
+#include <utility>
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
@@ -160,6 +161,64 @@ const char16_t* xeXamGetOnlineLanguageString(uint8_t id) {
   };
 #pragma warning(suppress : 6385)
   return id < rex::countof(table) ? table[id] : nullptr;
+}
+
+uint32_t xeXamGetOnlineCountryFeatures(uint8_t id) {
+  // {online country, features}
+  static constexpr std::pair<uint8_t, uint32_t> table[] = {
+      {4, 4},  // Argentina
+      {6, 12},  // Australia
+      {5, 12},  // Austria
+      {8, 12},  // Belgium
+      {13, 4},  // Brazil
+      {16, 12},  // Canada
+      {19, 0},  // Chile
+      {21, 0},  // Colombia
+      {23, 0},  // Czech Republic
+      {25, 12},  // Denmark
+      {30, 0},  // Egypt
+      {32, 12},  // Finland
+      {34, 12},  // France
+      {24, 12},  // Germany
+      {37, 0},  // Greece
+      {39, 4},  // Hong Kong
+      {42, 0},  // Hungary
+      {46, 0},  // India
+      {44, 12},  // Ireland
+      {45, 0},  // Israel
+      {50, 12},  // Italy
+      {53, 8},  // Japan
+      {56, 4},  // Korea
+      {72, 0},  // Malaysia
+      {71, 12},  // Mexico
+      {74, 12},  // Netherlands
+      {76, 12},  // New Zealand
+      {75, 12},  // Norway
+      {82, 4},  // Poland
+      {84, 4},  // Portugal
+      {236, 0},  // Not a public country, xam lists it with no features
+      {88, 0},  // Russian Federation
+      {89, 0},  // Saudi Arabia
+      {91, 4},  // Singapore
+      {93, 0},  // Slovak Republic
+      {109, 0},  // South Africa
+      {31, 12},  // Spain
+      {90, 12},  // Sweden
+      {18, 12},  // Switzerland
+      {101, 4},  // Taiwan
+      {97, 0},  // Thailand
+      {99, 4},  // Turkey
+      {35, 12},  // Great Britain
+      {1, 0},  // United Arab Emirates
+      {103, 12},  // United States
+      {107, 0},  // Viet Nam
+  };
+  for (const auto& [country, features] : table) {
+    if (country == id) {
+      return features;
+    }
+  }
+  return 0x80000000;
 }
 
 uint8_t xeXamGetCountryFromOnlineCountry(uint8_t id) {
@@ -395,6 +454,10 @@ u32 XamGetCountryFromOnlineCountry_entry(u32 id) {
   return xeXamGetCountryFromOnlineCountry(static_cast<uint8_t>(id));
 }
 
+u32 XamGetOnlineCountryFeatures_entry(u32 id) {
+  return xeXamGetOnlineCountryFeatures(static_cast<uint8_t>(id));
+}
+
 u32 XamGetLocaleEx_entry(u32 max_country_id, u32 max_locale_id) {
   return xeXamGetLocaleEx(static_cast<uint8_t>(max_country_id),
                           static_cast<uint8_t>(max_locale_id));
@@ -547,6 +610,7 @@ REX_EXPORT(__imp__XamGetLanguageFromOnlineLanguage,
 REX_EXPORT(__imp__XamGetOnlineLanguageString, rex::kernel::xam::XamGetOnlineLanguageString_entry)
 REX_EXPORT(__imp__XamGetCountryFromOnlineCountry,
            rex::kernel::xam::XamGetCountryFromOnlineCountry_entry)
+REX_EXPORT(__imp__XamGetOnlineCountryFeatures, rex::kernel::xam::XamGetOnlineCountryFeatures_entry)
 REX_EXPORT(__imp__XamGetLocaleEx, rex::kernel::xam::XamGetLocaleEx_entry)
 REX_EXPORT(__imp__XamGetLanguage, rex::kernel::xam::XamGetLanguage_entry)
 REX_EXPORT(__imp__XTLGetLanguageV2, rex::kernel::xam::XTLGetLanguageV2_entry)
@@ -567,7 +631,6 @@ REX_EXPORT_STUB(__imp__XamGetCurrencyFormat);
 REX_EXPORT_STUB(__imp__XamGetLanguageLocaleFallbackString);
 REX_EXPORT_STUB(__imp__XamGetLanguageTypefacePatch);
 REX_EXPORT_STUB(__imp__XamGetLocaleTimeFormat);
-REX_EXPORT_STUB(__imp__XamGetOnlineCountryFeatures);
 REX_EXPORT_STUB(__imp__XamGetStoreFront);
 REX_EXPORT_STUB(__imp__XamUniSortCmpString);
 REX_EXPORT_STUB(__imp__XamValidateCountry);

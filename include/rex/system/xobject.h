@@ -15,6 +15,7 @@
 #include <concepts>
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -203,6 +204,8 @@ class XObject {
                                        int32_t as_type = -1);
 
  protected:
+  void set_name(std::string name) { name_ = std::move(name); }
+
   bool SaveObject(stream::ByteStream* stream);
   bool RestoreObject(stream::ByteStream* stream);
 

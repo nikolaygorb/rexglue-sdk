@@ -412,6 +412,18 @@ struct MemExportRange {
       : base_address_dwords(base_address_dwords), size_bytes(size_bytes) {}
 };
 
+// Writes to guest memory only what a memexport draw changed in the shared
+// memory. Compared per byte as exports of 8 and 16 bit formats give ranges that
+// aren't a multiple of 4 bytes.
+inline void WriteBackChangedBytes(uint8_t* guest, const uint8_t* before, const uint8_t* after,
+                                  uint32_t size) {
+  for (uint32_t i = 0; i < size; ++i) {
+    if (after[i] != before[i]) {
+      guest[i] = after[i];
+    }
+  }
+}
+
 // Gathers memory ranges involved in memexports in the shader with the float
 // constants from the registers, adding them to ranges_out.
 void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,

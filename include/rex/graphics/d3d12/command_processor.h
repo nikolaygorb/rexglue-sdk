@@ -397,7 +397,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
-  bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+  // Without readback_memexport_fast, copies the memexport ranges to the readback
+  // buffer before the draw. Returns whether it did.
+  bool IssueDraw_MemexportSnapshot();
+  bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size, bool snapshot_taken = false);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
   // Returns a buffer for reading GPU data back to the CPU. Assuming

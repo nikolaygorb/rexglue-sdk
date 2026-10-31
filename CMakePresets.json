@@ -111,6 +111,27 @@
             "inherits": "windows-base"
         },
         {
+            "name": "win-amd64-asan",
+            "displayName": "Windows AMD64 ASan",
+            "description": "AddressSanitizer build with tests; use the RelWithDebInfo configuration. Output goes to out/win-amd64-asan",
+            "inherits": "windows-base",
+            "cacheVariables": {
+                "REXGLUE_SANITIZERS": "address",
+                "REXGLUE_BUILD_TESTS": "ON"
+            }
+        },
+        {
+            "name": "win-amd64-fuzz",
+            "displayName": "Windows AMD64 libFuzzer",
+            "description": "libFuzzer targets (tests/fuzz) with AddressSanitizer; use the RelWithDebInfo configuration. Output goes to out/win-amd64-asan-fuzz",
+            "inherits": "windows-base",
+            "cacheVariables": {
+                "REXGLUE_SANITIZERS": "address",
+                "REXGLUE_BUILD_FUZZERS": "ON",
+                "REXGLUE_USE_VULKAN": "ON"
+            }
+        },
+        {
             "name": "win-arm64",
             "displayName": "Windows ARM64",
             "description": "Multi-config build for Windows ARM64 using Clang",
@@ -121,6 +142,16 @@
             "displayName": "Linux AMD64",
             "description": "Multi-config build for Linux AMD64 using Clang",
             "inherits": "linux-base"
+        },
+        {
+            "name": "linux-amd64-asan",
+            "displayName": "Linux AMD64 ASan+UBSan",
+            "description": "AddressSanitizer (with LeakSanitizer) and UBSan build with tests. Output goes to out/linux-amd64-asan-ubsan",
+            "inherits": "linux-base",
+            "cacheVariables": {
+                "REXGLUE_SANITIZERS": "address,undefined",
+                "REXGLUE_BUILD_TESTS": "ON"
+            }
         },
         {
             "name": "linux-arm64",
@@ -158,6 +189,16 @@
             "configuration": "RelWithDebInfo"
         },
         {
+            "name": "win-amd64-asan",
+            "configurePreset": "win-amd64-asan",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "win-amd64-fuzz",
+            "configurePreset": "win-amd64-fuzz",
+            "configuration": "RelWithDebInfo"
+        },
+        {
             "name": "win-arm64-debug",
             "configurePreset": "win-arm64",
             "configuration": "Debug"
@@ -185,6 +226,11 @@
         {
             "name": "linux-amd64-relwithdebinfo",
             "configurePreset": "linux-amd64",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "linux-amd64-asan",
+            "configurePreset": "linux-amd64-asan",
             "configuration": "RelWithDebInfo"
         },
         {
@@ -250,6 +296,14 @@
             "configuration": "RelWithDebInfo"
         },
         {
+            "name": "win-amd64-asan",
+            "configurePreset": "win-amd64-asan",
+            "configuration": "RelWithDebInfo",
+            "environment": {
+                "ASAN_OPTIONS": "print_stacktrace=1:check_initialization_order=1:detect_stack_use_after_return=0"
+            }
+        },
+        {
             "name": "win-arm64-debug",
             "configurePreset": "win-arm64",
             "configuration": "Debug"
@@ -278,6 +332,15 @@
             "name": "linux-amd64-relwithdebinfo",
             "configurePreset": "linux-amd64",
             "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "linux-amd64-asan",
+            "configurePreset": "linux-amd64-asan",
+            "configuration": "RelWithDebInfo",
+            "environment": {
+                "ASAN_OPTIONS": "print_stacktrace=1:check_initialization_order=1:detect_leaks=1",
+                "UBSAN_OPTIONS": "print_stacktrace=1"
+            }
         },
         {
             "name": "linux-arm64-debug",

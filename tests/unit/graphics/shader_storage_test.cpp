@@ -212,6 +212,34 @@ TEST_CASE("Shader storage truncates corrupted entries", "[graphics][shader_stora
 }
 
 // xenia-canary 64e51c544.
+// Found by shader_storage_fuzzer: the microcode buffer was sized from the
+// entry header before anything was checked, so a damaged header (up to 2^31
+// dwords) asked for up to 8 GB at every start of the title.
+TEST_CASE("Shader storage stops at an entry larger than the file", "[graphics][shader_storage]") {
+  Scratch scratch("huge_entry");
+  Load(scratch.root);
+
+  std::vector<uint32_t> ucode = {0xAAAAAAAA, 0xBBBBBBBB};
+  fs::path shader_path = GetShaderStorageFilePath(scratch.root, kTestTitleId);
+  {
+    FILE* file = rex::filesystem::OpenFile(shader_path, "ab");
+    REQUIRE(file);
+    AppendShader(file, xenos::ShaderType::kPixel, ucode);
+    ShaderStoredHeader header = {};
+    header.ucode_data_hash = 1;
+    header.ucode_dword_count = 0x7FFFFFFF;
+    fwrite(&header, sizeof(header), 1, file);
+    fwrite(ucode.data(), sizeof(uint32_t), ucode.size(), file);
+    fclose(file);
+  }
+
+  LoadResult result = Load(scratch.root);
+  REQUIRE(result.initialized);
+  CHECK(result.shaders.size() == 1);
+  CHECK(fs::file_size(shader_path) ==
+        sizeof(ShaderStorageFileHeader) + sizeof(ShaderStoredHeader) + sizeof(uint32_t) * 2);
+}
+
 TEST_CASE("Shader storage discards pipelines of another version", "[graphics][shader_storage]") {
   Scratch scratch("version");
   Load(scratch.root);

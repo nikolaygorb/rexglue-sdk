@@ -158,6 +158,42 @@ inline void XeCryptMd5(const uint8_t* input_1, uint32_t input_1_size, const uint
   XeCryptMd5Final(&state, output, output_size);
 }
 
+// Long keys are assumed to truncate, as in XeCryptHmacSha.
+inline void XeCryptHmacMd5(const uint8_t* key, uint32_t key_size_in, const uint8_t* input_1,
+                           uint32_t input_1_size, const uint8_t* input_2, uint32_t input_2_size,
+                           const uint8_t* input_3, uint32_t input_3_size, uint8_t* output,
+                           uint32_t output_size) {
+  uint8_t inner_pad[0x40];
+  uint8_t outer_pad[0x40];
+  std::memset(inner_pad, 0x36, sizeof(inner_pad));
+  std::memset(outer_pad, 0x5C, sizeof(outer_pad));
+  const uint32_t key_size = std::min<uint32_t>(key_size_in, 0x40);
+  for (uint32_t i = 0; i < key_size; i++) {
+    inner_pad[i] ^= key[i];
+    outer_pad[i] ^= key[i];
+  }
+
+  XECRYPT_MD5_STATE state;
+  XeCryptMd5Init(&state);
+  XeCryptMd5Update(&state, inner_pad, sizeof(inner_pad));
+  if (input_1 && input_1_size) {
+    XeCryptMd5Update(&state, input_1, input_1_size);
+  }
+  if (input_2 && input_2_size) {
+    XeCryptMd5Update(&state, input_2, input_2_size);
+  }
+  if (input_3 && input_3_size) {
+    XeCryptMd5Update(&state, input_3, input_3_size);
+  }
+  uint8_t digest[16];
+  XeCryptMd5Final(&state, digest, sizeof(digest));
+
+  XeCryptMd5Init(&state);
+  XeCryptMd5Update(&state, outer_pad, sizeof(outer_pad));
+  XeCryptMd5Update(&state, digest, sizeof(digest));
+  XeCryptMd5Final(&state, output, output_size);
+}
+
 }  // namespace xboxkrnl
 }  // namespace kernel
 }  // namespace rex

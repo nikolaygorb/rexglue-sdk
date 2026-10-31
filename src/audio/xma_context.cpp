@@ -47,6 +47,13 @@ namespace {
 // Guest physical memory; TranslatePhysical wraps every address into it.
 constexpr uint32_t kPhysicalMemorySize = 0x20000000;
 
+// Decode passes in a row a kick may spend with no output. Only output ends the
+// loop in Work when frames are bad: an endless loop keeps jumping back to its
+// start, and a packet header counting more frames than the packet chains sends
+// the read offset back inside the packet. Frames in a good stream give output
+// after a few passes; what a kick left is for the next one.
+constexpr uint32_t kMaxPassesWithoutOutput = 1024;
+
 // Input the decoder must not read. Each kind is logged the first time only: a
 // stream that has one usually has it on every kick.
 enum InputProblem : uint32_t {
@@ -167,6 +174,12 @@ bool XmaContext::Work() {
     return true;
   }
 
+  // The ring buffer's offsets are taken modulo its capacity.
+  if (!data.output_buffer_block_count) {
+    REXAPU_ERROR("XmaContext {}: Error - Received 0 for output_buffer_block_count!", id());
+    return true;
+  }
+
   memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
 
   // A kick that brings no input means the stream has ended, so its final frame
@@ -202,9 +215,11 @@ bool XmaContext::Work() {
     return true;
   }
 
+  uint32_t passes_without_output = 0;
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
     const uint32_t pre_decode_offset = data.input_buffer_read_offset;
     const uint8_t pre_remaining_subframes = current_frame_remaining_subframes_;
+    const int32_t pre_remaining_blocks = remaining_subframe_blocks_in_output_buffer_;
 
     Decode(&data);
     Consume(&output_rb, &data);
@@ -225,6 +240,15 @@ bool XmaContext::Work() {
         current_frame_remaining_subframes_ == 0) {
       REXAPU_NOISY_DEBUG("XmaContext {}: Decode stalled at offset {} (no progress)", id(),
                          pre_decode_offset);
+      break;
+    }
+
+    if (remaining_subframe_blocks_in_output_buffer_ != pre_remaining_blocks) {
+      passes_without_output = 0;
+    } else if (++passes_without_output >= kMaxPassesWithoutOutput) {
+      REXAPU_NOISY_DEBUG("XmaContext {}: No output after {} decode passes, stopping at offset {}",
+                         id(), passes_without_output,
+                         static_cast<uint32_t>(data.input_buffer_read_offset));
       break;
     }
   }
@@ -767,11 +791,6 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   if (data->loop_count > 0) {
     const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
     is_loop_end_frame = (data->input_buffer_read_offset == loop_end);
-  }
-
-  if (!data->output_buffer_block_count) {
-    REXAPU_ERROR("XmaContext {}: Error - Received 0 for output_buffer_block_count!", id());
-    return;
   }
 
   if (data->input_buffer_read_offset < kBitsPerPacketHeader) {

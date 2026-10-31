@@ -341,8 +341,14 @@ void ParsedVertexFetchInstruction::Disassemble(string::StringBuffer* out) const 
     out->AppendFormat(", Offset={}", attributes.offset);
   }
   if (attributes.data_format != xenos::VertexFormat::kUndefined) {
-    out->AppendFormat(", DataFormat={}",
-                      kVertexFetchDataFormats[static_cast<int>(attributes.data_format)].name);
+    // Malformed microcode may have a format with no name.
+    const char* data_format_name =
+        kVertexFetchDataFormats[static_cast<int>(attributes.data_format)].name;
+    if (data_format_name) {
+      out->AppendFormat(", DataFormat={}", data_format_name);
+    } else {
+      out->AppendFormat(", DataFormat={}", static_cast<uint32_t>(attributes.data_format));
+    }
   }
   if (!is_mini_fetch && attributes.stride) {
     out->AppendFormat(", Stride={}", attributes.stride);

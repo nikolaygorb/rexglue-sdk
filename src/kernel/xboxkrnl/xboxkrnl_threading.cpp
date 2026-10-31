@@ -77,33 +77,48 @@ using rex::runtime::current_ppc_context;
 //   stw r3, 0x160(r11)
 // }
 
+// A NtCreate* call on a name in use opens the object only with OBJ_OPENIF and
+// the same type, returning X_STATUS_OBJECT_NAME_EXISTS. Otherwise it fails with
+// a collision, or a type mismatch under OBJ_OPENIF, and writes handle 0.
+// X_STATUS_SUCCESS means the name is free to create.
 template <typename T>
-object_ref<T> LookupNamedObject(KernelState* kernel_state, uint32_t obj_attributes_ptr) {
-  // If the name exists and its type matches, we can return that (ref+1)
-  // with a success of NAME_EXISTS.
-  // If the name exists and its type doesn't match, we do NAME_COLLISION.
-  // Otherwise, we add like normal.
+X_STATUS OpenNamedObject(KernelState* kernel_state, uint32_t obj_attributes_ptr,
+                         mapped_u32 handle_ptr) {
+  constexpr uint32_t kObjOpenIf = 0x80;
   if (!obj_attributes_ptr) {
-    return nullptr;
+    return X_STATUS_SUCCESS;
   }
   auto obj_attributes =
       kernel_state->memory()->TranslateVirtual<X_OBJECT_ATTRIBUTES*>(obj_attributes_ptr);
   assert_true(obj_attributes->name_ptr != 0);
   auto name = util::TranslateAnsiStringAddress(kernel_state->memory(), obj_attributes->name_ptr);
-  if (!name.empty()) {
-    X_HANDLE handle = X_INVALID_HANDLE_VALUE;
-    X_RESULT result = kernel_state->object_table()->GetObjectByName(name, &handle);
-    if (XSUCCEEDED(result)) {
-      // Found something! It's been retained, so return.
-      auto obj = kernel_state->object_table()->LookupObject<T>(handle);
-      if (obj) {
-        // The caller will do as it likes.
-        obj->ReleaseHandle();
-        return obj;
-      }
-    }
+  if (name.empty()) {
+    return X_STATUS_SUCCESS;
   }
-  return nullptr;
+  auto object_table = kernel_state->object_table();
+  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+  if (XFAILED(object_table->GetObjectByName(name, &handle))) {
+    return X_STATUS_SUCCESS;
+  }
+  const bool open_if = obj_attributes->attributes & kObjOpenIf;
+  auto object = object_table->LookupObject<XObject>(handle);
+  if (object && open_if && object->type() == T::kObjectType) {
+    // The lookup's handle reference is the caller's.
+    if (handle_ptr) {
+      *handle_ptr = handle;
+    } else {
+      object_table->ReleaseHandle(handle);
+    }
+    return X_STATUS_OBJECT_NAME_EXISTS;
+  }
+  object_table->ReleaseHandle(handle);
+  if (!object) {
+    return X_STATUS_SUCCESS;
+  }
+  if (handle_ptr) {
+    *handle_ptr = 0;
+  }
+  return open_if ? X_STATUS_OBJECT_TYPE_MISMATCH : X_STATUS_OBJECT_NAME_COLLISION;
 }
 
 u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 thread_id_ptr,
@@ -515,18 +530,10 @@ u32 KeResetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr) {
 u32 NtCreateEvent_entry(mapped_u32 handle_ptr, ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
                         u32 event_type, u32 initial_state) {
   // Check for an existing timer with the same name.
-  auto existing_object =
-      LookupNamedObject<XEvent>(REX_KERNEL_STATE(), obj_attributes_ptr.guest_address());
-  if (existing_object) {
-    if (existing_object->type() == XObject::Type::Event) {
-      if (handle_ptr) {
-        existing_object->RetainHandle();
-        *handle_ptr = existing_object->handle();
-      }
-      return X_STATUS_OBJECT_NAME_EXISTS;
-    } else {
-      return X_STATUS_INVALID_HANDLE;
-    }
+  if (X_STATUS result = OpenNamedObject<XEvent>(
+          REX_KERNEL_STATE(), obj_attributes_ptr.guest_address(), handle_ptr);
+      result != X_STATUS_SUCCESS) {
+    return result;
   }
 
   auto ev = object_ref<XEvent>(new XEvent(REX_KERNEL_STATE()));
@@ -635,18 +642,10 @@ u32 KeReleaseSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 incremen
 u32 NtCreateSemaphore_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u32 count,
                             u32 limit) {
   // Check for an existing semaphore with the same name.
-  auto existing_object =
-      LookupNamedObject<XSemaphore>(REX_KERNEL_STATE(), obj_attributes_ptr.guest_address());
-  if (existing_object) {
-    if (existing_object->type() == XObject::Type::Semaphore) {
-      if (handle_ptr) {
-        existing_object->RetainHandle();
-        *handle_ptr = existing_object->handle();
-      }
-      return X_STATUS_OBJECT_NAME_EXISTS;
-    } else {
-      return X_STATUS_INVALID_HANDLE;
-    }
+  if (X_STATUS result = OpenNamedObject<XSemaphore>(
+          REX_KERNEL_STATE(), obj_attributes_ptr.guest_address(), handle_ptr);
+      result != X_STATUS_SUCCESS) {
+    return result;
   }
 
   auto sem = object_ref<XSemaphore>(new XSemaphore(REX_KERNEL_STATE()));
@@ -693,18 +692,10 @@ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previ
 u32 NtCreateMutant_entry(mapped_u32 handle_out, ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attributes,
                          u32 initial_owner) {
   // Check for an existing timer with the same name.
-  auto existing_object =
-      LookupNamedObject<XMutant>(REX_KERNEL_STATE(), obj_attributes.guest_address());
-  if (existing_object) {
-    if (existing_object->type() == XObject::Type::Mutant) {
-      if (handle_out) {
-        existing_object->RetainHandle();
-        *handle_out = existing_object->handle();
-      }
-      return X_STATUS_OBJECT_NAME_EXISTS;
-    } else {
-      return X_STATUS_INVALID_HANDLE;
-    }
+  if (X_STATUS result = OpenNamedObject<XMutant>(
+          REX_KERNEL_STATE(), obj_attributes.guest_address(), handle_out);
+      result != X_STATUS_SUCCESS) {
+    return result;
   }
 
   auto mutant = object_ref<XMutant>(new XMutant(REX_KERNEL_STATE()));
@@ -750,18 +741,10 @@ u32 NtCreateTimer_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u
   // timer_type = NotificationTimer (0) or SynchronizationTimer (1)
 
   // Check for an existing timer with the same name.
-  auto existing_object =
-      LookupNamedObject<XTimer>(REX_KERNEL_STATE(), obj_attributes_ptr.guest_address());
-  if (existing_object) {
-    if (existing_object->type() == XObject::Type::Timer) {
-      if (handle_ptr) {
-        existing_object->RetainHandle();
-        *handle_ptr = existing_object->handle();
-      }
-      return X_STATUS_OBJECT_NAME_EXISTS;
-    } else {
-      return X_STATUS_INVALID_HANDLE;
-    }
+  if (X_STATUS result = OpenNamedObject<XTimer>(
+          REX_KERNEL_STATE(), obj_attributes_ptr.guest_address(), handle_ptr);
+      result != X_STATUS_SUCCESS) {
+    return result;
   }
 
   auto timer = object_ref<XTimer>(new XTimer(REX_KERNEL_STATE()));

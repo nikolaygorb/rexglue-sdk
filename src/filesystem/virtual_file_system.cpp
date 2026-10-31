@@ -352,7 +352,7 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
         break;
       case FileDisposition::kOverwrite:
       case FileDisposition::kOverwriteIf:
-        if (!entry->Truncate()) {
+        if (!entry->Overwrite() && !entry->Truncate()) {
           if (!entry->Delete()) {
             return X_STATUS_ACCESS_DENIED;
           }

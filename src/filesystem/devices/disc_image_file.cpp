@@ -27,7 +27,8 @@ void DiscImageFile::Destroy() {
 
 X_STATUS DiscImageFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
                                  size_t* out_bytes_read) {
-  if (byte_offset >= entry_->size()) {
+  // data_size is below size if the image is truncated.
+  if (byte_offset >= entry_->data_size()) {
     return X_STATUS_END_OF_FILE;
   }
   size_t real_offset = entry_->data_offset() + byte_offset;

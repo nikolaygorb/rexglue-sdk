@@ -37,6 +37,10 @@ REXCVAR_DEFINE_STRING(
     "times the host memory.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(render_target_reuse, true, "GPU",
+                    "Reuse an idle render target of the same shape for a surface moved to a new "
+                    "EDRAM base instead of allocating another one");
+
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
@@ -445,21 +449,8 @@ void RenderTargetCache::ClearCache() {
   // Keep only render targets currently owning any EDRAM data.
   if (!render_targets_.empty()) {
     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
-    for (const auto& ownership_range_pair : ownership_ranges_) {
-      const OwnershipRange& ownership_range = ownership_range_pair.second;
-      if (!ownership_range.render_target.IsEmpty()) {
-        used_render_targets.emplace(ownership_range.render_target);
-      }
-      if (!ownership_range.depth_bits_target.IsEmpty()) {
-        used_render_targets.emplace(ownership_range.depth_bits_target);
-      }
-      if (!ownership_range.host_depth_render_target_unorm24.IsEmpty()) {
-        used_render_targets.emplace(ownership_range.host_depth_render_target_unorm24);
-      }
-      if (!ownership_range.host_depth_render_target_float24.IsEmpty()) {
-        used_render_targets.emplace(ownership_range.host_depth_render_target_float24);
-      }
-    }
+    ForEachEdramOwner(
+        [&used_render_targets](RenderTargetKey owner) { used_render_targets.emplace(owner); });
     if (render_targets_.size() != used_render_targets.size()) {
       typename decltype(render_targets_)::iterator it_next;
       for (auto it = render_targets_.begin(); it != render_targets_.end(); it = it_next) {
@@ -1579,6 +1570,9 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
   RenderTarget* render_target = nullptr;
   if (it_rt != render_targets_.end()) {
     render_target = it_rt->second;
+    if (render_target) {
+      render_target->SetLastUseFrame(render_target_use_frame_);
+    }
     if (!render_target || render_target->height() >= minimum_height) {
       return render_target;
     }
@@ -1593,8 +1587,10 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
   if (render_target) {
     height = std::max(height, render_target->height() + render_target->height() / 2);
   }
-  height = std::min(rex::align(height, tile_height),
-                    GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples));
+  height = AreMixedHeightRenderTargetsSupported()
+               ? std::min(rex::align(height, tile_height),
+                          GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples))
+               : GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples);
   if (render_target && render_target->height() >= height) {
     return render_target;
   }
@@ -1632,6 +1628,11 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
     it_rt->second = render_target;
     // Bindings and Update reuse hold the old allocation.
     ResetAccumulatedRenderTargets();
+  } else if (RenderTarget* reused_render_target = ReuseRenderTarget(key, minimum_height)) {
+    render_targets_.emplace(key, reused_render_target);
+    ++update_state_generation_;
+    reused_render_target->SetLastUseFrame(render_target_use_frame_);
+    return reused_render_target;
   } else {
     render_target = CreateRenderTarget(key, height);
     // Insert even if failed to create, not to try to create again.
@@ -1639,6 +1640,7 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
     ++update_state_generation_;
   }
   if (render_target) {
+    render_target->SetLastUseFrame(render_target_use_frame_);
     REXGPU_DEBUG(
         "Created a {}x{} {}xMSAA {} render target with guest format {} at "
         "EDRAM base {}",
@@ -1653,6 +1655,65 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(
         key.is_depth ? "depth" : "color", static_cast<uint32_t>(key.resource_format),
         static_cast<uint32_t>(key.base_tiles));
   }
+  return render_target;
+}
+
+RenderTargetCache::RenderTarget* RenderTargetCache::ReuseRenderTarget(RenderTargetKey key,
+                                                                      uint32_t minimum_height) {
+  if (!REXCVAR_GET(render_target_reuse)) {
+    return nullptr;
+  }
+  // The host format doesn't depend on the base.
+  auto GetShape = [](RenderTargetKey shape_key) {
+    shape_key.base_tiles = 0;
+    shape_key.next_period = 0;
+    return shape_key;
+  };
+  RenderTargetKey shape = GetShape(key);
+  bool owners_gathered = false;
+  auto it_reuse = render_targets_.end();
+  for (auto it = render_targets_.begin(); it != render_targets_.end(); ++it) {
+    const RenderTarget* render_target = it->second;
+    if (!render_target || GetShape(it->first) != shape ||
+        render_target->height() < minimum_height ||
+        render_target_use_frame_ - render_target->last_use_frame() <
+            kRenderTargetReuseUnusedFrames ||
+        (it_reuse != render_targets_.end() &&
+         it_reuse->second->last_use_frame() <= render_target->last_use_frame())) {
+      continue;
+    }
+    bool used_by_last_update = false;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (last_update_used_render_targets_[i] == render_target ||
+          last_update_accumulated_render_targets_[i] == render_target) {
+        used_by_last_update = true;
+        break;
+      }
+    }
+    if (used_by_last_update) {
+      continue;
+    }
+    if (!owners_gathered) {
+      owners_gathered = true;
+      reuse_owners_.clear();
+      ForEachEdramOwner([this](RenderTargetKey owner) { reuse_owners_.push_back(owner); });
+    }
+    if (std::find(reuse_owners_.cbegin(), reuse_owners_.cend(), it->first) !=
+            reuse_owners_.cend() ||
+        !CanReuseRenderTarget(*render_target)) {
+      continue;
+    }
+    it_reuse = it;
+  }
+  if (it_reuse == render_targets_.end()) {
+    return nullptr;
+  }
+  RenderTarget* render_target = it_reuse->second;
+  RenderTargetKey old_key = it_reuse->first;
+  render_targets_.erase(it_reuse);
+  render_target->SetKey(key);
+  REXGPU_DEBUG("Reusing render target {} as {}", old_key.GetDebugName(), key.GetDebugName());
+  RenderTargetReused(*render_target);
   return render_target;
 }
 

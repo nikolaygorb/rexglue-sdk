@@ -17,6 +17,12 @@
 
 namespace rex::system {
 
+// A notification's area and number, without its version.
+static uint32_t QueueKey(XNotificationID id) {
+  const XNotificationKey key(id);
+  return uint32_t(key.mask_index) << 25 | key.local_id;
+}
+
 XNotifyListener::XNotifyListener(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
 
 XNotifyListener::~XNotifyListener() {}
@@ -24,7 +30,8 @@ XNotifyListener::~XNotifyListener() {}
 void XNotifyListener::Initialize(uint64_t mask, uint32_t max_version) {
   assert_false(wait_handle_);
 
-  wait_handle_ = rex::thread::Event::CreateManualResetEvent(false);
+  // A wait that sees the listener signaled takes the signal, as on the console.
+  wait_handle_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(wait_handle_);
   mask_ = mask;
   max_version_ = max_version;
@@ -43,45 +50,43 @@ void XNotifyListener::EnqueueNotification(XNotificationID id, uint32_t data) {
     return;
   }
   auto global_lock = global_critical_region_.Acquire();
-  notifications_.push_back(std::pair<XNotificationID, uint32_t>(id, data));
+  // A repeat replaces the pending one's data, and still signals.
+  notifications_[QueueKey(id)] = {id, data};
   wait_handle_->Set();
+}
+
+// The console keeps a queue per area and clears the signal when a read empties
+// one, even with notifications left in another area.
+void XNotifyListener::RemoveNotification(Notifications::iterator it) {
+  const uint32_t area = it->first >> 25;
+  notifications_.erase(it);
+  auto rest = notifications_.lower_bound(area << 25);
+  if (rest == notifications_.end() || rest->first >> 25 != area) {
+    wait_handle_->Reset();
+  }
 }
 
 bool XNotifyListener::DequeueNotification(XNotificationID* out_id, uint32_t* out_data) {
   auto global_lock = global_critical_region_.Acquire();
-  bool dequeued = false;
-  if (notifications_.size()) {
-    dequeued = true;
-    auto it = notifications_.begin();
-    *out_id = it->first;
-    *out_data = it->second;
-    notifications_.erase(it);
-    if (!notifications_.size()) {
-      wait_handle_->Reset();
-    }
+  if (notifications_.empty()) {
+    return false;
   }
-  return dequeued;
+  auto it = notifications_.begin();
+  *out_id = it->second.first;
+  *out_data = it->second.second;
+  RemoveNotification(it);
+  return true;
 }
 
 bool XNotifyListener::DequeueNotification(XNotificationID id, uint32_t* out_data) {
   auto global_lock = global_critical_region_.Acquire();
-  if (!notifications_.size()) {
+  auto it = notifications_.find(QueueKey(id));
+  if (it == notifications_.end()) {
     return false;
   }
-  bool dequeued = false;
-  for (auto it = notifications_.begin(); it != notifications_.end(); ++it) {
-    if (it->first != id) {
-      continue;
-    }
-    dequeued = true;
-    *out_data = it->second;
-    notifications_.erase(it);
-    if (!notifications_.size()) {
-      wait_handle_->Reset();
-    }
-    break;
-  }
-  return dequeued;
+  *out_data = it->second.second;
+  RemoveNotification(it);
+  return true;
 }
 
 bool XNotifyListener::Save(stream::ByteStream* stream) {
@@ -90,9 +95,9 @@ bool XNotifyListener::Save(stream::ByteStream* stream) {
   stream->Write(mask_);
   stream->Write(max_version_);
   stream->Write(notifications_.size());
-  for (auto pair : notifications_) {
-    stream->Write<uint32_t>(pair.first);
-    stream->Write<uint32_t>(pair.second);
+  for (const auto& [key, notification] : notifications_) {
+    stream->Write<uint32_t>(notification.first);
+    stream->Write<uint32_t>(notification.second);
   }
 
   return true;
@@ -111,10 +116,9 @@ object_ref<XNotifyListener> XNotifyListener::Restore(KernelState* kernel_state,
 
   auto notification_count_ = stream->Read<size_t>();
   for (size_t i = 0; i < notification_count_; i++) {
-    std::pair<XNotificationID, uint32_t> pair;
-    pair.first = stream->Read<uint32_t>();
-    pair.second = stream->Read<uint32_t>();
-    notify->notifications_.push_back(pair);
+    const XNotificationID id = stream->Read<uint32_t>();
+    const uint32_t data = stream->Read<uint32_t>();
+    notify->notifications_[QueueKey(id)] = {id, data};
   }
 
   return object_ref<XNotifyListener>(notify);

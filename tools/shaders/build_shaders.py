@@ -11,13 +11,19 @@ Usage:
 
 Sources and outputs (rexglue layout):
   <dir>/<name>.<stage>.xesl|.hlsl  -> <dir>/bytecode/d3d12_5_1/<name>_<stage>.h (FXC)
+  <dir>/<name>.<stage>.xesl|.hlsl  -> <dir>/bytecode/d3d11_5_0/<name>_<stage>.h (FXC,
+                                      Shader Model 5.0 for the Direct3D 11 backend)
   <dir>/<name>.<stage>.xesl|.glsl  -> <dir>/vulkan_spirv/<name>_<stage>.h
   <dir>/<name>.<stage>.spvasm      -> <dir>/vulkan_spirv/<name>_<stage>.h (spirv-as)
   where <stage> is vs, hs, ds, gs, ps or cs.
+  Sources named d3d11_* are only for the Direct3D 11 backend and get only the
+  d3d11_5_0 header.
 
 The compiler flags match xenia-canary's `xb buildshaders` (canary 0b2ffa314),
 which the checked-in headers came from:
   FXC:   /D SHADING_LANGUAGE_HLSL_XE=1 /T <stage>_5_1 /Vn <identifier>
+  The Direct3D 11 set (not in canary) uses /T <stage>_5_0 and also
+  /D XESL_HLSL_NO_REGISTER_SPACE_XE=1, since register spaces need SM 5.1.
   SPIR-V: glslangValidator -V, spirv-opt -O, spirv-remap --do-everything.
   Without spirv-remap (newer Vulkan SDKs), spirv-opt -O --canonicalize-ids is
   used instead, as canary does now.
@@ -44,6 +50,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 DEFAULT_SHADER_DIRS = ['src/graphics/shaders', 'src/ui/shaders']
 
 DXBC_DIR = os.path.join('bytecode', 'd3d12_5_1')
+DXBC_SM50_DIR = os.path.join('bytecode', 'd3d11_5_0')
 SPIRV_DIR = 'vulkan_spirv'
 STAGES = ('vs', 'hs', 'ds', 'gs', 'ps', 'cs')
 SPIRV_STAGES = {'vs': 'vert', 'hs': 'tesc', 'ds': 'tese', 'gs': 'geom', 'ps': 'frag',
@@ -51,6 +58,8 @@ SPIRV_STAGES = {'vs': 'vert', 'hs': 'tesc', 'ds': 'tese', 'gs': 'geom', 'ps': 'f
 
 # Sources that must not get a generated header.
 SKIP_SOURCES = set()
+# Prefix of sources built only for Shader Model 5.0 (the Direct3D 11 backend).
+D3D11_ONLY_PREFIX = 'd3d11_'
 
 # #version and extensions must come before everything else in a GLSL file, so
 # XeSL sources are compiled through this wrapper from stdin.
@@ -134,10 +143,13 @@ def write_spirv_header(out_path, identifier, comment_first_line, comment_body, s
         out.write('\n};\n')
 
 
-def build_dxbc(src_path, identifier, stage, out_path, fxc):
+def build_dxbc(src_path, identifier, stage, out_path, fxc, shader_model='5_1'):
     args = [fxc] if sys.platform == 'win32' else ['wine', fxc]
-    args += ['/D', 'SHADING_LANGUAGE_HLSL_XE=1', '/Fh', out_path, '/T', stage + '_5_1',
-             '/Vn', identifier, '/nologo', src_path]
+    args += ['/D', 'SHADING_LANGUAGE_HLSL_XE=1']
+    if shader_model == '5_0':
+        args += ['/D', 'XESL_HLSL_NO_REGISTER_SPACE_XE=1']
+    args += ['/Fh', out_path, '/T', stage + '_' + shader_model, '/Vn', identifier, '/nologo',
+             src_path]
     run(args)
 
 
@@ -239,9 +251,12 @@ def main():
                     continue
                 src_path = os.path.join(shader_dir, src_name)
                 jobs = []
+                d3d11_only = src_name.startswith(D3D11_ONLY_PREFIX)
                 if do_dxbc and ext in ('.xesl', '.hlsl'):
-                    jobs.append((DXBC_DIR, 'dxbc'))
-                if do_spirv and ext in ('.xesl', '.glsl', '.spvasm'):
+                    if not d3d11_only:
+                        jobs.append((DXBC_DIR, 'dxbc'))
+                    jobs.append((DXBC_SM50_DIR, 'dxbc_sm50'))
+                if do_spirv and not d3d11_only and ext in ('.xesl', '.glsl', '.spvasm'):
                     jobs.append((SPIRV_DIR, 'spirv'))
                 for out_subdir, kind in jobs:
                     final_path = os.path.join(shader_dir, out_subdir, identifier + '.h')
@@ -252,6 +267,8 @@ def main():
                     try:
                         if kind == 'dxbc':
                             build_dxbc(src_path, identifier, stage, out_path, fxc)
+                        elif kind == 'dxbc_sm50':
+                            build_dxbc(src_path, identifier, stage, out_path, fxc, '5_0')
                         else:
                             build_spirv(src_path, identifier, stage, out_path, tools, work_dir)
                         if clang_format:

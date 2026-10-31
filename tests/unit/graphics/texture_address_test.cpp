@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <initializer_list>
 
@@ -100,4 +101,41 @@ TEST_CASE("Tiled 3D mip extent uses the slice stride", "[graphics][texture]") {
         uint32_t(texture_util::GetTiledAddressUpperBound3D(65, 65, 8, 128, 128, 2)));
   CHECK(mip.array_slice_data_extent_bytes >
         uint32_t(texture_util::GetTiledAddressUpperBound3D(65, 65, 8, 128, 96, 2)));
+}
+
+// Found by texture_layout_fuzzer: with a pitch below 32 blocks (0 in a garbage fetch constant),
+// Z / 4 no longer moves the address forward, and the last, partial 4-slice portion didn't hold
+// the highest address, so the extent the texture cache watches ended before the data.
+TEST_CASE("Tiled 3D upper bound covers all slices with a zero pitch", "[graphics][texture]") {
+  // 1x1x6 with 4-byte blocks: slices 4 and 5 are the last portion.
+  int64_t end = 0;
+  for (int32_t z = 0; z < 6; ++z) {
+    end = std::max(end, texture_address::Tiled3D(0, 0, z, 0, 32, 2) + 4);
+  }
+  REQUIRE(end == 5124);
+  CHECK(texture_util::GetTiledAddressUpperBound3D(1, 1, 6, 0, 32, 2) >= uint64_t(end));
+  // A normal pitch keeps the last portion only.
+  CHECK(texture_util::GetTiledAddressUpperBound3D(1, 1, 6, 32, 32, 2) ==
+        uint64_t(texture_address::Tiled3D(0, 0, 5, 32, 32, 2) + 4));
+}
+
+// Found by texture_layout_fuzzer: the level sizes were 32-bit, so a garbage fetch constant for a
+// huge texture wrapped around to a small range of guest memory to load and watch.
+TEST_CASE("A texture larger than the guest memory has an empty layout", "[graphics][texture]") {
+  // 8192x8192x64 stacked with 16-byte texels: 64 GB.
+  texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(
+      xenos::DataDimension::k2DOrStacked, 8192 >> 5, 8192, 8192, 64, true,
+      xenos::TextureFormat::k_32_32_32_32_FLOAT, false, true, 0);
+  CHECK(layout.base.level_data_extent_bytes == 0);
+  CHECK(layout.mips_total_extent_bytes == 0);
+  // 2048x2048x1024 volume with 4-byte texels: 16 GB.
+  layout = texture_util::GetGuestTextureLayout(xenos::DataDimension::k3D, 2048 >> 5, 2048, 2048,
+                                               1024, false, xenos::TextureFormat::k_8_8_8_8,
+                                               false, true, 0);
+  CHECK(layout.base.level_data_extent_bytes == 0);
+  // 2048x2048x16 is 256 MB and still loads.
+  layout = texture_util::GetGuestTextureLayout(xenos::DataDimension::k2DOrStacked, 2048 >> 5,
+                                               2048, 2048, 16, false,
+                                               xenos::TextureFormat::k_8_8_8_8, false, true, 0);
+  CHECK(layout.base.level_data_extent_bytes == 2048u * 2048u * 4u * 16u);
 }

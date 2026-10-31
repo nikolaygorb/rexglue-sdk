@@ -88,8 +88,8 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
                 double(rex::perf::GetSnapshotCounter(rex::perf::CounterId::kTextureLoadBytes)) /
                     (1024.0 * 1024.0));
 
-    // Graphics card time (Vulkan with vulkan_gpu_time), by the frame its work
-    // completed in.
+    // Graphics card time (Vulkan with vulkan_gpu_time, Direct3D 11 with
+    // d3d11_gpu_time), by the frame its work completed in.
     auto gpu_ms = [](rex::perf::CounterId id) {
       return double(rex::perf::GetSnapshotCounter(id)) / 1000.0;
     };

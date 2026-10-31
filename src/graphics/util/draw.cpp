@@ -1268,12 +1268,29 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
       copy_dest_height = rb_copy_surface_slice / rb_copy_dest_pitch.copy_dest_pitch;
     }
   }
+  // The shaders get the slice height in a bit field
+  // (ResolveCopyDestCoordinateInfo::height_aligned_div_32). A taller slice
+  // (RB_COPY_SURFACE_SLICE / pitch from garbage registers gives up to 2^32
+  // rows) would be cut there, and the shaders would write elsewhere than the
+  // destination extent calculated here, so such a copy is dropped.
+  constexpr uint32_t kCopyDestHeightAlignedMax =
+      ((UINT32_C(1) << (xenos::kTexture2DCubeMaxWidthHeightLog2 + 2 -
+                        xenos::kTextureTileWidthHeightLog2)) -
+       1)
+      << xenos::kTextureTileWidthHeightLog2;
+  bool copy_dest_height_supported = copy_dest_height <= kCopyDestHeightAlignedMax;
+  if (!copy_dest_height_supported) {
+    REXGPU_ERROR("Resolve destination slice height {} is larger than {}, dropping the copy",
+                 copy_dest_height, kCopyDestHeightAlignedMax);
+    copy_dest_height = 0;
+  }
   const uint32_t copy_dest_height_aligned =
       rex::align(copy_dest_height, texture_address::kStoragePitchHeightAlignmentBlocks);
   info_out.copy_dest_coordinate_info.height_aligned_div_32 = copy_dest_height_aligned >> 5;
   const FormatInfo& dest_format_info = *FormatInfo::Get(dest_format);
-  if (is_convert_to_1111 ? convert_to_1111_supported
-                         : (is_depth || dest_format_info.type == FormatType::kResolvable)) {
+  if (copy_dest_height_supported &&
+      (is_convert_to_1111 ? convert_to_1111_supported
+                          : (is_depth || dest_format_info.type == FormatType::kResolvable))) {
     uint32_t bpp_log2 = rex::log2_floor(dest_format_info.bytes_per_block());
     // The destination coordinates are in blocks, which are 4x4 pixels for
     // k_DXT3A_AS_1_1_1_1 and 1x1 for other resolvable formats.
@@ -1319,14 +1336,24 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
       copy_dest_base_adjusted += uint32_t(
           texture_address::Tiled3D(int32_t(dest_base_x), int32_t(dest_base_y), 0,
                                    copy_dest_pitch_aligned, copy_dest_height_aligned, bpp_log2));
-      copy_dest_extent_start =
-          dest_addr_base + uint32_t(texture_util::GetTiledAddressLowerBound3D(
-                               dest_addr_x0, dest_addr_y0, rb_copy_dest_info.copy_dest_slice,
-                               copy_dest_pitch_aligned, copy_dest_height_aligned, bpp_log2));
-      copy_dest_extent_end =
-          dest_addr_base + uint32_t(texture_util::GetTiledAddressUpperBound3D(
-                               dest_addr_x1, dest_addr_y1, rb_copy_dest_info.copy_dest_slice + 1,
-                               copy_dest_pitch_aligned, copy_dest_height_aligned, bpp_log2));
+      const uint64_t copy_dest_extent_end_relative = texture_util::GetTiledAddressUpperBound3D(
+          dest_addr_x1, dest_addr_y1, rb_copy_dest_info.copy_dest_slice + 1,
+          copy_dest_pitch_aligned, copy_dest_height_aligned, bpp_log2);
+      // A volume from garbage registers can end beyond 4 GB. Cut to 32 bits,
+      // the extent would be a smaller range than the shaders write to, so such
+      // a copy is dropped.
+      if (copy_dest_extent_end_relative > texture_util::kGuestPhysicalMemoryBytes) {
+        REXGPU_ERROR("Resolve destination volume ends {} bytes from its base, dropping the copy",
+                     copy_dest_extent_end_relative);
+        copy_dest_extent_start = copy_dest_base_adjusted;
+        copy_dest_extent_end = copy_dest_base_adjusted;
+      } else {
+        copy_dest_extent_start =
+            dest_addr_base + uint32_t(texture_util::GetTiledAddressLowerBound3D(
+                                 dest_addr_x0, dest_addr_y0, rb_copy_dest_info.copy_dest_slice,
+                                 copy_dest_pitch_aligned, copy_dest_height_aligned, bpp_log2));
+        copy_dest_extent_end = dest_addr_base + uint32_t(copy_dest_extent_end_relative);
+      }
     } else {
       copy_dest_base_adjusted += texture_address::Tiled2D(
           int32_t(dest_base_x), int32_t(dest_base_y), copy_dest_pitch_aligned, bpp_log2);
@@ -1338,7 +1365,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                                dest_addr_x1, dest_addr_y1, copy_dest_pitch_aligned, bpp_log2);
     }
   } else {
-    if (!is_convert_to_1111) {
+    if (copy_dest_height_supported && !is_convert_to_1111) {
       REXGPU_ERROR("Tried to resolve to format {}, which is not a ColorFormat",
                    dest_format_info.name);
     }

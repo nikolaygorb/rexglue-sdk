@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <thread>
 #include <utility>
 
 #include <rex/assert.h>
@@ -1704,6 +1705,7 @@ Microsoft::WRL::ComPtr<IDXGIOutput> Presenter::GetDXGIOutputForMonitor(IDXGIFact
 
 void Presenter::DXGIUITickThread() {
   std::unique_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+  uint32_t fast_vblank_waits = 0;
   while (true) {
     if (dxgi_ui_tick_thread_shutdown_) {
       return;
@@ -1719,7 +1721,18 @@ void Presenter::DXGIUITickThread() {
     {
       Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
       dxgi_ui_tick_lock.unlock();
+      const auto wait_start = std::chrono::steady_clock::now();
       wait_succeeded = SUCCEEDED(dxgi_output->WaitForVBlank());
+      // On a monitor that is off or asleep the wait returns at once, and this loop and the UI
+      // thread it wakes would take a core each. One short wait is normal: it may have started
+      // just before a vertical blank.
+      if (std::chrono::steady_clock::now() - wait_start < std::chrono::milliseconds(1)) {
+        if (++fast_vblank_waits >= 2) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+      } else {
+        fast_vblank_waits = 0;
+      }
     }
     dxgi_ui_tick_lock.lock();
     if (wait_succeeded) {

@@ -92,9 +92,12 @@ void XEvent::SetGuestSignalState(uint32_t signal_state) {
 
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
   std::lock_guard<std::mutex> lock(state_lock_);
+  // KeSetEvent returns the signal state from before.
+  const int32_t old_signal_state =
+      guest_object() ? int32_t(guest_object<X_KEVENT>()->header.signal_state) : 0;
   SetGuestSignalState(1);
   event_->Set();
-  return 1;
+  return old_signal_state;
 }
 
 int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
@@ -110,9 +113,12 @@ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
 
 int32_t XEvent::Reset() {
   std::lock_guard<std::mutex> lock(state_lock_);
+  // KeResetEvent returns the signal state from before.
+  const int32_t old_signal_state =
+      guest_object() ? int32_t(guest_object<X_KEVENT>()->header.signal_state) : 0;
   SetGuestSignalState(0);
   event_->Reset();
-  return 1;
+  return old_signal_state;
 }
 
 void XEvent::Clear() {

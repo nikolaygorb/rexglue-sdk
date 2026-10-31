@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <vector>
@@ -184,8 +185,12 @@ void XObject::SetAttributes(uint32_t obj_attributes_ptr) {
       memory(),
       memory::load_and_swap<uint32_t>(memory()->TranslateVirtual(obj_attributes_ptr + 4)));
   if (!name.empty()) {
-    name_ = std::string(name);
-    kernel_state_->object_table()->AddNameMapping(name_, handles_[0]);
+    set_name(std::string(name));
+    // A host object's own handle must never reach the guest.
+    auto guest_handle = std::find_if(handles_.begin(), handles_.end(),
+                                     [](X_HANDLE h) { return !is_handle_host_object(h); });
+    kernel_state_->object_table()->AddNameMapping(
+        name_, guest_handle != handles_.end() ? *guest_handle : handles_[0]);
   }
 }
 

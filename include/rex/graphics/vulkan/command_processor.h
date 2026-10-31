@@ -546,7 +546,10 @@ class VulkanCommandProcessor : public CommandProcessor {
                                                 uint32_t draw_resolution_scale_y,
                                                 RenderTargetCache::Path render_target_path);
   bool IssueCopy_ReadbackResolvePath();
-  bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+  // Without readback_memexport_fast, copies the memexport ranges to the readback
+  // buffer before the draw. Returns whether it did.
+  bool IssueDraw_MemexportSnapshot();
+  bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size, bool snapshot_taken = false);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
   void SplitPendingBarrier();
@@ -1055,7 +1058,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   void* memexport_full_readback_mapping_ = nullptr;
   uint32_t memexport_full_readback_size_ = 0;
   bool RequestMemexportFullReadbackBuffer(uint32_t size);
-  void ReadMemexportRanges(const void* readback_mapping);
+  void ReadMemexportRanges(const void* readback_mapping,
+                           const void* snapshot_mapping = nullptr);
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's

@@ -120,6 +120,9 @@ class Entry {
   bool Delete(Entry* entry);
   bool Delete();
   virtual bool Truncate() { return false; }
+  // Empties the file as FATX does, keeping its old bytes for when it grows
+  // again. False when it has to be truncated instead.
+  virtual bool Overwrite() { return false; }
   X_STATUS Rename(const std::filesystem::path& file_path, bool replace_existing = false);
   void Touch();
 

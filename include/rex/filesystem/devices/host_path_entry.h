@@ -35,6 +35,7 @@ class HostPathEntry : public Entry {
 
   X_STATUS Open(uint32_t desired_access, File** out_file) override;
   bool Truncate() override;
+  bool Overwrite() override;
 
   bool can_map() const override { return true; }
   std::unique_ptr<memory::MappedMemory> OpenMapped(memory::MappedMemory::Mode mode, size_t offset,
@@ -50,6 +51,9 @@ class HostPathEntry : public Entry {
 
  private:
   friend class HostPathDevice;
+  friend class HostPathFile;
+
+  void SetOverwrittenSize(size_t size);
 
   std::unique_ptr<Entry> CreateEntryInternal(const std::string_view name,
                                              uint32_t attributes) override;
@@ -58,6 +62,9 @@ class HostPathEntry : public Entry {
 
   std::filesystem::path host_path_;
   std::atomic<size_t> open_files_{0};
+  // Set by Overwrite until the last handle closes. The host file still holds
+  // the old bytes past size_, which growing the file brings back.
+  bool overwritten_ = false;
 };
 
 }  // namespace rex::filesystem

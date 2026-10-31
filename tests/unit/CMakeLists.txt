@@ -14,6 +14,7 @@ add_executable(unit_tests
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/filesystem_test.cpp
+    core/content_device_test.cpp
     core/vfs_overwrite_test.cpp
     core/vfs_io_queued_test.cpp
     core/vfs_rename_test.cpp
@@ -46,9 +47,12 @@ add_executable(unit_tests
     system/function_dispatcher_test.cpp
     system/content_name_test.cpp
     system/xex_identity_test.cpp
+    system/xex_load_test.cpp
+    system/xdbf_test.cpp
     audio/conversion_test.cpp
     audio/nop_audio_driver_test.cpp
     audio/xma_packet_test.cpp
+    audio/xma_work_test.cpp
     audio/audio_output_fallback_test.cpp
     input/input_assignment_test.cpp
     input/mnk_stick_test.cpp
@@ -68,11 +72,14 @@ add_executable(unit_tests
     graphics/pipeline_priority_test.cpp
     graphics/shader_storage_test.cpp
     graphics/resolve_clear_value_test.cpp
+    graphics/resolve_info_test.cpp
+    graphics/primitive_reset_test.cpp
     graphics/edram_tile_count_test.cpp
     graphics/gamma_midpoint_test.cpp
     graphics/zpd_report_test.cpp
     graphics/gpu_completion_timeline_test.cpp
     graphics/float_constant_runs_test.cpp
+    graphics/memexport_write_back_test.cpp
     graphics/texture_replacement_test.cpp
     graphics/scaled_resolve_coverage_test.cpp
     graphics/half_pixel_offset_test.cpp
@@ -83,6 +90,8 @@ add_executable(unit_tests
     graphics/gpu_time_test.cpp
     graphics/shader_translation_memo_test.cpp
     graphics/display_transfer_test.cpp
+    graphics/d3d11_shader_bytecode_test.cpp
+    graphics/d3d11_geometry_shader_test.cpp
     ui/presenter_paint_config_test.cpp
     ui/keybind_names_test.cpp
 )
@@ -103,13 +112,23 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator_disasm.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/replacement.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/primitive_processor.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/registers.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
+    # FloatToD3D11Fixed16p8 for draw.cpp (rexui, which unit_tests doesn't link).
+    ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/d3d11/geometry_shader.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/d3d11/shader_bytecode.cpp
+    ${PROJECT_SOURCE_DIR}/thirdparty/dxbc/DXBCChecksum.cpp
 )
 
 target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/thirdparty/renderdoc
+    ${PROJECT_SOURCE_DIR}  # For thirdparty/dxbc/DXBCChecksum.h
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -118,6 +137,31 @@ target_link_libraries(unit_tests PRIVATE
     rexruntime
     Catch2::Catch2WithMain
 )
+if(REXGLUE_USE_D3D11)
+    # The D3D11 UI backend is in rexui only with the option on.
+    target_sources(unit_tests PRIVATE ui/d3d11_presenter_test.cpp)
+endif()
+if(WIN32)
+    # WARP checks of the D3D11 shaders; the render target shader copy uses
+    # dxgiformat.h.
+    target_link_libraries(unit_tests PRIVATE d3d11)
+    target_sources(unit_tests PRIVATE
+        graphics/d3d11_draw_path_test.cpp
+        graphics/d3d11_render_target_shaders_test.cpp
+        graphics/d3d11_resolution_scale_test.cpp
+        graphics/d3d11_texture_upload_test.cpp
+        graphics/d3d11_test_cvars.cpp
+        graphics/dxbc_translator_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/d3d11/render_target_shaders.cpp
+        # Number format and gamma helpers used by the copied generators.
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator_memexport.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+    )
+endif()
 
 # ReXApp is shipped as source for recomp projects, rather than compiled into
 # rexui. Keep its SDK-consumer compilation path covered by the test build.
@@ -150,6 +194,15 @@ endif()
 
 # Discover tests
 include(Catch)
+# The D3D11 backend's generated copies of D3D12 code must match their
+# originals (tools/d3d11/sync_copies.py).
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME unit.d3d11_copies_in_sync
+        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/d3d11/sync_copies.py" --check)
+    set_tests_properties(unit.d3d11_copies_in_sync PROPERTIES LABELS unit)
+endif()
+
 catch_discover_tests(unit_tests
     TEST_PREFIX "unit."
     PROPERTIES

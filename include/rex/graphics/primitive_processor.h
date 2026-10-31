@@ -155,6 +155,15 @@ class PrimitiveProcessor {
   virtual ~PrimitiveProcessor();
 
   bool AreFull32BitVertexIndicesUsed() const { return full_32bit_vertex_indices_used_; }
+  // Direct3D 11 always treats an all-ones index as a cut in strip topologies,
+  // while the guest may draw a strip without primitive reset that uses 0xFFFF
+  // (16-bit) or an index read as 0xFFFFFFFF (32-bit) as a real vertex. With
+  // this on, such guest index buffers are converted so the host never sees an
+  // all-ones index in a strip without reset. Off by default (D3D12 and Vulkan
+  // disable primitive restart in the pipeline); call before InitializeCommon.
+  void SetHostStripPrimitiveResetAlwaysEnabled(bool enabled) {
+    host_strip_primitive_reset_always_enabled_ = enabled;
+  }
   bool IsConvertingTriangleFansToLists() const { return convert_triangle_fans_to_lists_; }
   bool IsConvertingLineLoopsToStrips() const { return convert_line_loops_to_strips_; }
   // Quad lists may be emulated as line lists with adjacency and a geometry
@@ -572,6 +581,30 @@ class PrimitiveProcessor {
                               const PassthroughIndexTransform& index_transform);
   static void LineLoopToStrip(uint32_t* dest, const uint32_t* source, uint32_t source_index_count,
                               const PassthroughIndexTransform& index_transform);
+  // For loops a line strip can't hold: more than one in the draw (primitive
+  // reset is off for converted indices), or a vertex a host that always cuts
+  // strips (Direct3D 11) would take for a cut.
+  static constexpr uint32_t GetLineLoopListIndexCount(uint32_t loop_index_count) {
+    return loop_index_count > 1 ? loop_index_count * 2 : 0;
+  }
+  template <typename Index, typename IndexTransform>
+  static void LineLoopToList(Index* dest, const Index* source, uint32_t source_index_count,
+                             const IndexTransform& index_transform) {
+    if (source_index_count <= 1) {
+      // To match GetLineLoopListIndexCount.
+      return;
+    }
+    Index index_first = index_transform(source[0]);
+    Index index_previous = index_first;
+    for (uint32_t i = 1; i < source_index_count; ++i) {
+      Index index_current = index_transform(source[i]);
+      *(dest++) = index_previous;
+      *(dest++) = index_current;
+      index_previous = index_current;
+    }
+    *(dest++) = index_previous;
+    *(dest++) = index_first;
+  }
 
   // Quad list test cases:
   // - 4D5307E6 - main menu - flying dust on the road - no index buffer.
@@ -612,7 +645,12 @@ class PrimitiveProcessor {
     uint32_t guest_offset;
     uint32_t guest_index_count;
     uint32_t host_index_count;
+    // kLineLoop only: LineLoopToList rather than LineLoopToStrip.
+    bool line_loop_to_list = false;
   };
+  // Switches all of single_primitive_ranges_ to line lists, returns the host
+  // index count.
+  uint32_t SetLineLoopRangesToLists();
   static uint32_t GetMultiPrimitiveHostIndexCountAndRanges(
       std::function<uint32_t(uint32_t)> single_primitive_guest_to_host_count,
       const uint16_t* source, uint32_t source_index_count, uint16_t reset_index_guest_endian,
@@ -649,8 +687,13 @@ class PrimitiveProcessor {
       case xenos::PrimitiveType::kLineLoop:
         for (PrimitiveRangeIterator range_it = ranges_beginning; range_it != ranges_end;
              ++range_it) {
-          LineLoopToStrip(dest_write_ptr, source + range_it->guest_offset,
-                          range_it->guest_index_count, index_transform);
+          if (range_it->line_loop_to_list) {
+            LineLoopToList(dest_write_ptr, source + range_it->guest_offset,
+                           range_it->guest_index_count, index_transform);
+          } else {
+            LineLoopToStrip(dest_write_ptr, source + range_it->guest_offset,
+                            range_it->guest_index_count, index_transform);
+          }
           dest_write_ptr += range_it->host_index_count;
         }
         break;
@@ -674,6 +717,7 @@ class PrimitiveProcessor {
   std::pair<uint32_t, uint32_t> last_guest_index_range_{};
 
   bool full_32bit_vertex_indices_used_ = false;
+  bool host_strip_primitive_reset_always_enabled_ = false;
   bool convert_triangle_fans_to_lists_ = false;
   bool convert_line_loops_to_strips_ = false;
   bool convert_quad_lists_to_triangle_lists_ = false;
@@ -697,25 +741,30 @@ class PrimitiveProcessor {
   static constexpr uint32_t kCacheBucketCount =
       rex::align(SharedMemory::kBufferSize, kCacheBucketSizeBytes) / kCacheBucketSizeBytes;
 
-  union CacheKey {
-    uint64_t key;
-    struct {
-      uint32_t base;                  // 32 total
-      uint32_t count : 16;            // 48
-      xenos::IndexFormat format : 1;  // 49
-      xenos::Endian endian : 2;       // 52
-      uint32_t is_reset_enabled : 1;  // 53
-      // kNone if not changing the type (like only processing the reset index).
-      xenos::PrimitiveType conversion_guest_primitive_type : 6;  // 59
-      // If set, entry is for forced 32-bit guest DMA to host-endian 24-bit
-      // index conversion used by non-kVertex host vertex shader types on
-      // backends not supporting full 32-bit index fetch in this path.
-      uint32_t non_vertex_32bit_dma_to_24bit : 1;  // 60
+  struct CacheKey {
+    union {
+      uint64_t key;
+      struct {
+        uint32_t base;                  // 32 total
+        uint32_t count : 16;            // 48
+        xenos::IndexFormat format : 1;  // 49
+        xenos::Endian endian : 2;       // 52
+        uint32_t is_reset_enabled : 1;  // 53
+        // kNone if not changing the type (like only processing the reset index).
+        xenos::PrimitiveType conversion_guest_primitive_type : 6;  // 59
+        // If set, entry is for forced 32-bit guest DMA to host-endian 24-bit
+        // index conversion used by non-kVertex host vertex shader types on
+        // backends not supporting full 32-bit index fetch in this path.
+        uint32_t non_vertex_32bit_dma_to_24bit : 1;  // 60
+      };
     };
+    // Guest-endian, 0 with reset disabled. Draws of one buffer in a frame may
+    // use different reset indices, and the result depends on which.
+    uint32_t reset_index;
 
-    CacheKey() : key(0) { static_assert_size(*this, sizeof(key)); }
+    CacheKey() : key(0), reset_index(0) {}
     CacheKey(uint32_t base, uint32_t count, xenos::IndexFormat format, xenos::Endian endian,
-             bool is_reset_enabled,
+             bool is_reset_enabled, uint32_t reset_index,
              xenos::PrimitiveType conversion_guest_primitive_type = xenos::PrimitiveType::kNone,
              bool non_vertex_32bit_dma_to_24bit = false) {
       // Clear unused bits, then set each field explicitly, not via the
@@ -727,14 +776,19 @@ class PrimitiveProcessor {
       this->format = format;
       this->endian = endian;
       this->is_reset_enabled = is_reset_enabled;
+      this->reset_index = reset_index;
       this->conversion_guest_primitive_type = conversion_guest_primitive_type;
       this->non_vertex_32bit_dma_to_24bit = non_vertex_32bit_dma_to_24bit;
     }
 
     struct Hasher {
-      size_t operator()(const CacheKey& key) const { return std::hash<uint64_t>{}(key.key); }
+      size_t operator()(const CacheKey& key) const {
+        return std::hash<uint64_t>{}(key.key * 31 + key.reset_index);
+      }
     };
-    bool operator==(const CacheKey& other_key) const { return key == other_key.key; }
+    bool operator==(const CacheKey& other_key) const {
+      return key == other_key.key && reset_index == other_key.reset_index;
+    }
 
     uint32_t GetSizeBytes() const {
       return count * (format == xenos::IndexFormat::kInt16 ? sizeof(uint16_t) : sizeof(uint32_t));
@@ -751,6 +805,8 @@ class PrimitiveProcessor {
     xenos::Endian host_shader_index_endian;
     bool host_primitive_reset_enabled;
     size_t host_index_buffer_handle;
+    // Line loops converted to a line list rather than to a line strip.
+    bool line_loop_host_list;
   };
 
   struct CacheEntry {

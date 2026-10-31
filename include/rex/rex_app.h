@@ -108,6 +108,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called after ImGui drawer is created. Add custom dialogs here.
   virtual void OnCreateDialogs(ui::ImGuiDrawer* drawer) { (void)drawer; }
 
+  /// Override to report a dialog of the app's own that needs the mouse. Polled
+  /// from input threads, so it must not block.
+  virtual bool HasAppOverlay() const { return false; }
+
   /// Called before cleanup begins. Release custom resources here.
   virtual void OnShutdown() {}
 
@@ -256,6 +260,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   ui::ImGuiDrawer* imgui_drawer() const { return imgui_drawer_.get(); }
   ui::ImmediateDrawer* immediate_drawer() const { return immediate_drawer_.get(); }
   system::AchievementManager& achievements() const;
+
+  /// An overlay that needs the mouse is open: the guest gets no input and the
+  /// pointer stays free. The debug overlay is passive and doesn't count.
+  bool HasInteractiveOverlay() const {
+    return console_overlay_ || settings_overlay_ || achievements_overlay_ || HasAppOverlay();
+  }
 
   const std::filesystem::path& game_data_root() const { return game_data_root_; }
   const std::filesystem::path& user_data_root() const { return user_data_root_; }

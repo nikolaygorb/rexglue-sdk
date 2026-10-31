@@ -15,7 +15,9 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <random>
 #include <span>
 #include <utility>
 
@@ -222,6 +224,22 @@ void XeCryptSha256Final_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, ppc_ptr
   std::copy(std::begin(hash), std::end(hash), sha_state->buffer);
 }
 
+void XeCryptSha256_entry(mapped_void input_1, u32 input_1_size, mapped_void input_2,
+                         u32 input_2_size, mapped_void input_3, u32 input_3_size,
+                         mapped_void output, u32 output_size) {
+  sha256::SHA256 sha;
+  for (auto [input, size] : {std::pair{input_1, input_1_size}, std::pair{input_2, input_2_size},
+                             std::pair{input_3, input_3_size}}) {
+    if (input && size) {
+      sha.add(input, size);
+    }
+  }
+
+  uint8_t hash[32];
+  sha.getHash(hash);
+  std::copy_n(hash, std::min<size_t>(rex::countof(hash), output_size), output.as<uint8_t*>());
+}
+
 // Byteswaps each 8 bytes
 void XeCryptBnQw_SwapDwQwLeBe_entry(ppc_ptr_t<uint64_t> qw_inp, ppc_ptr_t<uint64_t> qw_out,
                                     u32 size) {
@@ -259,7 +277,12 @@ u32 XeCryptBnDwLePkcs1Verify_entry(mapped_void hash, mapped_void sig, u32 size) 
 }
 
 void XeCryptRandom_entry(mapped_void buf, u32 buf_size) {
-  std::memset(buf, 0xFD, buf_size);
+  uint8_t* buf_data = buf.as<uint8_t*>();
+
+  thread_local std::mt19937_64 gen(std::random_device{}());
+  std::uniform_int_distribution<uint16_t> dist(0, std::numeric_limits<uint8_t>::max());
+
+  std::generate(buf_data, buf_data + buf_size, [&]() { return static_cast<uint8_t>(dist(gen)); });
 }
 
 struct XECRYPT_DES_STATE {
@@ -620,6 +643,25 @@ void XeCryptHmacSha_entry(mapped_void key, u32 key_size_in, mapped_void inp_1, u
                             out_size);
 }
 
+u32 XeCryptHmacShaVerify_entry(mapped_void key, u32 key_size, mapped_void inp_1, u32 inp_1_size,
+                               mapped_void inp_2, u32 inp_2_size, mapped_void inp_3,
+                               u32 inp_3_size, mapped_void ver, u32 ver_size) {
+  uint8_t digest[0x14];
+  XeCryptHmacSha_entry(key, key_size, inp_1, inp_1_size, inp_2, inp_2_size, inp_3, inp_3_size,
+                       mapped_void::from_host(digest), sizeof(digest));
+
+  const size_t compare_size = std::min<size_t>(sizeof(digest), ver_size);
+  return std::memcmp(digest, ver, compare_size) == 0;
+}
+
+void XeCryptHmacMd5_entry(mapped_void key, u32 key_size, mapped_void inp_1, u32 inp_1_size,
+                          mapped_void inp_2, u32 inp_2_size, mapped_void inp_3, u32 inp_3_size,
+                          mapped_void out, u32 out_size) {
+  XeCryptHmacMd5(key.as<const uint8_t*>(), key_size, inp_1.as<const uint8_t*>(), inp_1_size,
+                 inp_2.as<const uint8_t*>(), inp_2_size, inp_3.as<const uint8_t*>(), inp_3_size,
+                 out.as<uint8_t*>(), out_size);
+}
+
 // The guest SHA-512 state mirrors the private FFmpeg context (AVSHA512 in
 // libavutil/sha512.c of thirdparty/FFmpeg), which is loaded from and stored back
 // to guest memory around every call, as xenia-canary does.
@@ -971,11 +1013,8 @@ REX_EXPORT_STUB(__imp__XeCryptChainAndSumMac);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Init);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Update);
 REX_EXPORT_STUB(__imp__XeCryptHmacMd5Final);
-REX_EXPORT_STUB(__imp__XeCryptHmacMd5);
-REX_EXPORT_STUB(__imp__XeCryptHmacShaVerify);
 REX_EXPORT_STUB(__imp__XeCryptParveEcb);
 REX_EXPORT_STUB(__imp__XeCryptParveCbcMac);
-REX_EXPORT_STUB(__imp__XeCryptSha256);
 REX_EXPORT_STUB(__imp__XeCryptSha384Init);
 REX_EXPORT_STUB(__imp__XeCryptSha384Update);
 REX_EXPORT_STUB(__imp__XeCryptSha384Final);
@@ -1065,6 +1104,7 @@ REX_EXPORT(__imp__XeCryptShaInit, rex::kernel::xboxkrnl::XeCryptShaInit_entry)
 REX_EXPORT(__imp__XeCryptShaUpdate, rex::kernel::xboxkrnl::XeCryptShaUpdate_entry)
 REX_EXPORT(__imp__XeCryptShaFinal, rex::kernel::xboxkrnl::XeCryptShaFinal_entry)
 REX_EXPORT(__imp__XeCryptSha, rex::kernel::xboxkrnl::XeCryptSha_entry)
+REX_EXPORT(__imp__XeCryptSha256, rex::kernel::xboxkrnl::XeCryptSha256_entry)
 REX_EXPORT(__imp__XeCryptSha256Init, rex::kernel::xboxkrnl::XeCryptSha256Init_entry)
 REX_EXPORT(__imp__XeCryptSha256Update, rex::kernel::xboxkrnl::XeCryptSha256Update_entry)
 REX_EXPORT(__imp__XeCryptSha256Final, rex::kernel::xboxkrnl::XeCryptSha256Final_entry)
@@ -1081,6 +1121,8 @@ REX_EXPORT(__imp__XeCryptAesKey, rex::kernel::xboxkrnl::XeCryptAesKey_entry)
 REX_EXPORT(__imp__XeCryptAesEcb, rex::kernel::xboxkrnl::XeCryptAesEcb_entry)
 REX_EXPORT(__imp__XeCryptAesCbc, rex::kernel::xboxkrnl::XeCryptAesCbc_entry)
 REX_EXPORT(__imp__XeCryptHmacSha, rex::kernel::xboxkrnl::XeCryptHmacSha_entry)
+REX_EXPORT(__imp__XeCryptHmacShaVerify, rex::kernel::xboxkrnl::XeCryptHmacShaVerify_entry)
+REX_EXPORT(__imp__XeCryptHmacMd5, rex::kernel::xboxkrnl::XeCryptHmacMd5_entry)
 REX_EXPORT(__imp__XeCryptHmacShaInit, rex::kernel::xboxkrnl::XeCryptHmacShaInit_entry)
 REX_EXPORT(__imp__XeCryptHmacShaUpdate, rex::kernel::xboxkrnl::XeCryptHmacShaUpdate_entry)
 REX_EXPORT(__imp__XeCryptHmacShaFinal, rex::kernel::xboxkrnl::XeCryptHmacShaFinal_entry)

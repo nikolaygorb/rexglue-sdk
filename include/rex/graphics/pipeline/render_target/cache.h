@@ -204,6 +204,10 @@ class RenderTargetCache {
 
   virtual void BeginFrame();
 
+  // Call once per frame. Render targets used in the last few frames aren't
+  // reused.
+  void AdvanceRenderTargetUseFrame() { ++render_target_use_frame_; }
+
   // Keeps each tile on one window offset path. If a draw has to leave its
   // offset in the viewport, later draws with the same offset, surface pitch,
   // and MSAA do the same until a frame passes without one. This keeps a tiled
@@ -368,6 +372,11 @@ class RenderTargetCache {
     // In pixels at 1x (the key's scale applies on top), a multiple of the tile
     // height, at most GetRenderTargetHeight.
     uint32_t height() const { return height_; }
+    // For the cache reusing it at another key of the same shape.
+    void SetKey(RenderTargetKey key) { key_ = key; }
+    // render_target_use_frame_ of the last update or resolve that got it.
+    uint64_t last_use_frame() const { return last_use_frame_; }
+    void SetLastUseFrame(uint64_t frame) { last_use_frame_ = frame; }
 
    protected:
     RenderTarget(RenderTargetKey key, uint32_t height) : key_(key), height_(height) {}
@@ -375,6 +384,7 @@ class RenderTargetCache {
    private:
     RenderTargetKey key_;
     uint32_t height_;
+    uint64_t last_use_frame_ = 0;
   };
 
   struct Transfer {
@@ -548,6 +558,11 @@ class RenderTargetCache {
   uint32_t GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
                                  xenos::MsaaSamples msaa_samples) const;
 
+  // Whether render targets of different heights can be bound together. If not,
+  // they're all created with the full GetRenderTargetHeight, which is the same
+  // for everything bound together, and don't grow.
+  virtual bool AreMixedHeightRenderTargetsSupported() const { return true; }
+
   // Host render targets start at the height the draw or clear needs and grow
   // as needed (GetOrCreateRenderTarget).
   virtual RenderTarget* CreateRenderTarget(RenderTargetKey key, uint32_t height) = 0;
@@ -567,6 +582,14 @@ class RenderTargetCache {
   // "striped" way if the depth precision is lost (if this is made always return
   // false).
   virtual bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const = 0;
+
+  // Whether the implementation still references the render target outside of
+  // the common code.
+  virtual bool CanReuseRenderTarget(const RenderTarget&) const { return true; }
+  // For the implementation to update what depends on the key of a render
+  // target given a new one by ReuseRenderTarget, and to clear it to zero like a
+  // new one.
+  virtual void RenderTargetReused(RenderTarget&) {}
 
   void ResetAccumulatedRenderTargets() {
     are_accumulated_render_targets_valid_ = false;
@@ -778,6 +801,27 @@ class RenderTargetCache {
   }
 
   RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key, uint32_t minimum_height);
+  // Some titles place the same surfaces at changing EDRAM bases, so rather than
+  // creating a render target per base, gives the key to the least recently used
+  // render target of the same host format, at least minimum_height tall, that
+  // holds no EDRAM data and hasn't been used in the last few frames. Returns
+  // nullptr if there's none.
+  RenderTarget* ReuseRenderTarget(RenderTargetKey key, uint32_t minimum_height);
+  // Calls the function with the key of every render target owning an EDRAM
+  // range, holding the only copy of its tiles, possibly repeatedly for one.
+  template <typename Function>
+  void ForEachEdramOwner(Function function) const {
+    for (const auto& ownership_range_pair : ownership_ranges_) {
+      const OwnershipRange& range = ownership_range_pair.second;
+      for (RenderTargetKey owner :
+           {range.render_target, range.depth_bits_target, range.host_depth_render_target_unorm24,
+            range.host_depth_render_target_float24}) {
+        if (!owner.IsEmpty()) {
+          function(owner);
+        }
+      }
+    }
+  }
 
   // Checks if changing ownership of the range to the specified render target
   // would require transferring data - primarily for barrier placement on the
@@ -826,7 +870,7 @@ class RenderTargetCache {
   // Render targets actually used by the draw call with the last successful
   // update. 0 is depth, color starting from 1, nullptr if not bound.
   // Only valid for non-pixel-shader-interlock paths.
-  RenderTarget* last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets];
+  RenderTarget* last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets] = {};
   // Render targets used by the draw call with the last successful update or
   // previous updates, unless a different or a totally new one was bound (or
   // surface info was changed), to avoid unneeded render target switching (which
@@ -836,7 +880,7 @@ class RenderTargetCache {
   // whether it's safe to enable depth / stencil or writing to a specific color
   // render target in the pipeline for this draw call.
   // Only valid for non-pixel-shader-interlock paths.
-  RenderTarget* last_update_accumulated_render_targets_[1 + xenos::kMaxColorRenderTargets];
+  RenderTarget* last_update_accumulated_render_targets_[1 + xenos::kMaxColorRenderTargets] = {};
   // If false, the next update must copy last_update_used_render_targets_ to
   // last_update_accumulated_render_targets_ - it's not beneficial or even
   // incorrect to keep the previously bound render targets.
@@ -849,6 +893,13 @@ class RenderTargetCache {
 
   // See update_state_generation().
   uint64_t update_state_generation_ = 0;
+  // Render targets used fewer frames ago aren't reused, so surfaces alternating
+  // between EDRAM bases every frame keep a render target for each, and one
+  // update or resolve clear doesn't reuse a render target it has already got.
+  static constexpr uint64_t kRenderTargetReuseUnusedFrames = 4;
+  uint64_t render_target_use_frame_ = 0;
+  // Keys of the render targets owning EDRAM ranges, gathered for reuse.
+  std::vector<RenderTargetKey> reuse_owners_;
 };
 
 }  // namespace rex::graphics

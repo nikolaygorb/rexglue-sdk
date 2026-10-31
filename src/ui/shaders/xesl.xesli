@@ -413,6 +413,17 @@ float4_xe float_x4_xe(float x) { return float4_xe(x, x, x, x); }
 // a name for the buffer binding.
 // In GLSL, the offsets in the push constants are global across shader stages.
 // In HLSL, they're local to the specific root constant buffer.
+#if SHADING_LANGUAGE_HLSL_XE
+  // Register spaces exist only in Shader Model 5.1 and newer. Direct3D 11
+  // (Shader Model 5.0) builds define XESL_HLSL_NO_REGISTER_SPACE_XE and use the
+  // same slots without the space.
+  #if XESL_HLSL_NO_REGISTER_SPACE_XE
+    #define register_xe(hlsl_register, hlsl_space) register(hlsl_register)
+  #else
+    #define register_xe(hlsl_register, hlsl_space) \
+        register(hlsl_register, hlsl_space)
+  #endif
+#endif
 #if SHADING_LANGUAGE_GLSL_XE
   #define const_buffer_begin_xe(name, glsl_set, glsl_binding, hlsl_b, \
                                 hlsl_b_space)                         \
@@ -430,12 +441,12 @@ float4_xe float_x4_xe(float x) { return float4_xe(x, x, x, x); }
 #elif SHADING_LANGUAGE_HLSL_XE
   #define const_buffer_begin_xe(name, glsl_set, glsl_binding, hlsl_b, \
                                 hlsl_b_space)                         \
-      cbuffer name : register(hlsl_b, hlsl_b_space) {
+      cbuffer name : register_xe(hlsl_b, hlsl_b_space) {
   #define const_buffer_end_xe(name) \
       };
   #define constant_xe(const_buffer_name, constant_name) constant_name
   #define push_const_begin_xe(hlsl_b, hlsl_b_space) \
-      cbuffer push_consts_xe : register(hlsl_b, hlsl_b_space) {
+      cbuffer push_consts_xe : register_xe(hlsl_b, hlsl_b_space) {
   #define push_const_end_xe \
       };
   #define push_const_xe(name) name
@@ -548,10 +559,10 @@ float4_xe float_x4_xe(float x) { return float4_xe(x, x, x, x); }
 #elif SHADING_LANGUAGE_HLSL_XE
   #define byte_buffer_declare_xe_impl(value_type, name, glsl_set,         \
                                       glsl_binding, hlsl_t, hlsl_t_space) \
-      ByteAddressBuffer name : register(hlsl_t, hlsl_t_space);
+      ByteAddressBuffer name : register_xe(hlsl_t, hlsl_t_space);
   #define byte_buffer_wo_declare_xe_impl(value_type, name, glsl_set,         \
                                          glsl_binding, hlsl_t, hlsl_t_space) \
-      RWByteAddressBuffer name : register(hlsl_t, hlsl_t_space);
+      RWByteAddressBuffer name : register_xe(hlsl_t, hlsl_t_space);
 
   #define byte_buffer_align4_load4_xe(name, byte_address) \
       ((name).Load(uint(byte_address)))
@@ -742,13 +753,13 @@ float4_xe float_x4_xe(float x) { return float4_xe(x, x, x, x); }
   // Binding declarations.
   #define texture_xe(texture_type, name, glsl_set, glsl_binding, hlsl_t, \
                      hlsl_t_space, msl_texture)                          \
-      texture_type name : register(hlsl_t, hlsl_t_space);
+      texture_type name : register_xe(hlsl_t, hlsl_t_space);
   #define sampler_state_xe(name, glsl_set, glsl_binding, hlsl_s, hlsl_s_space, \
                            msl_sampler)                                        \
-      SamplerState name : register(hlsl_s, hlsl_s_space);
+      SamplerState name : register_xe(hlsl_s, hlsl_s_space);
   #define image_wo_xe(type, format, name, glsl_set, glsl_binding, hlsl_u, \
                       hlsl_u_space, msl_texture)                          \
-      type<format> name : register(hlsl_u, hlsl_u_space);
+      type<format> name : register_xe(hlsl_u, hlsl_u_space);
   // Fetching and storing.
   #define texel_fetch_buffer_xe(texture_name, position) \
       ((texture_name).Load(int(position)))

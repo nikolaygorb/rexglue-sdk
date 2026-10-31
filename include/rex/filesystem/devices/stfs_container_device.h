@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <rex/filesystem/device.h>
 #include <rex/math.h>
@@ -113,7 +114,8 @@ class StfsContainerDevice : public Device {
   Error ReadHeaderAndVerify(FILE* header_file);
 
   Error ReadSVOD();
-  Error ReadEntrySVOD(uint32_t sector, uint32_t ordinal, StfsContainerEntry* parent);
+  Error ReadEntrySVOD(uint32_t sector, uint32_t ordinal, StfsContainerEntry* parent,
+                      uint32_t depth);
   void BlockToOffsetSVOD(size_t sector, size_t* address, size_t* file_index);
 
   Error ReadSTFS();
@@ -138,6 +140,9 @@ class StfsContainerDevice : public Device {
   uint32_t block_step[2];
 
   std::unordered_map<size_t, StfsHashTable> cached_hash_tables_;
+  // SVOD directory entries already read: a damaged tree can have cycles and
+  // nodes shared by many parents.
+  std::unordered_set<uint64_t> svod_read_entries_;
 };
 
 }  // namespace rex::filesystem

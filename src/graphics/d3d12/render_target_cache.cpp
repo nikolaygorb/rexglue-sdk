@@ -1734,6 +1734,35 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
                                std::move(descriptor_srv_stencil), resource_state);
 }
 
+void D3D12RenderTargetCache::RenderTargetReused(RenderTarget& render_target) {
+  D3D12RenderTarget& d3d12_render_target = static_cast<D3D12RenderTarget&>(render_target);
+  RenderTargetKey key = render_target.key();
+  {
+    std::u16string resource_name = rex::string::to_utf16(key.GetDebugName());
+    d3d12_render_target.resource()->SetName(reinterpret_cast<LPCWSTR>(resource_name.c_str()));
+  }
+  // It may still be bound in the command list.
+  InvalidateCommandListRenderTargets();
+  // Clear it to zero like a new one, under its own sample pattern if it's
+  // depth, as depth surfaces lock in their pattern on clear.
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  D3D12_CPU_DESCRIPTOR_HANDLE descriptor_draw_handle =
+      d3d12_render_target.descriptor_draw().GetHandle();
+  if (key.is_depth) {
+    TransitionRenderTarget(d3d12_render_target, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    command_processor_.SubmitBarriers();
+    command_processor_.UpdateSamplePositions(key.msaa_samples);
+    command_list.D3DClearDepthStencilView(descriptor_draw_handle,
+                                          D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f,
+                                          0, 0, nullptr);
+  } else {
+    TransitionRenderTarget(d3d12_render_target, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    command_processor_.SubmitBarriers();
+    static constexpr FLOAT kClearColor[4] = {};
+    command_list.D3DClearRenderTargetView(descriptor_draw_handle, kClearColor, 0, nullptr);
+  }
+}
+
 RenderTargetCache::RenderTarget* D3D12RenderTargetCache::GrowRenderTarget(
     RenderTarget* source, uint32_t height, const std::vector<Transfer>& transfers) {
   RenderTarget* dest = CreateRenderTarget(source->key(), height);

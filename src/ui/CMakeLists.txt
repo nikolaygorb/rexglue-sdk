@@ -64,6 +64,15 @@ if(REXGLUE_USE_D3D12)
     )
 endif()
 
+# D3D11 UI backend (experimental)
+if(REXGLUE_USE_D3D11)
+    set(REXUI_D3D11_SOURCES
+        d3d11/d3d11_immediate_drawer.cpp
+        d3d11/d3d11_presenter.cpp
+        d3d11/d3d11_provider.cpp
+    )
+endif()
+
 # Platform-specific sources (windowing itself is SDL3, platform-independent)
 if(WIN32)
     set(REXUI_PLATFORM_SOURCES
@@ -92,6 +101,10 @@ endif()
 
 if(REXGLUE_USE_D3D12)
     list(APPEND REXUI_SOURCES ${REXUI_D3D12_SOURCES})
+endif()
+
+if(REXGLUE_USE_D3D11)
+    list(APPEND REXUI_SOURCES ${REXUI_D3D11_SOURCES})
 endif()
 
 add_library(rexui OBJECT ${REXUI_SOURCES})

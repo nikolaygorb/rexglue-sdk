@@ -12,6 +12,8 @@
 #include <rex/filesystem/devices/disc_image_device.h>
 #include <rex/filesystem/devices/disc_image_entry.h>
 
+#include <algorithm>
+
 #include <rex/literals.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -22,6 +24,14 @@ namespace rex::filesystem {
 using namespace rex::literals;
 
 const size_t kXESectorSize = 2_KiB;
+const size_t kMagicSize = 20;
+// The volume descriptor's fields read here end at this offset.
+const size_t kVolumeDescriptorFieldsSize = 28;
+// Size of a directory entry before its name.
+const size_t kEntryHeaderSize = 14;
+// Directory trees are balanced, so this is far above any real one, and low
+// enough for the stack: a damaged list of nodes can be 16K long per directory.
+const uint32_t kMaxEntryDepth = 256;
 
 DiscImageDevice::DiscImageDevice(const std::string_view mount_path,
                                  const std::filesystem::path& host_path)
@@ -89,7 +99,7 @@ DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {
   }
 
   // Read sector 32 to get FS state.
-  if (state->size < state->game_offset + (32 * kXESectorSize)) {
+  if (state->size < state->game_offset + (32 * kXESectorSize) + kVolumeDescriptorFieldsSize) {
     return Error::kErrorReadError;
   }
   uint8_t* fs_ptr = state->ptr + state->game_offset + (32 * kXESectorSize);
@@ -97,6 +107,9 @@ DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {
   state->root_size = memory::load<uint32_t>(fs_ptr + 24);
   state->root_offset = state->game_offset + (state->root_sector * kXESectorSize);
   if (state->root_size < 13 || state->root_size > 32_MiB) {
+    return Error::kErrorDamagedFile;
+  }
+  if (state->root_offset > state->size || state->root_size > state->size - state->root_offset) {
     return Error::kErrorDamagedFile;
   }
 
@@ -109,12 +122,12 @@ DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {
 }
 
 bool DiscImageDevice::VerifyMagic(ParseState* state, size_t offset) {
-  if (offset >= state->size) {
+  if (offset + kMagicSize > state->size) {
     return false;
   }
 
   // Simple check to see if the given offset contains the magic value.
-  return std::memcmp(state->ptr + offset, "MICROSOFT*XBOX*MEDIA", 20) == 0;
+  return std::memcmp(state->ptr + offset, "MICROSOFT*XBOX*MEDIA", kMagicSize) == 0;
 }
 
 DiscImageDevice::Error DiscImageDevice::ReadAllEntries(ParseState* state,
@@ -123,16 +136,26 @@ DiscImageDevice::Error DiscImageDevice::ReadAllEntries(ParseState* state,
   root_entry->attributes_ = kFileAttributeDirectory;
   root_entry_ = std::unique_ptr<Entry>(root_entry);
 
-  if (!ReadEntry(state, root_buffer, 0, root_entry)) {
-    return Error::kErrorOutOfMemory;
+  if (!ReadEntry(state, root_buffer, state->root_size, 0, root_entry, 0)) {
+    return Error::kErrorDamagedFile;
   }
 
   return Error::kSuccess;
 }
 
-bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer, uint16_t entry_ordinal,
-                                DiscImageEntry* parent) {
-  const uint8_t* p = buffer + (entry_ordinal * 4);
+bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer, size_t buffer_size,
+                                uint16_t entry_ordinal, DiscImageEntry* parent, uint32_t depth) {
+  if (depth > kMaxEntryDepth) {
+    return false;
+  }
+  size_t entry_offset = size_t(entry_ordinal) * 4;
+  if (buffer_size < kEntryHeaderSize || entry_offset > buffer_size - kEntryHeaderSize) {
+    return false;
+  }
+  const uint8_t* p = buffer + entry_offset;
+  if (!state->read_entries.insert(size_t(p - state->ptr)).second) {
+    return true;
+  }
 
   uint16_t node_l = memory::load<uint16_t>(p + 0);
   uint16_t node_r = memory::load<uint16_t>(p + 2);
@@ -140,13 +163,19 @@ bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer, uint16
   size_t length = memory::load<uint32_t>(p + 8);
   uint8_t attributes = memory::load<uint8_t>(p + 12);
   uint8_t name_length = memory::load<uint8_t>(p + 13);
-  auto name_buffer = reinterpret_cast<const char*>(p + 14);
+  auto name_buffer = reinterpret_cast<const char*>(p + kEntryHeaderSize);
+  if (name_length > buffer_size - entry_offset - kEntryHeaderSize) {
+    return false;
+  }
 
-  if (node_l && !ReadEntry(state, buffer, node_l, parent)) {
+  if (node_l && !ReadEntry(state, buffer, buffer_size, node_l, parent, depth + 1)) {
     return false;
   }
 
   auto name = std::string(name_buffer, name_length);
+  if (!rex::string::utf8_is_valid(name)) {
+    return false;
+  }
 
   auto entry = DiscImageEntry::Create(this, parent, name, mmap_.get());
   entry->attributes_ = attributes | kFileAttributeReadOnly;
@@ -164,20 +193,21 @@ bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer, uint16
     entry->data_size_ = 0;
     if (length) {
       // Not a leaf - read in children.
-      if (state->size < state->game_offset + (sector * kXESectorSize)) {
+      size_t folder_offset = state->game_offset + (sector * kXESectorSize);
+      if (folder_offset > state->size || length > state->size - folder_offset) {
         // Out of bounds read.
         return false;
       }
       // Read child list.
-      uint8_t* folder_ptr = state->ptr + state->game_offset + (sector * kXESectorSize);
-      if (!ReadEntry(state, folder_ptr, 0, entry.get())) {
+      if (!ReadEntry(state, state->ptr + folder_offset, length, 0, entry.get(), depth + 1)) {
         return false;
       }
     }
   } else {
     // File.
-    entry->data_offset_ = state->game_offset + (sector * kXESectorSize);
-    entry->data_size_ = length;
+    // A truncated image still mounts; what's missing can't be read.
+    entry->data_offset_ = std::min(state->game_offset + (sector * kXESectorSize), state->size);
+    entry->data_size_ = std::min(length, state->size - entry->data_offset_);
     ++file_count_;
     total_file_size_ += length;
   }
@@ -186,7 +216,7 @@ bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer, uint16
   parent->children_.emplace_back(std::move(entry));
 
   // Read next file in the list.
-  if (node_r && !ReadEntry(state, buffer, node_r, parent)) {
+  if (node_r && !ReadEntry(state, buffer, buffer_size, node_r, parent, depth + 1)) {
     return false;
   }
 

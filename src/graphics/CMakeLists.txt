@@ -90,6 +90,26 @@ if(REXGLUE_USE_D3D12)
     )
 endif()
 
+# D3D11 backend (experimental; selected only explicitly, never by "any").
+# Uses the DXBC sources of the D3D12 backend, so it requires D3D12.
+if(REXGLUE_USE_D3D11)
+    set(REXGPU_XENOS_D3D11_SOURCES
+        d3d11/command_processor.cpp
+        d3d11/command_processor_copies.cpp
+        d3d11/geometry_shader.cpp
+        d3d11/graphics_system.cpp
+        d3d11/pipeline_cache.cpp
+        d3d11/pipeline_cache_copies.cpp
+        d3d11/primitive_processor.cpp
+        d3d11/render_target_cache.cpp
+        d3d11/render_target_shaders.cpp
+        d3d11/shader_bytecode.cpp
+        d3d11/shared_memory.cpp
+        d3d11/texture_cache.cpp
+        d3d11/texture_cache_copies.cpp
+    )
+endif()
+
 if(REXGLUE_USE_VULKAN)
     list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
 endif()
@@ -99,6 +119,10 @@ if(REXGLUE_USE_D3D12)
         ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}
         ${REXGPU_XENOS_DXBC_SOURCES}
         ${REXGPU_XENOS_D3D12_SOURCES})
+endif()
+
+if(REXGLUE_USE_D3D11)
+    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_D3D11_SOURCES})
 endif()
 
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
@@ -163,4 +187,8 @@ if(REXGLUE_USE_D3D12)
         dxgi
         dxguid
     )
+endif()
+
+if(REXGLUE_USE_D3D11)
+    target_link_libraries(rexgpu-xenos PRIVATE d3d11)
 endif()

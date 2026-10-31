@@ -302,7 +302,7 @@ TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
     // Loop iteration is the actual level being loaded.
     loop_level_last = max_stored_level;
   }
-  uint32_t mip_offset_bytes = 0;
+  uint64_t mip_offset_bytes = 0;
   for (uint32_t loop_level = has_base ? 0 : 1; loop_level <= loop_level_last; ++loop_level) {
     bool is_base = loop_level == 0;
     uint32_t level = (layout.packed_level == 0) ? 0 : loop_level;
@@ -345,18 +345,20 @@ TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
                       format_info->block_height,
                   xenos::kTextureTileWidthHeight)
             : 1;
-    level_layout.array_slice_stride_bytes =
-        level_layout.row_pitch_bytes * level_layout.z_slice_stride_block_rows;
-    uint32_t z_stride_bytes = level_layout.array_slice_stride_bytes;
+    // The sizes are summed in 64 bits: garbage fetch constants (8192x8192x64
+    // with 16-byte texels, or a 2048x2048x1024 volume) describe tens of GB.
+    uint64_t z_stride_bytes =
+        uint64_t(level_layout.row_pitch_bytes) * level_layout.z_slice_stride_block_rows;
+    uint64_t array_slice_stride_bytes = z_stride_bytes;
     if (dimension == xenos::DataDimension::k3D) {
-      level_layout.array_slice_stride_bytes *=
+      array_slice_stride_bytes *=
           rex::align(is_base && layout.packed_level != 0
                          ? depth
                          : std::max(rex::next_pow2(depth) >> level, uint32_t(1)),
                      xenos::kTextureTileDepth);
     }
-    level_layout.array_slice_stride_bytes =
-        rex::align(level_layout.array_slice_stride_bytes, xenos::kTextureSubresourceAlignmentBytes);
+    array_slice_stride_bytes = rex::align(array_slice_stride_bytes,
+                                          uint64_t(xenos::kTextureSubresourceAlignmentBytes));
 
     // Estimate the memory amount actually referenced by the texture, which may
     // be smaller (especially in the 1280x720 linear k_8_8_8_8 case in 4E4D083E,
@@ -411,33 +413,49 @@ TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
           format_info->block_height;
       level_layout.z_extent = std::max(depth >> level, uint32_t(1));
     }
+    uint64_t array_slice_data_extent_bytes;
     if (is_tiled) {
       uint32_t bytes_per_block_log2 = rex::log2_floor(bytes_per_block);
       if (dimension == xenos::DataDimension::k3D) {
-        level_layout.array_slice_data_extent_bytes = uint32_t(GetTiledAddressUpperBound3D(
+        array_slice_data_extent_bytes = GetTiledAddressUpperBound3D(
             level_layout.x_extent_blocks, level_layout.y_extent_blocks, level_layout.z_extent,
             row_pitch_blocks_tile_aligned, level_layout.z_slice_stride_block_rows,
-            bytes_per_block_log2));
+            bytes_per_block_log2);
       } else {
-        level_layout.array_slice_data_extent_bytes =
+        array_slice_data_extent_bytes =
             GetTiledAddressUpperBound2D(level_layout.x_extent_blocks, level_layout.y_extent_blocks,
                                         row_pitch_blocks_tile_aligned, bytes_per_block_log2);
       }
     } else {
-      level_layout.array_slice_data_extent_bytes =
+      array_slice_data_extent_bytes =
           z_stride_bytes * (level_layout.z_extent - 1) +
-          level_layout.row_pitch_bytes * (level_layout.y_extent_blocks - 1) +
-          bytes_per_block * level_layout.x_extent_blocks;
+          uint64_t(level_layout.row_pitch_bytes) * (level_layout.y_extent_blocks - 1) +
+          uint64_t(bytes_per_block) * level_layout.x_extent_blocks;
     }
-    level_layout.level_data_extent_bytes =
-        level_layout.array_slice_stride_bytes * (layout.array_size - 1) +
-        level_layout.array_slice_data_extent_bytes;
+    uint64_t level_data_extent_bytes =
+        array_slice_stride_bytes * (layout.array_size - 1) + array_slice_data_extent_bytes;
+    uint64_t mips_total_extent_bytes = layout.mips_total_extent_bytes;
+    if (!is_base) {
+      mips_total_extent_bytes =
+          std::max(mips_total_extent_bytes, mip_offset_bytes + level_data_extent_bytes);
+    }
+    // No texture is larger than the guest's physical memory: the texture
+    // cache would request and watch a wrapped-around range. An empty layout
+    // makes it create the texture without loading any data, like for an
+    // empty texture.
+    if (level_data_extent_bytes > kGuestPhysicalMemoryBytes ||
+        mips_total_extent_bytes > kGuestPhysicalMemoryBytes) {
+      std::memset(&layout, 0, sizeof(layout));
+      return layout;
+    }
+    level_layout.array_slice_stride_bytes = uint32_t(array_slice_stride_bytes);
+    level_layout.array_slice_data_extent_bytes = uint32_t(array_slice_data_extent_bytes);
+    level_layout.level_data_extent_bytes = uint32_t(level_data_extent_bytes);
 
     if (!is_base) {
-      layout.mip_offsets_bytes[level] = mip_offset_bytes;
-      layout.mips_total_extent_bytes = std::max(
-          layout.mips_total_extent_bytes, mip_offset_bytes + level_layout.level_data_extent_bytes);
-      mip_offset_bytes += level_layout.array_slice_stride_bytes * mip_array_size;
+      layout.mip_offsets_bytes[level] = uint32_t(mip_offset_bytes);
+      layout.mips_total_extent_bytes = uint32_t(mips_total_extent_bytes);
+      mip_offset_bytes += array_slice_stride_bytes * mip_array_size;
     }
   }
 
@@ -493,6 +511,14 @@ uint64_t GetTiledAddressUpperBound3D(uint32_t right, uint32_t bottom, uint32_t b
   uint32_t y_first =
       right > pitch_aligned ? 0 : (bottom - 1) & ~(xenos::kTextureTileWidthHeight - 1);
   uint32_t z_first = (back - 1) & ~(xenos::kTextureTileDepth - 1);
+  // With a pitch below one macro tile (0 in garbage fetch constants and
+  // resolve registers), Z / 4 no longer moves the address forward: every
+  // 4-slice portion is stored at the same place except for the bank bit, so
+  // a last portion with fewer slices may not hold the highest address. The
+  // two full portions before it have both bank values.
+  if (pitch_aligned < xenos::kTextureTileWidthHeight) {
+    z_first -= std::min(z_first, 2 * xenos::kTextureTileDepth);
+  }
   int64_t upper_bound = 0;
   for (uint32_t z = z_first; z < back; ++z) {
     for (uint32_t y = y_first; y < bottom; ++y) {

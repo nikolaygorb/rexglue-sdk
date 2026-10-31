@@ -104,6 +104,16 @@ u32 XamContentGetDeviceState_entry(u32 device_id, mapped_void overlapped_ptr) {
   }
 }
 
+// xam reports the first mounted device. The dummy HDD always is, and comes first.
+u32 XamContentGetDefaultDevice_entry(mapped_u32 device_id_ptr) {
+  // xam doesn't check and faults on a null pointer.
+  if (!device_id_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  *device_id_ptr = static_cast<uint32_t>(DummyDeviceId::HDD);
+  return X_ERROR_SUCCESS;
+}
+
 typedef struct {
   rex::be<uint32_t> device_id;
   rex::be<uint32_t> device_type;
@@ -228,6 +238,7 @@ const DummyDeviceInfo* GetDummyDeviceInfo(uint32_t device_id) {
 
 REX_EXPORT(__imp__XamContentGetDeviceName, rex::kernel::xam::XamContentGetDeviceName_entry)
 REX_EXPORT(__imp__XamContentGetDeviceState, rex::kernel::xam::XamContentGetDeviceState_entry)
+REX_EXPORT(__imp__XamContentGetDefaultDevice, rex::kernel::xam::XamContentGetDefaultDevice_entry)
 REX_EXPORT(__imp__XamContentGetDeviceData, rex::kernel::xam::XamContentGetDeviceData_entry)
 REX_EXPORT(__imp__XamContentCreateDeviceEnumerator,
            rex::kernel::xam::XamContentCreateDeviceEnumerator_entry)
@@ -238,6 +249,5 @@ REX_EXPORT(__imp__XamContentGetDeviceVolumePath,
 
 REX_EXPORT_STUB(__imp__XamContentAddCacheDevice);
 REX_EXPORT_STUB(__imp__XamContentDeviceCheckUpdates);
-REX_EXPORT_STUB(__imp__XamContentGetDefaultDevice);
 REX_EXPORT_STUB(__imp__XamContentGetDeviceSerialNumber);
 REX_EXPORT_STUB(__imp__XamContentRemoveCacheDevice);

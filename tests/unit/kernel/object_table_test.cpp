@@ -28,6 +28,7 @@ class TestObject : public XObject {
   static constexpr Type kObjectType = Type::Undefined;
 
   TestObject() : XObject(Type::Undefined) {}
+  using XObject::set_name;
 
   // Track destructor calls for leak detection
   static int destructor_count;
@@ -456,6 +457,36 @@ TEST_CASE("ObjectTable duplicate name returns collision", "[kernel][object_table
   CHECK(table.AddNameMapping("SharedName", h1) == X_STATUS_SUCCESS);
   CHECK(table.AddNameMapping("SharedName", h2) == X_STATUS_OBJECT_NAME_COLLISION);
 
+  table.Reset();
+}
+
+TEST_CASE("ObjectTable name stays while another handle of the object lives",
+          "[kernel][object_table]") {
+  InitTestLogging();
+
+  ObjectTable table;
+  auto* obj = new TestObject();
+  obj->Retain();  // Keep alive after table releases
+  obj->set_name("TestName");
+
+  X_HANDLE h1 = 0, h2 = 0;
+  table.AddHandle(obj, &h1);
+  table.DuplicateHandle(h1, &h2);
+  table.AddNameMapping("TestName", h1);
+
+  // Closing the named handle moves the name to the other one.
+  CHECK(table.RemoveHandle(h1) == X_STATUS_SUCCESS);
+  X_HANDLE found = 0;
+  CHECK(table.GetObjectByName("TestName", &found) == X_STATUS_SUCCESS);
+  CHECK(found == h2);
+  // The lookup's reference is on the name's handle.
+  CHECK(table.ReleaseHandle(h2) == X_STATUS_SUCCESS);
+  CHECK(table.LookupObject<XObject>(h2).get() == obj);
+
+  CHECK(table.RemoveHandle(h2) == X_STATUS_SUCCESS);
+  CHECK(table.GetObjectByName("TestName", &found) == X_STATUS_OBJECT_NAME_NOT_FOUND);
+
+  obj->Release();
   table.Reset();
 }
 

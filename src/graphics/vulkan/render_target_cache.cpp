@@ -2460,6 +2460,13 @@ void VulkanRenderTargetCache::InvalidateRenderTargetFramebuffers(
               sizeof(last_update_framebuffer_attachments_));
 }
 
+void VulkanRenderTargetCache::RenderTargetReused(RenderTarget& render_target) {
+  // Framebuffers are keyed by the EDRAM bases, so the ones made at the old key
+  // would give its image to a later render target at that key.
+  command_processor_.EndRenderPass();
+  InvalidateRenderTargetFramebuffers(static_cast<const VulkanRenderTarget&>(render_target));
+}
+
 RenderTargetCache::RenderTarget* VulkanRenderTargetCache::GrowRenderTarget(
     RenderTarget* source, uint32_t height, const std::vector<Transfer>& transfers) {
   RenderTarget* dest = CreateRenderTarget(source->key(), height);

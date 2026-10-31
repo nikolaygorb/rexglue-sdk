@@ -4971,6 +4971,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
+  // Snapshot the export ranges before the draw so the readback after it only
+  // copies the bytes the shaders actually changed. Copying the whole range
+  // back would overwrite anything the CPU wrote there while the draw was in
+  // flight, since the ranges are usually much larger than what gets exported.
+  const bool memexport_snapshot_taken = IssueDraw_MemexportSnapshot();
+
   // Insert the shared memory barrier if needed.
   // TODO(Triang3l): Find some PM4 command that can be used for indication of
   // when memexports should be awaited instead of inserting the barrier in Use
@@ -5124,7 +5130,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       if (REXCVAR_GET(readback_memexport_fast)) {
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
       } else {
-        IssueDraw_MemexportReadbackFullPath(memexport_total_size);
+        IssueDraw_MemexportReadbackFullPath(memexport_total_size, memexport_snapshot_taken);
       }
     }
   }
@@ -5173,24 +5179,37 @@ bool VulkanCommandProcessor::RequestMemexportFullReadbackBuffer(uint32_t size) {
   return true;
 }
 
-void VulkanCommandProcessor::ReadMemexportRanges(const void* readback_mapping) {
-  const uint8_t* readback_bytes = static_cast<const uint8_t*>(readback_mapping);
+void VulkanCommandProcessor::ReadMemexportRanges(const void* readback_mapping,
+                                                  const void* snapshot_mapping) {
+  const uint8_t* after_bytes = static_cast<const uint8_t*>(readback_mapping);
+  const uint8_t* before_bytes = static_cast<const uint8_t*>(snapshot_mapping);
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-    std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
-                readback_bytes, memexport_range.size_bytes);
-    readback_bytes += memexport_range.size_bytes;
+    uint8_t* guest_bytes = memory_->TranslatePhysical(memexport_range.base_address_dwords << 2);
+    if (before_bytes) {
+      draw_util::WriteBackChangedBytes(guest_bytes, before_bytes, after_bytes,
+                                       memexport_range.size_bytes);
+      before_bytes += memexport_range.size_bytes;
+    } else {
+      std::memcpy(guest_bytes, after_bytes, memexport_range.size_bytes);
+    }
+    after_bytes += memexport_range.size_bytes;
   }
 }
 
-bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
-  if (!total_size || memexport_ranges_.empty()) {
-    return true;
+bool VulkanCommandProcessor::IssueDraw_MemexportSnapshot() {
+  if (memexport_ranges_.empty() || REXCVAR_GET(readback_memexport_fast) ||
+      !IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
+    return false;
   }
-
-  if (!RequestMemexportFullReadbackBuffer(total_size)) {
-    return true;
+  uint32_t total_size = 0;
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    total_size += memexport_range.size_bytes;
   }
-  const VkBuffer readback_buffer = memexport_full_readback_buffer_;
+  // The first half of the readback buffer holds the snapshot, the second half
+  // the result.
+  if (!RequestMemexportFullReadbackBuffer(total_size * 2)) {
+    return false;
+  }
 
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   SubmitBarriers(true);
@@ -5201,13 +5220,41 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
     readback_region.srcOffset = memexport_range.base_address_dwords << 2;
     readback_region.dstOffset = readback_offset;
     readback_region.size = memexport_range.size_bytes;
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(),
+                                             memexport_full_readback_buffer_, 1, &readback_region);
+    readback_offset += memexport_range.size_bytes;
+  }
+  return true;
+}
+
+bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size,
+                                                                 bool snapshot_taken) {
+  if (!total_size || memexport_ranges_.empty()) {
+    return true;
+  }
+
+  const uint32_t result_offset = snapshot_taken ? total_size : 0;
+  if (!RequestMemexportFullReadbackBuffer(result_offset + total_size)) {
+    return true;
+  }
+  const VkBuffer readback_buffer = memexport_full_readback_buffer_;
+
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+
+  uint32_t readback_offset = result_offset;
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    VkBufferCopy readback_region = {};
+    readback_region.srcOffset = memexport_range.base_address_dwords << 2;
+    readback_region.dstOffset = readback_offset;
+    readback_region.size = memexport_range.size_bytes;
     deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), readback_buffer, 1,
                                              &readback_region);
     readback_offset += memexport_range.size_bytes;
   }
-  PushBufferMemoryBarrier(readback_buffer, 0, total_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                          VK_ACCESS_HOST_READ_BIT);
+  PushBufferMemoryBarrier(readback_buffer, 0, result_offset + total_size,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
 
   if (!AwaitAllQueueOperationsCompletion()) {
     REXGPU_ERROR("Failed to await completion of Vulkan memexport readback");
@@ -5223,7 +5270,8 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   vulkan_device->functions().vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1,
                                                             &readback_memory_range);
 
-  ReadMemexportRanges(memexport_full_readback_mapping_);
+  const uint8_t* mapping = static_cast<const uint8_t*>(memexport_full_readback_mapping_);
+  ReadMemexportRanges(mapping + result_offset, snapshot_taken ? mapping : nullptr);
   return true;
 }
 
@@ -5907,7 +5955,10 @@ void VulkanCommandProcessor::EvictOldReadbackBuffers(
     ReadbackBuffer& readback = it->second;
     bool evict =
         buffer_map.size() > kMaxReadbackBuffers || readback.last_used_frame < eviction_frame_floor;
-    if (!evict) {
+    // A copy into the buffer may still be queued: destroying it now loses the device. The map
+    // may stay over the cap until the next frame.
+    if (!evict || readback.submission_written[0] > GetCompletedSubmission() ||
+        readback.submission_written[1] > GetCompletedSubmission()) {
       ++it;
       continue;
     }
@@ -6725,6 +6776,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+
+    render_target_cache_->AdvanceRenderTargetUseFrame();
   }
 
   return true;

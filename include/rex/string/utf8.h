@@ -31,6 +31,10 @@ std::u16string to_utf16(const std::string_view source);
 
 size_t utf8_count(const std::string_view view);
 
+// Whether the view is valid UTF-8. The other functions here throw on data that
+// isn't, so names from files are checked before they become paths.
+bool utf8_is_valid(const std::string_view view);
+
 std::string utf8_lower_ascii(const std::string_view view);
 std::string utf8_upper_ascii(const std::string_view view);
 

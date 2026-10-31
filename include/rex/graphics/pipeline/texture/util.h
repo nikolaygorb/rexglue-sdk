@@ -178,6 +178,11 @@ struct TextureGuestLayout {
   uint32_t array_size;
 };
 
+// The guest's physical memory, which no texture can be larger than.
+constexpr uint32_t kGuestPhysicalMemoryBytes = UINT32_C(512) << 20;
+
+// All zeros (nothing to load) if a level or the mips would be larger than
+// kGuestPhysicalMemoryBytes, as garbage fetch constants can describe.
 TextureGuestLayout GetGuestTextureLayout(xenos::DataDimension dimension,
                                          uint32_t base_pitch_texels_div_32, uint32_t width_texels,
                                          uint32_t height_texels, uint32_t depth_or_array_size,

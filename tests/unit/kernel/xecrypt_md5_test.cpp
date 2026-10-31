@@ -23,6 +23,7 @@
 namespace {
 
 using rex::kernel::xboxkrnl::XECRYPT_MD5_STATE;
+using rex::kernel::xboxkrnl::XeCryptHmacMd5;
 using rex::kernel::xboxkrnl::XeCryptMd5;
 using rex::kernel::xboxkrnl::XeCryptMd5Final;
 using rex::kernel::xboxkrnl::XeCryptMd5Init;
@@ -119,4 +120,20 @@ TEST_CASE("XeCryptMd5Final pads a 32-bit bit count", "[kernel][crypt]") {
   XeCryptMd5Update(&state, Bytes("abc"), 3);
   state.count = 0x20000003;
   REQUIRE(Final(state) == FromHex("900150983cd24fb0d6963f7d28e17f72"));
+}
+
+TEST_CASE("XeCryptHmacMd5 matches the RFC 2202 vectors", "[kernel][xecrypt]") {
+  const auto hmac = [](std::string_view key, std::string_view head, std::string_view tail) {
+    Digest digest;
+    XeCryptHmacMd5(Bytes(key), static_cast<uint32_t>(key.size()), Bytes(head),
+                   static_cast<uint32_t>(head.size()), Bytes(tail),
+                   static_cast<uint32_t>(tail.size()), nullptr, 0, digest.data(),
+                   static_cast<uint32_t>(digest.size()));
+    return digest;
+  };
+  const std::string key_0b(16, '\x0b');
+  REQUIRE(hmac(key_0b, "Hi There", "") == FromHex("9294727a3638bb1c13f48ef8158bfc9d"));
+  // The message may come in pieces.
+  REQUIRE(hmac("Jefe", "what do ya want ", "for nothing?") ==
+          FromHex("750c783e6ab0b503eaa86e310a5db738"));
 }

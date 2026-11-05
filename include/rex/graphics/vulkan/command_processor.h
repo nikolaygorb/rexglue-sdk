@@ -11,11 +11,15 @@
  */
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -161,6 +165,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking,
                                std::function<void()> completion_callback = nullptr) override;
+
+  void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
+  void RestoreEdramSnapshot(const void* snapshot, uint32_t size) override;
 
   void PollCompletedSubmission() override;
 
@@ -320,6 +327,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
+  void OnGuestMemorySyncPoint() override;
+  SharedMemory* GetSharedMemoryForStats() const override { return shared_memory_.get(); }
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -330,6 +339,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  void InitializeTrace() override;
 
   bool CanReadBackResolvesNow() const override { return true; }
   void ReadBackResolvesNow(const ResolveFetch* fetches, size_t count,
@@ -346,6 +356,23 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct CommandBuffer {
     VkCommandPool pool;
     VkCommandBuffer buffer;
+  };
+
+  // Threaded submission (vulkan_threaded_submission): EndSubmission hands the
+  // closed submission to a thread that records its deferred commands into the
+  // Vulkan command buffer and submits it, while the command processor goes on
+  // with the next packets.
+  struct SubmissionJob {
+    uint64_t submission = 0;
+    DeferredCommandBuffer::Streams streams;
+    VulkanQueryPool::ResolveBatch resolve_batch;
+    CommandBuffer command_buffer = {};
+    VkFence fence = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> wait_semaphores;
+    std::vector<VkPipelineStageFlags> wait_stage_masks;
+    // Instead of a submission: work to run on the thread after the jobs before
+    // it, the presenter's publish step.
+    std::function<void()> callback;
   };
 
   struct SparseBufferBind {
@@ -528,6 +555,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
+  void SubmissionThread();
+  // Queues the closed submission for the thread. False leaves everything for
+  // EndSubmission to fail with.
+  bool HandOverSubmission(const CommandBuffer& command_buffer, uint64_t submission);
+  // Returns once the thread has given the submission to the queue, or failed.
+  void AwaitSubmissionThread(uint64_t submission);
+  void ShutdownSubmissionThread();
+  // With vulkan_present_on_submission_thread, the swap does not wait for the
+  // thread to replay the frame: the presenter's publish step is queued behind
+  // the frame, and the next swap waits for it only if it has not run.
+  void DeferPresentStep(std::function<void()> step);
+  void AwaitPresentSteps();
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionCompletionAndDeviceLoss(GetCurrentSubmission());
     return !submission_open_ && GetCompletedSubmission() + 1u >= GetCurrentSubmission();
@@ -792,6 +831,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Tracks whether any draw in the current frame was skipped because its
   // graphics pipeline was still being created, so the output is incomplete.
   bool frame_used_pending_pipeline_ = false;
+  // One of those draws was depth-only or a full-screen pass, so the frame is
+  // held whatever vulkan_async_skip_incomplete_frames_ms says.
+  bool frame_pending_pipeline_must_hold_ = false;
+  // Frames have been held back in a row since this time.
+  bool incomplete_frames_held_ = false;
+  std::chrono::steady_clock::time_point incomplete_frames_held_since_;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
@@ -809,6 +854,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+
+  std::unique_ptr<rex::thread::Thread> submission_thread_;
+  std::mutex submission_thread_mutex_;
+  std::condition_variable submission_thread_request_cond_;
+  std::condition_variable submission_thread_done_cond_;
+  std::deque<SubmissionJob> submission_thread_jobs_;
+  std::vector<SubmissionJob> submission_thread_free_jobs_;
+  bool submission_thread_shutdown_ = false;
+  // The last submission the thread has handled (submitted, or failed to).
+  std::atomic<uint64_t> submission_thread_submitted_{0};
+  std::atomic<bool> submission_thread_failed_{false};
+  // The presenter whose publish steps run on the thread, if any, the steps
+  // queued so far (command processor thread) and those the thread has run.
+  ui::Presenter* present_deferred_presenter_ = nullptr;
+  uint64_t present_steps_queued_ = 0;
+  std::atomic<uint64_t> present_steps_done_{0};
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
@@ -1104,6 +1165,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   // but in_render_pass_ is true.
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
+  // With dynamic rendering, a transfer pass and a draw pass into the same
+  // framebuffer differ only in their attachments (the transfer binds just the
+  // destination, through an ownership transfer view whose format may be an
+  // integer one), so the framebuffer alone can't tell whether the open pass is
+  // the one needed. The transfer destination view, VK_NULL_HANDLE for a draw
+  // pass.
+  VkImageView current_transfer_dest_view_ = VK_NULL_HANDLE;
   bool in_render_pass_ = false;
 
   // Upload hoisting (CanHoistSharedMemoryUpload): whether the current render

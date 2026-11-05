@@ -15,6 +15,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,6 +52,10 @@ class StfsContainerDevice : public Device {
   uint32_t attributes() const override { return 0; }
   uint32_t component_name_max_length() const override { return 40; }
   const StfsHeader& header() const { return header_; }
+
+  // Every file of the package reads through the same FILE*s; a seek and its read
+  // hold this.
+  std::mutex& read_mutex() { return read_mutex_; }
 
   // Reads and validates the StfsHeader from an STFS package file without
   // mounting the device. Returns nullptr if the file is missing, too small,
@@ -103,6 +108,7 @@ class StfsContainerDevice : public Device {
     kEnhancedGDF = 0x1,
     kXSF = 0x2,
     kSingleFile = 0x4,
+    kMultipleFiles = 0x8,
   };
 
   XContentPackageType ReadMagic(const std::filesystem::path& path);
@@ -129,6 +135,7 @@ class StfsContainerDevice : public Device {
   std::filesystem::path host_path_;
 
   std::map<size_t, FILE*> files_;
+  std::mutex read_mutex_;
   size_t files_total_size_;
 
   size_t svod_base_offset_;

@@ -39,6 +39,506 @@ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id ope
       const_float_0_, value);
 }
 
+spv::Id SpirvShaderTranslator::ScalarEstimate(ScalarEstimateOp op, spv::Id value) {
+  EnsureBuildPointAvailable();
+
+  if (!alu_op_result_rounding_sensitive_) {
+    switch (op) {
+      case ScalarEstimateOp::kRcp:
+        return ReduceFloatPrecision(
+            builder_->createNoContractionBinOp(spv::OpFDiv, type_float_, const_float_1_, value),
+            21);
+      case ScalarEstimateOp::kRsq:
+        return ReduceFloatPrecision(
+            builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                             GLSLstd450InverseSqrt, value),
+            21);
+      case ScalarEstimateOp::kSqrt:
+        return ReduceFloatPrecision(builder_->createUnaryBuiltinCall(
+                                        type_float_, ext_inst_glsl_std_450_, GLSLstd450Sqrt, value),
+                                    21);
+      case ScalarEstimateOp::kExp:
+        return ReduceFloatPrecision(builder_->createUnaryBuiltinCall(
+                                        type_float_, ext_inst_glsl_std_450_, GLSLstd450Exp2, value),
+                                    21);
+      case ScalarEstimateOp::kLog:
+        return ReduceFloatPrecision(builder_->createUnaryBuiltinCall(
+                                        type_float_, ext_inst_glsl_std_450_, GLSLstd450Log2, value),
+                                    21);
+    }
+  }
+
+  const xenos::ScalarEstimate* estimate = nullptr;
+  const char* coefficients_name = nullptr;
+  switch (op) {
+    case ScalarEstimateOp::kRcp:
+      estimate = &xenos::GetRcpEstimate();
+      coefficients_name = "xe_var_rcp_coefficients";
+      break;
+    case ScalarEstimateOp::kRsq:
+      estimate = &xenos::GetRsqEstimate();
+      coefficients_name = "xe_var_rsq_coefficients";
+      break;
+    case ScalarEstimateOp::kSqrt:
+      estimate = &xenos::GetSqrtEstimate();
+      coefficients_name = "xe_var_sqrt_coefficients";
+      break;
+    case ScalarEstimateOp::kExp:
+      estimate = &xenos::GetExpEstimate();
+      coefficients_name = "xe_var_exp_coefficients";
+      break;
+    case ScalarEstimateOp::kLog:
+      estimate = &xenos::GetLogEstimate();
+      coefficients_name = "xe_var_log_coefficients";
+      break;
+  }
+  spv::Id& var_coefficients = var_main_estimate_coefficients_[size_t(op)];
+  if (var_coefficients == spv::NoResult) {
+    std::vector<spv::Id> segments;
+    segments.reserve(rex::countof(estimate->coefficients));
+    for (const auto& segment_coefficients : estimate->coefficients) {
+      id_vector_temp_.clear();
+      for (uint32_t coefficient : segment_coefficients) {
+        id_vector_temp_.push_back(builder_->makeUintConstant(coefficient));
+      }
+      segments.push_back(builder_->makeCompositeConstant(type_uint4_, id_vector_temp_));
+    }
+    spv::Id type_coefficients = builder_->makeArrayType(
+        type_uint4_, builder_->makeUintConstant(uint32_t(segments.size())), -1);
+    var_coefficients = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassFunction, type_coefficients, coefficients_name,
+        builder_->makeCompositeConstant(type_coefficients, segments));
+  }
+
+  auto uint_constant = [&](uint32_t constant) { return builder_->makeUintConstant(constant); };
+  auto uint_op = [&](spv::Op uint_op_code, spv::Id a, spv::Id b) {
+    return builder_->createBinOp(uint_op_code, type_uint_, a, b);
+  };
+  auto uint_op_constant = [&](spv::Op uint_op_code, spv::Id a, uint32_t b) {
+    return uint_op(uint_op_code, a, uint_constant(b));
+  };
+  auto select = [&](spv::Id condition, spv::Id a, spv::Id b) {
+    return builder_->createTriOp(spv::OpSelect, type_uint_, condition, a, b);
+  };
+  auto compare = [&](spv::Op compare_op, spv::Id a, spv::Id b) {
+    return builder_->createBinOp(compare_op, type_bool_, a, b);
+  };
+  auto round_to_odd_1 = [&](spv::Id a) {
+    return uint_op(spv::OpBitwiseOr, uint_op_constant(spv::OpShiftRightLogical, a, 1),
+                   uint_op_constant(spv::OpBitwiseAnd, a, 1));
+  };
+  auto shift_right_sticky = [&](spv::Id a, uint32_t shift) {
+    return uint_op(
+        spv::OpBitwiseOr,
+        uint_op_constant(spv::OpShiftLeftLogical,
+                         uint_op_constant(spv::OpShiftRightLogical, a, shift), 1),
+        builder_->createBinBuiltinCall(
+            type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMin,
+            uint_op_constant(spv::OpBitwiseAnd, a, (uint32_t(1) << shift) - 1), uint_constant(1)));
+  };
+  // floor(C1 * offset / 2^(low_bits + shift)) from 32-bit pieces.
+  auto split_linear = [&](spv::Id c1, spv::Id offset, uint32_t low_bits, uint32_t shift) {
+    return uint_op_constant(
+        spv::OpShiftRightLogical,
+        uint_op(
+            spv::OpIAdd,
+            uint_op(spv::OpIMul, c1, uint_op_constant(spv::OpShiftRightLogical, offset, low_bits)),
+            uint_op_constant(
+                spv::OpShiftRightLogical,
+                uint_op(spv::OpIMul, c1,
+                        uint_op_constant(spv::OpBitwiseAnd, offset, (uint32_t(1) << low_bits) - 1)),
+                low_bits)),
+        shift);
+  };
+
+  spv::Id bits = builder_->createUnaryOp(spv::OpBitcast, type_uint_, value);
+  spv::Id sign = uint_op_constant(spv::OpBitwiseAnd, bits, UINT32_C(0x80000000));
+  spv::Id is_negative = compare(spv::OpINotEqual, sign, const_uint_0_);
+  spv::Id exponent = uint_op_constant(spv::OpBitwiseAnd,
+                                      uint_op_constant(spv::OpShiftRightLogical, bits, 23), 0xFF);
+  spv::Id is_exponent_0 = compare(spv::OpIEqual, exponent, const_uint_0_);
+  spv::Id is_exponent_255 = compare(spv::OpIEqual, exponent, uint_constant(0xFF));
+
+  // The segment and the offset within it, of the mantissa or for EXP of the
+  // fixed-point fraction.
+  spv::Id segment = spv::NoResult, offset = spv::NoResult;
+  spv::Id exp_integer = spv::NoResult, exp_fraction = spv::NoResult;
+  switch (op) {
+    case ScalarEstimateOp::kRcp:
+    case ScalarEstimateOp::kLog:
+      segment = uint_op_constant(spv::OpBitwiseAnd,
+                                 uint_op_constant(spv::OpShiftRightLogical, bits, 18), 0x1F);
+      offset = uint_op_constant(spv::OpBitwiseAnd, bits, 0x3FFFF);
+      break;
+    case ScalarEstimateOp::kRsq:
+    case ScalarEstimateOp::kSqrt:
+      // Segments 16-31 are for an odd unbiased exponent, an even biased one.
+      segment = uint_op_constant(
+          spv::OpBitwiseXor,
+          uint_op_constant(spv::OpBitwiseAnd, uint_op_constant(spv::OpShiftRightLogical, bits, 19),
+                           0x1F),
+          0x10);
+      offset = uint_op_constant(spv::OpBitwiseAnd, bits, 0x7FFFF);
+      break;
+    case ScalarEstimateOp::kExp: {
+      // |x| truncated to fixed point with 23 fraction bits, with the shifts
+      // clamped where the result is replaced anyway.
+      spv::Id significand = uint_op_constant(
+          spv::OpBitwiseOr, uint_op_constant(spv::OpBitwiseAnd, bits, 0x7FFFFF), 0x800000);
+      spv::Id shift_right = builder_->createTriBuiltinCall(
+          type_uint_, ext_inst_glsl_std_450_, GLSLstd450UClamp,
+          uint_op(spv::OpISub, uint_constant(127),
+                  builder_->createBinBuiltinCall(type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMin,
+                                                 exponent, uint_constant(127))),
+          const_uint_0_, uint_constant(24));
+      spv::Id shift_left = builder_->createBinBuiltinCall(
+          type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMin,
+          uint_op_constant(
+              spv::OpISub,
+              builder_->createBinBuiltinCall(type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMax,
+                                             exponent, uint_constant(127)),
+              127),
+          uint_constant(7));
+      spv::Id fixed =
+          uint_op(spv::OpShiftLeftLogical,
+                  uint_op(spv::OpShiftRightLogical, significand, shift_right), shift_left);
+      exp_integer = uint_op_constant(spv::OpShiftRightLogical, fixed, 23);
+      exp_fraction = uint_op_constant(spv::OpBitwiseAnd, fixed, 0x7FFFFF);
+      // 2^-(i + f) = 2^-(i + 1) * 2^(1 - f), with 1 - f in ones' complement.
+      spv::Id mantissa_input = select(
+          is_negative, uint_op_constant(spv::OpBitwiseXor, exp_fraction, 0x7FFFFF), exp_fraction);
+      segment = uint_op_constant(spv::OpShiftRightLogical, mantissa_input, 18);
+      offset = uint_op_constant(spv::OpBitwiseAnd, mantissa_input, 0x3FFFF);
+    } break;
+  }
+
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(segment);
+  spv::Id segment_coefficients = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassFunction, var_coefficients, id_vector_temp_),
+      spv::NoPrecision);
+  spv::Id coefficients[4];
+  for (uint32_t i = 0; i < 4; ++i) {
+    coefficients[i] = builder_->createCompositeExtract(segment_coefficients, type_uint_, i);
+  }
+
+  spv::Id square_input = shift_right_sticky(offset, estimate->square_input_shift);
+  spv::Id square = round_to_odd_1(uint_op_constant(spv::OpShiftRightLogical,
+                                                   uint_op(spv::OpIMul, square_input, square_input),
+                                                   estimate->square_shift));
+  spv::Id square_coarse =
+      uint_op_constant(spv::OpShiftLeftLogical,
+                       round_to_odd_1(uint_op_constant(spv::OpShiftRightLogical, square,
+                                                       estimate->square_coarse_shift)),
+                       estimate->square_coarse_shift + 1);
+  spv::Id cubic =
+      uint_op(spv::OpIMul, coefficients[3], shift_right_sticky(offset, estimate->block_shift));
+  if (estimate->cubic_rounds_up) {
+    cubic = uint_op_constant(spv::OpIAdd, cubic, (uint32_t(1) << estimate->cubic_shift) - 1);
+  }
+  cubic = round_to_odd_1(uint_op_constant(spv::OpShiftRightLogical, cubic, estimate->cubic_shift));
+  spv::Id quadratic = uint_op(spv::OpIMul, coefficients[2], square);
+  spv::Id cubic_term = uint_op(spv::OpIMul, cubic, square_coarse);
+
+  spv::Id result = spv::NoResult;
+  switch (op) {
+    case ScalarEstimateOp::kRcp:
+    case ScalarEstimateOp::kRsq: {
+      uint32_t offset_bits = op == ScalarEstimateOp::kRcp ? 18 : 19;
+      spv::Id higher_order =
+          uint_op(spv::OpIAdd, coefficients[0],
+                  uint_op_constant(spv::OpShiftRightLogical,
+                                   uint_op(spv::OpISub, quadratic, cubic_term), offset_bits - 3));
+      // The linear term is subtracted in ones' complement.
+      spv::Id mantissa = uint_op_constant(
+          spv::OpShiftRightLogical,
+          uint_op(spv::OpISub, higher_order,
+                  uint_op_constant(spv::OpIAdd,
+                                   split_linear(coefficients[1], offset, 12, offset_bits - 12), 1)),
+          1);
+      if (op == ScalarEstimateOp::kRsq) {
+        result =
+            uint_op(spv::OpIAdd,
+                    uint_op_constant(
+                        spv::OpShiftLeftLogical,
+                        uint_op(spv::OpISub, uint_constant(189),
+                                uint_op_constant(spv::OpShiftRightLogical,
+                                                 uint_op_constant(spv::OpIAdd, exponent, 1), 1)),
+                        23),
+                    mantissa);
+        result = select(is_exponent_255, const_uint_0_, result);
+        result = select(is_negative, uint_constant(UINT32_C(0xFFC00000)), result);
+      } else {
+        spv::Id magnitude =
+            uint_op(spv::OpIAdd,
+                    uint_op_constant(spv::OpShiftLeftLogical,
+                                     uint_op(spv::OpISub, uint_constant(252), exponent), 23),
+                    mantissa);
+        // Results below the normal range are +0 whatever the sign.
+        result = select(
+            builder_->createBinOp(spv::OpSGreaterThanEqual, type_bool_,
+                                  builder_->createUnaryOp(spv::OpBitcast, type_int_, magnitude),
+                                  builder_->makeIntConstant(1 << 23)),
+            uint_op(spv::OpBitwiseOr, sign, magnitude), const_uint_0_);
+        result = select(is_exponent_255, sign, result);
+      }
+      // Denormals are zero.
+      result = select(is_exponent_0, uint_op_constant(spv::OpBitwiseOr, sign, UINT32_C(0x7F800000)),
+                      result);
+    } break;
+    case ScalarEstimateOp::kSqrt: {
+      spv::Id higher_order = uint_op(
+          spv::OpISub, coefficients[0],
+          uint_op_constant(
+              spv::OpShiftRightLogical,
+              uint_op_constant(spv::OpIAdd, uint_op(spv::OpISub, quadratic, cubic_term), 0x7FFF),
+              15));
+      // The mantissa of a result in [1, 2).
+      spv::Id mantissa = uint_op_constant(
+          spv::OpBitwiseAnd,
+          uint_op_constant(
+              spv::OpShiftRightLogical,
+              uint_op(spv::OpIAdd, split_linear(coefficients[1], offset, 12, 6), higher_order), 2),
+          0x7FFFFF);
+      result = uint_op(
+          spv::OpBitwiseOr,
+          uint_op_constant(spv::OpShiftLeftLogical,
+                           uint_op_constant(spv::OpShiftRightLogical,
+                                            uint_op_constant(spv::OpIAdd, exponent, 127), 1),
+                           23),
+          mantissa);
+      result = select(is_exponent_255, bits, result);
+      result = select(is_negative, uint_constant(UINT32_C(0xFFC00000)), result);
+      // Denormals are zero.
+      result = select(is_exponent_0, sign, result);
+    } break;
+    case ScalarEstimateOp::kExp: {
+      spv::Id higher_order =
+          uint_op(spv::OpIAdd, coefficients[0],
+                  uint_op_constant(spv::OpShiftRightLogical,
+                                   uint_op(spv::OpIAdd, quadratic, cubic_term), 14));
+      // floor((C1 * offset + higher_order * 2^17) / 2^19) in 32 bits.
+      spv::Id linear_low = uint_op(
+          spv::OpIAdd,
+          uint_op(spv::OpIMul, coefficients[1], uint_op_constant(spv::OpBitwiseAnd, offset, 0x1FF)),
+          uint_op_constant(spv::OpShiftLeftLogical,
+                           uint_op_constant(spv::OpBitwiseAnd, higher_order, 3), 17));
+      spv::Id linear_high = uint_op(spv::OpIAdd,
+                                    uint_op(spv::OpIMul, coefficients[1],
+                                            uint_op_constant(spv::OpShiftRightLogical, offset, 9)),
+                                    uint_op_constant(spv::OpShiftRightLogical, linear_low, 9));
+      spv::Id mantissa = uint_op_constant(
+          spv::OpBitwiseAnd,
+          uint_op(spv::OpIAdd, uint_op_constant(spv::OpShiftRightLogical, higher_order, 2),
+                  uint_op_constant(spv::OpShiftRightLogical, linear_high, 10)),
+          0x7FFFFF);
+      spv::Id positive =
+          uint_op(spv::OpBitwiseOr,
+                  uint_op_constant(spv::OpShiftLeftLogical,
+                                   uint_op_constant(spv::OpIAdd, exp_integer, 127), 23),
+                  mantissa);
+      // Results below the normal range are +0.
+      spv::Id negative = select(
+          compare(spv::OpUGreaterThanEqual, exp_integer, uint_constant(126)), const_uint_0_,
+          uint_op(spv::OpBitwiseOr,
+                  uint_op_constant(spv::OpShiftLeftLogical,
+                                   uint_op(spv::OpISub, uint_constant(126), exp_integer), 23),
+                  mantissa));
+      spv::Id negative_exact =
+          select(compare(spv::OpULessThan, exp_integer, uint_constant(127)),
+                 uint_op_constant(spv::OpShiftLeftLogical,
+                                  uint_op(spv::OpISub, uint_constant(127), exp_integer), 23),
+                 const_uint_0_);
+      result = select(
+          is_negative,
+          select(compare(spv::OpIEqual, exp_fraction, const_uint_0_), negative_exact, negative),
+          positive);
+      result =
+          select(compare(spv::OpUGreaterThanEqual, exponent, uint_constant(127 + 7)),
+                 select(is_negative, const_uint_0_, uint_constant(UINT32_C(0x7F800000))), result);
+      // Denormals are zero.
+      result = select(is_exponent_0, uint_constant(UINT32_C(0x3F800000)), result);
+    } break;
+    case ScalarEstimateOp::kLog: {
+      // log2 of the mantissa with 25 fraction bits.
+      spv::Id mantissa_log = uint_op(
+          spv::OpISub,
+          uint_op(spv::OpIAdd, coefficients[0], split_linear(coefficients[1], offset, 9, 8)),
+          uint_op_constant(
+              spv::OpShiftRightLogical,
+              uint_op_constant(spv::OpIAdd, uint_op(spv::OpISub, quadratic, cubic_term), 0x7FFF),
+              15));
+      // The exponent added, negative sums negated in ones' complement.
+      spv::Id is_below_1 = compare(spv::OpULessThan, exponent, uint_constant(127));
+      spv::Id magnitude =
+          select(is_below_1,
+                 uint_op(spv::OpBitwiseOr,
+                         uint_op_constant(spv::OpShiftLeftLogical,
+                                          uint_op(spv::OpISub, uint_constant(126), exponent), 25),
+                         uint_op_constant(spv::OpBitwiseXor, mantissa_log, 0x1FFFFFF)),
+                 uint_op(spv::OpBitwiseOr,
+                         uint_op_constant(spv::OpShiftLeftLogical,
+                                          uint_op_constant(spv::OpISub, exponent, 127), 25),
+                         mantissa_log));
+      // Normalized with the low bits truncated, one of the shifts is 0. A zero
+      // magnitude, with no highest bit, is replaced below.
+      spv::Id msb = builder_->createBinBuiltinCall(
+          type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMin,
+          builder_->createUnaryOp(
+              spv::OpBitcast, type_uint_,
+              builder_->createUnaryBuiltinCall(type_int_, ext_inst_glsl_std_450_,
+                                               GLSLstd450FindUMsb, magnitude)),
+          uint_constant(31));
+      spv::Id significand = uint_op(
+          spv::OpShiftLeftLogical,
+          uint_op(spv::OpShiftRightLogical, magnitude,
+                  uint_op_constant(
+                      spv::OpISub,
+                      builder_->createBinBuiltinCall(type_uint_, ext_inst_glsl_std_450_,
+                                                     GLSLstd450UMax, msb, uint_constant(23)),
+                      23)),
+          uint_op(spv::OpISub, uint_constant(23),
+                  builder_->createBinBuiltinCall(type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMin,
+                                                 msb, uint_constant(23))));
+      result = uint_op(spv::OpBitwiseOr,
+                       select(is_below_1, uint_constant(UINT32_C(0x80000000)), const_uint_0_),
+                       uint_op(spv::OpBitwiseOr,
+                               uint_op_constant(spv::OpShiftLeftLogical,
+                                                uint_op_constant(spv::OpIAdd, msb, 102), 23),
+                               uint_op_constant(spv::OpBitwiseAnd, significand, 0x7FFFFF)));
+      result = select(compare(spv::OpIEqual, magnitude, const_uint_0_), const_uint_0_, result);
+      result = select(is_exponent_255, bits, result);
+      result = select(is_negative, uint_constant(UINT32_C(0xFFC00000)), result);
+      // Denormals are zero, and the sign of a zero doesn't matter.
+      result = select(is_exponent_0, uint_constant(UINT32_C(0xFF800000)), result);
+    } break;
+  }
+  // NaNs pass through.
+  result = select(
+      compare(spv::OpUGreaterThan, uint_op_constant(spv::OpBitwiseAnd, bits, UINT32_C(0x7FFFFFFF)),
+              uint_constant(UINT32_C(0x7F800000))),
+      bits, result);
+  return builder_->createUnaryOp(spv::OpBitcast, type_float_, result);
+}
+
+spv::Id SpirvShaderTranslator::RoundTowardZero(spv::Id rounded, spv::Id error, spv::Id a,
+                                               spv::Id b) {
+  spv::Id type = builder_->getTypeId(rounded);
+  int component_count = builder_->getNumComponents(rounded);
+  spv::Id type_bool = type_bool_vectors_[component_count - 1];
+  spv::Id type_uint = type_uint_vectors_[component_count - 1];
+  spv::Id const_zero = const_float_vectors_0_[component_count - 1];
+  auto splat = [&](spv::Id vector_type, spv::Id scalar) {
+    if (component_count == 1) {
+      return scalar;
+    }
+    std::vector<spv::Id> components(component_count, scalar);
+    return builder_->makeCompositeConstant(vector_type, components);
+  };
+  auto compare = [&](spv::Op op, spv::Id x, spv::Id y) {
+    return builder_->createBinOp(op, type_bool, x, y);
+  };
+  auto absolute = [&](spv::Id x) {
+    return builder_->createUnaryBuiltinCall(type, ext_inst_glsl_std_450_, GLSLstd450FAbs, x);
+  };
+
+  // Opposite signs mean the rounding went away from zero.
+  spv::Id step = builder_->createBinOp(
+      spv::OpLogicalAnd, type_bool, compare(spv::OpFOrdNotEqual, error, const_zero),
+      builder_->createBinOp(spv::OpLogicalNotEqual, type_bool,
+                            compare(spv::OpFOrdLessThan, error, const_zero),
+                            compare(spv::OpFOrdLessThan, rounded, const_zero)));
+  step = builder_->createBinOp(spv::OpLogicalAnd, type_bool, step,
+                               compare(spv::OpFOrdNotEqual, rounded, const_zero));
+  // Overflow from finite operands saturates.
+  spv::Id const_infinity = splat(type, builder_->makeFloatConstant(INFINITY));
+  spv::Id overflowed = builder_->createBinOp(
+      spv::OpLogicalAnd, type_bool, compare(spv::OpFOrdEqual, absolute(rounded), const_infinity),
+      builder_->createBinOp(spv::OpLogicalAnd, type_bool,
+                            compare(spv::OpFOrdNotEqual, absolute(a), const_infinity),
+                            compare(spv::OpFOrdNotEqual, absolute(b), const_infinity)));
+  step = builder_->createBinOp(spv::OpLogicalOr, type_bool, step, overflowed);
+  spv::Id stepped = builder_->createUnaryOp(
+      spv::OpBitcast, type,
+      builder_->createBinOp(spv::OpISub, type_uint,
+                            builder_->createUnaryOp(spv::OpBitcast, type_uint, rounded),
+                            splat(type_uint, builder_->makeUintConstant(1))));
+  return builder_->createTriOp(spv::OpSelect, type, step, stepped, rounded);
+}
+
+bool SpirvShaderTranslator::RoundsTowardZero() const {
+  return REXCVAR_GET(vulkan_exact_vertex_math) && is_vertex_shader() &&
+         (features_.rounding_mode_rtz_float32 || alu_op_result_rounding_sensitive_);
+}
+
+bool SpirvShaderTranslator::RoundsTowardZeroInHardware() const {
+  return REXCVAR_GET(vulkan_exact_vertex_math) && is_vertex_shader() &&
+         features_.rounding_mode_rtz_float32;
+}
+
+spv::Id SpirvShaderTranslator::AluAdd(spv::Id a, spv::Id b) {
+  spv::Id type = builder_->getTypeId(a);
+  spv::Id sum = builder_->createNoContractionBinOp(spv::OpFAdd, type, a, b);
+  if (!RoundsTowardZero() || RoundsTowardZeroInHardware()) {
+    return sum;
+  }
+  // Two-sum error of the rounded sum, exact unless it overflowed.
+  spv::Id b_rounded = builder_->createNoContractionBinOp(spv::OpFSub, type, sum, a);
+  spv::Id error = builder_->createNoContractionBinOp(
+      spv::OpFAdd, type,
+      builder_->createNoContractionBinOp(
+          spv::OpFSub, type, a,
+          builder_->createNoContractionBinOp(spv::OpFSub, type, sum, b_rounded)),
+      builder_->createNoContractionBinOp(spv::OpFSub, type, b, b_rounded));
+  return RoundTowardZero(sum, error, a, b);
+}
+
+spv::Id SpirvShaderTranslator::AluSubtract(spv::Id a, spv::Id b) {
+  if (!RoundsTowardZero() || RoundsTowardZeroInHardware()) {
+    return builder_->createNoContractionBinOp(spv::OpFSub, builder_->getTypeId(a), a, b);
+  }
+  return AluAdd(a, builder_->createNoContractionUnaryOp(spv::OpFNegate, builder_->getTypeId(b), b));
+}
+
+spv::Id SpirvShaderTranslator::AluMultiply(spv::Id a, spv::Id b) {
+  spv::Id type = builder_->getTypeId(a);
+  spv::Id product = builder_->createNoContractionBinOp(spv::OpFMul, type, a, b);
+  if (!RoundsTowardZero() || RoundsTowardZeroInHardware()) {
+    return product;
+  }
+  // Fma isn't guaranteed to be fused (spirv_to_dxil splits 32-bit Fma into a
+  // multiply and an add), so recover the product error with a Veltkamp split
+  // and Dekker error sum instead.
+  auto mul = [&](spv::Id x, spv::Id y) {
+    return builder_->createNoContractionBinOp(spv::OpFMul, type, x, y);
+  };
+  auto add = [&](spv::Id x, spv::Id y) {
+    return builder_->createNoContractionBinOp(spv::OpFAdd, type, x, y);
+  };
+  auto sub = [&](spv::Id x, spv::Id y) {
+    return builder_->createNoContractionBinOp(spv::OpFSub, type, x, y);
+  };
+  int component_count = builder_->getNumComponents(a);
+  spv::Id const_split = builder_->makeFloatConstant(4097.0f);
+  if (component_count > 1) {
+    std::vector<spv::Id> components(component_count, const_split);
+    const_split = builder_->makeCompositeConstant(type, components);
+  }
+  auto split = [&](spv::Id value, spv::Id& high, spv::Id& low) {
+    spv::Id scaled = mul(value, const_split);
+    high = sub(scaled, sub(scaled, value));
+    low = sub(value, high);
+  };
+  spv::Id a_high, a_low, b_high, b_low;
+  split(a, a_high, a_low);
+  split(b, b_high, b_low);
+  spv::Id error = sub(mul(a_high, b_high), product);
+  error = add(error, mul(a_high, b_low));
+  error = add(error, mul(a_low, b_high));
+  error = add(error, mul(a_low, b_low));
+  return RoundTowardZero(product, error, a, b);
+}
+
 void SpirvShaderTranslator::KillPixel(spv::Id condition,
                                       uint8_t memexport_eM_potentially_written_before) {
   SpirvBuilder::IfBuilder kill_if(condition, spv::SelectionControlMaskNone, *builder_);
@@ -58,6 +558,10 @@ void SpirvShaderTranslator::KillPixel(spv::Id condition,
 
 void SpirvShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& instr,
                                                   uint8_t memexport_eM_potentially_written_before) {
+  if (BisectSkipsInstruction()) {
+    return;
+  }
+  BisectInstructionScope bisect_scope(*this);
   if (instr.IsNop()) {
     // Don't even disassemble or update predication.
     return;
@@ -75,13 +579,20 @@ void SpirvShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& in
   // allow for multipass rendering (in addition to the Invariant decoration on
   // outputs).
 
+  const Shader& shader = current_shader();
+  uint32_t instruction_address = current_instruction_address();
+
   // Whether the instruction has changed the predicate, and it needs to be
   // checked again later.
   bool predicate_written_vector = false;
+  alu_op_result_rounding_sensitive_ =
+      shader.IsAluVectorResultRoundingSensitive(instruction_address);
   spv::Id vector_result = ProcessVectorAluOperation(instr, memexport_eM_potentially_written_before,
                                                     predicate_written_vector);
 
   bool predicate_written_scalar = false;
+  alu_op_result_rounding_sensitive_ =
+      shader.IsAluScalarResultRoundingSensitive(instruction_address);
   spv::Id scalar_result = ProcessScalarAluOperation(instr, memexport_eM_potentially_written_before,
                                                     predicate_written_scalar);
   if (scalar_result != spv::NoResult) {
@@ -174,12 +685,10 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
 
   switch (instr.vector_opcode) {
     case ucode::AluVectorOpcode::kAdd: {
-      return builder_->createNoContractionBinOp(
-          spv::OpFAdd, result_type,
-          GetOperandComponents(operand_storage[0], instr.vector_operands[0],
-                               used_result_components),
-          GetOperandComponents(operand_storage[1], instr.vector_operands[1],
-                               used_result_components));
+      return AluAdd(GetOperandComponents(operand_storage[0], instr.vector_operands[0],
+                                         used_result_components),
+                    GetOperandComponents(operand_storage[1], instr.vector_operands[1],
+                                         used_result_components));
     }
     case ucode::AluVectorOpcode::kMul:
     case ucode::AluVectorOpcode::kMad: {
@@ -188,8 +697,7 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
         multiplicands[i] = GetOperandComponents(operand_storage[i], instr.vector_operands[i],
                                                 used_result_components);
       }
-      spv::Id result = builder_->createNoContractionBinOp(spv::OpFMul, result_type,
-                                                          multiplicands[0], multiplicands[1]);
+      spv::Id result = AluMultiply(multiplicands[0], multiplicands[1]);
       uint32_t multiplicands_different =
           used_result_components &
           ~instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]);
@@ -273,10 +781,8 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
       if (instr.vector_opcode == ucode::AluVectorOpcode::kMad) {
         // Not replacing true `0 + term` with conditional selection of the term
         // because +0 + -0 should result in +0, not -0.
-        result = builder_->createNoContractionBinOp(
-            spv::OpFAdd, result_type, result,
-            GetOperandComponents(operand_storage[2], instr.vector_operands[2],
-                                 used_result_components));
+        result = AluAdd(result, GetOperandComponents(operand_storage[2], instr.vector_operands[2],
+                                                     used_result_components));
       }
       return result;
     }
@@ -414,11 +920,18 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
 
     case ucode::AluVectorOpcode::kFrc:
     case ucode::AluVectorOpcode::kTrunc:
-    case ucode::AluVectorOpcode::kFloor:
-      return builder_->createUnaryBuiltinCall(
-          result_type, ext_inst_glsl_std_450_, GLSLstd450(kOps[size_t(instr.vector_opcode)]),
-          GetOperandComponents(operand_storage[0], instr.vector_operands[0],
-                               used_result_components));
+    case ucode::AluVectorOpcode::kFloor: {
+      spv::Id operand = GetOperandComponents(operand_storage[0], instr.vector_operands[0],
+                                             used_result_components);
+      if (instr.vector_opcode == ucode::AluVectorOpcode::kFrc && RoundsTowardZero()) {
+        return AluSubtract(operand,
+                           builder_->createUnaryBuiltinCall(result_type, ext_inst_glsl_std_450_,
+                                                            GLSLstd450Floor, operand));
+      }
+      return builder_->createUnaryBuiltinCall(result_type, ext_inst_glsl_std_450_,
+                                              GLSLstd450(kOps[size_t(instr.vector_opcode)]),
+                                              operand);
+    }
 
     case ucode::AluVectorOpcode::kCndEq:
     case ucode::AluVectorOpcode::kCndGe:
@@ -757,8 +1270,7 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
         operands_y[1] = (used_result_components & 0b1000)
                             ? builder_->createCompositeExtract(operands[1], type_float_, 0)
                             : operands[1];
-        result_y = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, operands_y[0],
-                                                      operands_y[1]);
+        result_y = AluMultiply(operands_y[0], operands_y[1]);
         if (!(instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]) & 0b0010)) {
           // Shader Model 3: +0 or denormal * anything = +-0.
           result_y = ZeroIfAnyOperandIsZero(
@@ -936,20 +1448,20 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
     case ucode::AluScalarOpcode::kSubs: {
       spv::Id a, b;
       GetOperandScalarXY(operand_storage[0], instr.scalar_operands[0], a, b);
-      return builder_->createNoContractionBinOp(spv::Op(kOps[size_t(instr.scalar_opcode)]),
-                                                type_float_, a, b);
+      return instr.scalar_opcode == ucode::AluScalarOpcode::kAdds ? AluAdd(a, b)
+                                                                  : AluSubtract(a, b);
     }
     case ucode::AluScalarOpcode::kAddsPrev:
     case ucode::AluScalarOpcode::kSubsPrev: {
-      return builder_->createNoContractionBinOp(
-          spv::Op(kOps[size_t(instr.scalar_opcode)]), type_float_,
-          GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001),
-          builder_->createLoad(var_main_previous_scalar_, spv::NoPrecision));
+      spv::Id a = GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001);
+      spv::Id ps = builder_->createLoad(var_main_previous_scalar_, spv::NoPrecision);
+      return instr.scalar_opcode == ucode::AluScalarOpcode::kAddsPrev ? AluAdd(a, ps)
+                                                                      : AluSubtract(a, ps);
     }
     case ucode::AluScalarOpcode::kMuls: {
       spv::Id a, b;
       GetOperandScalarXY(operand_storage[0], instr.scalar_operands[0], a, b);
-      spv::Id result = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, a, b);
+      spv::Id result = AluMultiply(a, b);
       if (a != b) {
         // Shader Model 3: +0 or denormal * anything = +-0.
         result = ZeroIfAnyOperandIsZero(result, GetAbsoluteOperand(a, instr.scalar_operands[0]),
@@ -960,7 +1472,7 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
     case ucode::AluScalarOpcode::kMulsPrev: {
       spv::Id a = GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001);
       spv::Id ps = builder_->createLoad(var_main_previous_scalar_, spv::NoPrecision);
-      spv::Id result = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, a, ps);
+      spv::Id result = AluMultiply(a, ps);
       // Shader Model 3: +0 or denormal * anything = +-0.
       return ZeroIfAnyOperandIsZero(result, GetAbsoluteOperand(a, instr.scalar_operands[0]),
                                     builder_->createUnaryBuiltinCall(
@@ -1012,7 +1524,7 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
             instr.scalar_operands[0].GetComponent(0) != instr.scalar_operands[0].GetComponent(1)
                 ? GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001)
                 : b;
-        product = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, a, ps);
+        product = AluMultiply(a, ps);
         // Shader Model 3: +0 or denormal * anything = +-0.
         product = ZeroIfAnyOperandIsZero(product, GetAbsoluteOperand(a, instr.scalar_operands[0]),
                                          ps_abs);
@@ -1079,49 +1591,48 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
     case ucode::AluScalarOpcode::kTruncs:
     case ucode::AluScalarOpcode::kFloors:
     case ucode::AluScalarOpcode::kSin:
-    case ucode::AluScalarOpcode::kCos:
-      return builder_->createUnaryBuiltinCall(
-          type_float_, ext_inst_glsl_std_450_, GLSLstd450(kOps[size_t(instr.scalar_opcode)]),
-          GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
+    case ucode::AluScalarOpcode::kCos: {
+      spv::Id a = GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001);
+      if (instr.scalar_opcode == ucode::AluScalarOpcode::kFrcs && RoundsTowardZero()) {
+        return AluSubtract(a, builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                               GLSLstd450Floor, a));
+      }
+      return builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                              GLSLstd450(kOps[size_t(instr.scalar_opcode)]), a);
+    }
     case ucode::AluScalarOpcode::kExp: {
-      spv::Id result = builder_->createUnaryBuiltinCall(
-          type_float_, ext_inst_glsl_std_450_, GLSLstd450Exp2,
+      return ScalarEstimate(
+          ScalarEstimateOp::kExp,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      return ReduceFloatPrecision(result, 21);
     }
     case ucode::AluScalarOpcode::kLog: {
-      spv::Id result = builder_->createUnaryBuiltinCall(
-          type_float_, ext_inst_glsl_std_450_, GLSLstd450Log2,
+      return ScalarEstimate(
+          ScalarEstimateOp::kLog,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      return ReduceFloatPrecision(result, 21);
     }
     case ucode::AluScalarOpcode::kSqrt: {
-      spv::Id result = builder_->createUnaryBuiltinCall(
-          type_float_, ext_inst_glsl_std_450_, GLSLstd450Sqrt,
+      return ScalarEstimate(
+          ScalarEstimateOp::kSqrt,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      return ReduceFloatPrecision(result, 21);
     }
     case ucode::AluScalarOpcode::kRsq: {
-      spv::Id result = builder_->createUnaryBuiltinCall(
-          type_float_, ext_inst_glsl_std_450_, GLSLstd450InverseSqrt,
+      return ScalarEstimate(
+          ScalarEstimateOp::kRsq,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      return ReduceFloatPrecision(result, 21);
     }
     case ucode::AluScalarOpcode::kLogc: {
-      spv::Id result = builder_->createUnaryBuiltinCall(
-          type_float_, ext_inst_glsl_std_450_, GLSLstd450Log2,
+      spv::Id result = ScalarEstimate(
+          ScalarEstimateOp::kLog,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      result = ReduceFloatPrecision(result, 21);
       return builder_->createTriOp(spv::OpSelect, type_float_,
                                    builder_->createBinOp(spv::OpFOrdEqual, type_bool_, result,
                                                          builder_->makeFloatConstant(-INFINITY)),
                                    builder_->makeFloatConstant(-FLT_MAX), result);
     }
     case ucode::AluScalarOpcode::kRcpc: {
-      spv::Id result = builder_->createNoContractionBinOp(
-          spv::OpFDiv, type_float_, const_float_1_,
+      spv::Id result = ScalarEstimate(
+          ScalarEstimateOp::kRcp,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      result = ReduceFloatPrecision(result, 21);
       result = builder_->createTriOp(spv::OpSelect, type_float_,
                                      builder_->createBinOp(spv::OpFOrdEqual, type_bool_, result,
                                                            builder_->makeFloatConstant(-INFINITY)),
@@ -1132,10 +1643,9 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
                                    builder_->makeFloatConstant(FLT_MAX), result);
     }
     case ucode::AluScalarOpcode::kRcpf: {
-      spv::Id result = builder_->createNoContractionBinOp(
-          spv::OpFDiv, type_float_, const_float_1_,
+      spv::Id result = ScalarEstimate(
+          ScalarEstimateOp::kRcp,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      result = ReduceFloatPrecision(result, 21);
       result = builder_->createTriOp(spv::OpSelect, type_float_,
                                      builder_->createBinOp(spv::OpFOrdEqual, type_bool_, result,
                                                            builder_->makeFloatConstant(INFINITY)),
@@ -1150,16 +1660,14 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
       return builder_->createUnaryOp(spv::OpBitcast, type_float_, result);
     }
     case ucode::AluScalarOpcode::kRcp: {
-      spv::Id result = builder_->createNoContractionBinOp(
-          spv::OpFDiv, type_float_, const_float_1_,
+      return ScalarEstimate(
+          ScalarEstimateOp::kRcp,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      return ReduceFloatPrecision(result, 21);
     }
     case ucode::AluScalarOpcode::kRsqc: {
-      spv::Id result = builder_->createUnaryBuiltinCall(
-          type_float_, ext_inst_glsl_std_450_, GLSLstd450InverseSqrt,
+      spv::Id result = ScalarEstimate(
+          ScalarEstimateOp::kRsq,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      result = ReduceFloatPrecision(result, 21);
       result = builder_->createTriOp(spv::OpSelect, type_float_,
                                      builder_->createBinOp(spv::OpFOrdEqual, type_bool_, result,
                                                            builder_->makeFloatConstant(-INFINITY)),
@@ -1170,10 +1678,9 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
                                    builder_->makeFloatConstant(FLT_MAX), result);
     }
     case ucode::AluScalarOpcode::kRsqf: {
-      spv::Id result = builder_->createUnaryBuiltinCall(
-          type_float_, ext_inst_glsl_std_450_, GLSLstd450InverseSqrt,
+      spv::Id result = ScalarEstimate(
+          ScalarEstimateOp::kRsq,
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001));
-      result = ReduceFloatPrecision(result, 21);
       result = builder_->createTriOp(spv::OpSelect, type_float_,
                                      builder_->createBinOp(spv::OpFOrdEqual, type_bool_, result,
                                                            builder_->makeFloatConstant(INFINITY)),
@@ -1214,10 +1721,9 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
               const_float_1_, a));
     }
     case ucode::AluScalarOpcode::kSetpPop: {
-      spv::Id a_minus_1 = builder_->createNoContractionBinOp(
-          spv::OpFSub, type_float_,
-          GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001),
-          const_float_1_);
+      spv::Id a_minus_1 =
+          AluSubtract(GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001),
+                      const_float_1_);
       spv::Id predicate =
           builder_->createBinOp(spv::OpFOrdLessThanEqual, type_bool_, a_minus_1, const_float_0_);
       builder_->createStore(predicate, var_main_predicate_);
@@ -1259,13 +1765,12 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
           GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001);
       spv::Id operand_1 =
           GetOperandComponents(operand_storage[1], instr.scalar_operands[1], 0b0001);
-      spv::Id result =
-          builder_->createNoContractionBinOp(spv::OpFMul, type_float_, operand_0, operand_1);
+      spv::Id result = AluMultiply(operand_0, operand_1);
       // TODO(boma): Experimental round to zero for Volition titles (5451080D,
       // 4B4D07F6, 5451086D) that experience camera-independent, batch-boundary
       // vertex explosions with the default round-to-nearest behavior.
       // Real hardware rounding behavior needs to be verified.
-      if (REXCVAR_GET(mulsc_round_toward_zero)) {
+      if (REXCVAR_GET(mulsc_round_toward_zero) && !RoundsTowardZero()) {
         // Keep the Fma as one operation so it can recover the product error.
         spv::Id error = builder_->createTriBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Fma, operand_0, operand_1,
@@ -1299,10 +1804,12 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
     case ucode::AluScalarOpcode::kAddsc1:
     case ucode::AluScalarOpcode::kSubsc0:
     case ucode::AluScalarOpcode::kSubsc1: {
-      return builder_->createNoContractionBinOp(
-          spv::Op(kOps[size_t(instr.scalar_opcode)]), type_float_,
-          GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001),
-          GetOperandComponents(operand_storage[1], instr.scalar_operands[1], 0b0001));
+      spv::Id a = GetOperandComponents(operand_storage[0], instr.scalar_operands[0], 0b0001);
+      spv::Id b = GetOperandComponents(operand_storage[1], instr.scalar_operands[1], 0b0001);
+      return (instr.scalar_opcode == ucode::AluScalarOpcode::kAddsc0 ||
+              instr.scalar_opcode == ucode::AluScalarOpcode::kAddsc1)
+                 ? AluAdd(a, b)
+                 : AluSubtract(a, b);
     }
 
     case ucode::AluScalarOpcode::kRetainPrev:

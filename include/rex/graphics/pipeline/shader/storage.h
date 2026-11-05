@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <span>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -28,6 +29,7 @@
 #include <rex/assert.h>
 #include <rex/filesystem.h>
 #include <rex/graphics/pipeline/shader/shader.h>
+#include <rex/graphics/pipeline/shader/storage_seed.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
@@ -235,6 +237,20 @@ class ShaderStorageWriter {
     auto pipeline_storage_file_path =
         shader_storage_shareable_root /
         fmt::format("{:08X}{}", title_id, pipeline_config.file_suffix);
+    {
+      // The hash of a stored description covers the description, the rest of
+      // the record.
+      static_assert(sizeof(TPipelineStoredDescription) ==
+                    sizeof(uint64_t) + sizeof(TPipelineStoredDescription::description));
+      PipelineStorageFileHeader seed_header;
+      seed_header.magic = kPipelineStorageMagic;
+      seed_header.magic_api = pipeline_config.api_magic;
+      seed_header.version_swapped = rex::byte_swap(pipeline_config.version);
+      SeedFromShippedShaderCache(
+          pipeline_storage_file_path,
+          {std::span(reinterpret_cast<const uint8_t*>(&seed_header), sizeof(seed_header)),
+           sizeof(TPipelineStoredDescription)});
+    }
     pipeline_storage_file_ = rex::filesystem::OpenFile(pipeline_storage_file_path, "a+b");
     if (!pipeline_storage_file_) {
       REXGPU_ERROR(
@@ -300,6 +316,15 @@ class ShaderStorageWriter {
 
     // Open shader storage file.
     auto shader_storage_file_path = GetShaderStorageFilePath(cache_root, title_id);
+    {
+      static_assert(sizeof(ShaderStoredHeader) == 12);
+      ShaderStorageFileHeader seed_header;
+      seed_header.magic = kShaderStorageMagic;
+      seed_header.version_swapped = rex::byte_swap(ShaderStoredHeader::kVersion);
+      SeedFromShippedShaderCache(
+          shader_storage_file_path,
+          {std::span(reinterpret_cast<const uint8_t*>(&seed_header), sizeof(seed_header)), 0});
+    }
     shader_storage_file_ = rex::filesystem::OpenFile(shader_storage_file_path, "a+b");
     if (!shader_storage_file_) {
       REXGPU_ERROR(

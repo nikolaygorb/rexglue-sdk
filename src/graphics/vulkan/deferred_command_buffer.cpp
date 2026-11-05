@@ -9,16 +9,25 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_BOOL(vulkan_merge_adjacent_barriers, false, "GPU/Vulkan",
+                    "Pipeline barriers recorded one after another, with only binds, push "
+                    "constants and dynamic state between them, are executed as one "
+                    "vkCmdPipelineBarrier (stage masks joined, barrier arrays joined): fewer "
+                    "points where the graphics card waits for earlier work")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
 
@@ -55,11 +64,180 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  ExecuteStream(command_buffer, command_stream_.data(), command_stream_.size());
+  merge_barriers_ = REXCVAR_GET(vulkan_merge_adjacent_barriers);
+  ExecuteStream(command_buffer, command_stream_.data(), command_stream_.size(),
+                hoisted_stream_.data());
+}
+
+void DeferredCommandBuffer::ExecuteStreams(VkCommandBuffer command_buffer,
+                                           const Streams& streams) const {
+  // Read here too: with vulkan_threaded_submission this is the only entry, on
+  // the replay thread, which alone uses the merge scratch.
+  merge_barriers_ = REXCVAR_GET(vulkan_merge_adjacent_barriers);
+  ExecuteStream(command_buffer, streams.main.data(), streams.main.size(), streams.hoisted.data());
+}
+
+// Commands that only set state for later draws and dispatches: a barrier may
+// be executed before them instead of after.
+bool DeferredCommandBuffer::IsStateCommand(Command command) {
+  switch (command) {
+    case Command::kVkBindDescriptorSets:
+    case Command::kVkBindIndexBuffer:
+    case Command::kVkBindPipeline:
+    case Command::kVkBindVertexBuffers:
+    case Command::kVkPushConstants:
+    case Command::kVkSetBlendConstants:
+    case Command::kVkSetDepthBias:
+    case Command::kVkSetDepthBias2EXT:
+    case Command::kVkSetScissor:
+    case Command::kVkSetStencilCompareMask:
+    case Command::kVkSetStencilReference:
+    case Command::kVkSetStencilWriteMask:
+    case Command::kVkSetViewport:
+      return true;
+    default:
+      return false;
+  }
+}
+
+DeferredCommandBuffer::BarrierArrays DeferredCommandBuffer::GetBarrierArrays(
+    const ArgsVkPipelineBarrier& args) {
+  BarrierArrays arrays;
+  const uint8_t* args_bytes = reinterpret_cast<const uint8_t*>(&args);
+  size_t barrier_offset_bytes = sizeof(ArgsVkPipelineBarrier);
+  if (args.memory_barrier_count) {
+    barrier_offset_bytes = rex::align(barrier_offset_bytes, alignof(VkMemoryBarrier));
+    arrays.memory = reinterpret_cast<const VkMemoryBarrier*>(args_bytes + barrier_offset_bytes);
+    barrier_offset_bytes += sizeof(VkMemoryBarrier) * args.memory_barrier_count;
+  }
+  if (args.buffer_memory_barrier_count) {
+    barrier_offset_bytes = rex::align(barrier_offset_bytes, alignof(VkBufferMemoryBarrier));
+    arrays.buffer =
+        reinterpret_cast<const VkBufferMemoryBarrier*>(args_bytes + barrier_offset_bytes);
+    barrier_offset_bytes += sizeof(VkBufferMemoryBarrier) * args.buffer_memory_barrier_count;
+  }
+  if (args.image_memory_barrier_count) {
+    barrier_offset_bytes = rex::align(barrier_offset_bytes, alignof(VkImageMemoryBarrier));
+    arrays.image =
+        reinterpret_cast<const VkImageMemoryBarrier*>(args_bytes + barrier_offset_bytes);
+    barrier_offset_bytes += sizeof(VkImageMemoryBarrier) * args.image_memory_barrier_count;
+  }
+  arrays.end_offset_bytes = barrier_offset_bytes;
+  return arrays;
+}
+
+bool DeferredCommandBuffer::MergeBarriersAt(VkCommandBuffer command_buffer,
+                                            const uintmax_t*& stream, size_t& stream_remaining,
+                                            const uintmax_t* hoisted_stream) const {
+  // stream is at the first barrier's arguments. Barriers with dependency flags
+  // or sample locations are executed as they are, and a second barrier on an
+  // image ends the run (two layout transitions must stay in order).
+  const auto& first = *reinterpret_cast<const ArgsVkPipelineBarrier*>(stream);
+  if (first.dependency_flags || first.sample_locations_info_count) {
+    return false;
+  }
+  const auto& first_header =
+      *reinterpret_cast<const CommandHeader*>(stream - kCommandHeaderSizeElements);
+  const uintmax_t* scan = stream + first_header.arguments_size_elements;
+  size_t scan_remaining = stream_remaining - first_header.arguments_size_elements;
+
+  merged_args_.clear();
+  merge_state_commands_.clear();
+  merge_images_.clear();
+  merged_args_.push_back(&first);
+  {
+    const BarrierArrays arrays = GetBarrierArrays(first);
+    for (uint32_t i = 0; i < first.image_memory_barrier_count; ++i) {
+      merge_images_.push_back(arrays.image[i].image);
+    }
+  }
+  // State commands between the barriers are executed after the merged one;
+  // the ones after the last barrier taken stay in the stream.
+  size_t state_commands_taken = 0;
+  const uintmax_t* run_end = scan;
+  size_t run_end_remaining = scan_remaining;
+  while (scan_remaining) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(scan);
+    const size_t command_elements = kCommandHeaderSizeElements + header.arguments_size_elements;
+    if (IsStateCommand(header.command)) {
+      merge_state_commands_.push_back(scan);
+    } else if (header.command == Command::kVkPipelineBarrier) {
+      const auto& barrier =
+          *reinterpret_cast<const ArgsVkPipelineBarrier*>(scan + kCommandHeaderSizeElements);
+      if (barrier.dependency_flags || barrier.sample_locations_info_count) {
+        break;
+      }
+      const BarrierArrays arrays = GetBarrierArrays(barrier);
+      bool same_image = false;
+      for (uint32_t i = 0; i < barrier.image_memory_barrier_count && !same_image; ++i) {
+        same_image = std::find(merge_images_.begin(), merge_images_.end(),
+                               arrays.image[i].image) != merge_images_.end();
+      }
+      if (same_image) {
+        break;
+      }
+      for (uint32_t i = 0; i < barrier.image_memory_barrier_count; ++i) {
+        merge_images_.push_back(arrays.image[i].image);
+      }
+      merged_args_.push_back(&barrier);
+      state_commands_taken = merge_state_commands_.size();
+      run_end = scan + command_elements;
+      run_end_remaining = scan_remaining - command_elements;
+    } else {
+      break;
+    }
+    scan += command_elements;
+    scan_remaining -= command_elements;
+  }
+  if (merged_args_.size() < 2) {
+    return false;
+  }
+
+  VkPipelineStageFlags src_stage_mask = 0;
+  VkPipelineStageFlags dst_stage_mask = 0;
+  merged_memory_barriers_.clear();
+  merged_buffer_barriers_.clear();
+  merged_image_barriers_.clear();
+  for (const ArgsVkPipelineBarrier* barrier : merged_args_) {
+    src_stage_mask |= barrier->src_stage_mask;
+    dst_stage_mask |= barrier->dst_stage_mask;
+    const BarrierArrays arrays = GetBarrierArrays(*barrier);
+    if (barrier->memory_barrier_count) {
+      merged_memory_barriers_.insert(merged_memory_barriers_.end(), arrays.memory,
+                                     arrays.memory + barrier->memory_barrier_count);
+    }
+    if (barrier->buffer_memory_barrier_count) {
+      merged_buffer_barriers_.insert(merged_buffer_barriers_.end(), arrays.buffer,
+                                     arrays.buffer + barrier->buffer_memory_barrier_count);
+    }
+    if (barrier->image_memory_barrier_count) {
+      merged_image_barriers_.insert(merged_image_barriers_.end(), arrays.image,
+                                    arrays.image + barrier->image_memory_barrier_count);
+    }
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn =
+      command_processor_.GetVulkanDevice()->functions();
+  dfn.vkCmdPipelineBarrier(
+      command_buffer, src_stage_mask, dst_stage_mask, 0, uint32_t(merged_memory_barriers_.size()),
+      merged_memory_barriers_.data(), uint32_t(merged_buffer_barriers_.size()),
+      merged_buffer_barriers_.data(), uint32_t(merged_image_barriers_.size()),
+      merged_image_barriers_.data());
+  // State commands never contain barriers, so their replay doesn't touch the
+  // merge scratch.
+  for (size_t i = 0; i < state_commands_taken; ++i) {
+    const uintmax_t* command = merge_state_commands_[i];
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(command);
+    ExecuteStream(command_buffer, command,
+                  kCommandHeaderSizeElements + header.arguments_size_elements, hoisted_stream);
+  }
+  stream = run_end;
+  stream_remaining = run_end_remaining;
+  return true;
 }
 
 void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
-                                          size_t stream_remaining) {
+                                          size_t stream_remaining,
+                                          const uintmax_t* hoisted_stream) const {
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
   while (stream_remaining) {
@@ -203,6 +381,16 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
       } break;
 
+      case Command::kVkCopyImageToBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyImageToBuffer*>(stream);
+        dfn.vkCmdCopyImageToBuffer(
+            command_buffer, args.src_image, args.src_image_layout, args.dst_buffer,
+            args.region_count,
+            reinterpret_cast<const VkBufferImageCopy*>(
+                reinterpret_cast<const uint8_t*>(stream) +
+                rex::align(sizeof(ArgsVkCopyImageToBuffer), alignof(VkBufferImageCopy))));
+      } break;
+
       case Command::kVkCopyImage: {
         auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
         dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
@@ -286,29 +474,17 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
         break;
 
       case Command::kVkPipelineBarrier: {
+        if (merge_barriers_ &&
+            MergeBarriersAt(command_buffer, stream, stream_remaining, hoisted_stream)) {
+          // stream is past the last barrier merged.
+          continue;
+        }
         auto& args = *reinterpret_cast<const ArgsVkPipelineBarrier*>(stream);
-        size_t barrier_offset_bytes = sizeof(ArgsVkPipelineBarrier);
-        const VkMemoryBarrier* memory_barriers = nullptr;
-        if (args.memory_barrier_count) {
-          barrier_offset_bytes = rex::align(barrier_offset_bytes, alignof(VkMemoryBarrier));
-          memory_barriers = reinterpret_cast<const VkMemoryBarrier*>(
-              reinterpret_cast<const uint8_t*>(stream) + barrier_offset_bytes);
-          barrier_offset_bytes += sizeof(VkMemoryBarrier) * args.memory_barrier_count;
-        }
-        const VkBufferMemoryBarrier* buffer_memory_barriers = nullptr;
-        if (args.buffer_memory_barrier_count) {
-          barrier_offset_bytes = rex::align(barrier_offset_bytes, alignof(VkBufferMemoryBarrier));
-          buffer_memory_barriers = reinterpret_cast<const VkBufferMemoryBarrier*>(
-              reinterpret_cast<const uint8_t*>(stream) + barrier_offset_bytes);
-          barrier_offset_bytes += sizeof(VkBufferMemoryBarrier) * args.buffer_memory_barrier_count;
-        }
-        const VkImageMemoryBarrier* image_memory_barriers = nullptr;
-        if (args.image_memory_barrier_count) {
-          barrier_offset_bytes = rex::align(barrier_offset_bytes, alignof(VkImageMemoryBarrier));
-          image_memory_barriers = reinterpret_cast<const VkImageMemoryBarrier*>(
-              reinterpret_cast<const uint8_t*>(stream) + barrier_offset_bytes);
-          barrier_offset_bytes += sizeof(VkImageMemoryBarrier) * args.image_memory_barrier_count;
-        }
+        const BarrierArrays arrays = GetBarrierArrays(args);
+        size_t barrier_offset_bytes = arrays.end_offset_bytes;
+        const VkMemoryBarrier* memory_barriers = arrays.memory;
+        const VkBufferMemoryBarrier* buffer_memory_barriers = arrays.buffer;
+        const VkImageMemoryBarrier* image_memory_barriers = arrays.image;
         if (args.sample_locations_info_count) {
           image_barriers_with_sample_locations_.assign(
               image_memory_barriers, image_memory_barriers + args.image_memory_barrier_count);
@@ -438,8 +614,8 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
       case Command::kHoistedCommands: {
         auto& args = *reinterpret_cast<const ArgsHoistedCommands*>(stream);
         if (args.end > args.begin) {
-          ExecuteStream(command_buffer, hoisted_stream_.data() + args.begin,
-                        args.end - args.begin);
+          ExecuteStream(command_buffer, hoisted_stream + args.begin, args.end - args.begin,
+                        hoisted_stream);
         }
       } break;
 

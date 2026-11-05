@@ -62,13 +62,19 @@ class global_critical_region {
   // to keep an instance of global_critical_region near the members requiring
   // it to keep things readable.
   static std::unique_lock<std::recursive_mutex> AcquireDirect() {
-    return std::unique_lock<std::recursive_mutex>(mutex());
+    std::unique_lock<std::recursive_mutex> lock(mutex(), std::try_to_lock);
+    if (!lock.owns_lock()) {
+      LockContended(lock);
+    }
+    return lock;
   }
 
   // Acquires a lock on the global critical section.
-  inline std::unique_lock<std::recursive_mutex> Acquire() {
-    return std::unique_lock<std::recursive_mutex>(mutex());
-  }
+  inline std::unique_lock<std::recursive_mutex> Acquire() { return AcquireDirect(); }
+
+  // Takes `lock` (of mutex(), not held) while another thread holds the region:
+  // checks for it for global_lock_spin_us, then sleeps until it is free.
+  static void LockContended(std::unique_lock<std::recursive_mutex>& lock);
 
   // Acquires a deferred lock on the global critical section.
   inline std::unique_lock<std::recursive_mutex> AcquireDeferred() {

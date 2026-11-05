@@ -60,6 +60,9 @@ class D3D12CommandProcessor : public CommandProcessor {
                                bool blocking,
                                std::function<void()> completion_callback = nullptr) override;
 
+  void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
+  void RestoreEdramSnapshot(const void* snapshot, uint32_t size) override;
+
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
   }
@@ -220,6 +223,8 @@ class D3D12CommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+  void OnGuestMemorySyncPoint() override;
+  SharedMemory* GetSharedMemoryForStats() const override { return shared_memory_.get(); }
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -227,6 +232,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  void InitializeTrace() override;
 
   bool CanReadBackResolvesNow() const override { return true; }
   void ReadBackResolvesNow(const ResolveFetch* fetches, size_t count,

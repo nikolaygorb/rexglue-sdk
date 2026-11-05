@@ -41,7 +41,12 @@ enum class CounterId : uint16_t {
   // Threading
   kActiveThreads,
   kApcQueueDepth,
+  // Global lock (global_critical_region) acquisitions that found it taken, the
+  // time they waited in microseconds, and how many got it while spinning
+  // (global_lock_spin_us).
   kCriticalRegionContentions,
+  kCriticalRegionWaitUs,
+  kCriticalRegionSpinWins,
 
   // Caches
   kTextureCacheHits,

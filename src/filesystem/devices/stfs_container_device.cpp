@@ -48,11 +48,13 @@ StfsContainerDevice::~StfsContainerDevice() {
 
 std::unique_ptr<StfsHeader> StfsContainerDevice::ReadPackageHeader(
     const std::filesystem::path& file_path) {
-  if (!std::filesystem::exists(file_path)) {
+  std::error_code ec;
+  if (!std::filesystem::exists(file_path, ec)) {
     return nullptr;
   }
 
-  if (std::filesystem::file_size(file_path) < sizeof(StfsHeader)) {
+  const uint64_t file_size = std::filesystem::file_size(file_path, ec);
+  if (ec || file_size < sizeof(StfsHeader)) {
     return nullptr;
   }
 
@@ -77,12 +79,13 @@ std::unique_ptr<StfsHeader> StfsContainerDevice::ReadPackageHeader(
 
 bool StfsContainerDevice::Initialize() {
   // Resolve a valid STFS file if a directory is given.
-  if (std::filesystem::is_directory(host_path_) && !ResolveFromFolder(host_path_)) {
+  std::error_code ec;
+  if (std::filesystem::is_directory(host_path_, ec) && !ResolveFromFolder(host_path_)) {
     REXFS_ERROR("Could not resolve an STFS container given path {}", rex::path_to_utf8(host_path_));
     return false;
   }
 
-  if (!std::filesystem::exists(host_path_)) {
+  if (!std::filesystem::exists(host_path_, ec)) {
     REXFS_ERROR("Path to STFS container does not exist: {}", rex::path_to_utf8(host_path_));
     return false;
   }
@@ -138,7 +141,8 @@ StfsContainerDevice::Error StfsContainerDevice::OpenFiles() {
   // the files in the .data folder and can discard the header.
   auto data_fragment_path = host_path_;
   data_fragment_path += ".data";
-  if (!std::filesystem::exists(data_fragment_path)) {
+  std::error_code ec;
+  if (!std::filesystem::exists(data_fragment_path, ec)) {
     REXFS_ERROR("STFS container is multi-file, but path {} does not exist.",
                 rex::path_to_utf8(data_fragment_path));
     return Error::kErrorFileMismatch;
@@ -317,8 +321,21 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSVOD() {
               "0xD000.");
         }
       } else {
-        REXFS_ERROR("Could not locate SVOD magic block.");
-        return Error::kErrorReadError;
+        // Multiple-file packages, and some single-file Games on Demand ones,
+        // have it at 0x2000 without the EGDF flag.
+        rex::filesystem::Seek(svod_header, 0x2000, SEEK_SET);
+        if (fread(magic_buf, 1, countof(magic_buf), svod_header) != countof(magic_buf)) {
+          REXFS_ERROR("ReadSVOD failed to read SVOD magic at 0x2000");
+          return Error::kErrorReadError;
+        }
+        if (std::memcmp(magic_buf, MEDIA_MAGIC, 20) != 0) {
+          REXFS_ERROR("Could not locate SVOD magic block.");
+          return Error::kErrorReadError;
+        }
+        svod_base_offset_ = 0x0000;
+        magic_offset = 0x2000;
+        svod_layout_ = SvodLayoutType::kMultipleFiles;
+        REXFS_INFO("SVOD uses a multiple-file layout. Magic block present at 0x2000.");
       }
     }
   }
@@ -637,15 +654,28 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
       // Fill in all block records.
       // It's easier to do this now and just look them up later, at the cost
       // of some memory. Nasty chain walk.
-      // TODO(benvanik): optimize if flags.contiguous is set.
       if (entry->attributes() & system::X_FILE_ATTRIBUTE_NORMAL) {
         uint32_t block_index = dir_entry.start_block_number();
         size_t remaining_size = dir_entry.length;
+        size_t block_count = 0;
         while (remaining_size && block_index != kEndOfChain) {
           size_t block_size = std::min(static_cast<size_t>(kBlockSize), remaining_size);
           size_t offset = BlockToOffsetSTFS(block_index);
-          entry->block_list_.push_back({0, offset, block_size});
+          // Blocks adjacent in the package share one record.
+          auto& block_list = entry->block_list_;
+          if (!block_list.empty() &&
+              block_list.back().offset + block_list.back().length == offset) {
+            block_list.back().length += block_size;
+          } else {
+            block_list.push_back({0, offset, block_size});
+          }
+          ++block_count;
           remaining_size -= block_size;
+          // A read-only package numbers a contiguous file's blocks consecutively.
+          if (dir_entry.flags.contiguous && is_read_only()) {
+            ++block_index;
+            continue;
+          }
           auto block_hash = GetBlockHash(block_index);
           if (!block_hash) {
             break;
@@ -665,11 +695,11 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
 
         // Check that the number of blocks retrieved from hash entries matches
         // the block count read from the file entry
-        if (entry->block_list_.size() != dir_entry.allocated_data_blocks()) {
+        if (block_count != dir_entry.allocated_data_blocks()) {
           REXFS_WARN(
               "STFS failed to read correct block-chain for entry {}, read {} "
               "blocks, expected {}",
-              entry->name_, entry->block_list_.size(), dir_entry.allocated_data_blocks());
+              entry->name_, block_count, dir_entry.allocated_data_blocks());
           assert_always();
         }
       }

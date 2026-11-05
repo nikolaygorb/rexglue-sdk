@@ -105,6 +105,8 @@ rex_add_fuzzer(resolve_fuzzer
     ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/registers.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
+    # TraceWriter::WriteMemoryRead behind TraceWriter::active() in draw.cpp.
+    ${PROJECT_SOURCE_DIR}/src/graphics/trace_writer.cpp
     ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
 )
 
@@ -125,6 +127,8 @@ rex_add_fuzzer(primitive_processor_fuzzer
     ${PROJECT_SOURCE_DIR}/src/graphics/primitive_processor.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
+    # TraceWriter::WriteMemoryRead behind TraceWriter::active() (never set here).
+    ${PROJECT_SOURCE_DIR}/src/graphics/trace_writer.cpp
 )
 
 # The XMA decoder context on the guest's context data and packets

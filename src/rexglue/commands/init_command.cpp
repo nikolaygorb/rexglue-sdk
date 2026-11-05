@@ -53,10 +53,12 @@ std::string LowercaseAscii(std::string s) {
 std::string ManifestPath(const fs::path& target, const fs::path& base) {
   std::error_code ec;
   fs::path rel = fs::relative(target, base, ec);
+  // Host paths keep their case: they are opened on case-sensitive file systems
+  // too (issue #455). Guest paths are normalized separately.
   if (ec || rel.empty()) {
-    return LowercaseAscii(target.generic_string());
+    return target.generic_string();
   }
-  return LowercaseAscii(rel.generic_string());
+  return rel.generic_string();
 }
 
 std::string ModuleStem(const fs::path& xex) {

@@ -48,8 +48,6 @@ namespace shaders {
 #include "../shaders/bytecode/d3d11_5_0/discrete_quad_4cp_hs.h"
 #include "../shaders/bytecode/d3d11_5_0/discrete_triangle_1cp_hs.h"
 #include "../shaders/bytecode/d3d11_5_0/discrete_triangle_3cp_hs.h"
-#include "../shaders/bytecode/d3d11_5_0/float24_round_ps.h"
-#include "../shaders/bytecode/d3d11_5_0/float24_truncate_ps.h"
 #include "../shaders/bytecode/d3d11_5_0/tessellation_adaptive_vs.h"
 #include "../shaders/bytecode/d3d11_5_0/tessellation_indexed_vs.h"
 }  // namespace shaders
@@ -127,6 +125,18 @@ bool PipelineCache::CreateTranslatorAndDepthOnlyPixelShader() {
                                       "the depth-only pixel shader")) {
     return false;
   }
+  // A draw with no guest pixel shader has a vertex shader with no interpolators,
+  // so these come from the translator, not from a shader taking XeVertexPrePS.
+  if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+      (!create_depth_only_pixel_shader(float24_truncate_pixel_shader_, false,
+                                       DepthStencilMode::kFloat24Truncating,
+                                       "the float24 truncating depth-only pixel shader") ||
+       !create_depth_only_pixel_shader(float24_round_pixel_shader_, false,
+                                       DepthStencilMode::kFloat24Rounding,
+                                       "the float24 rounding depth-only pixel shader"))) {
+    REXGPU_ERROR("D3D11 pipeline cache: Failed to create the float24 depth pixel shaders");
+    return false;
+  }
   // As D3D12's for hybrid occlusion queries. Without them, the queries count
   // passed samples only.
   if (command_processor_.IsZpdHybridSupported()) {
@@ -168,6 +178,8 @@ void PipelineCache::DestroyDrawResolutionScaleDependentObjects() {
     }
   }
   depth_only_pixel_shader_.Reset();
+  float24_truncate_pixel_shader_.Reset();
+  float24_round_pixel_shader_.Reset();
   zpd_total_depth_only_pixel_shader_.Reset();
   zpd_total_float24_truncate_pixel_shader_.Reset();
   zpd_total_float24_round_pixel_shader_.Reset();
@@ -183,15 +195,6 @@ bool PipelineCache::Initialize() {
   ID3D11Device* device = provider.GetDevice();
 
   if (!CreateTranslatorAndDepthOnlyPixelShader()) {
-    Shutdown();
-    return false;
-  }
-  if (FAILED(device->CreatePixelShader(shaders::float24_truncate_ps,
-                                       sizeof(shaders::float24_truncate_ps), nullptr,
-                                       &float24_truncate_pixel_shader_)) ||
-      FAILED(device->CreatePixelShader(shaders::float24_round_ps, sizeof(shaders::float24_round_ps),
-                                       nullptr, &float24_round_pixel_shader_))) {
-    REXGPU_ERROR("D3D11 pipeline cache: Failed to create the float24 depth pixel shaders");
     Shutdown();
     return false;
   }
@@ -379,12 +382,22 @@ void PipelineCache::ClearCache() {
   pipelines_.clear();
   geometry_shaders_.clear();
   shaders_.clear();
+  shader_load_memo_.Clear();
   failed_pipeline_count_ = 0;
 }
 
 D3D11Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                                        uint32_t dword_count) {
-  uint64_t hash = XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
+  // Hash the memo's copy of the input memory and lookup the shader.
+  return shader_load_memo_.FindOrLoad(
+      shader_type, host_address, dword_count, [&](const uint32_t* words) {
+        return LoadShader(shader_type, words, dword_count,
+                          XXH3_64bits(words, dword_count * sizeof(uint32_t)));
+      });
+}
+
+D3D11Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
+                                       uint32_t dword_count, uint64_t hash) {
   auto it = shaders_.find(hash);
   if (it != shaders_.end()) {
     return it->second.get();
@@ -613,8 +626,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   if (!storage_writer_.InitializeShaderStorage(
           cache_root, title_id, pipeline_config,
           [&](xenos::ShaderType type, const uint32_t* ucode_dwords, uint32_t ucode_dword_count,
-              uint64_t /*ucode_data_hash*/) {
-            D3D11Shader* shader = LoadShader(type, ucode_dwords, ucode_dword_count);
+              uint64_t ucode_data_hash) {
+            D3D11Shader* shader =
+                LoadShader(type, ucode_dwords, ucode_dword_count, ucode_data_hash);
             // Already in the file.
             shader->set_ucode_storage_index(storage_index);
             return true;
@@ -883,6 +897,14 @@ void PipelineCache::GetCurrentStateDescription(
       break;
     case xenos::PrimitiveType::kQuadList:
       geometry_shader_type = GeometryShaderType::kQuadList;
+      break;
+    case xenos::PrimitiveType::kLineList:
+    case xenos::PrimitiveType::kLineStrip:
+      // Host lines are 1 host pixel wide, expand them to 1 guest pixel when the
+      // draw is resolution-scaled.
+      if (render_target_cache_.GetDrawScaleX() > 1 || render_target_cache_.GetDrawScaleY() > 1) {
+        geometry_shader_type = GeometryShaderType::kLineList;
+      }
       break;
     default:
       geometry_shader_type = GeometryShaderType::kNone;

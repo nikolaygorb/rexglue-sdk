@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <rex/graphics/shared_memory.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/memory.h>
 #include <rex/ui/vulkan/upload_buffer_pool.h>
 
@@ -48,6 +49,11 @@ class VulkanSharedMemory : public SharedMemory {
   void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
 
   VkBuffer buffer() const { return buffer_; }
+
+  // For frame traces. The first returns true if downloads were submitted, to
+  // be completed by the second after awaiting the queue.
+  bool InitializeTraceSubmitDownloads();
+  void InitializeTraceCompleteDownloads(TraceWriter& trace_writer);
 
   using SharedMemory::page_size_log2;
 
@@ -85,6 +91,13 @@ class VulkanSharedMemory : public SharedMemory {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
+
+  // For frame traces, created only while downloading.
+  VkBuffer trace_download_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory trace_download_buffer_memory_ = VK_NULL_HANDLE;
+  uint32_t trace_download_buffer_memory_type_ = UINT32_MAX;
+  VkDeviceSize trace_download_buffer_memory_size_ = 0;
+  void ResetTraceDownload();
 };
 
 }  // namespace rex::graphics::vulkan

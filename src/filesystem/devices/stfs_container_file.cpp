@@ -9,11 +9,13 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/filesystem/devices/stfs_container_entry.h>
 #include <rex/filesystem/devices/stfs_container_file.h>
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 #include <rex/math.h>
 
@@ -38,6 +40,7 @@ X_STATUS StfsContainerFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offs
   uint8_t* p = buffer.data();
   size_t remaining_length = std::min(buffer.size(), entry_->size() - byte_offset);
 
+  auto* device = static_cast<StfsContainerDevice*>(entry_->device());
   *out_bytes_read = 0;
   for (size_t i = 0; i < entry_->block_list().size(); i++) {
     auto& record = entry_->block_list()[i];
@@ -56,8 +59,12 @@ X_STATUS StfsContainerFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offs
       break;
     }
     FILE* file = file_it->second;
-    rex::filesystem::Seek(file, record.offset + read_offset, SEEK_SET);
-    auto num_read = fread(p, 1, read_length, file);
+    size_t num_read;
+    {
+      std::lock_guard<std::mutex> lock(device->read_mutex());
+      rex::filesystem::Seek(file, record.offset + read_offset, SEEK_SET);
+      num_read = fread(p, 1, read_length, file);
+    }
 
     *out_bytes_read += num_read;
     p += num_read;

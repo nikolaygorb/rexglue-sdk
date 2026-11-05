@@ -30,11 +30,25 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+#include <rex/filesystem.h>
+#include <rex/graphics/trace_player.h>
+
+REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU/Trace",
+                      "Directory for GPU frame traces, recorded with bind_gpu_trace. Empty: "
+                      "recording is off");
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU",
                       "Swap post effect: none, fxaa, fxaa_extreme, smaa")
     .allowed({"none", "fxaa", "fxaa_extreme", "smaa"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_DOUBLE(guest_vblank_rate, 0.0, "GPU",
+                      "Guest vblank rate in Hz (0 = video_mode_refresh_rate). Unlike "
+                      "video_mode_refresh_rate it doesn't change the refresh rate reported to the "
+                      "game, so games that present on vblank are capped to this rate (e.g. 30). "
+                      "Ignored when vsync is off.")
+    .range(0.0, 1000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
@@ -161,10 +175,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
         const double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
-        const uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
-        const uint64_t vsync_interval_ticks =
-            std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
 #if REX_PLATFORM_WIN32
+        const uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
 #else
         using steady_time_point = std::chrono::steady_clock::time_point;
@@ -178,10 +190,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             rex::thread::Sleep(std::chrono::milliseconds(1));
             continue;
           }
+          // The range isn't enforced for command line values, and NaN passes it.
+          const double vblank_rate = REXCVAR_GET(guest_vblank_rate);
+          const double vblank_rate_hz =
+              vblank_rate > 0.0 ? std::clamp(vblank_rate, 1.0, 1000.0) : refresh_rate_hz;
           // Real time of one vblank period at the current guest speed.
           const double period_ns =
-              1000000000.0 / (refresh_rate_hz * chrono::Clock::guest_time_scalar());
+              1000000000.0 / (vblank_rate_hz * chrono::Clock::guest_time_scalar());
 #if REX_PLATFORM_WIN32
+          const uint64_t vsync_interval_ticks =
+              std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / vblank_rate_hz));
           const uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           if (current_time - last_frame_time >= vsync_interval_ticks) {
             // Drop the missed beats: a burst of vblanks after a stall would make
@@ -445,6 +463,25 @@ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_
                                                       std::move(completion_callback));
         });
   }
+}
+
+void GraphicsSystem::RequestFrameTrace() {
+  const std::string& prefix = REXCVAR_GET(trace_gpu_prefix);
+  if (prefix.empty()) {
+    REXGPU_WARN("GPU trace: set trace_gpu_prefix to the directory for traces first");
+    return;
+  }
+  if (command_processor_) {
+    command_processor_->RequestFrameTrace(rex::to_path(prefix));
+  }
+}
+
+bool GraphicsSystem::PlayFrameTrace(const std::filesystem::path& path) {
+  if (!command_processor_) {
+    return false;
+  }
+  TracePlayer player(this);
+  return player.Play(path);
 }
 
 void GraphicsSystem::Pause() {

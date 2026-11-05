@@ -1,0 +1,124 @@
+/**
+ * @file        graphics/shaders/texture_load_scaled_direct.glsli
+ * @brief       Resolution-scaled 32bpb / 64bpb texture loads written straight
+ *              into the texture's image (vulkan_texture_load_direct)
+ *
+ * @copyright   Copyright (c) 2026 ReXGlue fork contributors
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
+
+// Idea from the WWE 2K14 recomp project (vulkan_texture_load_direct, session
+// 7c); its shader follows an older layout of the scaled resolve buffer, so
+// this one is written over the current load shaders instead.
+//
+// The same as texture_load_32bpb_scaled.cs.xesl / texture_load_64bpb_scaled.cs.xesl
+// (texture_load_32bpb.xesli / texture_load_64bpb.xesli with the identity
+// transform), down to the two 16-byte loads of a thread and their endian
+// swaps: the source address comes from the same XeTextureLoadSourceAddress and
+// XeTextureLoadLocalXAddressXor. Only where the words go differs. The buffer
+// shaders store them at host_offset + row * host_pitch + x * bytes_per_block,
+// from where vkCmdCopyBufferToImage copies texel (x, row) bit for bit; here
+// they are stored to texel (x, row) through a view with an unsigned integer
+// format of the same size, which keeps the bits:
+// - 32bpb: R32_UINT, one word per texel.
+// - 64bpb: R16G16B16A16_UINT, the two words of a block as four 16-bit halves,
+//   low half first: the byte order of the block in the buffer on a
+//   little-endian host. (R32G32_UINT would need the
+//   shaderStorageImageExtendedFormats feature.)
+// The buffer shaders also write the blocks past the width (the scratch pitch is
+// rounded up to the blocks of a thread), which the copy never reads; those are
+// skipped here. Single-level, single-layer 2D textures only: the dispatch has
+// one Z.
+//
+// Built by tools/shaders/build_shaders.py from
+// texture_load_32bpb_scaled_direct.cs.glsl and
+// texture_load_64bpb_scaled_direct.cs.glsl, which define
+// XE_TEXTURE_LOAD_DIRECT_32BPB or XE_TEXTURE_LOAD_DIRECT_64BPB.
+
+#if defined(XE_TEXTURE_LOAD_DIRECT_32BPB) == defined(XE_TEXTURE_LOAD_DIRECT_64BPB)
+#error Define exactly one of XE_TEXTURE_LOAD_DIRECT_32BPB and XE_TEXTURE_LOAD_DIRECT_64BPB.
+#endif
+
+#define XE_TEXTURE_LOAD_RESOLUTION_SCALED
+// Push constants (TextureCache::LoadConstants), XeTextureLoadGetInfo,
+// XeTextureLoadSourceAddress, XeTextureLoadLocalXAddressXor, LOCAL_SIZE_*_XE.
+#include "texture_load.xesli"
+
+// The scaled resolve buffer range of the texture: the same binding as the
+// buffer shaders' source (set 1).
+byte_buffer_align16_declare_xe(xe_texture_load_source, set=1, binding=0, t0, space0)
+
+// The texture's level 0, layer 0, in set 0 where the buffer shaders have their
+// destination buffer.
+#ifdef XE_TEXTURE_LOAD_DIRECT_32BPB
+layout(r32ui, set=0, binding=0) uniform writeonly uimage2D xe_texture_load_dest;
+#else
+layout(rgba16ui, set=0, binding=0) uniform writeonly uimage2D xe_texture_load_dest;
+#endif
+
+layout(local_size_x=LOCAL_SIZE_X_XE, local_size_y=LOCAL_SIZE_Y_XE,
+       local_size_z=LOCAL_SIZE_Z_XE) in;
+
+#ifdef XE_TEXTURE_LOAD_DIRECT_32BPB
+  const uint kXeTextureLoadDirectBytesPerBlockLog2 = 2u;
+  // 8 blocks per thread, 4 per 16-byte load.
+  const uint kXeTextureLoadDirectBlocksPerThreadLog2 = 3u;
+  const uint kXeTextureLoadDirectBlocksPerLoad = 4u;
+#else
+  const uint kXeTextureLoadDirectBytesPerBlockLog2 = 3u;
+  // 4 blocks per thread, 2 per 16-byte load.
+  const uint kXeTextureLoadDirectBlocksPerThreadLog2 = 2u;
+  const uint kXeTextureLoadDirectBlocksPerLoad = 2u;
+#endif
+
+// Stores the blocks of one 16-byte load, starting at block x of row y, leaving
+// out the ones at or past the width.
+void XeTextureLoadDirectStore(uint x, uint y, uint width_blocks, uvec4 blocks) {
+#ifdef XE_TEXTURE_LOAD_DIRECT_32BPB
+  for (uint i = 0u; i < 4u; ++i) {
+    if (x + i < width_blocks) {
+      imageStore(xe_texture_load_dest, ivec2(int(x + i), int(y)),
+                 uvec4(blocks[i], 0u, 0u, 0u));
+    }
+  }
+#else
+  if (x < width_blocks) {
+    imageStore(xe_texture_load_dest, ivec2(int(x), int(y)),
+               uvec4(blocks.x & 0xFFFFu, blocks.x >> 16u, blocks.y & 0xFFFFu,
+                     blocks.y >> 16u));
+  }
+  if (x + 1u < width_blocks) {
+    imageStore(xe_texture_load_dest, ivec2(int(x + 1u), int(y)),
+               uvec4(blocks.z & 0xFFFFu, blocks.z >> 16u, blocks.w & 0xFFFFu,
+                     blocks.w >> 16u));
+  }
+#endif
+}
+
+void main() {
+  XeTextureLoadInfo load_info = XeTextureLoadGetInfo(pass_push_consts_xe);
+  uvec3 block_index = gl_GlobalInvocationID
+                      << uvec3(kXeTextureLoadDirectBlocksPerThreadLog2, 0u, 0u);
+  dont_flatten_xe
+  if (any(greaterThanEqual(block_index.xy, load_info.size_blocks.xy))) {
+    return;
+  }
+  uint block_offset_guest = XeTextureLoadSourceAddress(
+      load_info, block_index, kXeTextureLoadDirectBytesPerBlockLog2);
+  uvec4 guest_blocks = XeEndianSwap32(
+      byte_buffer_align16_load16_xe(xe_texture_load_source, block_offset_guest),
+      load_info.endian_32);
+  XeTextureLoadDirectStore(block_index.x, block_index.y, load_info.size_blocks.x,
+                           guest_blocks);
+  block_offset_guest += XeTextureLoadLocalXAddressXor(
+      kXeTextureLoadDirectBlocksPerLoad, kXeTextureLoadDirectBytesPerBlockLog2,
+      load_info.is_tiled);
+  guest_blocks = XeEndianSwap32(
+      byte_buffer_align16_load16_xe(xe_texture_load_source, block_offset_guest),
+      load_info.endian_32);
+  XeTextureLoadDirectStore(block_index.x + kXeTextureLoadDirectBlocksPerLoad,
+                           block_index.y, load_info.size_blocks.x, guest_blocks);
+}

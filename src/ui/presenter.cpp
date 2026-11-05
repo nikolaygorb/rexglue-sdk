@@ -30,6 +30,12 @@
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
+REXCVAR_DEFINE_DOUBLE(ui_refresh_rate, 0.0, "UI/Presenter",
+                      "Linux and macOS without vsync in presentation: how often the window "
+                      "repaints for the interface alone, such as an open settings window, in Hz "
+                      "(0 = the display's refresh rate). Game frames are shown as soon as they "
+                      "are ready either way")
+    .range(0.0, 1000.0);
 
 // vsync paces the title; this one waits for the host display, which a screen
 // without variable refresh rate needs to show frames without tearing.
@@ -607,12 +613,18 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
   bool is_active = writable_properties.IsActive();
+  const uint32_t mailbox_index = guest_output_mailbox_writable_;
   if (is_active) {
-    if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
-                                frontbuffer_height, refresher, writable_properties.is_8bpc)) {
+    if (!RefreshGuestOutputImpl(mailbox_index, frontbuffer_width, frontbuffer_height, refresher,
+                                writable_properties.is_8bpc)) {
       // If failed to refresh, don't send the currently writable image to the
       // mailbox as it may be in an undefined state. Don't disable the guest
       // output either though because the failure may be something transient.
+      if (guest_output_publish_deferrer_) {
+        // The refresher may still have queued work referencing the image.
+        guest_output_publish_deferrer_(
+            [this, mailbox_index]() { GuestOutputRefreshSubmitted(mailbox_index); });
+      }
       return false;
     }
     guest_output_active_last_refresh_ = true;
@@ -625,6 +637,20 @@ bool Presenter::RefreshGuestOutput(
     guest_output_active_last_refresh_ = false;
   }
 
+  if (guest_output_publish_deferrer_) {
+    guest_output_publish_deferrer_([this, is_active, mailbox_index]() {
+      if (is_active) {
+        GuestOutputRefreshSubmitted(mailbox_index);
+      }
+      PublishGuestOutput();
+    });
+  } else {
+    PublishGuestOutput();
+  }
+  return is_active;
+}
+
+void Presenter::PublishGuestOutput() {
   // Make the new image the next to present on the host (the "ready" one),
   // replacing the one already specified as the next (dropping it instead of
   // enqueueing the new image after it) to achieve the lowest latency (also,
@@ -694,8 +720,6 @@ bool Presenter::RefreshGuestOutput(
       host_gpu_loss_callback_(false, false);
     }
   }
-
-  return is_active;
 }
 
 void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {
@@ -1668,11 +1692,43 @@ void Presenter::WaitForUITickFromUIThread() {
       return;
     }
   }
+#else
+  // No vblank ticks here: with presentation that doesn't wait for vsync, the UI
+  // asking for repaints (an open settings window) would paint and present as
+  // fast as the GPU can, taking GPU time from the game. Pace those repaints at
+  // the display's refresh rate (ui_refresh_rate overrides it); a new guest
+  // frame doesn't wait.
+  using Clock = std::chrono::steady_clock;
+  if (AreUITicksNeededFromUIThread()) {
+    double rate = REXCVAR_GET(ui_refresh_rate);
+    if (rate <= 0.0 && window_) {
+      rate = window_->GetDisplayRefreshRate();
+    }
+    if (rate <= 0.0) {
+      rate = 60.0;
+    }
+    const auto next =
+        ui_tick_last_paint_ + std::chrono::duration_cast<Clock::duration>(
+                                  std::chrono::duration<double>(1.0 / std::max(rate, 1.0)));
+    std::unique_lock<std::mutex> ui_tick_lock(ui_tick_mutex_);
+    ui_tick_condition_.wait_until(ui_tick_lock, next, [this] { return ui_tick_force_requested_; });
+    ui_tick_force_requested_ = false;
+  } else {
+    std::scoped_lock<std::mutex> ui_tick_lock(ui_tick_mutex_);
+    ui_tick_force_requested_ = false;
+  }
+  ui_tick_last_paint_ = Clock::now();
 #endif  // XE_PLATFORM
 }
 
 void Presenter::ForceUIThreadPaintTick() {
-#if REX_PLATFORM_WIN32
+#if !REX_PLATFORM_WIN32
+  {
+    std::scoped_lock<std::mutex> ui_tick_lock(ui_tick_mutex_);
+    ui_tick_force_requested_ = true;
+  }
+  ui_tick_condition_.notify_all();
+#else
   {
     std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
     dxgi_ui_tick_force_requested_ = true;

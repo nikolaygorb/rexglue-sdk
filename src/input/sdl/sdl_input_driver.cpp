@@ -164,7 +164,9 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       controllers_(),
       controllers_mutex_() {}
 
-SDLInputDriver::~SDLInputDriver() {}
+SDLInputDriver::~SDLInputDriver() {
+  StopHidWorker();
+}
 
 X_STATUS SDLInputDriver::Setup() {
   if (!TestSDLVersion()) {
@@ -217,6 +219,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
         return;
       }
       SDL_Gamepad_initialized_ = true;
+      StartHidWorker();
 
       // Load custom controller mappings if available
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
@@ -247,10 +250,15 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
       attached_window_->app_context().CallInUIThreadSynchronous(
           [this]() { attached_window_->app_context().ExecutePendingFunctionsFromUIThread(); });
     }
+    StopHidWorker();
     for (auto& controller : controllers_) {
       SDL_CloseGamepad(controller.sdl);
     }
     controllers_.clear();
+    for (SDL_Gamepad* opened : opened_gamepads_) {
+      SDL_CloseGamepad(opened);
+    }
+    opened_gamepads_.clear();
     if (SDL_Gamepad_initialized_) {
       SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
       SDL_Gamepad_initialized_ = false;
@@ -353,20 +361,22 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
 
   QueueControllerUpdate();
 
-  auto guard = DrainAndLock();
-
-  auto controller = FindController(id);
-  if (!controller) {
-    return X_ERROR_DEVICE_NOT_CONNECTED;
+  SDL_JoystickID instance_id = 0;
+  {
+    auto guard = DrainAndLock();
+    auto controller = FindController(id);
+    if (!controller) {
+      return X_ERROR_DEVICE_NOT_CONNECTED;
+    }
+    instance_id = SDL_GetJoystickID(SDL_GetGamepadJoystick(controller->sdl));
   }
 
-  // XInput vibration holds until the guest changes it, but SDL rumble expires,
-  // and a zero duration expires on the next SDL_UpdateJoysticks. Arm it for
-  // SDL's maximum instead; each call cancels the previous effect anyway.
-  return SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
-                           vibration->right_motor_speed, kRumbleDurationMs)
-             ? X_ERROR_SUCCESS
-             : X_ERROR_FUNCTION_FAILED;
+  {
+    std::lock_guard<std::mutex> lock(hid_mutex_);
+    hid_rumble_[instance_id] = {vibration->left_motor_speed, vibration->right_motor_speed};
+  }
+  hid_cv_.notify_one();
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
@@ -447,11 +457,14 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
   // Handle repeating
   auto guest_now = rex::chrono::Clock::QueryGuestUptimeMillis();
   static_assert(HID_SDL_REPEAT_DELAY >= HID_SDL_REPEAT_RATE);
-  if (last.repeat_state == RepeatState::Waiting &&
+  // A button let go while the title wasn't polling gets its up event below
+  // rather than a repeat.
+  const bool repeat_held = (curr_butts >> last.repeat_butt_idx) & 1;
+  if (repeat_held && last.repeat_state == RepeatState::Waiting &&
       (last.repeat_time + HID_SDL_REPEAT_DELAY < guest_now)) {
     last.repeat_state = RepeatState::Repeating;
   }
-  if (last.repeat_state == RepeatState::Repeating &&
+  if (repeat_held && last.repeat_state == RepeatState::Repeating &&
       (last.repeat_time + HID_SDL_REPEAT_RATE < guest_now)) {
     last.repeat_time = guest_now;
     rex::ui::VirtualKey vk = kVkLookup.at(last.repeat_butt_idx);
@@ -533,11 +546,24 @@ void SDLInputDriver::HandleEvent(const SDL_Event& event) {
 
 std::unique_lock<std::mutex> SDLInputDriver::DrainAndLock() {
   std::vector<SDL_Event> events;
+  std::vector<SDL_Gamepad*> opened;
   {
     std::lock_guard<std::mutex> guard(event_queue_mutex_);
     events.swap(pending_events_);
+    opened.swap(opened_gamepads_);
   }
   std::unique_lock<std::mutex> guard(controllers_mutex_);
+  // Before the events, so a pad's removal finds it.
+  for (SDL_Gamepad* controller : opened) {
+    if (SDL_GamepadConnected(controller)) {
+      OnControllerDeviceOpenedLocked(controller);
+    } else {
+      // Gone while it was being opened: its removal has already passed.
+      std::lock_guard<std::mutex> lock(hid_mutex_);
+      hid_close_queue_.push_back(controller);
+      hid_cv_.notify_one();
+    }
+  }
   for (const auto& event : events) {
     ProcessEventLocked(event);
   }
@@ -589,11 +615,14 @@ void SDLInputDriver::OnJoystickDeviceAddedLocked(const SDL_Event& event) {
 }
 
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
-  const auto controller = SDL_OpenGamepad(event.gdevice.which);
-  if (!controller) {
-    assert_always();
-    return;
+  {
+    std::lock_guard<std::mutex> lock(hid_mutex_);
+    hid_open_queue_.push_back(event.gdevice.which);
   }
+  hid_cv_.notify_one();
+}
+
+void SDLInputDriver::OnControllerDeviceOpenedLocked(SDL_Gamepad* controller) {
   char guid_text[33] = {};
   SDL_GUIDToString(SDL_GetJoystickGUID(SDL_GetGamepadJoystick(controller)), guid_text,
                    static_cast<int>(sizeof(guid_text)));
@@ -645,7 +674,11 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
                    static_cast<int>(sizeof(removed_guid)));
   REXLOG_INFO("SDL OnControllerDeviceRemoved: \"{}\", GUID({}).", removed_name ? removed_name : "?",
               removed_guid);
-  SDL_CloseGamepad(removed);
+  {
+    std::lock_guard<std::mutex> lock(hid_mutex_);
+    hid_close_queue_.push_back(removed);
+  }
+  hid_cv_.notify_one();
   controllers_.erase(controllers_.begin() + static_cast<ptrdiff_t>(*idx));
 
   // LEDs only. Guest user assignment does not shift, because InputSystem holds
@@ -654,6 +687,73 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
     SDL_SetGamepadPlayerIndex(controllers_[i].sdl, static_cast<int>(i));
   }
   REXLOG_INFO("SDL OnControllerDeviceRemoved: {} device(s) remain.", controllers_.size());
+}
+
+void SDLInputDriver::StartHidWorker() {
+  if (hid_worker_.joinable()) {
+    return;
+  }
+  hid_worker_stop_ = false;
+  hid_worker_ = std::thread([this]() { HidWorkerMain(); });
+}
+
+void SDLInputDriver::StopHidWorker() {
+  if (!hid_worker_.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(hid_mutex_);
+    hid_worker_stop_ = true;
+  }
+  hid_cv_.notify_one();
+  hid_worker_.join();
+}
+
+void SDLInputDriver::HidWorkerMain() {
+  std::unique_lock<std::mutex> lock(hid_mutex_);
+  for (;;) {
+    hid_cv_.wait(lock, [this]() {
+      return hid_worker_stop_ || !hid_open_queue_.empty() || !hid_rumble_.empty() ||
+             !hid_close_queue_.empty();
+    });
+    const bool stop = hid_worker_stop_;
+    std::vector<SDL_JoystickID> opens;
+    opens.swap(hid_open_queue_);
+    std::unordered_map<SDL_JoystickID, RumbleRequest> rumbles;
+    rumbles.swap(hid_rumble_);
+    std::vector<SDL_Gamepad*> closes;
+    closes.swap(hid_close_queue_);
+    lock.unlock();
+
+    for (SDL_JoystickID instance_id : opens) {
+      if (stop) {
+        break;
+      }
+      SDL_Gamepad* controller = SDL_OpenGamepad(instance_id);
+      if (!controller) {
+        REXLOG_ERROR("SDL: failed to open gamepad {}: {}", instance_id, SDL_GetError());
+        continue;
+      }
+      std::lock_guard<std::mutex> events_lock(event_queue_mutex_);
+      opened_gamepads_.push_back(controller);
+    }
+    for (const auto& [instance_id, rumble] : rumbles) {
+      // XInput vibration holds until the guest changes it, but SDL rumble
+      // expires, and a zero duration expires on the next SDL_UpdateJoysticks.
+      // Arm it for SDL's maximum instead; each call cancels the previous effect.
+      if (SDL_Gamepad* controller = SDL_GetGamepadFromID(instance_id)) {
+        SDL_RumbleGamepad(controller, rumble.left, rumble.right, kRumbleDurationMs);
+      }
+    }
+    for (SDL_Gamepad* controller : closes) {
+      SDL_CloseGamepad(controller);
+    }
+
+    lock.lock();
+    if (stop) {
+      return;
+    }
+  }
 }
 
 void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) {

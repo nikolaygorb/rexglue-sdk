@@ -40,6 +40,9 @@ struct FPSCRPlatform {
                                        (1 << 12);   // PM - Precision (Inexact)
   static constexpr size_t GuestToHost[] = {SIMDE_MM_ROUND_NEAREST, SIMDE_MM_ROUND_TOWARD_ZERO,
                                            SIMDE_MM_ROUND_UP, SIMDE_MM_ROUND_DOWN};
+  // MXCSR RC (00 nearest, 01 down, 10 up, 11 toward zero) to the guest's
+  // RN (0 nearest, 1 toward zero, 2 up, 3 down).
+  static constexpr u32 HostToGuest[] = {0, 3, 2, 1};
 
   // Sticky exception status flags (IE, ZE, OE, UE, PE; DE has no FPSCR bit).
   // They are in MXCSR itself (CsrStatusMask), so a write of a cached MXCSR
@@ -75,9 +78,12 @@ struct FPSCRPlatform {
   static constexpr size_t RoundMaskVal = 3 << RoundShift;
   // FZ and FZ16
   static constexpr size_t FlushMask = (1 << 19) | (1 << 24);
-  // Nearest, Zero, -Infinity, -Infinity
+  // Nearest, Zero, +Infinity, -Infinity
   static constexpr size_t GuestToHost[] = {0 << RoundShift, 3 << RoundShift, 1 << RoundShift,
                                            2 << RoundShift};
+  // FPCR RMode (00 nearest, 01 up, 10 down, 11 toward zero, unlike MXCSR) to
+  // the guest's RN (0 nearest, 1 toward zero, 2 up, 3 down).
+  static constexpr u32 HostToGuest[] = {0, 2, 3, 1};
   // Exception enable bits (0 = exception disabled, ARM defaults to 0)
   static constexpr u32 ExceptionMask = (1 << 8) |   // IOE - Invalid Operation
                                        (1 << 9) |   // DZE - Division by Zero

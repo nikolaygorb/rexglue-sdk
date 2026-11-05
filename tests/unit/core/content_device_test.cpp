@@ -20,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -332,4 +333,83 @@ TEST_CASE("STFS file whose block chain leaves the package still mounts", "[files
 
   StfsContainerDevice device("\\Device\\Test", file.path);
   CHECK(device.Initialize());
+}
+
+TEST_CASE("STFS contiguous file reads without its hash chain", "[filesystem][stfs]") {
+  TestFile file("rexglue_stfs_contiguous");
+  auto package = MakeStfsPackage();
+  // Blocks 1 and 2 follow the directory block. Their hash entries stay zero, so
+  // walking the chain would return to block 0.
+  package.resize(package.size() + 0x1000);
+  std::memset(package.data() + 0xC000, 'A', 0x1000);
+  std::memset(package.data() + 0xD000, 'B', 0x1000);
+  StfsDirectoryEntry& entry = FirstStfsEntry(package);
+  std::memcpy(entry.name, "a", 1);
+  entry.flags.name_length = 1;
+  entry.flags.contiguous = 1;
+  entry.directory_index = 0xFFFF;
+  entry.set_start_block_number(1);
+  entry.set_allocated_data_blocks(2);
+  entry.length = 0x1800;
+  file.Write(package);
+
+  StfsContainerDevice device("\\Device\\Test", file.path);
+  REQUIRE(device.Initialize());
+  Entry* found = device.ResolvePath("a");
+  REQUIRE(found);
+  File* opened = nullptr;
+  REQUIRE(found->Open(1, &opened) == X_STATUS_SUCCESS);
+  std::vector<uint8_t> buffer(0x10);
+  size_t bytes_read = 0;
+  CHECK(opened->ReadSync(std::span<uint8_t>(buffer), 0xFF8, &bytes_read) == X_STATUS_SUCCESS);
+  CHECK(bytes_read == buffer.size());
+  CHECK(buffer[7] == 'A');
+  CHECK(buffer[8] == 'B');
+  opened->Destroy();
+}
+
+TEST_CASE("STFS files of one package read at once keep their own bytes", "[filesystem][stfs]") {
+  TestFile file("rexglue_stfs_threads");
+  auto package = MakeStfsPackage();
+  package.resize(package.size() + 0x1000);
+  std::memset(package.data() + 0xC000, 'A', 0x1000);
+  std::memset(package.data() + 0xD000, 'B', 0x1000);
+  StfsDirectoryEntry& entry = FirstStfsEntry(package);
+  std::memcpy(entry.name, "a", 1);
+  entry.flags.name_length = 1;
+  entry.flags.contiguous = 1;
+  entry.directory_index = 0xFFFF;
+  entry.set_start_block_number(1);
+  entry.set_allocated_data_blocks(2);
+  entry.length = 0x2000;
+  file.Write(package);
+
+  StfsContainerDevice device("\\Device\\Test", file.path);
+  REQUIRE(device.Initialize());
+  Entry* found = device.ResolvePath("a");
+  REQUIRE(found);
+  File* opened[2] = {};
+  REQUIRE(found->Open(1, &opened[0]) == X_STATUS_SUCCESS);
+  REQUIRE(found->Open(1, &opened[1]) == X_STATUS_SUCCESS);
+
+  // Catch2's macros aren't for worker threads, so each counts its bad reads.
+  size_t bad_reads[2] = {};
+  auto reader = [&](size_t index, size_t offset, uint8_t expected) {
+    std::vector<uint8_t> buffer(0x1000);
+    for (int i = 0; i < 2000; ++i) {
+      size_t bytes_read = 0;
+      opened[index]->ReadSync(std::span<uint8_t>(buffer), offset, &bytes_read);
+      if (bytes_read != buffer.size() || buffer.front() != expected || buffer.back() != expected) {
+        ++bad_reads[index];
+      }
+    }
+  };
+  std::thread first(reader, size_t(0), size_t(0), uint8_t('A'));
+  std::thread second(reader, size_t(1), size_t(0x1000), uint8_t('B'));
+  first.join();
+  second.join();
+  CHECK(bad_reads[0] == 0);
+  CHECK(bad_reads[1] == 0);
+  opened[0]->Destroy();
+  opened[1]->Destroy();
 }

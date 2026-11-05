@@ -77,6 +77,21 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
       return X_E_SUCCESS;
     }
+    case 0x0005000B: {
+      // XStringVerify: Live's check of text a player typed. A failure reads as a
+      // verdict (the title calls the text profane), so with no Live every string
+      // passes.
+      REXKRNL_DEBUG("XStringVerify({:08X}, {:08X})", buffer_ptr, buffer_length);
+      return X_E_SUCCESS;
+    }
+    case 0x0005000E: {
+      // XUserFindUsers: no results. Titles dereference a null result on failure.
+      REXKRNL_DEBUG("XUserFindUsers({:08X}, {:08X})", buffer_ptr, buffer_length);
+      if (buffer_ptr && buffer_length >= 4) {
+        memory::store_and_swap<uint32_t>(buffer, 0);
+      }
+      return X_E_SUCCESS;
+    }
     case 0x0005800E: {
       // XUserMuteListQuery. The buffer ends in the result code and
       // buffer_length holds the address of the BOOL result. No mute list is

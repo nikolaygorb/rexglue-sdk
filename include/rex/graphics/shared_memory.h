@@ -11,7 +11,11 @@
  */
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,6 +37,14 @@ class SharedMemory {
   virtual void ClearCache();
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
+  // Call on the GPU thread when a frame ends (hot pages, see EnableHotPages, and
+  // the upload statistics).
+  void AdvanceHotPageFrame();
+  // Call on the GPU thread where guest memory that later commands read may
+  // have changed without an access violation (new commands from the guest, a
+  // wait for the guest, a packet writing memory): a hot page is compared at
+  // most once between two such points.
+  void AdvanceHotPageSyncPoint() { ++hot_page_sync_point_; }
 
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
@@ -73,11 +85,47 @@ class SharedMemory {
   // Unregisters previously registered watched memory range.
   void UnwatchMemoryRange(WatchHandle handle);
 
+  // What a request reads the pages for, for the upload statistics.
+  enum class RequestKind : uint8_t {
+    kVertex,
+    kIndex,
+    kTexture,
+    // Destination of a resolve, loaded before the GPU writes part of it.
+    kResolve,
+    kMemExport,
+    kOther,
+    kCount,
+  };
+
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the host GPU memory backing the range are resident. Returns true if
   // the range has been fully updated and is usable.
-  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
-  bool RequestRange(uint32_t start, uint32_t length);
+  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
+                     RequestKind kind = RequestKind::kOther);
+  bool RequestRange(uint32_t start, uint32_t length, RequestKind kind = RequestKind::kOther);
+
+  // Uploads since the last TakeUploadStats, in pages, gathered while enabled
+  // (by the command processor while frame_stats_interval is above 0). GPU
+  // thread only.
+  void SetUploadStatsEnabled(bool enabled) { upload_stats_enabled_ = enabled; }
+  struct UploadStats {
+    uint64_t uploaded_by_kind[size_t(RequestKind::kCount)] = {};
+    // Uploaded again in the frame of their previous upload.
+    uint64_t uploaded_again_in_frame = 0;
+    // Requested while not valid, with clear_memory_page_state's frame-end reset
+    // the only thing that invalidated them since they were last made valid.
+    uint64_t requested_after_reset_only = 0;
+    // With upload hashing (shared_memory_hash_uploads): requested pages whose
+    // bytes equal their last upload (not uploaded with
+    // shared_memory_skip_unchanged_uploads), and the pages requested after the
+    // reset only whose bytes had changed: stale with clear_memory_page_state
+    // off.
+    uint64_t unchanged = 0;
+    uint64_t changed_after_reset_only = 0;
+  };
+  UploadStats TakeUploadStats();
+  // One log line, per frame over the given number of frames.
+  std::string FormatUploadStats(const UploadStats& stats, size_t frames) const;
   // Returns whether every page in the range is currently valid in the host GPU
   // memory copy. Hold the global critical region if relying on this for state
   // transitions such as watch installation.
@@ -142,6 +190,24 @@ class SharedMemory {
   // Mark the memory range as updated and protect it.
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu);
 
+  // Hot pages (shared_memory_hot_pages): pages the CPU rewrites every frame,
+  // such as dynamic vertex data, are not write-protected. Whenever they are
+  // requested they are compared with a shadow copy of their last upload and
+  // uploaded only if changed, which saves a protection change per upload and an
+  // access violation per CPU write. Call in Initialize if UploadRanges copies
+  // the data with CopyPagesForUpload.
+  void EnableHotPages();
+  // Upload hashing (shared_memory_hash_uploads,
+  // shared_memory_skip_unchanged_uploads): the hash of the bytes last uploaded
+  // to each page of the buffer, kept until the GPU writes the page, so a page
+  // requested again is compared instead of trusting what invalidated it. Call
+  // in Initialize if UploadRanges copies the data with CopyPagesForUpload.
+  void EnableUploadHashing();
+  // Copies pages to upload to dst, hot pages from their shadow copies, so the
+  // buffer holds what the next comparison compares with, and records the
+  // hashes of the copied pages. Call after MakeRangeValid for the pages.
+  void CopyPagesForUpload(uint8_t* dst, uint32_t page_first, uint32_t page_count);
+
   // Uploads a range of host pages - only called if host GPU sparse memory
   // allocation succeeded if needed. While uploading, MakeRangeValid must be
   // called for each successfully uploaded range as early as possible, before
@@ -152,6 +218,17 @@ class SharedMemory {
   // overall bounds of pages to be uploaded.
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+
+ public:
+  // For starting a frame trace: invalidates everything not written by the GPU,
+  // so the frame uploads again what it uses, and fills
+  // trace_download_ranges() with the GPU-written byte ranges to download.
+  void PrepareForTraceDownload();
+  void ReleaseTraceDownloadRanges();
+  const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() const {
+    return trace_download_ranges_;
+  }
+  uint32_t trace_download_page_count() const { return trace_download_page_count_; }
 
  private:
   memory::Memory& memory_;
@@ -174,6 +251,39 @@ class SharedMemory {
   // persistently allocated vector).
   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
 
+  // Upload hashing (see EnableUploadHashing). Only used on the GPU thread.
+  bool upload_hashing_enabled_ = false;
+  bool upload_skip_unchanged_ = false;
+  std::vector<uint64_t> page_upload_hashes_;
+  // Pages whose entry in page_upload_hashes_ is the hash of what the buffer
+  // holds.
+  std::vector<uint64_t> page_upload_hash_valid_;
+  bool IsPageUploadHashValid(uint32_t page) const {
+    return upload_hashing_enabled_ && ((page_upload_hash_valid_[page >> 6] >> (page & 63)) & 1);
+  }
+  uint64_t HashPage(uint32_t page) const;
+  // shared_memory_hash_threads: calls work(begin, end) over the pages, on the
+  // workers too when there are enough pages.
+  class HashWorkers;
+  std::unique_ptr<HashWorkers> hash_workers_;
+  void HashPages(uint32_t page_first, uint32_t page_count,
+                 const std::function<void(uint32_t, uint32_t)>& work);
+  void InvalidateUploadHashes(uint32_t page_first, uint32_t page_last);
+  // Counts upload_ranges_ for the statistics and compares the pages that have
+  // a hash. With skipping, makes the unchanged ones valid without a copy and
+  // drops them from upload_ranges_; returns whether pages left in
+  // upload_ranges_ were made valid before their copy.
+  bool FilterUnchangedUploads(bool gather_stats);
+  std::vector<std::pair<uint32_t, uint32_t>> unchanged_filter_ranges_;
+  std::vector<uint8_t> unchanged_filter_flags_;
+
+  bool upload_stats_enabled_ = false;
+  UploadStats upload_stats_;
+  // The frame (hot_page_frame_) each page was last uploaded in, for the
+  // statistics; allocated when first needed.
+  std::vector<uint32_t> page_stats_upload_frame_;
+  void CountUploads(RequestKind kind);
+
   // Mutex between the guest memory subsystem and the command processor, to be
   // locked when checking or updating validity of pages/ranges and when firing
   // watches.
@@ -183,10 +293,57 @@ class SharedMemory {
   // Things below should be fully protected by global_critical_region.
   // ***************************************************************************
 
+  // Hot pages (see EnableHotPages). A page becomes hot after being uploaded
+  // after a CPU write in kHotPageUploadStreak frames in a row (uploads after
+  // clear_memory_page_state's per-frame reset don't count, they would make
+  // every page used in a frame hot), and stops being hot when unchanged or
+  // not requested for kHotPageIdleFrames, when watched, or when written by the
+  // GPU. Hot pages are never valid. The state only changes on the GPU thread,
+  // in the global critical region; the GPU thread may read it outside of it.
+  static constexpr uint8_t kHotPageUploadStreak = 3;
+  static constexpr uint32_t kHotPageIdleFrames = 120;
+  // Frames between checks for hot pages that are no longer requested.
+  static constexpr uint32_t kHotPageSweepFrames = 64;
+  // Memory for the shadow copies.
+  static constexpr uint32_t kMaxHotPageBytes = 64 * 1024 * 1024;
+  bool hot_pages_enabled_ = false;
+  uint32_t hot_page_frame_ = 1;
+  std::vector<uint64_t> hot_pages_;
+  uint32_t hot_page_count_ = 0;
+  // Only used on the GPU thread, so changed outside the global critical region.
+  uint32_t hot_page_sync_point_ = 1;
+  // For hot pages, the last frame they were requested in; for other pages, the
+  // last frame they were uploaded in after a CPU write.
+  std::vector<uint32_t> page_last_upload_frame_;
+  std::vector<uint32_t> page_last_change_frame_;
+  std::vector<uint8_t> page_upload_streak_;
+  // For hot pages, the sync point they were last compared at.
+  std::vector<uint32_t> page_last_compare_sync_point_;
+  // Pages invalidated by a CPU write since their last upload.
+  std::vector<uint64_t> page_cpu_written_;
+  std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> hot_page_shadows_;
+  std::vector<std::pair<uint32_t, uint32_t>> hot_page_upload_ranges_;
+  bool IsPageHot(uint32_t page) const {
+    return hot_pages_enabled_ && ((hot_pages_[page >> 6] >> (page & 63)) & 1);
+  }
+  // The functions below must be called in the global critical region.
+  bool IsPageWatched(uint32_t page) const;
+  // Makes the pages in the range normal again and protects them.
+  void DemoteHotPages(uint32_t page_first, uint32_t page_last);
+  // Compares requested hot pages with their shadow copies, dropping unchanged
+  // ones from upload_ranges_, and makes pages hot.
+  void FilterHotPageUploads(const std::unique_lock<std::recursive_mutex>& global_lock);
+
   // Pages whose contents in the buffer are in sync with guest memory.
   std::vector<uint64_t> system_page_flags_valid_;
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
+  // Pages invalidated by something other than clear_memory_page_state's
+  // frame-end reset since they were last made valid (upload statistics).
+  std::vector<uint64_t> page_invalidated_;
+  // GPU-written byte ranges for a frame trace: <start, length>.
+  std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
+  uint32_t trace_download_page_count_ = 0;
   uint32_t num_system_page_flags_ = 0;
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(

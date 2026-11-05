@@ -361,7 +361,16 @@ std::vector<uint32_t> gapFillCodeRegions(CodegenContext& ctx, const std::vector<
         addr += 4;
       }
 
-      for (const auto& segment : splitOnFlowEnds(decoded, runStart, addr)) {
+      for (auto segment : splitOnFlowEnds(decoded, runStart, addr)) {
+        // Null padding after a function: what follows can still be one.
+        while (segment.start < segment.end) {
+          const uint8_t* data = binary.translate(segment.start);
+          if (!data || load_and_swap<uint32_t>(data) != 0)
+            break;
+          segment.start += 4;
+        }
+        if (segment.start >= segment.end)
+          continue;
         if (graph.isEntryPoint(segment.start) || rejected.contains(segment.start))
           continue;
         if (looksLikeExceptionData(binary, graph, segment.start))

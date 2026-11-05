@@ -96,9 +96,12 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   }
   instance_ = this;
 
-  auto fail = [this](X_STATUS status, std::string_view reason) {
+  // Adopted first: the app's window and drawers use its presenter, so a failure at
+  // any step must not free it with `config`.
+  graphics_system_ = std::move(config.graphics);
+
+  auto fail = [](X_STATUS status, std::string_view reason) {
     REXSYS_ERROR("Runtime::Setup failed: {}", reason);
-    Shutdown();
     return status;
   };
 
@@ -180,8 +183,7 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   }
 
   // Initialize GPU from injected config
-  if (config.graphics) {
-    graphics_system_ = std::move(config.graphics);
+  if (graphics_system_) {
     bool with_presentation = (app_context_ != nullptr);
     X_STATUS gpu_status = graphics_system_->Setup(function_dispatcher_.get(), kernel_state_.get(),
                                                   app_context_, with_presentation);
@@ -210,7 +212,6 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
                                                      image_info.image_base, image_info.image_size,
                                                      /*is_entrypoint=*/true)) {
     REXSYS_ERROR("Failed to initialize function table");
-    Shutdown();
     return X_STATUS_UNSUCCESSFUL;
   }
 
@@ -238,7 +239,6 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
                  duplicates, rejected);
     if (rejected > 0) {
       REXSYS_ERROR("PPCImageInfo registration: {} func_mappings entries rejected", rejected);
-      Shutdown();
       return X_STATUS_UNSUCCESSFUL;
     }
   }

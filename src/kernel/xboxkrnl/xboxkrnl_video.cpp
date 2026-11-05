@@ -51,12 +51,28 @@ REXCVAR_DEFINE_DOUBLE(kernel_display_gamma_power, 2.22222233, "Kernel",
 
 namespace {
 
+// The console never reports more, and titles size EDRAM tiles from the mode. The
+// window keeps the larger size; resolution_scale carries the picture to it.
+constexpr double kMaxGuestVideoModeWidth = 1920.0;
+constexpr double kMaxGuestVideoModeHeight = 1080.0;
+
 void ConfiguredVideoMode(uint32_t& width, uint32_t& height) {
   int32_t configured_width = REXCVAR_GET(video_mode_width);
   int32_t configured_height = REXCVAR_GET(video_mode_height);
-  if (!rex::cvar::HasNonDefaultValue("video_mode_width") &&
-      !rex::cvar::HasNonDefaultValue("video_mode_height")) {
+  // Both need a restart, and this runs every frame: a lookup takes the registry
+  // lock and formats the value.
+  static const bool size_follows_window = !rex::cvar::HasNonDefaultValue("video_mode_width") &&
+                                          !rex::cvar::HasNonDefaultValue("video_mode_height");
+  if (size_follows_window) {
     rex::graphics::video_mode_util::ResolveConfiguredSize(configured_width, configured_height);
+    if (configured_width > kMaxGuestVideoModeWidth ||
+        configured_height > kMaxGuestVideoModeHeight) {
+      // Keeps the window's shape. video_mode_width / height stay uncapped.
+      const double scale = std::min(kMaxGuestVideoModeWidth / configured_width,
+                                    kMaxGuestVideoModeHeight / configured_height);
+      configured_width = int32_t(configured_width * scale) & ~1;
+      configured_height = int32_t(configured_height * scale) & ~1;
+    }
   }
   width = uint32_t(std::clamp(configured_width, 640, 0x0FFF));
   height = uint32_t(std::clamp(configured_height, 480, 0x0FFF));
@@ -227,12 +243,13 @@ void VdQueryVideoMode(X_VIDEO_MODE* video_mode) {
   video_mode->display_width = display_width;
   video_mode->display_height = display_height;
   video_mode->is_interlaced = 0;
-  video_mode->is_widescreen = display_width * 3 >= display_height * 4;
+  // Wider than 4:3: 640x480 and 1024x768 are standard modes.
+  video_mode->is_widescreen = display_width * 3 > display_height * 4;
   video_mode->is_hi_def = display_width >= 1280 || display_height >= 720;
   video_mode->refresh_rate = refresh_rate_hz;
   video_mode->video_standard = 1;  // NTSC
   video_mode->unknown_0x8a = 0x4A;
-  video_mode->unknown_0x01 = 0x01;
+  video_mode->unknown_0x01 = video_mode->is_widescreen ? 0x01 : 0x03;  // As canary.
 }
 
 void VdQueryVideoMode_entry(ppc_ptr_t<X_VIDEO_MODE> video_mode) {

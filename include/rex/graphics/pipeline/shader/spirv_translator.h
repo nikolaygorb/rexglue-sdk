@@ -97,6 +97,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // Strip NoContraction from the pixel shader (spirv_pixel_shader_no_contraction false).
+      uint32_t contraction_allowed : 1;
       // For host render targets with MIN/MAX blend op - the source blend factor
       // to pre-multiply the shader output by (since Vulkan/D3D12 MIN/MAX
       // ignores blend factors, but Xbox 360 applies them). kOne means no
@@ -438,6 +440,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool signed_zero_inf_nan_preserve_float32;
     bool denorm_flush_to_zero_float32;
     bool rounding_mode_rte_float32;
+    bool rounding_mode_rtz_float32 = false;
 
     bool fragment_shader_sample_interlock;
 
@@ -742,6 +745,33 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Reduces finite host approximations to a chosen mantissa width.
   // We still don't know the exact precision or rounding.
   spv::Id ReduceFloatPrecision(spv::Id value, uint32_t mantissa_bits);
+  enum class ScalarEstimateOp : uint32_t {
+    kRcp,
+    kRsq,
+    kSqrt,
+    kExp,
+    kLog,
+  };
+  // The scalar op of a float, the same as xenos::Rcp, Rsq, Sqrt, Exp or Log for
+  // rounding-sensitive vertex shader results, and the host's, reduced to 21
+  // mantissa bits, elsewhere where the extra instructions cost too much.
+  spv::Id ScalarEstimate(ScalarEstimateOp op, spv::Id value);
+  // Whether vulkan_exact_vertex_math rounds the ALU operation being translated
+  // toward zero. Only in vertex shaders since the extra instructions per
+  // operation are too slow per pixel, and unless the rounding mode does it, only
+  // for rounding-sensitive results since they're too slow for all.
+  bool RoundsTowardZero() const;
+  // Whether the shader's rounding mode does it for the whole vertex shader, with
+  // no extra instructions.
+  bool RoundsTowardZeroInHardware() const;
+  // Guest ALU sums and products of floats or float vectors, rounded toward zero
+  // if RoundsTowardZero.
+  spv::Id AluAdd(spv::Id a, spv::Id b);
+  spv::Id AluSubtract(spv::Id a, spv::Id b);
+  spv::Id AluMultiply(spv::Id a, spv::Id b);
+  // Steps a sum or product of a and b rounded to nearest toward zero if its
+  // exact error shows it rounded away, and saturates overflow.
+  spv::Id RoundTowardZero(spv::Id rounded, spv::Id error, spv::Id a, spv::Id b);
   spv::Id ProcessScalarAluOperation(const ParsedAluInstruction& instr,
                                     uint8_t memexport_eM_potentially_written_before,
                                     bool& predicate_written);
@@ -1107,8 +1137,34 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // float3.
   spv::Id var_main_tfetch_gradients_h_;
   spv::Id var_main_tfetch_gradients_v_;
+  // uint4[32] coefficients for ScalarEstimate, created on first use.
+  std::array<spv::Id, size_t(ScalarEstimateOp::kLog) + 1> var_main_estimate_coefficients_;
   // float4[register_count()].
   spv::Id var_main_registers_;
+
+  // Guest instruction bisect (shader_bisect_*), snapshotting a register to
+  // color 0.
+  bool BisectTargetsCurrentShader() const;
+  // Counts the instruction; true if shader_bisect_cut drops it.
+  bool BisectSkipsInstruction();
+  void BisectSnapshotAfterInstruction();
+  void BisectStoreSnapshot();
+  void BisectOverrideColorOutput();
+  // Snapshots the register once the instruction being translated is done,
+  // whichever way its translation returns.
+  class BisectInstructionScope {
+   public:
+    explicit BisectInstructionScope(SpirvShaderTranslator& translator) : translator_(translator) {}
+    ~BisectInstructionScope() { translator_.BisectSnapshotAfterInstruction(); }
+
+   private:
+    SpirvShaderTranslator& translator_;
+  };
+  uint32_t bisect_instruction_index_;
+  uint32_t bisect_current_instruction_;
+  bool bisect_snapshot_emitted_;
+  // float4 holding the watched register at the chosen instruction.
+  spv::Id var_main_bisect_snapshot_;
   // Memory export variables are created only when needed.
   // float4.
   spv::Id var_main_memexport_address_;
@@ -1222,6 +1278,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // the exec-level predicate value, and can't merge two execs with the same
   // predicate condition anymore.
   bool cf_exec_predicate_written_;
+
+  // Whether the result of the ALU operation being translated is
+  // rounding-sensitive (see Shader::IsAluVectorResultRoundingSensitive).
+  bool alu_op_result_rounding_sensitive_ = false;
 };
 
 }  // namespace rex::graphics

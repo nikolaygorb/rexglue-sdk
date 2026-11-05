@@ -20,6 +20,7 @@
 #include <unordered_map>
 
 #include <CLI/CLI.hpp>
+#include <fmt/format.h>
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
@@ -603,6 +604,89 @@ std::vector<std::string> ListModifiedFlags() {
   return result;
 }
 
+std::string RedactHomePath(std::string_view value, std::string_view home) {
+  const auto is_slash = [](char c) { return c == '/' || c == '\\'; };
+  while (!home.empty() && is_slash(home.back())) {
+    home.remove_suffix(1);
+  }
+  if (home.empty()) {
+    return std::string(value);
+  }
+  const auto fold = [](char c) {
+    return c == '\\' ? '/' : char(std::tolower(static_cast<unsigned char>(c)));
+  };
+  std::string result;
+  result.reserve(value.size());
+  size_t pos = 0;
+  while (pos < value.size()) {
+    const size_t end = pos + home.size();
+    if (end <= value.size() && (end == value.size() || is_slash(value[end])) &&
+        std::equal(home.begin(), home.end(), value.begin() + pos,
+                   [&](char a, char b) { return fold(a) == fold(b); })) {
+      result += '~';
+      pos = end;
+    } else {
+      result += value[pos++];
+    }
+  }
+  return result;
+}
+
+std::vector<std::string> DescribeFlags(bool modified) {
+  auto home = rex::platform::env::get("USERPROFILE");
+  if (!home) {
+    home = rex::platform::env::get("HOME");
+  }
+  const auto source_name = [](const FlagEntry& entry, bool entry_modified) -> std::string_view {
+    switch (entry.source) {
+      case Source::kConfig:
+        return "config";
+      case Source::kEnvironment:
+        return "environment";
+      case Source::kCommandLine:
+        return "command line";
+      case Source::kRuntime:
+        return "runtime";
+      default:
+        // REXCVAR_SET writes the value without going through a source.
+        return entry_modified ? "code" : "default";
+    }
+  };
+
+  std::lock_guard lock(GetRegistryMutex());
+  std::vector<std::string> result;
+  for (const auto& entry : GetRegistryStorage()) {
+    if (entry.type == FlagType::Command) {
+      continue;
+    }
+    std::string value = entry.getter();
+    const bool entry_modified = value != entry.default_value;
+    if (entry_modified != modified) {
+      continue;
+    }
+    if (entry.name.find("gamertag") != std::string::npos) {
+      value = "<hidden>";
+    } else if (home) {
+      value = RedactHomePath(value, *home);
+    }
+    result.push_back(
+        fmt::format("{} = {} ({})", entry.name, value, source_name(entry, entry_modified)));
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+
+void LogFlags() {
+  const auto modified = DescribeFlags(true);
+  REXLOG_INFO("Config: {} setting(s) changed from their defaults", modified.size());
+  for (const auto& line : modified) {
+    REXLOG_INFO("  {}", line);
+  }
+  for (const auto& line : DescribeFlags(false)) {
+    REXLOG_DEBUG("  {}", line);
+  }
+}
+
 namespace {
 
 // Quote a string value as a single-line TOML basic string, escaping backslashes,
@@ -902,6 +986,11 @@ void SaveConfig(const std::filesystem::path& config_path) {
   }
 
   try {
+    if (config_path.has_parent_path()) {
+      // A failure here shows up as the open failure below.
+      std::error_code create_ec;
+      std::filesystem::create_directories(config_path.parent_path(), create_ec);
+    }
     // Write to a temporary sibling and rename it over the target, so an
     // interrupted write (crash, power loss, full disk) cannot leave a truncated
     // config behind.

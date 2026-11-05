@@ -23,3 +23,13 @@ TEST_CASE("utf8_upper_ascii raises ASCII letters only", "[utf8]") {
   CHECK(rex::string::utf8_upper_ascii("\xC3\xA6" "ble \xC3\xA5" "b") ==
         "\xC3\xA6" "BLE \xC3\xA5" "B");
 }
+
+TEST_CASE("utf8_ends_with_case matches a suffix in any case", "[utf8]") {
+  CHECK(rex::string::utf8_ends_with_case("xenonjklatin.xttp", ".xttp"));
+  CHECK(rex::string::utf8_ends_with_case("aac.xexp", ".XEXP"));
+  CHECK(rex::string::utf8_ends_with_case("foo", "foo"));
+  CHECK(rex::string::utf8_ends_with_case("foo", ""));
+  CHECK_FALSE(rex::string::utf8_ends_with_case("foo.xttp", ".xex"));
+  CHECK_FALSE(rex::string::utf8_ends_with_case("foo", "o.foo"));
+  CHECK_FALSE(rex::string::utf8_ends_with_case("", "foo"));
+}

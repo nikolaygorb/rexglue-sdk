@@ -41,6 +41,7 @@
 #include <rex/system/xex_identity.h>
 #include <rex/system/xex_module.h>
 #include <rex/system/xthread.h>
+#include <rex/ui/gpu_trace_replay.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
@@ -302,12 +303,19 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 
   auto status = runtime_->Setup(ppc_info_, std::move(config_));
   if (XFAILED(status)) {
-    REXLOG_ERROR("Runtime setup failed: {:08X}", status);
+    auto msg = fmt::format("Runtime setup failed: {:08X}. See log for details.", status);
+    REXLOG_ERROR("{}", msg);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
 
   if (window_ && runtime_->input_system()) {
     static_cast<rex::input::InputSystem*>(runtime_->input_system())->AttachWindow(window_.get());
+  }
+
+  // A trace has everything the GPU reads: no title to load.
+  if (rex::ui::IsGpuTraceReplay()) {
+    return true;
   }
 
   if (ppc_info_.register_modules) {
@@ -386,16 +394,22 @@ bool ReXApp::SetupPresentation() {
 
   OnPreSetup(config_);
 
-  if (!config_.graphics && !config_.gpu_plugin.empty()) {
+  const bool load_gpu_plugin = !config_.graphics && !config_.gpu_plugin.empty();
+  if (load_gpu_plugin) {
     config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
-    if (!config_.graphics) {
-      // Fatal by design: no silent headless fallback.
-      auto msg =
-          fmt::format("Failed to load GPU plugin '{}'. See log for details.", config_.gpu_plugin);
-      REXLOG_ERROR("{}", msg);
-      rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
-      return false;
-    }
+  }
+
+  // After the plugin, whose cvars only exist once it is loaded, and before
+  // anything can fail, so that a report of a failed start has the settings.
+  rex::cvar::LogFlags();
+
+  if (load_gpu_plugin && !config_.graphics) {
+    // Fatal by design: no silent headless fallback.
+    auto msg =
+        fmt::format("Failed to load GPU plugin '{}'. See log for details.", config_.gpu_plugin);
+    REXLOG_ERROR("{}", msg);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+    return false;
   }
 
   if (config_.graphics) {
@@ -440,6 +454,8 @@ bool ReXApp::SetupPresentation() {
     window_->SetFullscreen(rex::string::from_string<bool>(value, false));
   });
   on_window_cvar("fullscreen_exclusive",
+                 [this](std::string_view) { window_->RefreshFullscreen(); });
+  on_window_cvar("fullscreen_refresh_rate",
                  [this](std::string_view) { window_->RefreshFullscreen(); });
   on_window_cvar("monitor", [this](std::string_view value) {
     window_->SetMonitor(rex::string::from_string<int32_t>(value, 0));
@@ -518,6 +534,12 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
   });
+  rex::ui::RegisterBind("bind_gpu_trace", "F10", "Record a GPU frame trace into trace_gpu_prefix",
+                        [this] {
+                          if (runtime_ && runtime_->graphics_system()) {
+                            runtime_->graphics_system()->RequestFrameTrace();
+                          }
+                        });
   rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
     if (achievements_overlay_) {
       achievements_overlay_.reset();
@@ -531,6 +553,17 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
 
 void ReXApp::LaunchModule() {
   app_context().CallInUIThreadDeferred([this]() {
+    if (rex::ui::IsGpuTraceReplay()) {
+      module_thread_ = std::thread([this]() {
+        auto* graphics_system = runtime_->graphics_system();
+        const int exit_code = graphics_system ? rex::ui::RunGpuTraceReplay(*graphics_system) : 2;
+        // As OnClosing: no subsystem teardown.
+        rex::FlushLogging();
+        std::_Exit(exit_code);
+      });
+      return;
+    }
+
     // Register the achievement notification callback now that the runtime and
     // KernelState are guaranteed to exist. Done here (not OnCreateDialogs)
     // because KernelState is null during SetupPresentation.
@@ -668,6 +701,7 @@ void ReXApp::OnDestroy() {
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
   rex::ui::UnregisterBind("bind_achievements");
+  rex::ui::UnregisterBind("bind_gpu_trace");
 
   // ImGui cleanup (reverse of setup)
   if (achievement_notification_listener_ != 0) {

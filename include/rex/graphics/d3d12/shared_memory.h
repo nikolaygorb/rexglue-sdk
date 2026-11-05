@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <rex/graphics/shared_memory.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/memory.h>
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
@@ -66,6 +67,11 @@ class D3D12SharedMemory : public SharedMemory {
     }
   }
 
+  // For frame traces. The first returns true if downloads were submitted, to
+  // be completed by the second after awaiting the queue.
+  bool InitializeTraceSubmitDownloads();
+  void InitializeTraceCompleteDownloads(TraceWriter& trace_writer);
+
   void WriteRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void WriteRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
 
@@ -98,6 +104,10 @@ class D3D12SharedMemory : public SharedMemory {
   D3D12_CPU_DESCRIPTOR_HANDLE buffer_descriptor_heap_start_;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> upload_buffer_pool_;
+
+  // For frame traces, created only while downloading.
+  ID3D12Resource* trace_download_buffer_ = nullptr;
+  void ResetTraceDownload();
 };
 
 }  // namespace rex::graphics::d3d12

@@ -29,6 +29,8 @@
 #include <rex/codegen/output_stamp.h>
 #include <rex/codegen/progress_reporter.h>
 #include <rex/codegen/template_registry.h>
+#include <rex/filesystem.h>
+#include <rex/hash.h>
 #include <rex/kernel/init.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -77,10 +79,22 @@ std::vector<std::filesystem::path> CollectModuleInputs(const RecompilerConfig& c
   return inputs;
 }
 
+// The generator's own code decides what it emits, and sdkVersion stays the same
+// across commits, so the running binary is part of the fingerprint: a rebuilt
+// rexglue (rexcodegen links into it statically) regenerates its modules.
+const std::string& GeneratorBinaryHash() {
+  static const std::string hash = [] {
+    std::string digest = rex::hash_file(rex::filesystem::GetExecutablePath());
+    return digest.empty() ? std::string("<unreadable>") : digest;
+  }();
+  return hash;
+}
+
 std::string FingerprintModule(const RecompilerConfig& cfg,
                               std::span<const std::filesystem::path> inputs,
                               std::string_view sdkVersion) {
   std::vector<std::string> flags{
+      fmt::format("generator={}", GeneratorBinaryHash()),
       fmt::format("templates={}", EmbeddedTemplatesHash()),
       fmt::format("generate_exception_handlers={}", cfg.generateExceptionHandlers),
       fmt::format("max_jump_extension={}", cfg.maxJumpExtension),

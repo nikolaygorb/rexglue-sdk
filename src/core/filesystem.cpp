@@ -20,8 +20,9 @@ namespace filesystem {
 bool CreateParentFolder(const std::filesystem::path& path) {
   if (path.has_parent_path()) {
     auto parent_path = path.parent_path();
-    if (!std::filesystem::exists(parent_path)) {
-      return std::filesystem::create_directories(parent_path);
+    std::error_code ec;
+    if (!std::filesystem::exists(parent_path, ec)) {
+      return std::filesystem::create_directories(parent_path, ec);
     }
   }
   return true;

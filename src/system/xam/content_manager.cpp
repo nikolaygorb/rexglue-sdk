@@ -72,8 +72,19 @@ ContentPackage::~ContentPackage() {
   fs->UnregisterDevice(device_path_);
 }
 
+namespace {
+
+// A folder the host refuses (Controlled Folder Access, a sleeping drive) reads as
+// missing: the throwing forms ended the title with 0xC0000409.
+bool PathExists(const std::filesystem::path& path) {
+  std::error_code ec;
+  return std::filesystem::exists(path, ec);
+}
+
+}  // namespace
+
 void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_path) {
-  if (!std::filesystem::exists(header_path)) {
+  if (!PathExists(header_path)) {
     return;
   }
 
@@ -82,8 +93,9 @@ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_p
     return;
   }
 
-  auto file_size = std::filesystem::file_size(header_path);
-  if (file_size < sizeof(XCONTENT_AGGREGATE_DATA) + sizeof(license_)) {
+  std::error_code ec;
+  auto file_size = std::filesystem::file_size(header_path, ec);
+  if (ec || file_size < sizeof(XCONTENT_AGGREGATE_DATA) + sizeof(license_)) {
     fclose(file);
     return;
   }
@@ -232,7 +244,7 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     return nullptr;
   }
   auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  if (!PathExists(package_path)) {
     return nullptr;
   }
   auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
@@ -244,7 +256,7 @@ bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA&
     return false;
   }
   auto path = ResolvePackagePath(xuid, data);
-  return std::filesystem::exists(path);
+  return PathExists(path);
 }
 
 X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGATE_DATA data,
@@ -264,8 +276,9 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
   auto parent_path = header_path.parent_path();
 
-  if (!std::filesystem::exists(parent_path)) {
-    if (!std::filesystem::create_directories(parent_path)) {
+  if (!PathExists(parent_path)) {
+    std::error_code ec;
+    if (!std::filesystem::create_directories(parent_path, ec)) {
       return X_ERROR_ACCESS_DENIED;
     }
   }
@@ -290,7 +303,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
   auto header_file_path = ResolvePackageHeaderPath(file_name, xuid, title_id, content_type);
   constexpr uint32_t header_size = sizeof(XCONTENT_AGGREGATE_DATA);
 
-  if (!std::filesystem::exists(header_file_path)) {
+  if (!PathExists(header_file_path)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
 
@@ -299,8 +312,9 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
     return X_ERROR_FILE_NOT_FOUND;
   }
 
-  auto file_size = std::filesystem::file_size(header_file_path);
-  if (file_size < header_size) {
+  std::error_code ec;
+  auto file_size = std::filesystem::file_size(header_file_path, ec);
+  if (ec || file_size < header_size) {
     fclose(file);
     return X_ERROR_FILE_NOT_FOUND;
   }
@@ -333,10 +347,11 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
     return name_result;
   }
   auto package_path = ResolvePackagePath(xuid, data);
-  if (std::filesystem::exists(package_path)) {
+  if (PathExists(package_path)) {
     return X_ERROR_ALREADY_EXISTS;
   }
-  if (!std::filesystem::create_directories(package_path)) {
+  std::error_code ec;
+  if (!std::filesystem::create_directories(package_path, ec)) {
     return X_ERROR_ACCESS_DENIED;
   }
   auto package = ResolvePackage(root_name, xuid, data);
@@ -369,7 +384,7 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
     return name_result;
   }
   auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  if (!PathExists(package_path)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
   auto package = ResolvePackage(root_name, xuid, data);
@@ -414,11 +429,11 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
     return name_result;
   }
   auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  if (!PathExists(package_path)) {
     return X_ERROR_PATH_NOT_FOUND;
   }
   auto thumb_path = package_path / rex::filesystem::kPackageThumbnailFileName;
-  if (std::filesystem::exists(thumb_path)) {
+  if (PathExists(thumb_path)) {
     auto file = rex::filesystem::OpenFile(thumb_path, "rb");
     fseek(file, 0, SEEK_END);
     size_t file_len = ftell(file);
@@ -440,7 +455,7 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
   }
   auto package_path = ResolvePackagePath(xuid, data);
   // The content must exist; setting a thumbnail does not create it.
-  if (!std::filesystem::exists(package_path)) {
+  if (!PathExists(package_path)) {
     return X_ERROR_PATH_NOT_FOUND;
   }
   auto file = rex::filesystem::OpenFile(
@@ -450,6 +465,42 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
   }
   fwrite(buffer.data(), 1, buffer.size(), file);
   fclose(file);
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT ContentManager::TruncateContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  auto global_lock = global_critical_region_.Acquire();
+
+  if (const X_RESULT name_result = CheckPackageName(data)) {
+    return name_result;
+  }
+  auto package_path = ResolvePackagePath(xuid, data);
+  if (IsContentOpen(package_path)) {
+    return X_ERROR_SHARING_VIOLATION;
+  }
+  std::error_code ec;
+  // A package stored as a container file becomes an empty directory.
+  if (!std::filesystem::is_directory(package_path, ec)) {
+    if (!std::filesystem::remove(package_path, ec) ||
+        !std::filesystem::create_directory(package_path, ec)) {
+      return X_ERROR_ACCESS_DENIED;
+    }
+    return X_ERROR_SUCCESS;
+  }
+  std::vector<std::filesystem::path> entries;
+  for (const auto& entry : std::filesystem::directory_iterator(package_path, ec)) {
+    if (entry.path().filename() != rex::filesystem::kPackageThumbnailFileName) {
+      entries.push_back(entry.path());
+    }
+  }
+  if (ec) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  for (const auto& entry : entries) {
+    if (std::filesystem::remove_all(entry, ec) == static_cast<uintmax_t>(-1)) {
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }
   return X_ERROR_SUCCESS;
 }
 
@@ -678,7 +729,7 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
 }
 
 X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {
-  if (!std::filesystem::exists(package_path)) {
+  if (!PathExists(package_path)) {
     return X_ERROR_FILE_NOT_FOUND;
   }
 

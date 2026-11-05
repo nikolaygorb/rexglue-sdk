@@ -19,6 +19,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
@@ -128,6 +129,13 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader,
     } else {
       assert_true(vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32);
       index_buffer_base &= ~uint32_t(sizeof(uint32_t) - 1);
+    }
+    if (TraceWriter* trace = TraceWriter::active()) {
+      uint32_t index_count =
+          std::min(uint32_t(vgt_draw_initiator.num_indices), uint32_t(vgt_dma_size.num_words));
+      trace->WriteMemoryRead(
+          index_buffer_base,
+          index_count << (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16 ? 1 : 2));
     }
     index_buffer = memory_.TranslatePhysical(index_buffer_base);
   }

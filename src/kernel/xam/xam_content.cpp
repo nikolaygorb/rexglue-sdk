@@ -120,6 +120,18 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
 
 enum class kDispositionState : uint32_t { Unknown = 0, Create = 1, Open = 2 };
 
+// A request with an overlapped completes it with ERROR_FUNCTION_FAILED and its
+// error as an HRESULT, or with success.
+static X_RESULT CompleteRequest(mapped_void overlapped_ptr, X_RESULT result) {
+  if (!overlapped_ptr) {
+    return result;
+  }
+  REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
+      overlapped_ptr.guest_address(), result ? X_ERROR_FUNCTION_FAILED : X_ERROR_SUCCESS,
+      X_HRESULT_FROM_WIN32(result), 0);
+  return X_ERROR_IO_PENDING;
+}
+
 u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void content_data_ptr,
                        u32 content_data_size, u32 flags, mapped_u32 disposition_ptr,
                        mapped_u32 license_mask_ptr, u32 cache_size, u64 content_size,
@@ -154,8 +166,9 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
   // which threw utf8::invalid_utf8 out of the deferred call and tripped
   // REX_FATAL. Own the bytes so the deferred run sees the name it was given.
   auto run = [content_manager, xuid, root_name = std::string(root_name.value()), flags,
-              content_data, disposition_ptr,
-              license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+              content_data, disposition_ptr, license_mask_ptr,
+              has_overlapped = bool(overlapped_ptr)](uint32_t& extended_error,
+                                                     uint32_t& length) -> X_RESULT {
     // A name FATX refuses fails before any root is closed or content deleted;
     // so does a root name the UTF-8 helpers would throw on.
     X_RESULT name_result = rex::system::xam::ContentManager::CheckRootName(root_name);
@@ -168,7 +181,7 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
       }
       extended_error = X_HRESULT_FROM_WIN32(name_result);
       length = 0;
-      return name_result;
+      return has_overlapped ? X_ERROR_FUNCTION_FAILED : name_result;
     }
 
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
@@ -211,15 +224,14 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         }
         break;
       case 5:  // TRUNCATE_EXISTING
-               // Fail if doesn't exist, if does exist delete and recreate.
+               // Fail if doesn't exist, if does exist empty and open it.
         if (!content_manager->ContentExists(xuid, content_data)) {
           result = X_ERROR_PATH_NOT_FOUND;
         } else {
           content_manager->CloseContent(root_name);
-          if (content_manager->DeleteContent(xuid, content_data) != X_ERROR_SUCCESS) {
-            result = X_ERROR_ACCESS_DENIED;
-          } else {
-            disposition = kDispositionState::Create;
+          result = content_manager->TruncateContent(xuid, content_data);
+          if (!result) {
+            disposition = kDispositionState::Open;
           }
         }
         break;
@@ -248,6 +260,9 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);
+    if (result && has_overlapped) {
+      result = X_ERROR_FUNCTION_FAILED;
+    }
     return result;
   };
 
@@ -291,26 +306,20 @@ u32 XamContentOpenFile_entry(u32 user_index, mapped_string root_name, mapped_str
 }
 
 u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
-  X_RESULT result = X_ERROR_SUCCESS;
-  if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
-    return X_ERROR_IO_PENDING;
-  } else {
-    return result;
+  if (!root_name || rex::system::xam::ContentManager::CheckRootName(root_name.value())) {
+    return X_ERROR_INVALID_NAME;
   }
+  X_RESULT result = X_ERROR_SUCCESS;
+  return CompleteRequest(overlapped_ptr, result);
 }
 
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
-  // Closes a previously opened root from XamContentCreate*.
-  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
-
-  if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(overlapped_ptr.guest_address(), result,
-                                                      X_HRESULT_FROM_WIN32(result), 0);
-    return X_ERROR_IO_PENDING;
-  } else {
-    return result;
+  if (!root_name || rex::system::xam::ContentManager::CheckRootName(root_name.value())) {
+    return X_ERROR_INVALID_NAME;
   }
+  // Closes a previously opened root from XamContentCreate*.
+  return CompleteRequest(overlapped_ptr,
+                         REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value()));
 }
 
 u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
@@ -347,12 +356,7 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
     }
   }
 
-  if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
-    return X_ERROR_IO_PENDING;
-  } else {
-    return result;
-  }
+  return CompleteRequest(overlapped_ptr, result);
 }
 
 u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
@@ -379,12 +383,7 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
     }
   }
 
-  if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
-    return X_ERROR_IO_PENDING;
-  } else {
-    return result;
-  }
+  return CompleteRequest(overlapped_ptr, result);
 }
 
 u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
@@ -398,12 +397,7 @@ u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
   auto result = REX_KERNEL_STATE()->content_manager()->SetContentThumbnail(xuid, content_data,
                                                                            std::move(buffer));
 
-  if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
-    return X_ERROR_IO_PENDING;
-  } else {
-    return result;
-  }
+  return CompleteRequest(overlapped_ptr, result);
 }
 
 u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
@@ -413,12 +407,7 @@ u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
 
-  if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
-    return X_ERROR_IO_PENDING;
-  } else {
-    return result;
-  }
+  return CompleteRequest(overlapped_ptr, result);
 }
 
 u32 XamContentDeleteInternal_entry(mapped_void content_data_ptr, mapped_void overlapped_ptr) {
@@ -429,12 +418,7 @@ u32 XamContentDeleteInternal_entry(mapped_void content_data_ptr, mapped_void ove
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
 
-  if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
-    return X_ERROR_IO_PENDING;
-  } else {
-    return result;
-  }
+  return CompleteRequest(overlapped_ptr, result);
 }
 
 //=============================================================================

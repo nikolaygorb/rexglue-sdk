@@ -92,6 +92,12 @@ class MnkInputDriver final : public InputDriver,
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
+  // Under state_mutex_: keys that went down since the last GetDeviceState (a
+  // tap released before the poll still counts once), and the order of the
+  // presses (press_seq_ counts them) for opposite stick keys.
+  bool key_tapped_[256] = {};
+  uint32_t key_press_seq_[256] = {};
+  uint32_t press_seq_ = 0;
 
   // Mouse delta tracking. Fractional because relative motion arrives in
   // fractions of a pixel, and truncating each event drops slow movement.

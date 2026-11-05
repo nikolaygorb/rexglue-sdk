@@ -18,6 +18,9 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
+    trace_player.cpp
+    trace_reader.cpp
+    trace_writer.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     util/smaa_textures.cpp

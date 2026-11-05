@@ -19,6 +19,8 @@ project(ReXGlue
 # Build Options
 #==========================================================
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+option(REXGLUE_PPC_CORPUS        "Build the hardware-captured PPC test corpus (170,000 cases, label ppc_corpus)" OFF)
+set(REXGLUE_PPC_CORPUS_DIR "" CACHE PATH "xenia-edge's src/xenia/cpu/ppc/testing, for REXGLUE_PPC_CORPUS")
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer (same as REXGLUE_SANITIZERS=undefined)" OFF)
 set(REXGLUE_SANITIZERS "" CACHE STRING "Comma-separated clang sanitizers: address, undefined")
 option(REXGLUE_BUILD_FUZZERS     "Build libFuzzer targets (tests/fuzz); best with REXGLUE_SANITIZERS=address" OFF)
@@ -47,6 +49,16 @@ endif()
 
 if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
     message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
+endif()
+
+# Guest memory on Windows: the 0xE0000000 view starts 4 KB into physical memory. By default
+# it is mapped there with placeholder views (VirtualAlloc2, MapViewOfFile3), so guest accesses
+# are base + address and the build needs Windows 10 version 1803 or later. This option keeps the
+# path for older Windows: the view is mapped 64 KB-aligned, 4 KB short, and every access at or
+# above 0xE0000000 adds the 0x1000 back (a compare and a select on most of a game's accesses).
+if(WIN32)
+    option(REXGLUE_WIN32_ROUNDED_PHYSICAL_VIEW
+        "Windows before 10 version 1803: add 0x1000 to guest accesses at 0xE0000000 and up" OFF)
 endif()
 
 # D3D11: experimental, Windows only, OFF by default. A third backend of
@@ -144,9 +156,10 @@ if(NOT WIN32)
 endif()
 
 # Global compile options
+# The floating-point model is set per directory further down, next to the
+# add_subdirectory() calls of src/.
 add_compile_options(
     -fno-strict-aliasing
-    -ffp-model=strict
     $<$<CONFIG:DEBUG>:-g>
     $<$<CONFIG:DEBUG>:-O0>
     $<$<CONFIG:RELEASE>:-O3>
@@ -177,6 +190,11 @@ if(WIN32)
         message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
     endif()
     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
+    if(REXGLUE_WIN32_ROUNDED_PHYSICAL_VIEW)
+        # The runtime and every caller of <rex/system/xmemory.h> or the generated code must agree;
+        # rexruntime passes it on to the games (src/system/CMakeLists.txt).
+        add_compile_definitions(REX_WIN32_ROUNDED_PHYSICAL_VIEW=1)
+    endif()
 elseif(UNIX AND NOT APPLE)
     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
@@ -345,16 +363,46 @@ endif()
 
 include_directories(${REXGLUE_ROOT}/include)
 
+# Floating-point model, per directory (a subdirectory copies the options set
+# here when it is added):
+# - core, system and kernel (rexruntime: the kernel's sources join the target
+#   src/system creates) run on guest threads, under the guest's FPSCR in the
+#   host's MXCSR / FPCR: strict, so no floating-point operation is folded under
+#   an assumed rounding mode or moved across a change of the environment.
+# - the SDK's other code: the default model, which lets the compiler fold,
+#   vectorize and move floating-point code, with contraction off so that no
+#   a * b + c becomes a fused multiply-add (ARM64): results as under strict.
+# - thirdparty and the tests: the default model, as the titles' generated code
+#   (REXGLUE_RECOMP_OPTIONS adds none), so the ppc tests check the recompiled
+#   instructions as the titles compile them.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(_rex_fp_host_option /clang:-ffp-contract=off)
+else()
+    set(_rex_fp_host_option -ffp-contract=off)
+endif()
+get_directory_property(_rex_compile_options COMPILE_OPTIONS)
+
+add_compile_options(-ffp-model=strict)
 add_subdirectory(src/core)
+set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_rex_compile_options}")
+
+add_compile_options(${_rex_fp_host_option})
 add_subdirectory(src/filesystem)
 add_subdirectory(src/ui)
 add_subdirectory(src/input)
 add_subdirectory(src/audio)
 add_subdirectory(src/graphics)
+set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_rex_compile_options}")
+
+add_compile_options(-ffp-model=strict)
 add_subdirectory(src/system)
 add_subdirectory(src/kernel)
+set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_rex_compile_options}")
+
+add_compile_options(${_rex_fp_host_option})
 add_subdirectory(src/codegen)
 add_subdirectory(src/rexglue)
+set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_rex_compile_options}")
 
 #==========================================================
 # Built-in shader regeneration (maintainers only)

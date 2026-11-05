@@ -324,6 +324,7 @@ bool build_lwzx(BuilderContext& ctx);
 
 // Doubleword loads
 bool build_ld(BuilderContext& ctx);
+bool build_lq(BuilderContext& ctx);
 bool build_ldu(BuilderContext& ctx);
 bool build_ldx(BuilderContext& ctx);
 bool build_ldux(BuilderContext& ctx);
@@ -380,6 +381,7 @@ bool build_stdbrx(BuilderContext& ctx);
 
 // Floating point stores
 bool build_stfd(BuilderContext& ctx);
+bool build_stfq(BuilderContext& ctx);
 bool build_stfdu(BuilderContext& ctx);
 bool build_stfdux(BuilderContext& ctx);
 bool build_stfdx(BuilderContext& ctx);
@@ -424,6 +426,7 @@ bool build_cctph(BuilderContext& ctx);
 bool build_twi(BuilderContext& ctx);  // Trap word immediate
 bool build_tdi(BuilderContext& ctx);  // Trap doubleword immediate
 bool build_tw(BuilderContext& ctx);   // Trap word register
+bool build_sc(BuilderContext& ctx);   // System call
 bool build_td(BuilderContext& ctx);   // Trap doubleword register
 
 // Cache operations
@@ -450,6 +453,7 @@ bool build_mfxer(BuilderContext& ctx);
 bool build_mfocrf(BuilderContext& ctx);
 bool build_mflr(BuilderContext& ctx);
 bool build_mfmsr(BuilderContext& ctx);
+bool build_mfpvr(BuilderContext& ctx);
 bool build_mffs(BuilderContext& ctx);
 bool build_mftb(BuilderContext& ctx);
 bool build_mftbu(BuilderContext& ctx);

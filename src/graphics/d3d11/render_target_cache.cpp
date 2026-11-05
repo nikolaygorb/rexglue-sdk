@@ -537,7 +537,8 @@ bool D3D11RenderTargetCache::Resolve(const memory::Memory& memory,
           dest_uav = texture_cache.GetCurrentScaledResolveRangeUAV();
         }
       } else if (shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length)) {
+                                            resolve_info.copy_dest_extent_length,
+                                            SharedMemory::RequestKind::kResolve)) {
         dest_uav = shared_memory.GetRawUAV();
       }
       if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,

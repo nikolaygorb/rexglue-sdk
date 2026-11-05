@@ -186,6 +186,19 @@ bool build_ld(BuilderContext& ctx) {
   return true;
 }
 
+bool build_lq(BuilderContext& ctx) {
+  const uint32_t rt = ctx.insn.operands[0];
+  const int32_t offset = static_cast<int32_t>(ctx.insn.operands[1]);
+  const uint32_t ra = ctx.insn.operands[2];
+  for (uint32_t i = 0; i < 2; ++i) {
+    ctx.print("\t{}.u64 = REX_LOAD_U64(", ctx.r(rt + i));
+    if (ra != 0)
+      ctx.print("{}.u32 + ", ctx.r(ra));
+    ctx.println("{});", offset + int32_t(i * 8));
+  }
+  return true;
+}
+
 bool build_ldu(BuilderContext& ctx) {
   emitLoadWithUpdate(ctx, "REX_LOAD_U64");
   return true;
@@ -483,6 +496,19 @@ bool build_stdbrx(BuilderContext& ctx) {
 //=============================================================================
 // Floating Point Stores
 //=============================================================================
+
+bool build_stfq(BuilderContext& ctx) {
+  const uint32_t frs = ctx.insn.operands[0];
+  const int32_t offset = static_cast<int32_t>(ctx.insn.operands[1]);
+  const uint32_t ra = ctx.insn.operands[2];
+  for (uint32_t i = 0; i < 2; ++i) {
+    ctx.print("\tREX_STORE_U64(");
+    if (ra != 0)
+      ctx.print("{}.u32 + ", ctx.r(ra));
+    ctx.println("{}, {}.u64);", offset + int32_t(i * 8), ctx.f(frs + i));
+  }
+  return true;
+}
 
 bool build_stfd(BuilderContext& ctx) {
   ctx.print("{}", ctx.mmio_check_d_form() ? "\tREX_MM_STORE_U64(" : "\tREX_STORE_U64(");

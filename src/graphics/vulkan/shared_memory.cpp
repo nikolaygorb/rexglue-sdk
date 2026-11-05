@@ -45,6 +45,8 @@ VulkanSharedMemory::~VulkanSharedMemory() {
 
 bool VulkanSharedMemory::Initialize() {
   InitializeCommon();
+  EnableHotPages();
+  EnableUploadHashing();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -173,6 +175,8 @@ bool VulkanSharedMemory::Initialize() {
 }
 
 void VulkanSharedMemory::Shutdown(bool from_destructor) {
+  ResetTraceDownload();
+
   upload_buffer_pool_.reset();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -229,6 +233,87 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
   }
   last_written_range_ = written_range;
+}
+
+bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {
+  ResetTraceDownload();
+  PrepareForTraceDownload();
+  uint32_t download_page_count = trace_download_page_count();
+  if (!download_page_count) {
+    return false;
+  }
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          command_processor_.GetVulkanDevice(),
+          VkDeviceSize(download_page_count) << page_size_log2(), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, trace_download_buffer_,
+          trace_download_buffer_memory_, &trace_download_buffer_memory_type_,
+          &trace_download_buffer_memory_size_)) {
+    REXGPU_ERROR("GPU trace: failed to create a {} KB buffer for the memory written by the GPU",
+                 download_page_count << page_size_log2() >> 10);
+    ResetTraceDownload();
+    return false;
+  }
+  Use(Usage::kRead);
+  command_processor_.SubmitBarriers(true);
+  const size_t download_range_count = trace_download_ranges().size();
+  VkBufferCopy* download_regions =
+      command_processor_.deferred_command_buffer().CmdCopyBufferEmplace(
+          buffer_, trace_download_buffer_, uint32_t(download_range_count));
+  VkDeviceSize download_buffer_offset = 0;
+  for (size_t i = 0; i < download_range_count; ++i) {
+    const std::pair<uint32_t, uint32_t>& range = trace_download_ranges()[i];
+    download_regions[i].srcOffset = range.first;
+    download_regions[i].dstOffset = download_buffer_offset;
+    download_regions[i].size = range.second;
+    download_buffer_offset += range.second;
+  }
+  command_processor_.PushBufferMemoryBarrier(
+      trace_download_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+  return true;
+}
+
+void VulkanSharedMemory::InitializeTraceCompleteDownloads(TraceWriter& trace_writer) {
+  if (trace_download_buffer_memory_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  void* mapping;
+  if (dfn.vkMapMemory(device, trace_download_buffer_memory_, 0, VK_WHOLE_SIZE, 0, &mapping) ==
+      VK_SUCCESS) {
+    if (!(vulkan_device->memory_types().host_coherent &
+          (uint32_t(1) << trace_download_buffer_memory_type_))) {
+      VkMappedMemoryRange memory_range = {};
+      memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      memory_range.memory = trace_download_buffer_memory_;
+      memory_range.offset = 0;
+      memory_range.size = VK_WHOLE_SIZE;
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &memory_range);
+    }
+    size_t download_buffer_offset = 0;
+    for (const auto& range : trace_download_ranges()) {
+      trace_writer.WriteMemoryRead(range.first, range.second,
+                                   static_cast<const uint8_t*>(mapping) + download_buffer_offset);
+      download_buffer_offset += range.second;
+    }
+    dfn.vkUnmapMemory(device, trace_download_buffer_memory_);
+  } else {
+    REXGPU_ERROR("GPU trace: failed to map the buffer of the memory written by the GPU");
+  }
+  ResetTraceDownload();
+}
+
+void VulkanSharedMemory::ResetTraceDownload() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, trace_download_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, trace_download_buffer_memory_);
+  trace_download_buffer_memory_type_ = UINT32_MAX;
+  trace_download_buffer_memory_size_ = 0;
+  ReleaseTraceDownloadRanges();
 }
 
 bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -348,9 +433,8 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      CopyPagesForUpload(upload_buffer_mapping, upload_range_start,
+                         uint32_t(upload_buffer_size >> page_size_log2()));
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,

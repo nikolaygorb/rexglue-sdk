@@ -590,8 +590,15 @@ void VulkanQueryPool::FlushCounterClears(DeferredCommandBuffer& deferred_command
                                                1, &ready_barrier, 0, nullptr);
 }
 
-void VulkanQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
-  if (resolve_batch_indices_.empty() && counter_resolve_batch_indices_.empty()) {
+void VulkanQueryPool::TakeResolveBatch(ResolveBatch& batch) {
+  batch.indices.clear();
+  batch.counter_indices.clear();
+  batch.indices.swap(resolve_batch_indices_);
+  batch.counter_indices.swap(counter_resolve_batch_indices_);
+}
+
+void VulkanQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer, ResolveBatch& batch) {
+  if (batch.indices.empty() && batch.counter_indices.empty()) {
     return;
   }
 
@@ -622,9 +629,9 @@ void VulkanQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
 
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
 
-  if (!resolve_batch_indices_.empty()) {
+  if (!batch.indices.empty()) {
     assert_true(fbo_initialized());
-    build_ranges(resolve_batch_indices_);
+    build_ranges(batch.indices);
 
     VkDeviceSize barrier_offset = VK_WHOLE_SIZE;
     VkDeviceSize barrier_end = 0;
@@ -657,13 +664,13 @@ void VulkanQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
                              nullptr);
   }
 
-  if (counter_resolve_batch_indices_.empty()) {
+  if (batch.counter_indices.empty()) {
     return;
   }
 
   assert_true(counter_initialized());
 
-  build_ranges(counter_resolve_batch_indices_);
+  build_ranges(batch.counter_indices);
 
   VkDeviceSize readback_barrier_offset = VK_WHOLE_SIZE;
   VkDeviceSize readback_barrier_end = 0;

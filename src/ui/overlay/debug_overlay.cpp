@@ -71,10 +71,16 @@ void DebugOverlayDialog::OnDraw(ImGuiIO& io) {
                 rex::perf::GetSnapshotCounter(rex::perf::CounterId::kInterruptDispatches));
 
     // Threading
-    ImGui::Text("Threads: %" PRId64 "  APC: %" PRId64 "  Contention: %" PRId64,
+    ImGui::Text("Threads: %" PRId64 "  APC: %" PRId64,
                 rex::perf::GetSnapshotCounter(rex::perf::CounterId::kActiveThreads),
-                rex::perf::GetSnapshotCounter(rex::perf::CounterId::kApcQueueDepth),
-                rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCriticalRegionContentions));
+                rex::perf::GetSnapshotCounter(rex::perf::CounterId::kApcQueueDepth));
+    // Global lock waits this frame, the time they took, and how many ended
+    // while spinning.
+    ImGui::Text(
+        "Global lock: %" PRId64 " waits  %.2f ms  %" PRId64 " spun",
+        rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCriticalRegionContentions),
+        double(rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCriticalRegionWaitUs)) / 1000.0,
+        rex::perf::GetSnapshotCounter(rex::perf::CounterId::kCriticalRegionSpinWins));
 
     // Caches
     auto tex_h = rex::perf::GetSnapshotCounter(rex::perf::CounterId::kTextureCacheHits);

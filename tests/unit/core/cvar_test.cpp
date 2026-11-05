@@ -6,6 +6,7 @@
  * @license     BSD 3-Clause License
  */
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -787,6 +788,18 @@ TEST_CASE("cvar SaveConfig", "[cvar]") {
     std::filesystem::remove(save_path);
   }
 
+  SECTION("SaveConfig creates the folders of a new path") {
+    auto folder = temp_dir / "test_save_config_folder";
+    std::filesystem::remove_all(folder);
+    auto nested_path = folder / "nested" / "config.toml";
+    REXCVAR_SET(test_int32_flag, 778);
+
+    rex::cvar::SaveConfig(nested_path);
+
+    CHECK(std::filesystem::exists(nested_path));
+    std::filesystem::remove_all(folder);
+  }
+
   SECTION("SaveConfig replaces an existing file and leaves no temporary file") {
     {
       std::ofstream old_file(save_path);
@@ -970,5 +983,34 @@ TEST_CASE("cvar InvokeCommand dispatches commands", "[cvar]") {
   }
   SECTION("missing name returns false") {
     CHECK_FALSE(rex::cvar::InvokeCommand("does_not_exist", ""));
+  }
+}
+
+TEST_CASE("RedactHomePath hides the home directory", "[cvar]") {
+  using rex::cvar::RedactHomePath;
+  CHECK(RedactHomePath("C:\\Users\\Bob\\saves", "C:\\Users\\Bob") == "~\\saves");
+  CHECK(RedactHomePath("c:/users/bob/saves", "C:\\Users\\Bob\\") == "~/saves");
+  CHECK(RedactHomePath("/home/bob", "/home/bob") == "~");
+  CHECK(RedactHomePath("/home/bob2/saves", "/home/bob") == "/home/bob2/saves");
+  CHECK(RedactHomePath("/home/bob/a;/home/bob/b", "/home/bob") == "~/a;~/b");
+  CHECK(RedactHomePath("D:/games", "") == "D:/games");
+}
+
+TEST_CASE("DescribeFlags splits changed settings from the rest", "[cvar]") {
+  const auto contains = [](const std::vector<std::string>& lines, std::string_view line) {
+    return std::find(lines.begin(), lines.end(), line) != lines.end();
+  };
+  rex::cvar::ResetToDefault("test_string_flag");
+  CHECK(contains(rex::cvar::DescribeFlags(false), "test_string_flag = default (default)"));
+
+  REQUIRE(rex::cvar::SetFlagByName("test_string_flag", "changed"));
+  CHECK(contains(rex::cvar::DescribeFlags(true), "test_string_flag = changed (runtime)"));
+  CHECK_FALSE(contains(rex::cvar::DescribeFlags(false), "test_string_flag = changed (runtime)"));
+  rex::cvar::ResetToDefault("test_string_flag");
+
+  for (const auto modified : {false, true}) {
+    for (const auto& line : rex::cvar::DescribeFlags(modified)) {
+      CHECK_FALSE(line.starts_with("test_noarg_cmd"));
+    }
   }
 }

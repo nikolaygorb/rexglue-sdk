@@ -29,6 +29,7 @@
 #include <rex/graphics/d3d11/shader_bytecode.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+#include <rex/graphics/pipeline/shader/load_memo.h>
 #include <rex/graphics/pipeline/shader/storage.h>
 #include <rex/graphics/primitive_processor.h>
 #include <rex/graphics/register_file.h>
@@ -148,8 +149,11 @@ class PipelineCache {
   // At the end of a frame: has the storage files flushed if written.
   void EndFrame();
 
+  // Through the memo: for guest loads (the command processor) only.
   D3D11Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                           uint32_t dword_count);
+  D3D11Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
+                          uint32_t dword_count, uint64_t data_hash);
   void AnalyzeShaderUcode(Shader& shader);
 
   // Generated copies of the D3D12 pipeline cache's functions
@@ -238,7 +242,8 @@ class PipelineCache {
     xenos::MsaaSamples host_msaa_samples;
 
     // Of the stored state (PipelineStoredData).
-    static constexpr uint32_t kVersion = 0x20261030;
+    // Bumped for the line geometry shader widening the geometry shader type.
+    static constexpr uint32_t kVersion = 0x20261103;
   };
   // A pipeline in the storage file: the shaders by hash and modification, the
   // channel mappings of their native variants (whether the shared memory is a
@@ -352,6 +357,8 @@ class PipelineCache {
 
   rex::string::StringBuffer ucode_disasm_buffer_;
   std::unordered_map<uint64_t, std::unique_ptr<D3D11Shader>> shaders_;
+  // Cleared where shaders_ loses shaders.
+  ShaderLoadMemo<D3D11Shader> shader_load_memo_;
 
   // Built-in vertex and hull shaders of tessellation, as D3D12 chooses them
   // (CreateD3D12Pipeline). Null for a combination that doesn't exist.

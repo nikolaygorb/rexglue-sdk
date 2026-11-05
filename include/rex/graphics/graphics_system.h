@@ -85,6 +85,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
                                std::function<void()> completion_callback = nullptr) override;
 
   bool is_paused() const { return paused_; }
+  void RequestFrameTrace() override;
+  bool PlayFrameTrace(const std::filesystem::path& path) override;
+
   void Pause();
   void Resume();
 

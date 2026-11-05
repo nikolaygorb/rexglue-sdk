@@ -7,6 +7,7 @@ add_executable(unit_tests
     memory/read_watch_test.cpp
     memory/range_access_test.cpp
     kernel/object_table_test.cpp
+    kernel/native_memory_test.cpp
     kernel/bignum_rsa_test.cpp
     kernel/xecrypt_md5_test.cpp
     kernel/ob_name_test.cpp
@@ -28,6 +29,7 @@ add_executable(unit_tests
     core/hash_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
+    core/thread_test.cpp
     core/chrono_steady_cast_test.cpp
     core/socket_test.cpp
     core/gpu_vendor_test.cpp
@@ -66,6 +68,8 @@ add_executable(unit_tests
     graphics/register_file_test.cpp
     graphics/register_reset_test.cpp
     graphics/float_precision_test.cpp
+    graphics/scalar_estimate_test.cpp
+    graphics/shader_replacements_test.cpp
     graphics/texture_fetch_constant_test.cpp
     graphics/texture_address_test.cpp
     graphics/texture_layout_test.cpp
@@ -92,8 +96,12 @@ add_executable(unit_tests
     graphics/display_transfer_test.cpp
     graphics/d3d11_shader_bytecode_test.cpp
     graphics/d3d11_geometry_shader_test.cpp
+    graphics/trace_format_test.cpp
+    graphics/frame_stats_test.cpp
+    graphics/storage_seed_test.cpp
     ui/presenter_paint_config_test.cpp
     ui/keybind_names_test.cpp
+    ui/image_decode_test.cpp
 )
 
 target_sources(unit_tests PRIVATE
@@ -116,9 +124,13 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/registers.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/trace_reader.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/trace_writer.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
     # FloatToD3D11Fixed16p8 for draw.cpp (rexui, which unit_tests doesn't link).
     ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
+    # PNG encoding and image comparison of GPU trace replay (rexui).
+    ${PROJECT_SOURCE_DIR}/src/ui/image_decode.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/d3d11/geometry_shader.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/d3d11/shader_bytecode.cpp
     ${PROJECT_SOURCE_DIR}/thirdparty/dxbc/DXBCChecksum.cpp
@@ -128,6 +140,7 @@ target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/thirdparty/renderdoc
+    ${PROJECT_SOURCE_DIR}/thirdparty/stb  # stb_image(_write).h for image_decode.cpp
     ${PROJECT_SOURCE_DIR}  # For thirdparty/dxbc/DXBCChecksum.h
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

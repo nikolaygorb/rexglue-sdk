@@ -34,6 +34,8 @@ D3D12SharedMemory::~D3D12SharedMemory() {
 
 bool D3D12SharedMemory::Initialize() {
   InitializeCommon();
+  EnableHotPages();
+  EnableUploadHashing();
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
@@ -109,6 +111,8 @@ bool D3D12SharedMemory::Initialize() {
 }
 
 void D3D12SharedMemory::Shutdown(bool from_destructor) {
+  ResetTraceDownload();
+
   upload_buffer_pool_.reset();
 
   ui::d3d12::util::ReleaseAndNull(buffer_descriptor_heap_);
@@ -218,6 +222,64 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
   return true;
 }
 
+bool D3D12SharedMemory::InitializeTraceSubmitDownloads() {
+  ResetTraceDownload();
+  PrepareForTraceDownload();
+  uint32_t download_page_count = trace_download_page_count();
+  if (!download_page_count) {
+    return false;
+  }
+  D3D12_RESOURCE_DESC download_buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(download_buffer_desc,
+                                          UINT64(download_page_count) << page_size_log2(),
+                                          D3D12_RESOURCE_FLAG_NONE);
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+          &download_buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&trace_download_buffer_)))) {
+    REXGPU_ERROR("GPU trace: failed to create a {} KB buffer for the memory written by the GPU",
+                 download_page_count << page_size_log2() >> 10);
+    ResetTraceDownload();
+    return false;
+  }
+  UseAsCopySource();
+  command_processor_.SubmitBarriers();
+  auto& command_list = command_processor_.GetDeferredCommandList();
+  UINT64 download_buffer_offset = 0;
+  for (const auto& range : trace_download_ranges()) {
+    command_list.D3DCopyBufferRegion(trace_download_buffer_, download_buffer_offset, buffer_,
+                                     range.first, range.second);
+    download_buffer_offset += range.second;
+  }
+  return true;
+}
+
+void D3D12SharedMemory::InitializeTraceCompleteDownloads(TraceWriter& trace_writer) {
+  if (!trace_download_buffer_) {
+    return;
+  }
+  void* mapping;
+  if (SUCCEEDED(trace_download_buffer_->Map(0, nullptr, &mapping))) {
+    size_t download_buffer_offset = 0;
+    for (const auto& range : trace_download_ranges()) {
+      trace_writer.WriteMemoryRead(range.first, range.second,
+                                   static_cast<const uint8_t*>(mapping) + download_buffer_offset);
+      download_buffer_offset += range.second;
+    }
+    D3D12_RANGE written_range = {};
+    trace_download_buffer_->Unmap(0, &written_range);
+  } else {
+    REXGPU_ERROR("GPU trace: failed to map the buffer of the memory written by the GPU");
+  }
+  ResetTraceDownload();
+}
+
+void D3D12SharedMemory::ResetTraceDownload() {
+  ui::d3d12::util::ReleaseAndNull(trace_download_buffer_);
+  ReleaseTraceDownloadRanges();
+}
+
 bool D3D12SharedMemory::UploadRanges(
     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   if (upload_page_ranges.empty()) {
@@ -261,9 +323,8 @@ bool D3D12SharedMemory::UploadRanges(
         return false;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      CopyPagesForUpload(upload_buffer_mapping, upload_range_start,
+                         uint32_t(upload_buffer_size >> page_size_log2()));
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));

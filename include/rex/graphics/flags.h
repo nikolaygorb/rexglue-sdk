@@ -92,6 +92,8 @@ REXCVAR_DECLARE(bool, use_fuzzy_alpha_epsilon);
 
 // GPU Shader ALU
 REXCVAR_DECLARE(bool, mulsc_round_toward_zero);
+REXCVAR_DECLARE(bool, vulkan_exact_vertex_math);
+REXCVAR_DECLARE(bool, spirv_pixel_shader_no_contraction);
 
 // GPU Shader Translation
 REXCVAR_DECLARE(std::string, dump_shaders);

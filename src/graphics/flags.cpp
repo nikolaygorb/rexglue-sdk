@@ -42,6 +42,17 @@ REXCVAR_DEFINE_BOOL(mulsc_round_toward_zero, false, "GPU",
                     "geometry in several Volition Engine titles and possibly others. This rounding "
                     "behavior hasn't been confirmed on real hardware, so it's disabled by default.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(spirv_pixel_shader_no_contraction, true, "GPU/Vulkan",
+                    "Keep the NoContraction decoration (no fused multiply-add) on pixel shader "
+                    "arithmetic. false lets the host compiler fuse multiplies and adds in pixel "
+                    "shaders, faster on GPUs where the decoration disables fast paths (Apple "
+                    "GPUs via MoltenVK); vertex shaders always keep it for position invariance");
+REXCVAR_DEFINE_BOOL(vulkan_exact_vertex_math, false, "GPU/Vulkan",
+                    "Compute vertex shader sums, products, RCP, RSQ, SQRT, EXP and LOG as the "
+                    "Xenos does, for results that can change by a whole unit: fetch indices, the "
+                    "address register, memory exports, floor, trunc and frc. GPUs with the "
+                    "round-toward-zero shader mode use it for all vertex math.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(use_fuzzy_alpha_epsilon, false, "GPU",
                     "Use approximate compare for alpha test values to prevent "
                     "flickering on NVIDIA graphics cards");

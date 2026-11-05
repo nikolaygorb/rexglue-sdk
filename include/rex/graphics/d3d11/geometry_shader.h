@@ -21,7 +21,7 @@
 
 namespace rex::graphics::d3d11 {
 
-// Point, rectangle and quad list expansion with geometry shaders, as in the
+// Point, rectangle, quad and line list expansion with geometry shaders, as in the
 // D3D12 backend. The generator (geometry_shader.cpp) is a copy of the D3D12
 // pipeline cache's, made by tools/d3d11/sync_copies.py; the key has the same
 // layout as d3d12::PipelineCache::GeometryShaderKey, and the enum the same
@@ -32,12 +32,14 @@ enum class GeometryShaderType : uint32_t {
   kPointList,
   kRectangleList,
   kQuadList,
+  // Lines expanded to 1 guest pixel wide for resolution-scaled draws.
+  kLineList,
 };
 
 union GeometryShaderKey {
   uint32_t key;
   struct {
-    GeometryShaderType type : 2;
+    GeometryShaderType type : 3;
     uint32_t interpolator_count : 5;
     uint32_t user_clip_plane_count : 3;
     uint32_t user_clip_plane_cull : 1;

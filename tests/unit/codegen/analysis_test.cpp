@@ -45,6 +45,9 @@ namespace {
 //   w3_dispatch: (table3 lookup by r4)
 //   o:      mtctr r4                          with t, overlapping when both are
 //   t:      addi r3,r3,1; bdnz t; blr         config entries
+//   q:      mtctr r4; bctr                    an indirect tail call
+//           0                                 padding
+//   s:      li r3,9; blr                      only reachable by a pointer
 //
 //   .rodata vtable: p0, p1, h_loop
 //           table1: w1_c0, w1_c1, w1_c2, w1_c0, w1_c1, 0
@@ -58,7 +61,7 @@ constexpr uint32_t kMain = 0x82000000, kT = 0x82000018, kF = 0x82000020, kP0 = 0
                    kP1 = 0x82000034, kHLoop = 0x8200003C, kW1 = 0x82000048, kW2 = 0x8200008C,
                    kCaller = 0x820000C8, kSetjmp = 0x820000DC, kLongjmp = 0x8200013C,
                    kX = 0x8200019C, kY = 0x820001A4, kW3 = 0x820001AC,
-                   kO = 0x820001E8, kTl = 0x820001EC;
+                   kO = 0x820001E8, kTl = 0x820001EC, kS = 0x82000218;
 
 const std::vector<uint32_t> kTextWords = {
     // main
@@ -110,6 +113,8 @@ const std::vector<uint32_t> kTextWords = {
     // r1: li r4,0; li r3,0; bl a      a catch funclet ending in a rethrow
     // r2: li r3,7; blr                the next funclet, right after it
     0x38800000, 0x38600000, 0x4BFFFE11, 0x38600007, 0x4E800020,
+    // q, padding, s
+    0x7C8903A6, 0x4E800420, 0x00000000, 0x38600009, 0x4E800020,
 };
 
 const std::vector<uint32_t> kRodataWords = {
@@ -200,6 +205,13 @@ size_t JumpTableSize(const CodegenContext& ctx, uint32_t function) {
 }
 
 }  // namespace
+
+TEST_CASE("Analysis finds a function after padding", "[codegen][analysis]") {
+  auto [ctx, error] = AnalyzeSynthetic();
+  INFO(error);
+  REQUIRE(error.empty());
+  CHECK(ctx.graph.isEntryPoint(kS));
+}
 
 TEST_CASE("Analysis registers a branch target no function covers", "[codegen][analysis]") {
   auto [ctx, error] = AnalyzeSynthetic();

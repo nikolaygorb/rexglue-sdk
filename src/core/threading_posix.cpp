@@ -322,7 +322,11 @@ class PosixConditionBase {
     }
   }
 
-  WaitResult Wait(std::chrono::milliseconds timeout) {
+  // With `to_signal`, this thread counts as waiting before it signals that handle
+  // (SignalObjectAndWait): a Signal of this handle from then on, by a thread `to_signal` released
+  // say, is for this thread and not for whoever starts waiting next. The handle's lock isn't held
+  // across the signal: two threads signalling each other's handle would deadlock.
+  WaitResult Wait(std::chrono::milliseconds timeout, PosixConditionBase* to_signal = nullptr) {
     bool executed;
     // Taken once the lock is held: a pulse counts only for threads already waiting.
     uint64_t entered = 0;
@@ -340,6 +344,17 @@ class PosixConditionBase {
     std::unique_lock<std::mutex> lock(mutex_);
 #endif
     entered = pulse_epoch_;
+    if (to_signal) {
+      ++blocked_;
+      lock.unlock();
+      const bool signalled = to_signal->Signal();
+      lock.lock();
+      --blocked_;
+      if (!signalled) {
+        waiter_left();
+        return WaitResult::kFailed;
+      }
+    }
     if (predicate()) {
       executed = true;
     } else {
@@ -368,8 +383,10 @@ class PosixConditionBase {
   static std::pair<WaitResult, size_t> WaitMultiple(std::vector<PosixConditionBase*>&& handles,
                                                     bool wait_all,
                                                     std::chrono::milliseconds timeout,
-                                                    AlertSource* alert = nullptr) {
+                                                    AlertSource* alert = nullptr,
+                                                    PosixConditionBase* to_signal = nullptr) {
     assert_true(!handles.empty() || alert);
+    assert_true(!to_signal || (handles.size() == 1 && alert));
 
     if (handles.size() == 1 && !alert) {
       auto result = handles[0]->Wait(timeout);
@@ -435,6 +452,17 @@ class PosixConditionBase {
         if (alert) alert->SetAlertWaiter(nullptr);
       }
     } registration(handles, &waiter, alert);
+
+    // As in Wait: waiting from before the signal, without the handle's lock across it.
+    if (to_signal) {
+      {
+        std::unique_lock<std::mutex> lock(handles[0]->mutex_);
+        registration.AddLocked();
+      }
+      if (!to_signal->Signal()) {
+        return std::make_pair<WaitResult, size_t>(WaitResult::kFailed, 0);
+      }
+    }
 
     std::vector<std::unique_lock<std::mutex>> locks;
     locks.reserve(handles.size());
@@ -585,9 +613,25 @@ class PosixCondition<Event> : public PosixConditionBase {
       : signal_(initial_state), manual_reset_(manual_reset) {}
   virtual ~PosixCondition() = default;
 
+  // SetEvent settles things at once on Windows and the console. A manual-reset event satisfies
+  // every wait in progress, whatever resets it next: guest condition variables set and reset it in
+  // a row. An auto-reset event goes to a thread already waiting, and a thread that starts waiting
+  // after this cannot take it. Both are kept the way Pulse keeps its wake-ups (pulse_epoch_).
   bool Signal() override {
     auto lock = std::unique_lock<std::mutex>(mutex_);
-    signal_ = true;
+    const uint32_t blocked = blocked_.load();
+    if (manual_reset_) {
+      signal_ = true;
+      if (blocked) {
+        ++pulse_epoch_;
+      }
+    } else if (!signal_ && blocked > pulses_) {
+      ++pulses_;
+      ++signals_owed_;
+      ++pulse_epoch_;
+    } else {
+      signal_ = true;
+    }
     NotifyAll();
     return true;
   }
@@ -604,16 +648,20 @@ class PosixCondition<Event> : public PosixConditionBase {
   // sleep, and the wake-up would be lost (Windows releases them atomically). Pulses of an
   // auto-reset event add up (two pulses release two waiters, even if the first one hasn't run
   // yet), up to the number of waiters. A thread that starts waiting after the pulse cannot
-  // take them (pulse_epoch_).
+  // take them (pulse_epoch_). A manual-reset event needs no count: everyone who was waiting at
+  // the newest epoch is released.
   void Pulse() {
     auto lock = std::unique_lock<std::mutex>(mutex_);
+    waiter_left();
     signal_ = false;
     const uint32_t blocked = blocked_.load();
     if (blocked == 0) {
       pulses_ = 0;
       return;  // Nobody waiting: a pulse does nothing.
     }
-    pulses_ = manual_reset_ ? blocked : std::min(pulses_ + 1, blocked);
+    if (!manual_reset_) {
+      pulses_ = std::min(pulses_ + 1, blocked);
+    }
     ++pulse_epoch_;
     NotifyAll();
   }
@@ -621,7 +669,7 @@ class PosixCondition<Event> : public PosixConditionBase {
  private:
   inline bool signaled() const override { return signal_; }
   bool SignaledFor(uint64_t entered) const override {
-    return signal_ || (pulses_ > 0 && entered < pulse_epoch_);
+    return signal_ || ((manual_reset_ || pulses_ > 0) && entered < pulse_epoch_);
   }
   inline void post_execution() override {
     if (signal_) {
@@ -630,15 +678,23 @@ class PosixCondition<Event> : public PosixConditionBase {
       }
     } else if (pulses_ > 0) {
       --pulses_;
+      signals_owed_ = std::min(signals_owed_, pulses_);
     }
   }
   void waiter_left() override {
-    // Don't keep wake-ups for waiters that are gone.
-    pulses_ = std::min(pulses_, blocked_.load());
+    // Don't keep wake-ups for waiters that are gone. One from a pulse goes with them; one from
+    // Signal stays in the event.
+    const uint32_t blocked = blocked_.load();
+    if (signals_owed_ > blocked) {
+      signal_ = true;
+    }
+    pulses_ = std::min(pulses_, blocked);
+    signals_owed_ = std::min(signals_owed_, pulses_);
   }
   bool signal_;
   const bool manual_reset_;
-  uint32_t pulses_ = 0;  // Wake-ups Pulse() owes to blocked threads; mutex_
+  uint32_t pulses_ = 0;        // Wake-ups owed to blocked threads; mutex_
+  uint32_t signals_owed_ = 0;  // How many of them Signal() gave; mutex_
 };
 
 template <>
@@ -1441,17 +1497,15 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
   if (posix_wait_handle_to_signal == nullptr || posix_wait_handle_to_wait_on == nullptr) {
     return WaitResult::kFailed;
   }
-  if (!posix_wait_handle_to_signal->condition().Signal()) {
-    return WaitResult::kFailed;
-  }
-
+  auto& to_signal = posix_wait_handle_to_signal->condition();
+  auto& to_wait_on = posix_wait_handle_to_wait_on->condition();
   if (!is_alertable) {
-    return posix_wait_handle_to_wait_on->condition().Wait(timeout);
+    return to_wait_on.Wait(timeout, &to_signal);
   }
 
   ScopedAlertableState alertable_state_guard(true);
-  return PosixConditionBase::WaitMultiple({&posix_wait_handle_to_wait_on->condition()}, false,
-                                          timeout, CurrentAlertSource())
+  return PosixConditionBase::WaitMultiple({&to_wait_on}, false, timeout, CurrentAlertSource(),
+                                          &to_signal)
       .first;
 }
 

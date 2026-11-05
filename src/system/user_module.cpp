@@ -23,6 +23,11 @@
 #include <rex/system/xfile.h>
 #include <rex/system/xthread.h>
 
+REXCVAR_DEFINE_BOOL(xex_apply_patch, true, "Kernel",
+                    "Apply a title update (<module>.xexp next to the XEX) at load. Recompiled code "
+                    "comes from one XEX image, so a patch must match that image; otherwise turn "
+                    "this off, or only the update's data changes under the old code");
+
 namespace rex::system {
 
 // Host object: the loader owns module handles, not the title's numbering
@@ -106,6 +111,10 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
 
   // Search for sibling XEX patch file
   auto patch_entry = kernel_state_->file_system()->ResolvePath(path_ + "p");
+  if (patch_entry && !REXCVAR_GET(xex_apply_patch)) {
+    REXSYS_WARN("Ignoring XEX patch {} (xex_apply_patch=false)", patch_entry->absolute_path());
+    patch_entry = nullptr;
+  }
   if (patch_entry) {
     auto patch_path = patch_entry->absolute_path();
 

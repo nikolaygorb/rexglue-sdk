@@ -127,8 +127,6 @@ void AudioSystem::WorkerThreadMain() {
       continue;
     }
 
-    // Number of clients pumped
-    bool pumped = false;
     if (result.first == rex::thread::WaitResult::kSuccess) {
       auto index = result.second;
 
@@ -162,17 +160,10 @@ void AudioSystem::WorkerThreadMain() {
       } else {
         REXAPU_DEBUG("AudioWorker: semaphore signaled for client {} but callback is 0", index);
       }
-
-      pumped = true;
     }
 
     if (!worker_running_) {
       break;
-    }
-
-    if (!pumped) {
-      SCOPE_profile_cpu_i("apu", "Sleep");
-      rex::thread::Sleep(std::chrono::milliseconds(500));
     }
   }
   worker_running_ = false;

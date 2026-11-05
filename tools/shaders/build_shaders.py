@@ -7,7 +7,8 @@ changing a shader source, then commit the sources and headers together.
 
 Usage:
   python build_shaders.py [--tools-dir DIR] [--fxc PATH] [--clang-format PATH]
-                          [--only dxbc|spirv] [--check] [shader dirs...]
+                          [--only dxbc|spirv] [--check] [--sources NAME...]
+                          [shader dirs...]
 
 Sources and outputs (rexglue layout):
   <dir>/<name>.<stage>.xesl|.hlsl  -> <dir>/bytecode/d3d12_5_1/<name>_<stage>.h (FXC)
@@ -35,6 +36,10 @@ repository's .clang-format, like the checked-in ones.
 
 --check writes nothing into the tree: it generates into a temporary directory
 and lists the headers whose array contents differ from the checked-in ones.
+
+--sources builds only the source files with these names (for example a new
+shader), leaving every other header as it is: a different toolchain version
+would otherwise change the bytes of all of them.
 """
 
 import argparse
@@ -209,6 +214,8 @@ def main():
     parser.add_argument('--only', choices=('dxbc', 'spirv'))
     parser.add_argument('--check', action='store_true',
                         help='compare with the checked-in headers instead of writing')
+    parser.add_argument('--sources', nargs='+', metavar='NAME',
+                        help='only build the source files with these names')
     args = parser.parse_args()
 
     dirs = [os.path.join(REPO_ROOT, d) for d in (args.dirs or DEFAULT_SHADER_DIRS)]
@@ -245,6 +252,8 @@ def main():
         for shader_dir in dirs:
             for src_name in sorted(os.listdir(shader_dir)):
                 if src_name in SKIP_SOURCES:
+                    continue
+                if args.sources and src_name not in args.sources:
                     continue
                 identifier, stage, ext = identifier_and_stage(src_name)
                 if identifier is None:

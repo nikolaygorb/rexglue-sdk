@@ -68,6 +68,10 @@ REXCVAR_DEFINE_BOOL(d3d12_pipeline_library, true, "GPU/D3D12",
                     "adapter change")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(shader_replacements, false, "GPU",
+                    "Use the title's replacement shaders (shader_replacements beside the "
+                    "executable) in place of the translated ones they name")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
@@ -85,8 +89,6 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/discrete_quad_4cp_hs.h"
 #include "../shaders/bytecode/d3d12_5_1/discrete_triangle_1cp_hs.h"
 #include "../shaders/bytecode/d3d12_5_1/discrete_triangle_3cp_hs.h"
-#include "../shaders/bytecode/d3d12_5_1/float24_round_ps.h"
-#include "../shaders/bytecode/d3d12_5_1/float24_truncate_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/tessellation_adaptive_vs.h"
 #include "../shaders/bytecode/d3d12_5_1/tessellation_indexed_vs.h"
 }  // namespace shaders
@@ -117,6 +119,8 @@ void PipelineCache::CreateTranslatorAndInternalShaders() {
       provider.GetGraphicsAnalysis() != nullptr);
 
   depth_only_pixel_shader_.clear();
+  depth_only_float24_truncate_pixel_shader_.clear();
+  depth_only_float24_round_pixel_shader_.clear();
   viz_survey_depth_only_pixel_shader_.clear();
   zpd_total_depth_only_pixel_shader_.clear();
   zpd_total_float24_truncate_pixel_shader_.clear();
@@ -126,6 +130,14 @@ void PipelineCache::CreateTranslatorAndInternalShaders() {
     using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
     viz_survey_depth_only_pixel_shader_ = std::move(shader_translator_->CreateDepthOnlyPixelShader(
         false, DepthStencilMode::kNoModifiers, true));
+  }
+  if (!edram_rov_used && render_target_cache_.depth_float24_convert_in_pixel_shader()) {
+    using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
+    depth_only_float24_truncate_pixel_shader_ =
+        std::move(shader_translator_->CreateDepthOnlyPixelShader(
+            false, DepthStencilMode::kFloat24Truncating));
+    depth_only_float24_round_pixel_shader_ = std::move(
+        shader_translator_->CreateDepthOnlyPixelShader(false, DepthStencilMode::kFloat24Rounding));
   }
   if (!edram_rov_used && zpd_hybrid_supported_) {
     using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
@@ -147,6 +159,13 @@ PipelineCache::~PipelineCache() {
 
 bool PipelineCache::Initialize() {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+
+  if (REXCVAR_GET(shader_replacements)) {
+    const std::filesystem::path folder =
+        rex::filesystem::GetExecutableFolder() / "shader_replacements";
+    const size_t count = shader_replacements_.Load(folder);
+    REXGPU_INFO("Shader replacements: {} from {}", count, rex::path_to_utf8(folder));
+  }
 
   // Initialize the command processor thread DXIL objects.
   dxbc_converter_ = nullptr;
@@ -271,6 +290,8 @@ void PipelineCache::DestroyDrawResolutionScaleDependentObjects() {
     }
   }
   depth_only_pixel_shader_.clear();
+  depth_only_float24_truncate_pixel_shader_.clear();
+  depth_only_float24_round_pixel_shader_.clear();
   viz_survey_depth_only_pixel_shader_.clear();
   zpd_total_depth_only_pixel_shader_.clear();
   zpd_total_float24_truncate_pixel_shader_.clear();
@@ -302,6 +323,7 @@ void PipelineCache::Shutdown() {
     delete it.second;
   }
   shaders_.clear();
+  shader_load_memo_.Clear();
 
   // Shut down shader translation.
   ui::d3d12::util::ReleaseAndNull(dxc_compiler_);
@@ -686,9 +708,12 @@ ID3D12PipelineState* PipelineCache::AwaitD3D12PipelineByHandle(void* handle) {
 
 D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                                        uint32_t dword_count) {
-  // Hash the input memory and lookup the shader.
-  return LoadShader(shader_type, host_address, dword_count,
-                    XXH3_64bits(host_address, dword_count * sizeof(uint32_t)));
+  // Hash the memo's copy of the input memory and lookup the shader.
+  return shader_load_memo_.FindOrLoad(
+      shader_type, host_address, dword_count, [&](const uint32_t* words) {
+        return LoadShader(shader_type, words, dword_count,
+                          XXH3_64bits(words, dword_count * sizeof(uint32_t)));
+      });
 }
 
 D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
@@ -971,6 +996,29 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
     return false;
   }
 
+  // A title's replacement stands in for the translated code, keeping the
+  // translation's bindings. Domain shaders are not replaced.
+  if (!shader_replacements_.empty()) {
+    const bool is_vertex = shader.type() == xenos::ShaderType::kVertex;
+    const bool replaceable =
+        !is_vertex ||
+        DxbcShaderTranslator::Modification(translation.modification())
+                .vertex.host_vertex_shader_type == Shader::HostVertexShaderType::kVertex;
+    const ShaderReplacements::Stage stage =
+        is_vertex ? ShaderReplacements::Stage::kVertex
+        : render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock
+            ? ShaderReplacements::Stage::kPixelRov
+            : ShaderReplacements::Stage::kPixelRtv;
+    if (const std::vector<uint8_t>* replacement =
+            replaceable ? shader_replacements_.Find(shader.ucode_data_hash(), stage,
+                                                    translation.modification())
+                        : nullptr) {
+      REXGPU_INFO("Shader {:016X} (modification {:016X}): title replacement used",
+                  shader.ucode_data_hash(), translation.modification());
+      translation.ReplaceTranslatedBinary(*replacement);
+    }
+  }
+
   const char* host_shader_type;
   if (shader.type() == xenos::ShaderType::kVertex) {
     DxbcShaderTranslator::Modification modification(translation.modification());
@@ -1249,6 +1297,9 @@ void PipelineCache::TranslateShadersForStorage(
       delete shader;
     }
   }
+  if (!shaders_failed_to_translate.empty()) {
+    shader_load_memo_.Clear();
+  }
 
   REXGPU_INFO("Translated {} shaders in {} ms",
               shaders_to_translate_list.size() - shaders_failed_to_translate.size(),
@@ -1360,6 +1411,15 @@ bool PipelineCache::GetCurrentStateDescription(
         break;
       case xenos::PrimitiveType::kQuadList:
         description_out.geometry_shader = PipelineGeometryShader::kQuadList;
+        break;
+      case xenos::PrimitiveType::kLineList:
+      case xenos::PrimitiveType::kLineStrip:
+        // Host lines are 1 host pixel wide, expand them to 1 guest pixel when
+        // the draw is resolution-scaled.
+        description_out.geometry_shader =
+            (render_target_cache_.GetDrawScaleX() > 1 || render_target_cache_.GetDrawScaleY() > 1)
+                ? PipelineGeometryShader::kLineList
+                : PipelineGeometryShader::kNone;
         break;
       default:
         description_out.geometry_shader = PipelineGeometryShader::kNone;
@@ -1713,8 +1773,10 @@ void PipelineCache::CreateDxbcGeometryShader(GeometryShaderKey key,
 
   uint32_t system_cbuffer_size_vector_aligned_bytes = 0;
 
-  if (key.type == PipelineGeometryShader::kPointList) {
-    // Need point parameters from the system constants.
+  if (key.type == PipelineGeometryShader::kPointList ||
+      key.type == PipelineGeometryShader::kLineList) {
+    // Need point parameters from the system constants (lines only use the NDC
+    // size of a guest pixel).
 
     // Constant types - float2 only.
     // Names.
@@ -2196,6 +2258,13 @@ void PipelineCache::CreateDxbcGeometryShader(GeometryShaderKey key,
       output_primitive_topology = dxbc::PrimitiveTopology::kTriangleStrip;
       max_output_vertex_count = 4;
       break;
+    case PipelineGeometryShader::kLineList:
+      // Line (of a list or a strip) to a strip of 2 triangles.
+      input_primitive = dxbc::Primitive::kLine;
+      input_primitive_vertex_count = 2;
+      output_primitive_topology = dxbc::PrimitiveTopology::kTriangleStrip;
+      max_output_vertex_count = 4;
+      break;
     default:
       assert_unhandled_case(key.type);
   }
@@ -2650,6 +2719,75 @@ void PipelineCache::CreateDxbcGeometryShader(GeometryShaderKey key,
       a.OpCutStream(stream);
     } break;
 
+    case PipelineGeometryShader::kLineList: {
+      // Host lines are rasterized 1 host pixel wide, but a guest line covers 1
+      // guest pixel, draw_resolution_scale host pixels. Expand the segment
+      // into a quad 1 guest pixel wide centered on the line, each end keeping
+      // its own attributes.
+      stat.temp_register_count = std::max(UINT32_C(3), stat.temp_register_count);
+      // The NDC radius of a 1 guest pixel diameter: half a guest pixel.
+      dxbc::Src half_pixel_ndc(dxbc::Src::CB(
+          0, uint32_t(DxbcShaderTranslator::CbufferRegister::kSystemConstants),
+          offsetof(DxbcShaderTranslator::SystemConstants, point_screen_diameter_to_ndc_radius) >> 4,
+          ((offsetof(DxbcShaderTranslator::SystemConstants,
+                     point_screen_diameter_to_ndc_radius[0]) >>
+            2) &
+           3) |
+              (((offsetof(DxbcShaderTranslator::SystemConstants,
+                          point_screen_diameter_to_ndc_radius[1]) >>
+                 2) &
+                3)
+               << 2)));
+      // The ends in half guest pixels (the NDC over the NDC size of half a
+      // guest pixel), so the direction is in screen space whatever the
+      // viewport aspect: r1.xy for the first, r2.xy for the second.
+      for (uint32_t i = 0; i < 2; ++i) {
+        a.OpDiv(dxbc::Dest::R(1 + i, 0b0011), dxbc::Src::V2D(i, input_register_position),
+                dxbc::Src::V2D(i, input_register_position, dxbc::Src::kWWWW));
+        a.OpDiv(dxbc::Dest::R(1 + i, 0b0011), dxbc::Src::R(1 + i), half_pixel_ndc);
+      }
+      // r2.xy = direction.
+      a.OpAdd(dxbc::Dest::R(2, 0b0011), dxbc::Src::R(2), -dxbc::Src::R(1));
+      // Drop zero-length (and NaN) lines: nothing to expand, and no normal.
+      a.OpDP2(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(2), dxbc::Src::R(2));
+      a.OpLT(dxbc::Dest::R(1, 0b1000), dxbc::Src::LF(0.0f), dxbc::Src::R(1, dxbc::Src::kZZZZ));
+      a.OpRetC(false, dxbc::Src::R(1, dxbc::Src::kWWWW));
+      a.OpRSq(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(1, dxbc::Src::kZZZZ));
+      // Unit normal (-dy, dx), then half a guest pixel along it in the NDC:
+      // r2.xy.
+      a.OpMul(dxbc::Dest::R(2, 0b0011), dxbc::Src::R(2).Swizzle(0b11100001),
+              dxbc::Src::R(1, dxbc::Src::kZZZZ));
+      a.OpMul(dxbc::Dest::R(2, 0b0011), dxbc::Src::R(2), half_pixel_ndc);
+      a.OpMov(dxbc::Dest::R(2, 0b0001), -dxbc::Src::R(2, dxbc::Src::kXXXX));
+
+      // Both sides of the first end, then of the second.
+      for (uint32_t i = 0; i < 4; ++i) {
+        uint32_t vertex = i >> 1;
+        for (uint32_t j = 0; j < key.interpolator_count; ++j) {
+          a.OpMov(dxbc::Dest::O(output_register_interpolators + j),
+                  dxbc::Src::V2D(vertex, input_register_interpolators + j));
+        }
+        if (key.has_point_coordinates) {
+          a.OpMov(dxbc::Dest::O(output_register_point_coordinates, 0b0011), dxbc::Src::LF(0.0f));
+        }
+        // The offset in the clip space is the NDC offset times W.
+        a.OpMAd(dxbc::Dest::R(0, 0b0011), (i & 1) ? dxbc::Src::R(2) : -dxbc::Src::R(2),
+                dxbc::Src::V2D(vertex, input_register_position, dxbc::Src::kWWWW),
+                dxbc::Src::V2D(vertex, input_register_position));
+        a.OpMov(dxbc::Dest::O(output_register_position, 0b0011), dxbc::Src::R(0));
+        a.OpMov(dxbc::Dest::O(output_register_position, 0b1100),
+                dxbc::Src::V2D(vertex, input_register_position));
+        for (uint32_t j = 0; j < input_clip_distance_count; j += 4) {
+          a.OpMov(dxbc::Dest::O(
+                      output_register_clip_distances + (j >> 2),
+                      (UINT32_C(1) << std::min(input_clip_distance_count - j, UINT32_C(4))) - 1),
+                  dxbc::Src::V2D(vertex, input_register_clip_and_cull_distances + (j >> 2)));
+        }
+        a.OpEmitStream(stream);
+      }
+      a.OpCutStream(stream);
+    } break;
+
     default:
       assert_unhandled_case(key.type);
   }
@@ -3025,13 +3163,11 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
         (description.depth_func != xenos::CompareFunction::kAlways || description.depth_write) &&
         description.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
-      if (render_target_cache_.depth_float24_round()) {
-        state_desc.PS.pShaderBytecode = shaders::float24_round_ps;
-        state_desc.PS.BytecodeLength = sizeof(shaders::float24_round_ps);
-      } else {
-        state_desc.PS.pShaderBytecode = shaders::float24_truncate_ps;
-        state_desc.PS.BytecodeLength = sizeof(shaders::float24_truncate_ps);
-      }
+      const std::vector<uint8_t>& float24_pixel_shader =
+          render_target_cache_.depth_float24_round() ? depth_only_float24_round_pixel_shader_
+                                                     : depth_only_float24_truncate_pixel_shader_;
+      state_desc.PS.pShaderBytecode = float24_pixel_shader.data();
+      state_desc.PS.BytecodeLength = float24_pixel_shader.size();
     } else if (!description.depth_write && !description.stencil_write_mask) {
       // Bind an empty PS to force rasterization.
       // D3D drops PS-less draws without depth/stencil writes, breaking

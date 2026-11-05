@@ -32,6 +32,8 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+#include <rex/graphics/pipeline/shader/load_memo.h>
+#include <rex/graphics/pipeline/shader/replacements.h>
 #include <rex/graphics/pipeline/shader/storage.h>
 #include <rex/graphics/primitive_processor.h>
 #include <rex/graphics/register_file.h>
@@ -175,6 +177,8 @@ class PipelineCache {
     kPointList,
     kRectangleList,
     kQuadList,
+    // Lines expanded to 1 guest pixel wide for resolution-scaled draws.
+    kLineList,
   };
 
   enum class PipelineCullMode : uint32_t {
@@ -231,25 +235,25 @@ class PipelineCache {
     // xenos::TessellationMode for a domain shader.
     uint32_t primitive_topology_type_or_tessellation_mode : 2;  // 4
     // Zero for non-kVertex host_vertex_shader_type.
-    PipelineGeometryShader geometry_shader : 2;       // 6
-    uint32_t fill_mode_wireframe : 1;                 // 7
-    PipelineCullMode cull_mode : 2;                   // 9
-    uint32_t front_counter_clockwise : 1;             // 10
-    uint32_t depth_clip : 1;                          // 11
-    xenos::MsaaSamples host_msaa_samples : 2;         // 13
-    xenos::DepthRenderTargetFormat depth_format : 1;  // 14
-    xenos::CompareFunction depth_func : 3;            // 17
-    uint32_t depth_write : 1;                         // 18
-    uint32_t stencil_enable : 1;                      // 19
-    uint32_t stencil_read_mask : 8;                   // 27
+    PipelineGeometryShader geometry_shader : 3;       // 7
+    uint32_t fill_mode_wireframe : 1;                 // 8
+    PipelineCullMode cull_mode : 2;                   // 10
+    uint32_t front_counter_clockwise : 1;             // 11
+    uint32_t depth_clip : 1;                          // 12
+    xenos::MsaaSamples host_msaa_samples : 2;         // 14
+    xenos::DepthRenderTargetFormat depth_format : 1;  // 15
+    xenos::CompareFunction depth_func : 3;            // 18
+    uint32_t depth_write : 1;                         // 19
+    uint32_t stencil_enable : 1;                      // 20
+    uint32_t stencil_read_mask : 8;                   // 28
     // Native draw (scale threshold), keeps slope-scale unscaled.
-    uint32_t resolution_scale_native : 1;  // 28
+    uint32_t resolution_scale_native : 1;  // 29
     // Hybrid occlusion query draw (RTV + shader counting for Total).
     // Selects the counting depth-only pixel shader when there's no guest PS.
-    uint32_t zpd_total : 1;  // 29
+    uint32_t zpd_total : 1;  // 30
     // Survey draw for conditional rendering (ROV + occlusion_query_viz).
     // Selects the depth-only pixel shader. Surveys don't have a guest PS.
-    uint32_t viz_survey : 1;  // 30
+    uint32_t viz_survey : 1;  // 31
 
     uint32_t stencil_write_mask : 8;                   // 8
     xenos::StencilOp stencil_front_fail_op : 3;        // 11
@@ -264,7 +268,8 @@ class PipelineCache {
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     inline bool operator==(const PipelineDescription& other) const;
-    static constexpr uint32_t kVersion = 0x20261013;
+    // Bumped for the line geometry shader widening geometry_shader.
+    static constexpr uint32_t kVersion = 0x20261103;
   });
 
   REXPACKEDSTRUCT(PipelineStoredDescription, {
@@ -283,7 +288,7 @@ class PipelineCache {
   union GeometryShaderKey {
     uint32_t key;
     struct {
-      PipelineGeometryShader type : 2;
+      PipelineGeometryShader type : 3;
       uint32_t interpolator_count : 5;
       uint32_t user_clip_plane_count : 3;
       uint32_t user_clip_plane_cull : 1;
@@ -372,6 +377,9 @@ class PipelineCache {
   // Background creation threads have their own translators to avoid contention.
   std::unique_ptr<DxbcShaderTranslator> shader_translator_;
 
+  // The title's replacement shaders, read once at startup.
+  ShaderReplacements shader_replacements_;
+
   // Command processor thread DXIL conversion/disassembly interfaces, if DXIL
   // disassembly is enabled.
   IDxbcConverter* dxbc_converter_ = nullptr;
@@ -380,6 +388,8 @@ class PipelineCache {
 
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, D3D12Shader*, rex::IdentityHasher<uint64_t>> shaders_;
+  // Cleared where shaders_ loses shaders.
+  ShaderLoadMemo<D3D12Shader> shader_load_memo_;
 
   struct LayoutUID {
     size_t uid;
@@ -409,6 +419,12 @@ class PipelineCache {
   // Xenos pixel shader provided, and for keeping RTV draws that write nothing
   // rasterized for occlusion queries.
   std::vector<uint8_t> depth_only_pixel_shader_;
+
+  // For draws with no Xenos pixel shader when float24 depth is converted in the
+  // pixel shader. Made by the translator: such a draw's vertex shader outputs no
+  // interpolators, so a shader that takes XeVertexPrePS doesn't link with it.
+  std::vector<uint8_t> depth_only_float24_truncate_pixel_shader_;
+  std::vector<uint8_t> depth_only_float24_round_pixel_shader_;
 
   std::vector<uint8_t> zpd_total_depth_only_pixel_shader_;
   std::vector<uint8_t> zpd_total_float24_truncate_pixel_shader_;

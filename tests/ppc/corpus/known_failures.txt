@@ -1,0 +1,2 @@
+# Corpus cases expected to fail, one per line: <file stem>/<label> <cause>.
+# Empty until the first run; see README.md.

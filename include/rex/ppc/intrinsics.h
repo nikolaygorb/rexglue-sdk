@@ -22,6 +22,7 @@
 
 #include <simde/x86/avx.h>
 #include <simde/x86/avx2.h>
+#include <simde/x86/fma.h>
 #include <simde/x86/sse.h>
 #include <simde/x86/sse4.1.h>
 
@@ -235,7 +236,21 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b) {
 
 // Vector Shift Left - shift entire 128-bit vector left by bits in low 3 bits of b
 inline simde__m128i simde_mm_vsl(simde__m128i a, simde__m128i b) {
-  int shift = simde_mm_extract_epi8(b, 15) & 0x7;  // Get low 3 bits from byte 15 (BE: byte 0)
+  // On hardware each byte shifts by its own count, taking the bits of the next byte; the 128-bit
+  // shift below is the usual case, where all the counts agree (a vspltisb count).
+  const simde__m128i counts = simde_mm_and_si128(b, simde_mm_set1_epi8(0x7));
+  if (simde_mm_movemask_epi8(simde_mm_cmpeq_epi8(
+          counts, simde_mm_shuffle_epi8(counts, simde_mm_setzero_si128()))) != 0xFFFF) {
+    alignas(16) uint8_t src[16], count[16], dst[16];
+    simde_mm_store_si128((simde__m128i*)src, a);
+    simde_mm_store_si128((simde__m128i*)count, counts);
+    // Host byte j is guest byte 15 - j, so the next guest byte is host j - 1.
+    for (int j = 0; j < 16; ++j) {
+      dst[j] = uint8_t((src[j] << count[j]) | (j ? src[j - 1] >> (8 - count[j]) : 0));
+    }
+    return simde_mm_load_si128((simde__m128i*)dst);
+  }
+  int shift = simde_mm_extract_epi8(counts, 0);
   if (shift == 0)
     return a;
 
@@ -563,23 +578,277 @@ inline bool fp_single_denormal_operand(Operands... operands) {
 
 inline constexpr double kFpDefaultQNaN = std::bit_cast<double>(0x7FF8000000000000ull);
 
-// Fixes up the result `r` of a vector multiply-add with operands a, b, c.
-inline simde__m128 vec_madd_result(simde__m128 r, simde__m128 a, simde__m128 b, simde__m128 c,
-                                   bool negate) {
-  if (negate) {
-    r = simde_mm_xor_ps(r, simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))));
+//=============================================================================
+// FPSCR[FR]: whether a result was rounded away from zero
+//=============================================================================
+// For the codegen option fpscr_result_bits. 1 when the inexact result is
+// larger in magnitude than the exact one, 0 when not, and -1 when the exact
+// one isn't known. The double-precision forms take the exact error from an
+// error-free transformation; the others compare with a double-precision
+// reference (exact for frsp, fmuls and fcfid's integer, within double rounding
+// otherwise).
+
+inline int fp_rounded_away_error(double result, double error) {
+  if (error == 0.0 || std::isnan(error) || !std::isfinite(result)) {
+    return 0;
   }
-  const simde__m128 r_nan = simde_mm_cmpunord_ps(r, r);
-  if (simde_mm_movemask_ps(r_nan) == 0) [[likely]] {
-    return r;
+  return std::signbit(error) != std::signbit(result) ? 1 : 0;
+}
+
+inline int fp_rounded_away_sum(double result, double a, double b) {
+  const double b_virtual = result - a;
+  const double error = (a - (result - b_virtual)) + (b - b_virtual);
+  return fp_rounded_away_error(result, error);
+}
+
+inline int fp_rounded_away_product(double result, double a, double b) {
+  return fp_rounded_away_error(result, std::fma(a, b, -result));
+}
+
+inline int fp_rounded_away_quotient(double result, double a, double b) {
+  // a - q * b has the sign of the error times b's.
+  const double remainder = std::fma(-result, b, a);
+  return fp_rounded_away_error(result, std::signbit(b) ? -remainder : remainder);
+}
+
+inline int fp_rounded_away_root(double result, double a) {
+  return fp_rounded_away_error(result, std::fma(-result, result, a));
+}
+
+// fcfid: compared with the integer exactly (a double at 2^63 or more is above
+// every int64_t).
+inline int fp_rounded_away_from_integer(double result, int64_t value) {
+  if (result >= 9223372036854775808.0) {
+    return 1;
   }
+  if (result < -9223372036854775808.0) {
+    return 1;
+  }
+  const int64_t back = int64_t(result);
+  return (result >= 0.0 ? back > value : back < value) ? 1 : 0;
+}
+
+inline int fp_rounded_away_from(double result, double reference) {
+  if (std::isnan(result) || std::isnan(reference)) {
+    return 0;
+  }
+  return std::fabs(result) > std::fabs(reference) ? 1 : 0;
+}
+
+//=============================================================================
+// Vector float results as on Xenon
+//=============================================================================
+// vmaddfp, vnmsubfp and their VMX128 forms round once: built with FMA that is
+// the fused instruction. Otherwise it is in inline assembly on a CPU that has
+// FMA, and on one without (or with REX_PPC_FMA=0) a multiply, then an add. That
+// differs from the console by more than the last bit: a product that underflows
+// is flushed before the add, a sum that cancels magnifies the product's
+// rounding, and a product that overflows float32 gives an infinity or a NaN the
+// single rounding does not.
+
+// The lanes of r that are NaN: the first NaN of a, b, c, quieted, or the default
+// QNaN when none is. Inlined into the [[unlikely]] branch of each site: an opaque
+// call there would make the compiler reload the guest registers it keeps in host
+// registers around every site, even when the branch is not taken.
+[[gnu::always_inline]] inline simde__m128 vec_nan3(simde__m128 r, simde__m128 a, simde__m128 b,
+                                                   simde__m128 c) {
   // Later blends win, so the operands go in reverse priority order.
   simde__m128 nan = simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7FC00000));
   nan = simde_mm_blendv_ps(nan, c, simde_mm_cmpunord_ps(c, c));
   nan = simde_mm_blendv_ps(nan, b, simde_mm_cmpunord_ps(b, b));
   nan = simde_mm_blendv_ps(nan, a, simde_mm_cmpunord_ps(a, a));
   nan = simde_mm_or_ps(nan, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x00400000)));
-  return simde_mm_blendv_ps(r, nan, r_nan);
+  return simde_mm_blendv_ps(r, nan, simde_mm_cmpunord_ps(r, r));
+}
+
+inline bool vec_any_nan(simde__m128 r) {
+  return simde_mm_movemask_ps(simde_mm_cmpunord_ps(r, r)) != 0;
+}
+
+#if defined(__FMA__) || defined(__aarch64__) || defined(_M_ARM64)
+
+inline simde__m128 vec_fma(simde__m128 a, simde__m128 c, simde__m128 b) {
+  return simde_mm_fmadd_ps(a, c, b);
+}
+
+// a * c - b is a * c + (-b), exactly (simde's fmsub is not fused on ARM64).
+inline simde__m128 vec_fms(simde__m128 a, simde__m128 c, simde__m128 b) {
+  return simde_mm_fmadd_ps(
+      a, c, simde_mm_xor_ps(b, simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));
+}
+
+#else
+
+// The instruction itself is needed, so REX_PPC_FMA=1 does not stand in for it.
+inline const bool vec_host_has_fma = fp_host_has_fma && fp_detect_host_fma();
+
+inline simde__m128 vec_fma(simde__m128 a, simde__m128 c, simde__m128 b) {
+  if (vec_host_has_fma) {
+    __asm__("vfmadd213ps %2, %1, %0" : "+x"(a) : "x"(c), "x"(b));
+    return a;
+  }
+  simde__m128 product = simde_mm_mul_ps(a, c);
+  __asm__("" : "+x"(product));
+  return simde_mm_add_ps(product, b);
+}
+
+inline simde__m128 vec_fms(simde__m128 a, simde__m128 c, simde__m128 b) {
+  if (vec_host_has_fma) {
+    __asm__("vfmsub213ps %2, %1, %0" : "+x"(a) : "x"(c), "x"(b));
+    return a;
+  }
+  simde__m128 product = simde_mm_mul_ps(a, c);
+  __asm__("" : "+x"(product));
+  return simde_mm_sub_ps(product, b);
+}
+
+#endif
+
+// vD = vA * vC + vB.
+inline simde__m128 vec_madd(simde__m128 a, simde__m128 c, simde__m128 b) {
+  simde__m128 r = vec_fma(a, c, b);
+  if (vec_any_nan(r)) [[unlikely]] {
+    r = vec_nan3(r, a, b, c);
+  }
+  return r;
+}
+
+// vD = -(vA * vC - vB). An exact zero comes out as -0; a NaN keeps its sign.
+inline simde__m128 vec_nmsub(simde__m128 a, simde__m128 c, simde__m128 b) {
+  simde__m128 r = simde_mm_xor_ps(vec_fms(a, c, b),
+                                  simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))));
+  if (vec_any_nan(r)) [[unlikely]] {
+    r = vec_nan3(r, a, b, c);
+  }
+  return r;
+}
+
+// vmaxfp and vminfp: a denormal is a signed zero, a NaN operand is the result
+// (vA first, quieted), and between zeros the maximum is -0 only when both are,
+// the minimum +0 only when both are. maxps and minps give the second operand for
+// a NaN and for equal values, and a denormal's bits: DAZ only makes their compare
+// see a zero. The AND (maximum) or OR (minimum) of equal values is the right zero.
+inline simde__m128 vec_flush_denormals(simde__m128 x) {
+  const simde__m128i bits = simde_mm_castps_si128(x);
+  const simde__m128i tiny = simde_mm_cmpeq_epi32(
+      simde_mm_and_si128(bits, simde_mm_set1_epi32(0x7F800000)), simde_mm_setzero_si128());
+  return simde_mm_castsi128_ps(
+      simde_mm_andnot_si128(simde_mm_and_si128(tiny, simde_mm_set1_epi32(0x7FFFFFFF)), bits));
+}
+
+// The lanes where a or b is a NaN: a quieted if it is one, else b quieted.
+[[gnu::always_inline]] inline simde__m128 vec_nan2(simde__m128 r, simde__m128 a, simde__m128 b) {
+  const simde__m128 quiet = simde_mm_castsi128_ps(simde_mm_set1_epi32(0x00400000));
+  const simde__m128 nan = simde_mm_blendv_ps(simde_mm_or_ps(b, quiet), simde_mm_or_ps(a, quiet),
+                                             simde_mm_cmpunord_ps(a, a));
+  return simde_mm_blendv_ps(r, nan, simde_mm_cmpunord_ps(a, b));
+}
+
+inline simde__m128 vec_max(simde__m128 a, simde__m128 b) {
+  simde__m128 r = vec_flush_denormals(
+      simde_mm_blendv_ps(simde_mm_max_ps(a, b), simde_mm_and_ps(a, b), simde_mm_cmpeq_ps(a, b)));
+  if (simde_mm_movemask_ps(simde_mm_cmpunord_ps(a, b)) != 0) [[unlikely]] {
+    r = vec_nan2(r, a, b);
+  }
+  return r;
+}
+
+inline simde__m128 vec_min(simde__m128 a, simde__m128 b) {
+  simde__m128 r = vec_flush_denormals(
+      simde_mm_blendv_ps(simde_mm_min_ps(a, b), simde_mm_or_ps(a, b), simde_mm_cmpeq_ps(a, b)));
+  if (simde_mm_movemask_ps(simde_mm_cmpunord_ps(a, b)) != 0) [[unlikely]] {
+    r = vec_nan2(r, a, b);
+  }
+  return r;
+}
+
+// vmsum3fp128 and vmsum4fp128: each product is exact in float64, summed in the
+// order Xenia's x64 backend matched to the console (DOT_PRODUCT_3/4),
+// (x + z) + y or (x + z) + (y + w), and rounded once to float32, in all four
+// lanes. Host lanes 3..0 hold the guest's x, y, z, w. Denormal inputs and results
+// are zeros through the flush mode the generated code sets.
+//
+// A result that is not finite is redone in the order of that sequence, so that it
+// doesn't depend on the order the compiler gives commutative operations: the
+// first NaN operand of each step goes through, quieted; a NaN a step makes is
+// 0x7FC00000; finite inputs that overflow float32 give 0x7FC00000 too, and an
+// infinity from the inputs is kept.
+[[gnu::noinline, gnu::cold, gnu::const]] inline uint32_t vec_msum_special(simde__m128 a,
+                                                                          simde__m128 b,
+                                                                          bool four) {
+  alignas(16) uint32_t av[4], bv[4];
+  simde_mm_store_si128(reinterpret_cast<simde__m128i*>(av), simde_mm_castps_si128(a));
+  simde_mm_store_si128(reinterpret_cast<simde__m128i*>(bv), simde_mm_castps_si128(b));
+  struct Term {
+    double value;
+    uint32_t nan;  // The result's bits when it is a NaN, else 0.
+  };
+  const auto is_nan = [](uint32_t x) { return (x & 0x7FFFFFFFu) > 0x7F800000u; };
+  const auto value = [](uint32_t x) {
+    if ((x & 0x7F800000u) == 0) {
+      x &= 0x80000000u;  // A denormal input is a signed zero.
+    }
+    return double(std::bit_cast<float>(x));
+  };
+  const auto product = [&](int lane) -> Term {
+    if (is_nan(av[lane])) {
+      return {0.0, av[lane] | 0x00400000u};
+    }
+    if (is_nan(bv[lane])) {
+      return {0.0, bv[lane] | 0x00400000u};
+    }
+    const double p = value(av[lane]) * value(bv[lane]);
+    return p != p ? Term{0.0, 0x7FC00000u} : Term{p, 0};
+  };
+  const auto add = [](Term x, Term y) -> Term {
+    if (x.nan) {
+      return x;
+    }
+    if (y.nan) {
+      return y;
+    }
+    const double s = x.value + y.value;
+    return s != s ? Term{0.0, 0x7FC00000u} : Term{s, 0};
+  };
+  const Term xz = add(product(3), product(1));
+  const Term total = four ? add(xz, add(product(2), product(0))) : add(xz, product(2));
+  if (total.nan) {
+    return total.nan;
+  }
+  const float narrow = float(total.value);
+  if (std::isinf(narrow) && std::isfinite(total.value)) {
+    return 0x7FC00000u;
+  }
+  return std::bit_cast<uint32_t>(narrow);
+}
+
+inline simde__m128d vec_msum_pairs(simde__m128 a, simde__m128 b, simde__m128d& yx) {
+  const simde__m128d wz = simde_mm_mul_pd(simde_mm_cvtps_pd(a), simde_mm_cvtps_pd(b));
+  yx = simde_mm_mul_pd(simde_mm_cvtps_pd(simde_mm_movehl_ps(a, a)),
+                       simde_mm_cvtps_pd(simde_mm_movehl_ps(b, b)));
+  return simde_mm_add_pd(yx, wz);  // {y + w, x + z}
+}
+
+// A plain conversion: simde's cvtsd_ss is fcvtxn on ARM64, which rounds to odd
+// and never overflows.
+inline simde__m128 vec_msum_result(simde__m128d sum, simde__m128 a, simde__m128 b, bool four) {
+  const float narrow = float(simde_mm_cvtsd_f64(sum));
+  if ((std::bit_cast<uint32_t>(narrow) << 1) >= 0xFF000000u) [[unlikely]] {
+    return simde_mm_castsi128_ps(simde_mm_set1_epi32(int(vec_msum_special(a, b, four))));
+  }
+  return simde_mm_set1_ps(narrow);
+}
+
+inline simde__m128 vec_msum3(simde__m128 a, simde__m128 b) {
+  simde__m128d yx;
+  const simde__m128d pairs = vec_msum_pairs(a, b, yx);
+  return vec_msum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), yx), a, b, false);
+}
+
+inline simde__m128 vec_msum4(simde__m128 a, simde__m128 b) {
+  simde__m128d yx;
+  const simde__m128d pairs = vec_msum_pairs(a, b, yx);
+  return vec_msum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), pairs), a, b, true);
 }
 
 }  // namespace rex::ppc

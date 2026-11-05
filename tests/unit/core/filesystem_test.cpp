@@ -203,3 +203,13 @@ TEST_CASE("ResolvePathCaseInsensitive leaves a missing path as given", "[filesys
   CHECK(resolved == dir.path() / "missing" / "default.xex");
   CHECK_FALSE(std::filesystem::exists(resolved));
 }
+
+TEST_CASE("CreateParentFolder fails without throwing on a refused path", "[filesystem]") {
+  ScopedTempDir dir;
+  dir.Touch("blocker");
+
+  bool created = true;
+  REQUIRE_NOTHROW(
+      created = rex::filesystem::CreateParentFolder(dir.path() / "blocker" / "sub" / "file.txt"));
+  CHECK_FALSE(created);
+}

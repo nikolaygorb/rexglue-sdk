@@ -5,7 +5,9 @@
  * Ported for the ReXGlue fork.
  */
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -44,4 +46,23 @@ TEST_CASE("A directory the host refuses to create fails without throwing", "[fil
   REQUIRE_NOTHROW(created = directory->CreateEntry("blocker", kFileAttributeDirectory));
   CHECK(created == nullptr);
   CHECK(std::filesystem::is_regular_file(temporary.path / "dir" / "blocker"));
+}
+
+TEST_CASE("Host path devices report the host disk's space", "[filesystem][vfs]") {
+  const auto root = std::filesystem::temp_directory_path();
+  const auto space = std::filesystem::space(root);
+  HostPathDevice device("\\Device\\Test", root, false);
+
+  CHECK(uint64_t(device.total_allocation_units()) ==
+        std::min<uint64_t>(space.capacity / 0x200, UINT32_MAX));
+  CHECK(device.available_allocation_units() <= device.total_allocation_units());
+}
+
+TEST_CASE("Host path devices report no space for a missing folder", "[filesystem][vfs]") {
+  HostPathDevice device("\\Device\\Test",
+                        std::filesystem::temp_directory_path() / "rexglue_no_such" / "folder",
+                        false);
+
+  CHECK(device.total_allocation_units() == 0);
+  CHECK(device.available_allocation_units() == 0);
 }

@@ -28,6 +28,7 @@
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
@@ -89,6 +90,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out, reg::RB_COPY_DEST_INFO* copy_dest_info_out = nullptr,
                bool* written_scaled_out = nullptr);
+
+  // For frame traces. The first returns true if downloads were submitted, to
+  // be completed by the second after awaiting the queue.
+  bool InitializeTraceSubmitDownloads();
+  void InitializeTraceCompleteDownloads(TraceWriter& trace_writer);
+  void RestoreEdramSnapshot(const void* snapshot, uint32_t size);
 
   // For host render targets.
 
@@ -750,6 +757,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   ID3D12PipelineState* host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k4X) + 1] = {};
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> transfer_vertex_buffer_pool_;
+
+  // For frame traces.
+  ID3D12Resource* edram_snapshot_download_buffer_ = nullptr;
+  std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> edram_snapshot_restore_pool_;
 
   ID3D12RootSignature* transfer_root_signatures_[size_t(TransferRootSignatureIndex::kCount)] = {};
   std::unordered_map<TransferShaderKey, ID3D12PipelineState*, TransferShaderKey::Hasher>

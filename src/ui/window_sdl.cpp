@@ -332,12 +332,17 @@ void WindowSDL::ApplyFullscreenModeNow() {
     height = desktop->h;
   }
 
+  const float refresh_rate = float(REXCVAR_GET(fullscreen_refresh_rate));
   SDL_DisplayMode mode = {};
-  if (!SDL_GetClosestFullscreenDisplayMode(display, width, height, 0.0f, true, &mode)) {
+  if (!SDL_GetClosestFullscreenDisplayMode(display, width, height, refresh_rate, true, &mode)) {
     REXLOG_WARN("Display {} has no mode near {}x{}: staying borderless", uint32_t(display), width,
                 height);
     SDL_SetWindowFullscreenMode(sdl_window_, nullptr);
     return;
+  }
+  if (refresh_rate > 0.0f && std::abs(mode.refresh_rate - refresh_rate) > 0.5f) {
+    REXLOG_WARN("Display {} has no {:.3g}Hz mode at {}x{}: using {:.3g}Hz", uint32_t(display),
+                refresh_rate, mode.w, mode.h, mode.refresh_rate);
   }
   if (!SDL_SetWindowFullscreenMode(sdl_window_, &mode)) {
     REXLOG_WARN("SDL_SetWindowFullscreenMode({}x{}) failed: {}", mode.w, mode.h, SDL_GetError());
@@ -345,6 +350,13 @@ void WindowSDL::ApplyFullscreenModeNow() {
   }
   REXLOG_INFO("Exclusive fullscreen mode {}x{} @ {:.3g}Hz on display {}", mode.w, mode.h,
               mode.refresh_rate, uint32_t(display));
+}
+
+double WindowSDL::GetDisplayRefreshRate() const {
+  const SDL_DisplayID display =
+      sdl_window_ ? SDL_GetDisplayForWindow(sdl_window_) : SDL_GetPrimaryDisplay();
+  const SDL_DisplayMode* mode = display ? SDL_GetCurrentDisplayMode(display) : nullptr;
+  return mode ? double(mode->refresh_rate) : 0.0;
 }
 
 void WindowSDL::ApplyNewTitle() {

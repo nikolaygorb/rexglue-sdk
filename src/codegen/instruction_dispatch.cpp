@@ -256,6 +256,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_LDX, build_ldx},
       {PPC_INST_LDUX, build_ldux},
       {PPC_INST_LDBRX, build_ldbrx},
+      {PPC_INST_LQ, build_lq},
       {PPC_INST_LMW, build_lmw},
       {PPC_INST_LWARX, build_lwarx},
       {PPC_INST_LDARX, build_ldarx},
@@ -293,6 +294,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_STDX, build_stdx},
       {PPC_INST_STDUX, build_stdux},
       {PPC_INST_STDBRX, build_stdbrx},
+      {PPC_INST_STFQ, build_stfq},
       {PPC_INST_STFD, build_stfd},
       {PPC_INST_STFDU, build_stfdu},
       {PPC_INST_STFDUX, build_stfdux},
@@ -443,6 +445,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_MFOCRF, build_mfocrf},
       {PPC_INST_MFLR, build_mflr},
       {PPC_INST_MFMSR, build_mfmsr},
+      {PPC_INST_MFPVR, build_mfpvr},
       {PPC_INST_MFFS, build_mffs},
       {PPC_INST_MFTB, build_mftb},
       {PPC_INST_MFTBU, build_mftbu},
@@ -452,6 +455,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_MTOCRF, build_mtcrf},
       {PPC_INST_MTCTR, build_mtctr},
       {PPC_INST_MTLR, build_mtlr},
+      {PPC_INST_MTMSR, build_mtmsrd},
       {PPC_INST_MTMSRD, build_mtmsrd},
       {PPC_INST_MTFSF, build_mtfsf},
       {PPC_INST_MTFSFI, build_mtfsfi},
@@ -726,10 +730,202 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
       {PPC_INST_VUPKHPX, build_vupkhpx},
       {PPC_INST_VUPKLPX, build_vupklpx},
       {PPC_INST_MFVSCR, build_mfvscr},
+      {PPC_INST_SC, build_sc},
       {PPC_INST_MTVSCR, build_mtvscr},
   };
   return table;
 }
+
+namespace {
+
+// fpscr_result_bits: how an instruction sets FPSCR's FR, FI and FPRF.
+enum class FpscrResultForm {
+  kNone,
+  kSum,         // D = A + B, double
+  kDifference,  // D = A - B, double
+  kProduct,     // D = A * B, double
+  kQuotient,    // D = A / B, double
+  kRoot,        // D = sqrt(B), double
+  kMultiplyAdd, // D = +-(A * C +- B), double: FR only in directed rounding
+  kSingle,      // single-precision result, compared with a double reference
+  kFromInteger, // fcfid
+  kToInteger,   // fctiw, fctid and z forms: FR and FI, FPRF undefined (kept)
+  kCompare,     // fcmpu, fcmpo: FPCC
+};
+
+struct FpscrResultInfo {
+  FpscrResultForm form = FpscrResultForm::kNone;
+  // kSingle: the double-precision reference, from fpr_a, fpr_b, fpr_c.
+  const char* reference = nullptr;
+};
+
+FpscrResultInfo GetFpscrResultInfo(int id) {
+  using F = FpscrResultForm;
+  switch (id) {
+    case PPC_INST_FADD:
+      return {F::kSum};
+    case PPC_INST_FSUB:
+      return {F::kDifference};
+    case PPC_INST_FMUL:
+      return {F::kProduct};
+    case PPC_INST_FDIV:
+      return {F::kQuotient};
+    case PPC_INST_FSQRT:
+      return {F::kRoot};
+    case PPC_INST_FMADD:
+    case PPC_INST_FMSUB:
+    case PPC_INST_FNMADD:
+    case PPC_INST_FNMSUB:
+      return {F::kMultiplyAdd};
+    case PPC_INST_FADDS:
+      return {F::kSingle, "fpr_a + fpr_b"};
+    case PPC_INST_FSUBS:
+      return {F::kSingle, "fpr_a - fpr_b"};
+    case PPC_INST_FMULS:
+      return {F::kSingle, "fpr_a * fpr_b"};
+    case PPC_INST_FDIVS:
+      return {F::kSingle, "fpr_a / fpr_b"};
+    case PPC_INST_FSQRTS:
+      return {F::kSingle, "std::sqrt(fpr_b)"};
+    case PPC_INST_FMADDS:
+    case PPC_INST_FNMADDS:
+      // The negation doesn't change the magnitude compared.
+      return {F::kSingle, "std::fma(fpr_a, fpr_c, fpr_b)"};
+    case PPC_INST_FMSUBS:
+    case PPC_INST_FNMSUBS:
+      return {F::kSingle, "std::fma(fpr_a, fpr_c, -fpr_b)"};
+    case PPC_INST_FRSP:
+      return {F::kSingle, "fpr_b"};
+    case PPC_INST_FRES:
+      return {F::kSingle, "1.0 / fpr_b"};
+    case PPC_INST_FRSQRTE:
+      return {F::kSingle, "1.0 / std::sqrt(fpr_b)"};
+    case PPC_INST_FCFID:
+      return {F::kFromInteger};
+    case PPC_INST_FCTIW:
+    case PPC_INST_FCTIWZ:
+    case PPC_INST_FCTID:
+    case PPC_INST_FCTIDZ:
+      return {F::kToInteger};
+    case PPC_INST_FCMPU:
+    case PPC_INST_FCMPO:
+      return {F::kCompare};
+    default:
+      return {};
+  }
+}
+
+// Saves the operands (the destination may be one of them) and moves the
+// host's inexact flag aside. Opens a block that EmitFpscrResultEnd closes.
+void EmitFpscrResultBegin(BuilderContext& ctx, int id, const FpscrResultInfo& info) {
+  using F = FpscrResultForm;
+  if (info.form == F::kNone || info.form == F::kCompare) {
+    return;
+  }
+  const auto& ops = ctx.insn.operands;
+  ctx.println("\t{{");
+  switch (info.form) {
+    case F::kRoot:
+    case F::kToInteger:
+      ctx.println("\tconst double fpr_b = {}.f64;", ctx.f(ops[1]));
+      break;
+    case F::kFromInteger:
+      ctx.println("\tconst int64_t fpr_i = {}.s64;", ctx.f(ops[1]));
+      break;
+    case F::kMultiplyAdd:
+      break;
+    case F::kSingle:
+      if (id == PPC_INST_FMADDS || id == PPC_INST_FMSUBS || id == PPC_INST_FNMADDS ||
+          id == PPC_INST_FNMSUBS) {
+        ctx.println("\tconst double fpr_a = {}.f64, fpr_c = {}.f64, fpr_b = {}.f64;",
+                    ctx.f(ops[1]), ctx.f(ops[2]), ctx.f(ops[3]));
+      } else if (id == PPC_INST_FSQRTS || id == PPC_INST_FRSP || id == PPC_INST_FRES ||
+                 id == PPC_INST_FRSQRTE) {
+        ctx.println("\tconst double fpr_b = {}.f64;", ctx.f(ops[1]));
+      } else {
+        ctx.println("\tconst double fpr_a = {}.f64, fpr_b = {}.f64;", ctx.f(ops[1]),
+                    ctx.f(ops[2]));
+      }
+      break;
+    default:
+      ctx.println("\tconst double fpr_a = {}.f64, fpr_b = {}.f64;", ctx.f(ops[1]),
+                  ctx.f(ops[2]));
+      break;
+  }
+  ctx.println("\tctx.fpscr.beginResult();");
+}
+
+void EmitFpscrResultEnd(BuilderContext& ctx, const FpscrResultInfo& info) {
+  using F = FpscrResultForm;
+  if (info.form == F::kNone) {
+    return;
+  }
+  if (info.form == F::kCompare) {
+    const auto cr = ctx.cr(ctx.insn.operands[0]);
+    ctx.println("\tctx.fpscr.setCompareResult({0}.lt, {0}.gt, {0}.eq, {0}.un);", cr);
+    return;
+  }
+  const auto d = ctx.f(ctx.insn.operands[0]);
+  std::string rounded_away;
+  bool single = false;
+  // The sum's error-free transformation and the single forms' double
+  // reference are exact only when rounding to nearest; in a directed mode FR
+  // follows from the mode (-1). The fma residuals and the integer comparisons
+  // are exact in any mode.
+  auto nearest_only = [](const std::string& expression) {
+    return fmt::format("(ctx.fpscr.isRoundingToNearest() ? {} : -1)", expression);
+  };
+  switch (info.form) {
+    case F::kSum:
+      rounded_away =
+          nearest_only(fmt::format("rex::ppc::fp_rounded_away_sum({}.f64, fpr_a, fpr_b)", d));
+      break;
+    case F::kDifference:
+      rounded_away =
+          nearest_only(fmt::format("rex::ppc::fp_rounded_away_sum({}.f64, fpr_a, -fpr_b)", d));
+      break;
+    case F::kProduct:
+      rounded_away = fmt::format("rex::ppc::fp_rounded_away_product({}.f64, fpr_a, fpr_b)", d);
+      break;
+    case F::kQuotient:
+      rounded_away = fmt::format("rex::ppc::fp_rounded_away_quotient({}.f64, fpr_a, fpr_b)", d);
+      break;
+    case F::kRoot:
+      rounded_away = fmt::format("rex::ppc::fp_rounded_away_root({}.f64, fpr_b)", d);
+      break;
+    case F::kMultiplyAdd:
+      rounded_away = "-1";
+      break;
+    case F::kSingle:
+      rounded_away = nearest_only(
+          fmt::format("rex::ppc::fp_rounded_away_from({}.f64, {})", d, info.reference));
+      single = true;
+      break;
+    case F::kFromInteger:
+      rounded_away = fmt::format("rex::ppc::fp_rounded_away_from_integer({}.f64, fpr_i)", d);
+      break;
+    case F::kToInteger:
+      rounded_away = fmt::format("rex::ppc::fp_rounded_away_from(double({}.s64), fpr_b)", d);
+      break;
+    default:
+      break;
+  }
+  // FI first; the arithmetic of FR runs after it, with the status flags saved
+  // and put back so it sets none of its own.
+  ctx.println("\tconst bool fpr_fi = ctx.fpscr.endInexact();");
+  ctx.println("\tconst uint32_t fpr_status = ctx.fpscr.saveStatus();");
+  ctx.println("\tconst int fpr_away = fpr_fi ? {} : 0;", rounded_away);
+  ctx.println("\tctx.fpscr.restoreStatus(fpr_status);");
+  if (info.form == F::kToInteger) {
+    ctx.println("\tctx.fpscr.setConversionResult(double({}.s64), fpr_fi, fpr_away);", d);
+  } else {
+    ctx.println("\tctx.fpscr.setArithmeticResult({}.f64, {}, fpr_fi, fpr_away);", d,
+                single ? "true" : "false");
+  }
+  ctx.println("\t}}");
+}
+
+}  // namespace
 
 bool CanDispatchInstruction(int id) {
   return GetDispatchTable().contains(id);
@@ -748,9 +944,17 @@ bool DispatchInstruction(int id, BuilderContext& ctx) {
   const auto& table = GetDispatchTable();
   auto it = table.find(id);
   if (it != table.end()) {
+    const FpscrResultInfo fpscr_result =
+        ctx.config().fpscrResultBits ? GetFpscrResultInfo(id) : FpscrResultInfo{};
+    EmitFpscrResultBegin(ctx, id, fpscr_result);
     if (!it->second(ctx)) {
+      if (fpscr_result.form != FpscrResultForm::kNone &&
+          fpscr_result.form != FpscrResultForm::kCompare) {
+        ctx.println("\t}}");
+      }
       return false;
     }
+    EmitFpscrResultEnd(ctx, fpscr_result);
     emitFpRecordCR1(ctx);
     return true;
   }

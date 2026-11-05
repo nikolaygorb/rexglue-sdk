@@ -17,6 +17,7 @@
 
 #include <fmt/format.h>
 #include <rex/assert.h>
+#include <rex/filesystem.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -47,6 +48,24 @@
 namespace rex::system {
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+
+namespace {
+
+// The shared library of a recompiled guest module, which the build puts beside
+// the executable. LoadLibrary adds .dll to a bare name and searches the
+// executable's folder first; dlopen adds neither the lib prefix nor the suffix
+// CMake gives a SHARED library and searches only the system paths (issue #454).
+std::filesystem::path RecompiledModuleLibraryPath(const std::string& shared_lib_name) {
+#if REX_PLATFORM_WIN32
+  return std::filesystem::path(shared_lib_name);
+#elif REX_PLATFORM_MAC
+  return rex::filesystem::GetExecutableFolder() / ("lib" + shared_lib_name + ".dylib");
+#else
+  return rex::filesystem::GetExecutableFolder() / ("lib" + shared_lib_name + ".so");
+#endif
+}
+
+}  // namespace
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
@@ -772,7 +791,7 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     }
 
     rex::platform::DynamicLibrary library_local;
-    if (!library_local.Load(std::filesystem::path(recomp->shared_lib_name),
+    if (!library_local.Load(RecompiledModuleLibraryPath(recomp->shared_lib_name),
                             rex::platform::SymbolResolution::kImmediate)) {
       REXSYS_ERROR("Failed to load shared library for module '{}': {}", recomp->pe_name,
                    library_local.last_error());
@@ -1184,8 +1203,10 @@ void KernelState::CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result,
                                        X_HANDLE thread_handle) {
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   // Result last, so a caller polling it for completion reads a valid length.
+  // A completed request leaves no context behind.
   XOverlappedSetExtendedError(ptr, extended_error);
   XOverlappedSetLength(ptr, length);
+  XOverlappedSetContext(ptr, 0);
   std::atomic_thread_fence(std::memory_order_release);
   XOverlappedSetResult(ptr, result);
   // The thread comes from the caller: InternalContext belongs to the title.

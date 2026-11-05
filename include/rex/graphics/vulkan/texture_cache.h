@@ -301,6 +301,10 @@ class VulkanTextureCache final : public TextureCache {
       kTransferDestination,
       kGuestShaderSampled,
       kSwapSampled,
+      // Written by a compute shader (vulkan_texture_load_direct).
+      kComputeWrite,
+      // Copied to a buffer (vulkan_texture_load_direct_verify).
+      kTransferSource,
     };
 
     // Takes ownership of the image and its memory.
@@ -327,6 +331,20 @@ class VulkanTextureCache final : public TextureCache {
     void set_red_blue_swapped(bool swapped) { red_blue_swapped_ = swapped; }
     uint32_t ViewSwizzle(uint32_t host_swizzle) const {
       return red_blue_swapped_ ? SwapRedAndBlueSources(host_swizzle) : host_swizzle;
+    }
+
+    // vulkan_texture_load_direct: the image was created with the storage
+    // usage and an unsigned integer view format, so loads can write it from
+    // the load shader. The view and its descriptor are made on the first such
+    // load.
+    bool direct_load() const { return direct_load_; }
+    void set_direct_load() { direct_load_ = true; }
+    VkImageView direct_load_view() const { return direct_load_view_; }
+    VkDescriptorSet direct_load_descriptor_set() const { return direct_load_descriptor_set_; }
+    void SetDirectLoadBindings(VkImageView view, VkDescriptorPool pool, VkDescriptorSet set) {
+      direct_load_view_ = view;
+      direct_load_descriptor_pool_ = pool;
+      direct_load_descriptor_set_ = set;
     }
 
    private:
@@ -383,6 +401,11 @@ class VulkanTextureCache final : public TextureCache {
     Usage usage_ = Usage::kUndefined;
     bool red_blue_swapped_ = false;
 
+    bool direct_load_ = false;
+    VkImageView direct_load_view_ = VK_NULL_HANDLE;
+    VkDescriptorPool direct_load_descriptor_pool_ = VK_NULL_HANDLE;
+    VkDescriptorSet direct_load_descriptor_set_ = VK_NULL_HANDLE;
+
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
@@ -435,14 +458,50 @@ class VulkanTextureCache final : public TextureCache {
 
   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
 
+  // The image formats of a texture for the key: [0] the image's, [1] the
+  // other view format of a mutable signed / unsigned pair, or undefined.
+  void GetTextureImageFormats(TextureKey key, VkFormat (&formats)[2]) const;
+
   // Creates the image of a texture for the key, width x height with
   // mip_levels levels: the key's own size and levels for CreateTexture, a
-  // replacement image's for CreateReplacementTexture.
+  // replacement image's for CreateReplacementTexture. direct_load_kind is a
+  // DirectLoadKind for an image that loads can write from a compute shader,
+  // or -1.
   std::unique_ptr<VulkanTexture> CreateVulkanTexture(TextureKey key, uint32_t width,
-                                                     uint32_t height, uint32_t mip_levels);
+                                                     uint32_t height, uint32_t mip_levels,
+                                                     int direct_load_kind = -1);
 
   void GetTextureUsageMasks(VulkanTexture::Usage usage, VkPipelineStageFlags& stage_mask,
                             VkAccessFlags& access_mask, VkImageLayout& layout);
+  // Marks the texture as used and pushes the barrier from its usage to
+  // new_usage, also between two writes of the same usage.
+  void TransitionTextureUsage(VulkanTexture& texture, VulkanTexture::Usage new_usage);
+
+  // vulkan_texture_load_direct (see texture_load_scaled_direct.glsli).
+  enum DirectLoadKind {
+    kDirectLoad32bpb,
+    kDirectLoad64bpb,
+    kDirectLoadKindCount,
+  };
+  static constexpr VkFormat kDirectLoadViewFormats[kDirectLoadKindCount] = {
+      VK_FORMAT_R32_UINT, VK_FORMAT_R16G16B16A16_UINT};
+  // The kind of direct load for a texture created for the key, or -1 if its
+  // loads go through the scratch buffer: resolution-scaled, tiled,
+  // single-level, single-layer 2D, an uncompressed host format loaded by the
+  // 32bpb or 64bpb shader that the device can create with the storage usage.
+  int GetDirectLoadKind(TextureKey key);
+  bool IsDirectLoadImageSupported(VkFormat format);
+  // Records the load of the texture's base straight into its image. False,
+  // with nothing recorded, if it can't be done that way.
+  bool LoadTextureDataDirect(VulkanTexture& texture, DirectLoadKind kind,
+                             const LoadShaderInfo& load_shader_info);
+  bool EnsureDirectLoadBindings(VulkanTexture& texture, DirectLoadKind kind);
+  // vulkan_texture_load_direct_verify: copies level 0 of the texture to a new
+  // readback buffer (index 0 the scratch buffer path, 1 the direct one).
+  bool ReadBackDirectLoadVerification(VulkanTexture& texture, uint32_t bytes_per_texel,
+                                      uint32_t index);
+  // Compares and frees the verifications of submissions up to the completed one.
+  void CompareDirectLoadVerification(uint64_t completed_submission_index);
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
 
@@ -479,6 +538,32 @@ class VulkanTextureCache final : public TextureCache {
   VkPipelineLayout load_pipeline_layout_ = VK_NULL_HANDLE;
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
+
+  // vulkan_texture_load_direct, read at startup; off when the device lacks
+  // something it needs.
+  bool direct_load_enabled_ = false;
+  VkDescriptorSetLayout direct_load_descriptor_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout direct_load_pipeline_layout_ = VK_NULL_HANDLE;
+  std::array<VkPipeline, kDirectLoadKindCount> direct_load_pipelines_{};
+  // Per-texture storage image descriptors, freed with the texture.
+  std::vector<VkDescriptorPool> direct_load_descriptor_pools_;
+  std::unordered_map<VkFormat, bool> direct_load_image_support_;
+  // vulkan_texture_load_direct_verify: a direct load being compared with the
+  // scratch buffer path once its submission has completed.
+  struct DirectLoadVerification {
+    uint64_t submission_index;
+    std::array<VkBuffer, 2> buffers{};
+    std::array<VmaAllocation, 2> allocations{};
+    TextureKey key;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bytes_per_texel;
+  };
+  std::vector<DirectLoadVerification> direct_load_verifications_;
+  DirectLoadVerification direct_load_verification_pending_;
+  uint32_t direct_load_verifications_in_frame_ = 0;
+  uint64_t direct_load_verified_count_ = 0;
+  uint64_t direct_load_mismatch_count_ = 0;
 
   // Persistent descriptor binding the whole shared memory buffer
   // (kStorageBufferCompute layout) for compute load/store, so per-operation

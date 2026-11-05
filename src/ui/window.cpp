@@ -39,6 +39,12 @@ REXCVAR_DEFINE_BOOL(fullscreen_exclusive, false, "UI/Window",
                     "Switch the display mode in fullscreen instead of going "
                     "borderless at the desktop mode");
 
+REXCVAR_DEFINE_DOUBLE(fullscreen_refresh_rate, 0.0, "UI/Window",
+                      "Display refresh rate in Hz with fullscreen_exclusive, the closest one the "
+                      "display has (0 = the desktop's). Doesn't change what the game is told, "
+                      "see video_mode_refresh_rate")
+    .range(0.0, 1000.0);
+
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")

@@ -16,6 +16,9 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iterator>
+#include <map>
+#include <mutex>
 #include <string>
 
 #include <fcntl.h>
@@ -224,31 +227,6 @@ static int QueryMapEntry(uintptr_t addr, LinuxMapEntry& out_entry) {
 }
 #endif  // PROCMAP_QUERY
 
-// Find the mapping entry in /proc/self/maps that contains the given address
-static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
-  const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
-#ifdef PROCMAP_QUERY
-  int queried = QueryMapEntry(addr, out_entry);
-  if (queried >= 0) {
-    return queried != 0;
-  }
-#endif  // PROCMAP_QUERY
-  std::ifstream maps("/proc/self/maps");
-  if (!maps.is_open())
-    return false;
-  std::string line;
-  while (std::getline(maps, line)) {
-    LinuxMapEntry e;
-    if (!ParseProcMapsLine(line, e))
-      continue;
-    if (addr >= e.start && addr < e.end) {
-      out_entry = e;
-      return true;
-    }
-  }
-  return false;
-}
-
 // Convert /proc/self/maps permission chars to PageAccess
 static PageAccess PermsToPageAccess(const char perms[5]) {
   const bool r = perms[0] == 'r';
@@ -262,7 +240,148 @@ static PageAccess PermsToPageAccess(const char perms[5]) {
   return w ? PageAccess::kReadWrite : PageAccess::kReadOnly;
 }
 
+static PageAccess ProtToPageAccess(int prot) {
+  const char perms[5] = {(prot & PROT_READ) ? 'r' : '-', (prot & PROT_WRITE) ? 'w' : '-',
+                         (prot & PROT_EXEC) ? 'x' : '-', 'p', 0};
+  return PermsToPageAccess(perms);
+}
+
+// The mappings as of the last read of /proc/self/maps, for kernels without PROCMAP_QUERY: the
+// access violation handler queries on every write watch fault, and reading the file then costs
+// about 0.55 ms (30 FPS on a Steam Deck, issue #523). The calls below keep it up to date; a lookup
+// that misses reads the file again, which also picks up mappings made elsewhere. Empty until a
+// lookup needs it, so kernels with the ioctl pay only for taking the lock.
+struct MapsRange {
+  uintptr_t end = 0;
+  PageAccess access = PageAccess::kNoAccess;
+};
+
+struct MapsCache {
+  std::mutex mutex;
+  std::map<uintptr_t, MapsRange> ranges;
+};
+
+static MapsCache& Maps() {
+  static MapsCache* cache = new MapsCache;
+  return *cache;
+}
+
+static void ReadMaps(MapsCache& cache) {
+  cache.ranges.clear();
+  std::ifstream maps("/proc/self/maps");
+  std::string line;
+  while (maps.is_open() && std::getline(maps, line)) {
+    LinuxMapEntry e;
+    if (ParseProcMapsLine(line, e)) {
+      cache.ranges[e.start] = {e.end, PermsToPageAccess(e.perms)};
+    }
+  }
+}
+
+static std::map<uintptr_t, MapsRange>::iterator FindCached(MapsCache& cache, uintptr_t addr) {
+  auto it = cache.ranges.upper_bound(addr);
+  if (it == cache.ranges.begin()) {
+    return cache.ranges.end();
+  }
+  --it;
+  return it->second.end > addr ? it : cache.ranges.end();
+}
+
+// Cuts the range around `pos` there. Returns the first range at or after `pos`.
+static std::map<uintptr_t, MapsRange>::iterator SplitAt(MapsCache& cache, uintptr_t pos) {
+  auto it = FindCached(cache, pos);
+  if (it == cache.ranges.end()) {
+    return cache.ranges.lower_bound(pos);
+  }
+  if (it->first == pos) {
+    return it;
+  }
+  const MapsRange right = it->second;
+  it->second.end = pos;
+  return cache.ranges.emplace(pos, right).first;
+}
+
+static void NoteUnmapped(void* base_address, size_t length) {
+  MapsCache& cache = Maps();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  if (cache.ranges.empty()) {
+    return;
+  }
+  const uintptr_t start = reinterpret_cast<uintptr_t>(base_address);
+  auto first = SplitAt(cache, start);
+  auto last = SplitAt(cache, start + length);
+  cache.ranges.erase(first, last);
+}
+
+static void NoteAccess(void* base_address, size_t length, int prot) {
+  MapsCache& cache = Maps();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  if (cache.ranges.empty()) {
+    return;
+  }
+  const uintptr_t start = reinterpret_cast<uintptr_t>(base_address);
+  uintptr_t end = start + length;
+  const PageAccess access = ProtToPageAccess(prot);
+  auto first = SplitAt(cache, start);
+  auto last = SplitAt(cache, end);
+  cache.ranges.erase(first, last);
+  // Joined with its neighbours, or the map grows a range per watched page.
+  uintptr_t begin = start;
+  auto next = cache.ranges.lower_bound(end);
+  if (next != cache.ranges.end() && next->first == end && next->second.access == access) {
+    end = next->second.end;
+    next = cache.ranges.erase(next);
+  }
+  if (next != cache.ranges.begin()) {
+    auto previous = std::prev(next);
+    if (previous->second.end == begin && previous->second.access == access) {
+      previous->second.end = end;
+      return;
+    }
+  }
+  cache.ranges[begin] = {end, access};
+}
+
+static void ForgetMaps() {
+  MapsCache& cache = Maps();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  cache.ranges.clear();
+}
+
+// Finds the mapping that contains the given address: where it ends, and its access.
+static bool FindMapping(void* address, uintptr_t& out_end, PageAccess& out_access) {
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+#ifdef PROCMAP_QUERY
+  LinuxMapEntry entry;
+  int queried = QueryMapEntry(addr, entry);
+  if (queried > 0) {
+    out_end = entry.end;
+    out_access = PermsToPageAccess(entry.perms);
+  }
+  if (queried >= 0) {
+    return queried != 0;
+  }
+#endif  // PROCMAP_QUERY
+  MapsCache& cache = Maps();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto it = FindCached(cache, addr);
+  if (it == cache.ranges.end()) {
+    ReadMaps(cache);
+    it = FindCached(cache, addr);
+    if (it == cache.ranges.end()) {
+      return false;
+    }
+  }
+  out_end = it->second.end;
+  out_access = it->second.access;
+  return true;
+}
+
 }  // namespace
+#else
+static void NoteUnmapped(void*, size_t) {}
+static void NoteAccess(void*, size_t, int) {}
+static void ForgetMaps() {}
 #endif  // REX_PLATFORM_LINUX
 
 void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
@@ -333,6 +452,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
   }
 #endif
   if (result != MAP_FAILED) {
+    NoteAccess(result, length, prot_initial);
     return result;
   }
 #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
@@ -345,6 +465,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
     // needs. Checking the range in /proc/self/maps first cost every such commit a read of the
     // whole file.
     if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+      NoteAccess(base_address, length, static_cast<int>(prot_requested));
       return base_address;
     }
   }
@@ -360,13 +481,20 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
       if (mprotect(base_address, length, PROT_NONE) != 0) {
         return false;
       }
+      NoteAccess(base_address, length, PROT_NONE);
 #if defined(MADV_DONTNEED)
       (void)madvise(base_address, length, MADV_DONTNEED);
 #endif
       return true;
     }
     case DeallocationType::kRelease: {
-      return munmap(base_address, length) == 0;
+      const bool unmapped = munmap(base_address, length) == 0;
+      if (unmapped) {
+        NoteUnmapped(base_address, length);
+      } else {
+        ForgetMaps();
+      }
+      return unmapped;
     }
     default:
       // how we get here? :(
@@ -394,9 +522,10 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   //             atomic in a mutli-threaded process either, but it's something to be aware of.
   // Query old access before changing, if the caller needs it
   if (out_old_access) {
-    LinuxMapEntry e;
-    if (FindEntryForAddress(base_address, e)) {
-      *out_old_access = PermsToPageAccess(e.perms);
+    uintptr_t end = 0;
+    PageAccess old_access;
+    if (FindMapping(base_address, end, old_access)) {
+      *out_old_access = old_access;
     }
   }
 #endif
@@ -406,6 +535,8 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   if (ret != 0) {
     REXSYS_ERROR("mprotect({}, 0x{:X}, {}) failed: {} ({})", base_address, length, prot,
                  strerror(errno), errno);
+  } else {
+    NoteAccess(base_address, length, static_cast<int>(prot));
   }
   return ret == 0;
 }
@@ -453,14 +584,14 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   access_out = PageAccess::kNoAccess;
   length = 0;
 
-  LinuxMapEntry e;
-  if (!FindEntryForAddress(base_address, e)) {
+  uintptr_t end = 0;
+  PageAccess access = PageAccess::kNoAccess;
+  if (!FindMapping(base_address, end, access)) {
     return false;
   }
 
-  const uintptr_t addr = reinterpret_cast<uintptr_t>(base_address);
-  length = static_cast<size_t>(e.end - addr);
-  access_out = PermsToPageAccess(e.perms);
+  length = static_cast<size_t>(end - reinterpret_cast<uintptr_t>(base_address));
+  access_out = access;
 
   return true;
 #endif
@@ -566,11 +697,22 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
     return nullptr;
   }
 
+  NoteAccess(result, length, static_cast<int>(prot));
   return result;
 }
 
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
-  return munmap(base_address, length) == 0;
+  const bool unmapped = munmap(base_address, length) == 0;
+  if (unmapped) {
+    NoteUnmapped(base_address, length);
+  } else {
+    ForgetMaps();
+  }
+  return unmapped;
+}
+
+bool MapFileViewTakesPageOffsets() {
+  return true;  // the allocation granularity is the page size
 }
 
 }  // namespace memory

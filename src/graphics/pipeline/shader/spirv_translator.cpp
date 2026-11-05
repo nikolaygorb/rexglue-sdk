@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -26,6 +27,7 @@
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/xenos_zpd_report.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
 
@@ -33,6 +35,35 @@ REXCVAR_DEFINE_BOOL(
     spirv_disable_rounding_mode_rte, false, "GPU/Vulkan",
     "Disable RoundingModeRTE capability in SPIR-V shaders. Enable this to allow shader "
     "debugging in RenderDoc, which doesn't support this capability.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(shader_bisect_ps_hash, "", "GPU/Debug",
+                      "Ucode hash (hex) of the pixel shader to bisect (Vulkan). Empty disables the "
+                      "bisect entirely. Read when a shader is translated")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(shader_bisect_instruction, -1, "GPU/Debug",
+                     "Guest instruction of the bisected shader to snapshot a register at, counted "
+                     "in translation order from 0. -1: the register's final value")
+    .range(-1, 65535)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(shader_bisect_register, -1, "GPU/Debug",
+                     "Guest register to write to color output 0 at the end of the bisected "
+                     "shader, so an intermediate value can be read back. -1 leaves the shader's "
+                     "own output alone")
+    .range(-1, 127)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(shader_bisect_probe, 0, "GPU/Debug",
+                     "What to write to color 0 for the bisected register, since an 8-bit target "
+                     "hides the values that matter most. 0: the register itself, 1: 1.0 per "
+                     "component that is NaN, 2: 1.0 per component that is infinite, 3: 1.0 per "
+                     "component whose magnitude is at least 1")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(shader_bisect_cut, false, "GPU/Debug",
+                    "Stop emitting the bisected shader after shader_bisect_instruction instead of "
+                    "only snapshotting the register there. Cutting also drops the shader's own "
+                    "color and depth exports, which changes what the render backend does with the "
+                    "pixel")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
@@ -49,6 +80,7 @@ SpirvShaderTranslator::Features::Features(bool all)
       signed_zero_inf_nan_preserve_float32(all),
       denorm_flush_to_zero_float32(all),
       rounding_mode_rte_float32(all),
+      rounding_mode_rtz_float32(all),
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
       sample_rate_shading(all),
@@ -67,6 +99,7 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
           vulkan_device->properties().shaderSignedZeroInfNanPreserveFloat32),
       denorm_flush_to_zero_float32(vulkan_device->properties().shaderDenormFlushToZeroFloat32),
       rounding_mode_rte_float32(vulkan_device->properties().shaderRoundingModeRTEFloat32),
+      rounding_mode_rtz_float32(vulkan_device->properties().shaderRoundingModeRTZFloat32),
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
       sample_rate_shading(vulkan_device->properties().sampleRateShading),
@@ -155,6 +188,11 @@ void SpirvShaderTranslator::Reset() {
   texture_bindings_.clear();
 
   main_interface_.clear();
+  var_main_estimate_coefficients_.fill(spv::NoResult);
+  bisect_instruction_index_ = 0;
+  bisect_current_instruction_ = UINT32_MAX;
+  bisect_snapshot_emitted_ = false;
+  var_main_bisect_snapshot_ = spv::NoResult;
   var_main_registers_ = spv::NoResult;
   var_main_memexport_address_ = spv::NoResult;
   for (size_t memexport_eM_index = 0; memexport_eM_index < rex::countof(var_main_memexport_data_);
@@ -191,16 +229,106 @@ uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {
                             : modification.pixel.dynamic_addressable_register_count;
 }
 
+bool SpirvShaderTranslator::BisectTargetsCurrentShader() const {
+  const std::string& hash_text = REXCVAR_GET(shader_bisect_ps_hash);
+  if (hash_text.empty()) {
+    return false;
+  }
+  uint64_t hash = std::strtoull(hash_text.c_str(), nullptr, 16);
+  return hash && hash == current_shader().ucode_data_hash();
+}
+
+bool SpirvShaderTranslator::BisectSkipsInstruction() {
+  if (!BisectTargetsCurrentShader()) {
+    return false;
+  }
+  bisect_current_instruction_ = bisect_instruction_index_++;
+  return REXCVAR_GET(shader_bisect_cut) && REXCVAR_GET(shader_bisect_instruction) >= 0 &&
+         bisect_current_instruction_ > uint32_t(REXCVAR_GET(shader_bisect_instruction));
+}
+
+void SpirvShaderTranslator::BisectSnapshotAfterInstruction() {
+  if (var_main_bisect_snapshot_ == spv::NoResult || REXCVAR_GET(shader_bisect_instruction) < 0 ||
+      bisect_current_instruction_ != uint32_t(REXCVAR_GET(shader_bisect_instruction))) {
+    return;
+  }
+  BisectStoreSnapshot();
+}
+
+void SpirvShaderTranslator::BisectStoreSnapshot() {
+  EnsureBuildPointAvailable();
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(REXCVAR_GET(shader_bisect_register)));
+  builder_->createStore(
+      builder_->createLoad(builder_->createAccessChain(spv::StorageClassFunction,
+                                                       var_main_registers_, id_vector_temp_),
+                           spv::NoPrecision),
+      var_main_bisect_snapshot_);
+  bisect_snapshot_emitted_ = true;
+}
+
+void SpirvShaderTranslator::BisectOverrideColorOutput() {
+  if (var_main_bisect_snapshot_ == spv::NoResult ||
+      output_or_var_fragment_data_[0] == spv::NoResult) {
+    return;
+  }
+  EnsureBuildPointAvailable();
+  // Past the last instruction the snapshot is the register's final value.
+  if (!bisect_snapshot_emitted_) {
+    BisectStoreSnapshot();
+  }
+  spv::Id value = builder_->createLoad(var_main_bisect_snapshot_, spv::NoPrecision);
+  spv::Id classified = spv::NoResult;
+  switch (REXCVAR_GET(shader_bisect_probe)) {
+    case 1:
+      classified = builder_->createUnaryOp(spv::OpIsNan, type_bool4_, value);
+      break;
+    case 2:
+      classified = builder_->createUnaryOp(spv::OpIsInf, type_bool4_, value);
+      break;
+    case 3:
+      classified =
+          builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool4_,
+                                builder_->createUnaryBuiltinCall(
+                                    type_float4_, ext_inst_glsl_std_450_, GLSLstd450FAbs, value),
+                                const_float4_1_);
+      break;
+    default:
+      break;
+  }
+  if (classified != spv::NoResult) {
+    value = builder_->createTriOp(spv::OpSelect, type_float4_, classified, const_float4_1_,
+                                  const_float4_0_);
+  }
+  builder_->createStore(value, output_or_var_fragment_data_[0]);
+  // The FSI path writes only the colors the shader marked as written.
+  if (var_main_fsi_color_written_ != spv::NoResult) {
+    builder_->createStore(
+        builder_->createBinOp(spv::OpBitwiseOr, type_uint_,
+                              builder_->createLoad(var_main_fsi_color_written_, spv::NoPrecision),
+                              builder_->makeUintConstant(uint32_t(1))),
+        var_main_fsi_color_written_);
+  }
+  REXGPU_INFO("shader_bisect: shader {:016X} {} instruction {} of {}, r{} to oC0",
+              current_shader().ucode_data_hash(),
+              REXCVAR_GET(shader_bisect_cut) ? "cut after" : "snapshot after",
+              REXCVAR_GET(shader_bisect_instruction), bisect_instruction_index_,
+              REXCVAR_GET(shader_bisect_register));
+}
+
 void SpirvShaderTranslator::StartTranslation() {
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
                                             nullptr);
+  // Vertex shaders always keep NoContraction for position invariance.
+  builder_->setNoContraction(!is_pixel_shader() ||
+                             !GetSpirvShaderModification().pixel.contraction_allowed);
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
   if (features_.spirv_version < spv::Spv_1_4) {
     if (features_.signed_zero_inf_nan_preserve_float32 || features_.denorm_flush_to_zero_float32 ||
-        features_.rounding_mode_rte_float32) {
+        features_.rounding_mode_rte_float32 || RoundsTowardZeroInHardware()) {
       builder_->addExtension("SPV_KHR_float_controls");
     }
   }
@@ -543,6 +671,13 @@ void SpirvShaderTranslator::StartTranslation() {
           builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
       var_main_registers_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                                      type_register_array, "xe_var_registers");
+      if (is_pixel_shader() && BisectTargetsCurrentShader() &&
+          REXCVAR_GET(shader_bisect_register) >= 0 &&
+          uint32_t(REXCVAR_GET(shader_bisect_register)) < register_count()) {
+        var_main_bisect_snapshot_ =
+            builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                                     "xe_var_bisect_snapshot", const_float4_0_);
+      }
     }
     if (IsSpirvRectangleListVertexLoopEnabled()) {
       Modification shader_modification = GetSpirvShaderModification();
@@ -1272,7 +1407,10 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     builder_->addCapability(spv::CapabilitySignedZeroInfNanPreserve);
     builder_->addExecutionMode(function_main_, spv::ExecutionModeSignedZeroInfNanPreserve, 32);
   }
-  if (features_.rounding_mode_rte_float32 && !REXCVAR_GET(spirv_disable_rounding_mode_rte)) {
+  if (RoundsTowardZeroInHardware()) {
+    builder_->addCapability(spv::CapabilityRoundingModeRTZ);
+    builder_->addExecutionMode(function_main_, spv::ExecutionModeRoundingModeRTZ, 32);
+  } else if (features_.rounding_mode_rte_float32 && !REXCVAR_GET(spirv_disable_rounding_mode_rte)) {
     builder_->addCapability(spv::CapabilityRoundingModeRTE);
     builder_->addExecutionMode(function_main_, spv::ExecutionModeRoundingModeRTE, 32);
   }

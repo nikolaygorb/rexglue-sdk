@@ -263,10 +263,13 @@ struct HostDepthPolygonOffset {
 // Detects a narrow type of coplanar redraws that tend to Z-fight when the depth
 // bias is applied via host fixed function polygon offset, like static decals in
 // UE3 and Halo engine titles. Host space offsets are computed so that the depth
-// bias is applied via shader depth output instead.
+// bias is applied via shader depth output instead. host_bias_exact is whether
+// the host's fixed-function bias has a constant unit on float depth buffers
+// (Vulkan with VK_EXT_depth_bias_control); if not, every draw with a bias is
+// taken by default (depth_bias_shader_offset_scope).
 bool GetHostDepthPolygonOffsetIfNeeded(const RegisterFile& regs, bool primitive_polygonal,
                                        reg::RB_DEPTHCONTROL normalized_depth_control,
-                                       uint32_t normalized_color_mask,
+                                       uint32_t normalized_color_mask, bool host_bias_exact,
                                        HostDepthPolygonOffset& polygon_offset_out);
 
 // For hosts not supporting separate front and back polygon offsets, returns the

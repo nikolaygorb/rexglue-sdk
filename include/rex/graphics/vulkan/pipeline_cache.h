@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <rex/graphics/pipeline/shader/load_memo.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/pipeline/shader/storage.h>
 #include <rex/hash.h>
@@ -157,6 +158,8 @@ class VulkanPipelineCache {
     kPointList,
     kRectangleList,
     kQuadList,
+    // Lines expanded to 1 guest pixel wide for resolution-scaled draws.
+    kLineList,
   };
 
   enum class PipelinePrimitiveTopology : uint32_t {
@@ -214,27 +217,27 @@ class VulkanPipelineCache {
     VulkanRenderTargetCache::RenderPassKey render_pass_key;
 
     // Shader stages.
-    PipelineGeometryShader geometry_shader : 2;  // 2
+    PipelineGeometryShader geometry_shader : 3;  // 3
     // Input assembly.
-    PipelinePrimitiveTopology primitive_topology : 3;  // 5
-    uint32_t primitive_restart : 1;                    // 6
-    xenos::TessellationMode tessellation_mode : 2;     // 8
+    PipelinePrimitiveTopology primitive_topology : 3;  // 6
+    uint32_t primitive_restart : 1;                    // 7
+    xenos::TessellationMode tessellation_mode : 2;     // 9
     // Rasterization.
-    uint32_t depth_clamp_enable : 1;       // 9
-    PipelinePolygonMode polygon_mode : 2;  // 11
-    uint32_t cull_front : 1;               // 12
-    uint32_t cull_back : 1;                // 13
-    uint32_t front_face_clockwise : 1;     // 14
-    uint32_t rasterizer_discard : 1;       // 15
+    uint32_t depth_clamp_enable : 1;       // 10
+    PipelinePolygonMode polygon_mode : 2;  // 12
+    uint32_t cull_front : 1;               // 13
+    uint32_t cull_back : 1;                // 14
+    uint32_t front_face_clockwise : 1;     // 15
+    uint32_t rasterizer_discard : 1;       // 16
     // Depth / stencil.
-    uint32_t depth_write_enable : 1;                      // 16
-    xenos::CompareFunction depth_compare_op : 3;          // 19
-    uint32_t stencil_test_enable : 1;                     // 20
-    xenos::StencilOp stencil_front_fail_op : 3;           // 23
-    xenos::StencilOp stencil_front_pass_op : 3;           // 26
-    xenos::StencilOp stencil_front_depth_fail_op : 3;     // 29
-    xenos::CompareFunction stencil_front_compare_op : 3;  // 32
-    xenos::StencilOp stencil_back_fail_op : 3;            // 35
+    uint32_t depth_write_enable : 1;                      // 17
+    xenos::CompareFunction depth_compare_op : 3;          // 20
+    uint32_t stencil_test_enable : 1;                     // 21
+    xenos::StencilOp stencil_front_fail_op : 3;           // 24
+    xenos::StencilOp stencil_front_pass_op : 3;           // 27
+    xenos::StencilOp stencil_front_depth_fail_op : 3;     // 30
+    xenos::CompareFunction stencil_front_compare_op : 3;  // 33
+    xenos::StencilOp stencil_back_fail_op : 3;            // 36
 
     xenos::StencilOp stencil_back_pass_op : 3;           // 3
     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
@@ -251,8 +254,9 @@ class VulkanPipelineCache {
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
-    // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20261013;
+    // Including all the padding, for a stable hash. Bumped for the line
+    // geometry shader widening geometry_shader.
+    static constexpr uint32_t kVersion = 0x20261103;
     PipelineDescription() {
       Reset();
     }
@@ -333,7 +337,7 @@ class VulkanPipelineCache {
   union GeometryShaderKey {
     uint32_t key;
     struct {
-      PipelineGeometryShader type : 2;
+      PipelineGeometryShader type : 3;
       uint32_t interpolator_count : 5;
       uint32_t user_clip_plane_count : 3;
       uint32_t user_clip_plane_cull : 1;
@@ -432,6 +436,8 @@ class VulkanPipelineCache {
 
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, VulkanShader*, rex::IdentityHasher<uint64_t>> shaders_;
+  // Cleared where shaders_ loses shaders.
+  ShaderLoadMemo<VulkanShader> shader_load_memo_;
 
   // Geometry shaders for Xenos primitive types not supported by Vulkan.
   // Stores VK_NULL_HANDLE if failed to create.

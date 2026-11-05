@@ -25,8 +25,10 @@
 #include <utility>
 #include <vector>
 
+#include <rex/graphics/frame_stats.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/xenos.h>
 #include <rex/graphics/xenos_zpd_report.h>
 #include <rex/memory.h>
@@ -43,6 +45,7 @@ namespace rex::graphics {
 
 class GraphicsSystem;
 class Shader;
+class SharedMemory;
 
 enum class ReadbackResolveMode {
   kDisabled,
@@ -175,7 +178,27 @@ class CommandProcessor {
 
   void UpdateWritePointer(uint32_t value);
 
-  void ExecutePacket(uint32_t ptr, uint32_t count);
+  // Records the next frame into a trace in root_path, starting at the next
+  // swap. Callable from any thread; ignored while a trace is being recorded.
+  void RequestFrameTrace(const std::filesystem::path& root_path);
+
+  // Trace playback, on the command processor thread.
+  // data: the packet dwords, big-endian.
+  void ExecutePacket(const void* data, uint32_t count);
+  // Makes waits on registers or memory pass at once: what the guest would
+  // have written during the wait isn't in a trace.
+  void set_trace_playback(bool trace_playback) { trace_playback_ = trace_playback; }
+  virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
+  void RestoreRegisters(uint32_t first_register, const uint32_t* values, uint32_t count);
+  void RestoreGammaRamp(const reg::DC_LUT_30_COLOR* table_256_entry,
+                        const reg::DC_LUT_PWL_DATA* pwl_rgb, uint32_t rw_component);
+  void RestoreShader(xenos::ShaderType shader_type, const uint32_t* ucode_big_endian,
+                     uint32_t dword_count);
+  // Not done by default: the trace is drawn over empty EDRAM.
+  virtual void RestoreEdramSnapshot(const void* snapshot, uint32_t size) {
+    (void)snapshot;
+    (void)size;
+  }
 
   bool is_paused() const { return paused_; }
   void Pause();
@@ -194,6 +217,10 @@ class CommandProcessor {
   };
 
   void WorkerThreadMain();
+  // Writes the state the frame starts with after the trace is opened. The
+  // implementations add the EDRAM and the memory written by the GPU, which
+  // aren't in guest memory, and must make the next uploads go to the trace.
+  virtual void InitializeTrace();
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
 
@@ -247,6 +274,12 @@ class CommandProcessor {
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
+  // Guest memory that later commands read may have changed: new commands from
+  // the guest, a wait for a value the guest writes, or a packet that writes
+  // memory (see SharedMemory::AdvanceHotPageSyncPoint).
+  virtual void OnGuestMemorySyncPoint() {}
+  // For the upload statistics of frame_stats_interval.
+  virtual SharedMemory* GetSharedMemoryForStats() const { return nullptr; }
 
   // TODO(boma): Add tracking for EVENT_WRITE_EXT reports.
   using ReportHandle = uint64_t;
@@ -453,6 +486,9 @@ class CommandProcessor {
   }
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
+  bool DispatchPacket(memory::RingBuffer* reader, uint32_t packet);
+  bool ExecutePacketTraced(memory::RingBuffer* reader, uint32_t packet);
+  void OnTraceSwap();
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet);
@@ -625,6 +661,10 @@ class CommandProcessor {
   // Strict reports containing the D3D sentinel the guest polls.
   uint32_t zpd_awaited_report_count_ = 0;
 
+  // frame_stats_interval: time between guest swaps.
+  FrameStats frame_stats_;
+  uint64_t frame_stats_last_swap_tick_ = 0;
+
   // The retired counter advances as intervals retire. The speculative counter
   // tracks the latest queued report so fast modes can monotonically write
   // increasing values at EVENT_WRITE_ZPD, using each report's last retired
@@ -691,6 +731,15 @@ class CommandProcessor {
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
+
+  TraceWriter trace_writer_;
+  // kClaimed: RequestFrameTrace is writing trace_frame_path_.
+  enum class TraceState { kDisabled, kClaimed, kRequested, kRecording };
+  std::atomic<TraceState> trace_state_ = TraceState::kDisabled;
+  std::filesystem::path trace_frame_path_;
+  bool trace_swap_executed_ = false;
+  bool trace_playback_ = false;
+  std::vector<uint32_t> trace_packet_;
 
   bool paused_ = false;
 

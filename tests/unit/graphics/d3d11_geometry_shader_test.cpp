@@ -36,7 +36,7 @@ using rex::graphics::d3d11::ShaderBytecode;
 // Every expansion type with a spread of the other key fields.
 std::vector<GeometryShaderKey> TestKeys() {
   std::vector<GeometryShaderKey> keys;
-  for (uint32_t type = 1; type <= 3; ++type) {
+  for (uint32_t type = 1; type <= uint32_t(GeometryShaderType::kLineList); ++type) {
     for (uint32_t interpolators : {0u, 1u, 8u, 16u}) {
       for (uint32_t clip_planes : {0u, 3u, 6u}) {
         for (uint32_t flags = 0; flags < 16; ++flags) {

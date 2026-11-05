@@ -105,6 +105,11 @@ bool build_cctph(BuilderContext& ctx) {
 // the same builder.
 //=============================================================================
 
+bool build_sc(BuilderContext& ctx) {
+  ctx.println("\tppc_syscall(ctx, base, {});", ctx.insn.operands[0]);
+  return true;
+}
+
 bool build_tdi(BuilderContext& ctx) {
   uint32_t to = (ctx.insn.instruction >> 21) & 0x1F;
   uint32_t ra = (ctx.insn.instruction >> 16) & 0x1F;
@@ -299,6 +304,13 @@ bool build_mfmsr(BuilderContext& ctx) {
   return true;
 }
 
+bool build_mfpvr(BuilderContext& ctx) {
+  // The PVR Xenia reports by default; Zephyr has 0x710200 and 0x710300, Jasper 0x710500, Corona
+  // 0x710800.
+  ctx.println("\t{}.u64 = 0x710700;", ctx.r(ctx.insn.operands[0]));
+  return true;
+}
+
 bool build_mffs(BuilderContext& ctx) {
   ctx.println("\t{}.u64 = ctx.fpscr.loadFromHost() | ctx.fpscr.loadExceptionsFromHost();",
               ctx.f(ctx.insn.operands[0]));
@@ -375,12 +387,21 @@ bool build_mtmsrd(BuilderContext& ctx) {
   return true;
 }
 
-// FPSCR is modelled as its rounding mode (RN, the low two bits of field 7)
-// and its exception bits (FX, VX, OX, UX, ZX, XX and the VX causes), which
-// live in the host's sticky exception status flags (rex::ppc::FPSCRRegister).
-// NI, FR, FI, FPRF and the enables are not modelled and read as zero. CR1 of a
-// record form is set by DispatchInstruction (emitFpRecordCR1) for every
-// floating-point instruction.
+// FPSCR is modelled as its rounding mode and NI (field 7), its exception bits
+// (FX, VX, OX, UX, ZX, XX and the VX causes), which live in the host's sticky
+// exception status flags, and FR, FI and FPRF, kept as written and set by the
+// arithmetic with the fpscr_result_bits option (rex::ppc::FPSCRRegister). The
+// enables are not modelled and read as zero. CR1 of a record form is set by
+// DispatchInstruction (emitFpRecordCR1) for every floating-point instruction.
+
+// Bits of fields 3 and 4 the guest can write: FR, FI and FPRF.
+static constexpr uint32_t kFpscrResultBits = 0x0007F000;
+
+// After a write of NI the flush mode follows it at the next mode switch, so
+// the code must not assume the mode it had.
+static void forget_flush_mode(BuilderContext& ctx) {
+  ctx.csrState = CSRState::Unknown;
+}
 
 bool build_mtfsf(BuilderContext& ctx) {
   // FM bit 7 (the leftmost) selects field 0, the top nibble of FPSCR; bit 0
@@ -394,6 +415,10 @@ bool build_mtfsf(BuilderContext& ctx) {
   const auto f = ctx.f(ctx.insn.operands[1]);
   if (mask & 0xF) {
     ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", f);
+    forget_flush_mode(ctx);
+  }
+  if (mask & kFpscrResultBits) {
+    ctx.println("\tctx.fpscr.storeResultBitsFromGuest({}.u32, 0x{:08X});", f, mask);
   }
   if (mask & ~0xFu) {
     ctx.println("\tctx.fpscr.storeExceptionsFromGuest({}.u32, 0x{:08X});", f, mask);
@@ -407,8 +432,13 @@ bool build_mtfsfi(BuilderContext& ctx) {
   const uint32_t imm = ctx.insn.operands[1] & 0xF;
   if (field == 7) {
     ctx.println("\tctx.fpscr.storeFromGuest({});", imm);
+    forget_flush_mode(ctx);
   } else {
     const uint32_t shift = 4 * (7 - field);
+    if ((0xFu << shift) & kFpscrResultBits) {
+      ctx.println("\tctx.fpscr.storeResultBitsFromGuest(0x{:08X}, 0x{:08X});", imm << shift,
+                  0xFu << shift);
+    }
     ctx.println("\tctx.fpscr.storeExceptionsFromGuest(0x{:08X}, 0x{:08X});", imm << shift,
                 0xFu << shift);
   }
@@ -416,15 +446,19 @@ bool build_mtfsfi(BuilderContext& ctx) {
 }
 
 static void emit_mtfsb(BuilderContext& ctx, bool set) {
-  // FPSCR bit BT (0 = leftmost). Bits 30 and 31 are RN.
+  // FPSCR bit BT (0 = leftmost). Bit 29 is NI, bits 30 and 31 are RN.
   const uint32_t bt = ctx.insn.operands[0];
   const uint32_t bit = 1u << (31 - bt);
-  if (bt == 30 || bt == 31) {
+  if (bt >= 29) {
     if (set) {
       ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() | {});", bit);
     } else {
       ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() & ~{}u);", bit);
     }
+    forget_flush_mode(ctx);
+  } else if (bit & kFpscrResultBits) {
+    ctx.println("\tctx.fpscr.storeResultBitsFromGuest(0x{:08X}, 0x{:08X});", set ? bit : 0u,
+                bit);
   } else {
     ctx.println("\tctx.fpscr.storeExceptionsFromGuest(0x{:08X}, 0x{:08X});", set ? bit : 0u,
                 bit);

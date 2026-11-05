@@ -1541,6 +1541,41 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   return true;
 }
 
+RenderTargetCache::RenderTarget*
+RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
+    xenos::ColorRenderTargetFormat color_format) {
+  assert_true(GetPath() == Path::kHostRenderTargets);
+  constexpr uint32_t kWidth = kSnapshotRestorationPitchTiles * xenos::kEdramTileWidthSamples;
+  if (kWidth * draw_resolution_scale_x() > GetMaxRenderTargetWidth()) {
+    return nullptr;
+  }
+  // Same height for 32bpp and 64bpp to allow mixing them. Every tile count is
+  // divisible by the width, so the last row is fully used.
+  static_assert(
+      xenos::kEdramTileCountMax / kSnapshotRestorationPitchTiles * xenos::kEdramTileHeightSamples <=
+          xenos::kTexture2DCubeMaxWidthHeight,
+      "The EDRAM snapshot restoration render target must not exceed the maximum guest "
+      "render target height.");
+  uint32_t height =
+      edram_tile_count_ / kSnapshotRestorationPitchTiles * xenos::kEdramTileHeightSamples;
+  if (height * draw_resolution_scale_y() > GetMaxRenderTargetHeight()) {
+    return nullptr;
+  }
+  RenderTargetKey render_target_key;
+  render_target_key.pitch_tiles_at_32bpp = kSnapshotRestorationPitchTiles;
+  render_target_key.resource_format = uint32_t(GetColorResourceFormat(color_format));
+  RenderTarget* render_target = GetOrCreateRenderTarget(render_target_key, height);
+  if (!render_target) {
+    return nullptr;
+  }
+  // Change the ownership without transferring the contents, they're replaced.
+  ownership_ranges_.clear();
+  ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+                            std::forward_as_tuple(edram_tile_count_, render_target_key,
+                                                  RenderTargetKey(), RenderTargetKey()));
+  return render_target;
+}
+
 void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
   assert_true(GetPath() == Path::kPixelShaderInterlock);
   interlock_last_window_offset_ = UINT32_MAX;

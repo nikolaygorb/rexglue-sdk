@@ -45,6 +45,8 @@ constexpr const char* kCounterNames[] = {
     "active_threads",
     "apc_queue_depth",
     "critical_region_contentions",
+    "critical_region_wait_us",
+    "critical_region_spin_wins",
     "texture_cache_hits",
     "texture_cache_misses",
     "pipeline_cache_hits",
@@ -77,7 +79,9 @@ constexpr bool kIsGauge[] = {
     false,  // kInterruptDispatches
     true,   // kActiveThreads     (inc/dec over lifetime)
     false,  // kApcQueueDepth
-    true,   // kCriticalRegionContentions (running total)
+    false,  // kCriticalRegionContentions
+    false,  // kCriticalRegionWaitUs
+    false,  // kCriticalRegionSpinWins
     false,  // kTextureCacheHits
     false,  // kTextureCacheMisses
     false,  // kPipelineCacheHits

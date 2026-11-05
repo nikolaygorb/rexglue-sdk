@@ -22,6 +22,7 @@
 #include <rex/graphics/primitive_processor.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -494,6 +495,10 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
         assert_always();
         return false;
       }
+      // Whatever the caches hold: their contents depend on the configuration.
+      if (TraceWriter* trace = TraceWriter::active()) {
+        trace->WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
+      }
     }
   } else if (vgt_draw_initiator.source_select == xenos::SourceSelect::kAutoIndex) {
     // Auto-indexed - use a remapping index buffer if needed to change the
@@ -684,6 +689,9 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           guest_index_base, guest_index_buffer_needed_bytes);
       assert_always();
       return false;
+    }
+    if (TraceWriter* trace = TraceWriter::active()) {
+      trace->WriteMemoryRead(guest_index_base, guest_index_buffer_needed_bytes);
     }
 
     cacheable.host_index_format = guest_index_format;
@@ -1058,7 +1066,8 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
     last_guest_index_range_ = {guest_index_base, guest_index_buffer_needed_bytes};
-    if (!shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes)) {
+    if (!shared_memory_.RequestRange(guest_index_base, guest_index_buffer_needed_bytes,
+                                     SharedMemory::RequestKind::kIndex)) {
       REXGPU_ERROR(
           "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, 0x{:X} "
           "bytes needed, in the shared memory",

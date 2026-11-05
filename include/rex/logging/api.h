@@ -164,9 +164,11 @@ void RegisterLogLevelCallback();
 /**
  * Create the sink the log file uses. It opens the file through
  * std::filesystem::path, so non-ASCII paths work on Windows, appends to it, and
- * lets other processes read it while it is written.
+ * lets other processes read it while it is written. With max_bytes, the file
+ * rolls over at that size into <name>.1.log (kept) and <name>.2.log (replaced
+ * by each later part).
  */
-spdlog::sink_ptr CreateFileSink(const std::filesystem::path& path);
+spdlog::sink_ptr CreateFileSink(const std::filesystem::path& path, uint64_t max_bytes = 0);
 
 /**
  * Add a sink to all current and future loggers.

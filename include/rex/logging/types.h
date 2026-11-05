@@ -112,6 +112,8 @@ struct LogConfig {
   std::string app_name;
   std::filesystem::path log_dir;
   uint64_t dir_budget_bytes = 0;
+  /** Size at which the log file rolls over (0 = no limit; log_file_max_mb). */
+  uint64_t file_max_bytes = 0;
   std::chrono::seconds flush_interval{0};
 };
 

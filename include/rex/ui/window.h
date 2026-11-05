@@ -327,6 +327,9 @@ class Window {
     return false;
   }
 
+  // The refresh rate of the display the window is on, in Hz (0 if unknown).
+  virtual double GetDisplayRefreshRate() const { return 0.0; }
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation. Whether the window is an active text input field for
   // the OS input method. Leaving it on for the session pulls in IME candidate

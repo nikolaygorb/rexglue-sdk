@@ -21,6 +21,7 @@
 
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/graphics/xenos.h>
@@ -137,6 +138,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out, reg::RB_COPY_DEST_INFO* copy_dest_info_out = nullptr,
                bool* written_scaled_out = nullptr);
+
+  // For frame traces. The first returns true if downloads were submitted, to
+  // be completed by the second after awaiting the queue.
+  bool InitializeTraceSubmitDownloads();
+  void InitializeTraceCompleteDownloads(TraceWriter& trace_writer);
+  void RestoreEdramSnapshot(const void* snapshot, uint32_t size);
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask, const Shader& vertex_shader,
@@ -948,6 +955,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipeline host_depth_store_pipelines_[size_t(xenos::MsaaSamples::k4X) + 1] = {};
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> transfer_vertex_buffer_pool_;
+
+  // For frame traces.
+  VkBuffer edram_snapshot_download_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory edram_snapshot_download_buffer_memory_ = VK_NULL_HANDLE;
+  uint32_t edram_snapshot_download_buffer_memory_type_ = UINT32_MAX;
+  VkDeviceSize edram_snapshot_download_buffer_memory_size_ = 0;
+  std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> edram_snapshot_restore_pool_;
+  void ResetTraceDownload();
   VkShaderModule transfer_passthrough_vertex_shader_ = VK_NULL_HANDLE;
   VkPipelineLayout transfer_pipeline_layouts_[size_t(TransferPipelineLayoutIndex::kCount)] = {};
   // VK_NULL_HANDLE if failed to create.

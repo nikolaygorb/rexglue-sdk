@@ -12,8 +12,11 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/input/input_driver.h>
@@ -79,6 +82,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void ProcessEventLocked(const SDL_Event& event);
   void OnJoystickDeviceAddedLocked(const SDL_Event& event);
   void OnControllerDeviceAddedLocked(const SDL_Event& event);
+  void OnControllerDeviceOpenedLocked(SDL_Gamepad* controller);
   void OnControllerDeviceRemovedLocked(const SDL_Event& event);
   void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
@@ -91,6 +95,18 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   void UpdateXCapabilities(ControllerState& state);
   void QueueControllerUpdate();
 
+  // Opening, rumbling and closing a pad can block for a long time (a DualSense
+  // over Bluetooth), so they run here, away from guest threads and from
+  // controllers_mutex_. The worker never takes controllers_mutex_ and holds no
+  // lock while it calls SDL.
+  struct RumbleRequest {
+    uint16_t left = 0;
+    uint16_t right = 0;
+  };
+  void StartHidWorker();
+  void StopHidWorker();
+  void HidWorkerMain();
+
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
@@ -102,6 +118,14 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   std::mutex controllers_mutex_;
   std::mutex event_queue_mutex_;
   std::vector<SDL_Event> pending_events_;
+  std::vector<SDL_Gamepad*> opened_gamepads_;  // Guarded by event_queue_mutex_.
+  std::thread hid_worker_;
+  std::mutex hid_mutex_;
+  std::condition_variable hid_cv_;
+  bool hid_worker_stop_ = false;
+  std::vector<SDL_JoystickID> hid_open_queue_;
+  std::unordered_map<SDL_JoystickID, RumbleRequest> hid_rumble_;  // Latest of each pad.
+  std::vector<SDL_Gamepad*> hid_close_queue_;
   // Never rewound, so a handle held past a disconnect resolves to nothing.
   uint64_t next_device_id_ = 1;
 };

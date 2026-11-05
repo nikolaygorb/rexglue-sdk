@@ -12,6 +12,7 @@
 #pragma once
 
 #include <deque>
+#include <atomic>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -125,6 +126,13 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
 
   void UpdateCompletedSubmission() override;
 
+  // For a user that submits on another thread: `limit` is the last submission
+  // given to the queue. The fences of later ones are in use by that thread and
+  // are not looked at, and the user must see that a submission has reached the
+  // queue before awaiting it. Null (the default) means each is submitted when
+  // its fence acquisition is released.
+  void SetSubmittedLimit(const std::atomic<uint64_t>* const limit) { submitted_limit_ = limit; }
+
  protected:
   void AwaitSubmissionImpl(uint64_t awaited_submission) override;
 
@@ -135,6 +143,8 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
 
   // <Submission index, fence>, in submission index order.
   std::deque<std::pair<uint64_t, VkFence>> pending_submission_fences_;
+
+  const std::atomic<uint64_t>* submitted_limit_ = nullptr;
 
 #ifndef NDEBUG
   size_t fences_acquired_ = 0;

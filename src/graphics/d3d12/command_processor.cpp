@@ -128,6 +128,38 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
                                            std::move(completion_callback));
 }
 
+void D3D12CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) {
+  shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
+  primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
+}
+
+void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot, uint32_t size) {
+  // A frame submission, descriptors may be needed.
+  if (!BeginSubmission(true)) {
+    return;
+  }
+  render_target_cache_->RestoreEdramSnapshot(snapshot, size);
+}
+
+void D3D12CommandProcessor::InitializeTrace() {
+  CommandProcessor::InitializeTrace();
+  if (!BeginSubmission(false)) {
+    return;
+  }
+  const bool render_target_cache_submitted = render_target_cache_->InitializeTraceSubmitDownloads();
+  const bool shared_memory_submitted = shared_memory_->InitializeTraceSubmitDownloads();
+  if (!render_target_cache_submitted && !shared_memory_submitted) {
+    return;
+  }
+  AwaitAllQueueOperationsCompletion();
+  if (render_target_cache_submitted) {
+    render_target_cache_->InitializeTraceCompleteDownloads(trace_writer_);
+  }
+  if (shared_memory_submitted) {
+    shared_memory_->InitializeTraceCompleteDownloads(trace_writer_);
+  }
+}
+
 void D3D12CommandProcessor::PollCompletedSubmission() {
   // Strict ZPD just needs the completed submission updated and any ready query
   // resolves drained here.
@@ -2433,6 +2465,12 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+void D3D12CommandProcessor::OnGuestMemorySyncPoint() {
+  if (shared_memory_) {
+    shared_memory_->AdvanceHotPageSyncPoint();
+  }
+}
+
 Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                           const uint32_t* host_address, uint32_t dword_count) {
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
@@ -2538,7 +2576,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
       draw_util::GetHostDepthPolygonOffsetIfNeeded(regs, primitive_polygonal,
                                                    normalized_depth_control, normalized_color_mask,
-                                                   host_depth_polygon_offset);
+                                                   false, host_depth_polygon_offset);
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
@@ -2802,7 +2840,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           rex::thread::global_critical_region::AcquireDirect();
 
       for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
-        if (!shared_memory_->RequestRange(vfetch_addresses[i] << 2, vfetch_sizes[i] << 2)) {
+        if (!shared_memory_->RequestRange(vfetch_addresses[i] << 2, vfetch_sizes[i] << 2,
+                                          SharedMemory::RequestKind::kVertex)) {
           REXGPU_ERROR(
               "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
               "shared memory",
@@ -2825,7 +2864,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     if (!shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
-                                      memexport_range.size_bytes)) {
+                                      memexport_range.size_bytes,
+                                      SharedMemory::RequestKind::kMemExport)) {
       REXGPU_ERROR(
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
           "shared memory",
@@ -2834,7 +2874,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
   if (memexport_used && memexport_ranges_.empty()) {
-    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize,
+                                      SharedMemory::RequestKind::kMemExport)) {
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
@@ -3989,6 +4030,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }
+    if (shared_memory_) {
+      shared_memory_->AdvanceHotPageFrame();
+    }
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = GetCurrentSubmission() - 1;
@@ -4578,8 +4622,12 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     system_constants_.param_gen_window_offset[i] = param_gen_window_offset[i];
   }
 
-  // Point size.
-  if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {
+  // Point size, and the NDC size of a guest pixel, which the line geometry
+  // shader also uses to expand resolution-scaled lines to 1 guest pixel wide.
+  if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList ||
+      vgt_draw_initiator.prim_type == xenos::PrimitiveType::kLineList ||
+      vgt_draw_initiator.prim_type == xenos::PrimitiveType::kLineStrip ||
+      vgt_draw_initiator.prim_type == xenos::PrimitiveType::kLineLoop) {
     auto pa_su_point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
     auto pa_su_point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
     float point_vertex_diameter_min = float(pa_su_point_minmax.min_size) * (2.0f / 16.0f);

@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include <SPIRV/GLSL.std.450.h>
 #include <fmt/format.h>
 
 #include <rex/assert.h>
@@ -889,6 +890,7 @@ void VulkanPipelineCache::Shutdown() {
     delete it.second;
   }
   shaders_.clear();
+  shader_load_memo_.Clear();
   texture_binding_layout_map_.clear();
   texture_binding_layouts_.clear();
 
@@ -898,9 +900,12 @@ void VulkanPipelineCache::Shutdown() {
 
 VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
                                               const uint32_t* host_address, uint32_t dword_count) {
-  // Hash the input memory and lookup the shader.
-  return LoadShader(shader_type, host_address, dword_count,
-                    XXH3_64bits(host_address, dword_count * sizeof(uint32_t)));
+  // Hash the memo's copy of the input memory and lookup the shader.
+  return shader_load_memo_.FindOrLoad(
+      shader_type, host_address, dword_count, [&](const uint32_t* words) {
+        return LoadShader(shader_type, words, dword_count,
+                          XXH3_64bits(words, dword_count * sizeof(uint32_t)));
+      });
 }
 
 VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
@@ -986,6 +991,7 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
       shader_translator_->GetDefaultPixelShaderModification(
           shader.GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg)));
 
+  modification.pixel.contraction_allowed = !REXCVAR_GET(spirv_pixel_shader_no_contraction);
   modification.pixel.interpolator_mask = interpolator_mask;
   modification.pixel.interpolators_centroid =
       interpolator_mask & ~xenos::GetInterpolatorSamplingPattern(
@@ -1572,10 +1578,18 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
           primitive_topology = PipelinePrimitiveTopology::kPointList;
           break;
         case xenos::PrimitiveType::kLineList:
-          primitive_topology = PipelinePrimitiveTopology::kLineList;
-          break;
         case xenos::PrimitiveType::kLineStrip:
-          primitive_topology = PipelinePrimitiveTopology::kLineStrip;
+          // Host lines are 1 host pixel wide, expand them to 1 guest pixel
+          // when the draw is resolution-scaled. Without geometry shaders,
+          // lines stay thin rather than being dropped.
+          if (device_properties.geometryShader && (render_target_cache_.GetDrawScaleX() > 1 ||
+                                                   render_target_cache_.GetDrawScaleY() > 1)) {
+            geometry_shader = PipelineGeometryShader::kLineList;
+          }
+          primitive_topology =
+              primitive_processing_result.host_primitive_type == xenos::PrimitiveType::kLineList
+                  ? PipelinePrimitiveTopology::kLineList
+                  : PipelinePrimitiveTopology::kLineStrip;
           break;
         case xenos::PrimitiveType::kTriangleList:
           primitive_topology = PipelinePrimitiveTopology::kTriangleList;
@@ -1975,6 +1989,13 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
       output_primitive_execution_mode = spv::ExecutionModeOutputTriangleStrip;
       output_max_vertices = 4;
       break;
+    case PipelineGeometryShader::kLineList:
+      // Line (of a list or a strip) to a strip of 2 triangles.
+      input_primitive_execution_mode = spv::ExecutionModeInputLines;
+      input_primitive_vertex_count = 2;
+      output_primitive_execution_mode = spv::ExecutionModeOutputTriangleStrip;
+      output_max_vertices = 4;
+      break;
     default:
       assert_unhandled_case(key.type);
   }
@@ -2070,7 +2091,10 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
     kPointConstantCount,
   };
   spv::Id type_system_constants = spv::NoType;
-  if (key.type == PipelineGeometryShader::kPointList) {
+  // Lines only need point_screen_diameter_to_ndc_radius, as the NDC size of a
+  // guest pixel.
+  if (key.type == PipelineGeometryShader::kPointList ||
+      key.type == PipelineGeometryShader::kLineList) {
     id_vector_temp.clear();
     id_vector_temp.resize(kPointConstantCount);
     id_vector_temp[kPointConstantConstantDiameter] = type_float2;
@@ -3010,6 +3034,181 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
       builder.createNoResultOp(spv::OpEndPrimitive);
     } break;
 
+    case PipelineGeometryShader::kLineList: {
+      // Host lines are rasterized 1 host pixel wide, but a guest line covers 1
+      // guest pixel, which is draw_resolution_scale host pixels. Expand the
+      // segment into a quad 1 guest pixel wide centered on the line, each end
+      // keeping its own attributes.
+
+      spv::Id const_int_0 = builder.makeIntConstant(0);
+      spv::Id const_int_1 = builder.makeIntConstant(1);
+      spv::Id const_float_0 = builder.makeFloatConstant(0.0f);
+      spv::Id const_float_1 = builder.makeFloatConstant(1.0f);
+
+      // Half of a guest pixel in the NDC along each axis - the constant is the
+      // NDC radius of a 1 guest pixel diameter.
+      id_vector_temp.clear();
+      id_vector_temp.push_back(
+          builder.makeIntConstant(int32_t(kPointConstantScreenDiameterToNdcRadius)));
+      id_vector_temp.push_back(const_int_0);
+      spv::Id half_pixel_ndc_x =
+          builder.createLoad(builder.createAccessChain(spv::StorageClassUniform,
+                                                       uniform_system_constants, id_vector_temp),
+                             spv::NoPrecision);
+      id_vector_temp.back() = const_int_1;
+      spv::Id half_pixel_ndc_y =
+          builder.createLoad(builder.createAccessChain(spv::StorageClassUniform,
+                                                       uniform_system_constants, id_vector_temp),
+                             spv::NoPrecision);
+
+      // Load the positions, and get the vertices in half guest pixel units
+      // (NDC divided by the NDC size of half a guest pixel) so the direction
+      // is measured in screen space regardless of the viewport aspect.
+      std::array<spv::Id, 2> line_vertex_x, line_vertex_y, line_vertex_z, line_vertex_w,
+          line_vertex_pixels_x, line_vertex_pixels_y;
+      for (uint32_t i = 0; i < 2; ++i) {
+        id_vector_temp.clear();
+        id_vector_temp.push_back(builder.makeIntConstant(int32_t(i)));
+        id_vector_temp.push_back(const_member_in_gl_per_vertex_position);
+        spv::Id line_vertex_position = builder.createLoad(
+            builder.createAccessChain(spv::StorageClassInput, in_gl_per_vertex, id_vector_temp),
+            spv::NoPrecision);
+        line_vertex_x[i] = builder.createCompositeExtract(line_vertex_position, type_float, 0);
+        line_vertex_y[i] = builder.createCompositeExtract(line_vertex_position, type_float, 1);
+        line_vertex_z[i] = builder.createCompositeExtract(line_vertex_position, type_float, 2);
+        line_vertex_w[i] = builder.createCompositeExtract(line_vertex_position, type_float, 3);
+        spv::Id line_vertex_inv_w =
+            builder.createBinOp(spv::OpFDiv, type_float, const_float_1, line_vertex_w[i]);
+        line_vertex_pixels_x[i] = builder.createBinOp(
+            spv::OpFDiv, type_float,
+            builder.createBinOp(spv::OpFMul, type_float, line_vertex_x[i], line_vertex_inv_w),
+            half_pixel_ndc_x);
+        line_vertex_pixels_y[i] = builder.createBinOp(
+            spv::OpFDiv, type_float,
+            builder.createBinOp(spv::OpFMul, type_float, line_vertex_y[i], line_vertex_inv_w),
+            half_pixel_ndc_y);
+      }
+
+      // Direction of the line in screen space.
+      spv::Id line_direction_x = builder.createBinOp(
+          spv::OpFSub, type_float, line_vertex_pixels_x[1], line_vertex_pixels_x[0]);
+      spv::Id line_direction_y = builder.createBinOp(
+          spv::OpFSub, type_float, line_vertex_pixels_y[1], line_vertex_pixels_y[0]);
+      spv::Id line_length = builder.createUnaryBuiltinCall(
+          type_float, ext_inst_glsl_std_450, GLSLstd450Sqrt,
+          builder.createBinOp(
+              spv::OpFAdd, type_float,
+              builder.createBinOp(spv::OpFMul, type_float, line_direction_x, line_direction_x),
+              builder.createBinOp(spv::OpFMul, type_float, line_direction_y, line_direction_y)));
+
+      // Drop zero-length lines (also NaN-safe), there's nothing to expand and
+      // the normal would be undefined.
+      spv::Id line_length_positive =
+          builder.createBinOp(spv::OpFOrdGreaterThan, type_bool, line_length, const_float_0);
+      spv::Block& line_degenerate_predecessor = *builder.getBuildPoint();
+      spv::Block& line_degenerate_then_block = builder.makeNewBlock();
+      spv::Block& line_degenerate_merge_block = builder.makeNewBlock();
+      builder.createSelectionMerge(&line_degenerate_merge_block,
+                                   spv::SelectionControlDontFlattenMask);
+      {
+        std::unique_ptr<spv::Instruction> branch_conditional_op(
+            std::make_unique<spv::Instruction>(spv::OpBranchConditional));
+        branch_conditional_op->addIdOperand(line_length_positive);
+        branch_conditional_op->addIdOperand(line_degenerate_merge_block.getId());
+        branch_conditional_op->addIdOperand(line_degenerate_then_block.getId());
+        branch_conditional_op->addImmediateOperand(2);
+        branch_conditional_op->addImmediateOperand(1);
+        line_degenerate_predecessor.addInstruction(std::move(branch_conditional_op));
+      }
+      line_degenerate_then_block.addPredecessor(&line_degenerate_predecessor);
+      line_degenerate_merge_block.addPredecessor(&line_degenerate_predecessor);
+      builder.setBuildPoint(&line_degenerate_then_block);
+      builder.createNoResultOp(spv::OpReturn);
+      builder.setBuildPoint(&line_degenerate_merge_block);
+
+      // Unit normal in screen space, then half a guest pixel along it in the
+      // NDC (back to the per-axis NDC size of half a guest pixel).
+      spv::Id line_inv_length =
+          builder.createBinOp(spv::OpFDiv, type_float, const_float_1, line_length);
+      spv::Id line_offset_ndc_x = builder.createBinOp(
+          spv::OpFMul, type_float,
+          builder.createBinOp(spv::OpFMul, type_float,
+                              builder.createUnaryOp(spv::OpFNegate, type_float, line_direction_y),
+                              line_inv_length),
+          half_pixel_ndc_x);
+      spv::Id line_offset_ndc_y = builder.createBinOp(
+          spv::OpFMul, type_float,
+          builder.createBinOp(spv::OpFMul, type_float, line_direction_x, line_inv_length),
+          half_pixel_ndc_y);
+
+      // Initialize the point coordinates output for safety if this shader type
+      // is used with has_point_coordinates for some reason.
+      spv::Id const_point_coordinates_zero = spv::NoResult;
+      if (key.has_point_coordinates) {
+        id_vector_temp.clear();
+        id_vector_temp.push_back(const_float_0);
+        id_vector_temp.push_back(const_float_0);
+        const_point_coordinates_zero = builder.makeCompositeConstant(type_float2, id_vector_temp);
+      }
+
+      // Emit the strip: both sides of the first vertex, then of the second.
+      for (uint32_t i = 0; i < 4; ++i) {
+        uint32_t line_vertex_index = i >> 1;
+        spv::Id const_line_vertex_index = builder.makeIntConstant(int32_t(line_vertex_index));
+        spv::Op line_offset_add_op = (i & 1) ? spv::OpFAdd : spv::OpFSub;
+        // Interpolators.
+        id_vector_temp.clear();
+        id_vector_temp.push_back(const_line_vertex_index);
+        for (uint32_t j = 0; j < key.interpolator_count; ++j) {
+          builder.createStore(
+              builder.createLoad(builder.createAccessChain(spv::StorageClassInput,
+                                                           in_interpolators[j], id_vector_temp),
+                                 spv::NoPrecision),
+              out_interpolators[j]);
+        }
+        // Point coordinates.
+        if (key.has_point_coordinates) {
+          builder.createStore(const_point_coordinates_zero, out_point_coordinates);
+        }
+        // Position - the NDC offset is transformed to the clip space by
+        // multiplying by W.
+        spv::Id line_vertex_w_value = line_vertex_w[line_vertex_index];
+        id_vector_temp.clear();
+        id_vector_temp.push_back(builder.createNoContractionBinOp(
+            line_offset_add_op, type_float, line_vertex_x[line_vertex_index],
+            builder.createBinOp(spv::OpFMul, type_float, line_offset_ndc_x, line_vertex_w_value)));
+        id_vector_temp.push_back(builder.createNoContractionBinOp(
+            line_offset_add_op, type_float, line_vertex_y[line_vertex_index],
+            builder.createBinOp(spv::OpFMul, type_float, line_offset_ndc_y, line_vertex_w_value)));
+        id_vector_temp.push_back(line_vertex_z[line_vertex_index]);
+        id_vector_temp.push_back(line_vertex_w_value);
+        spv::Id line_quad_vertex_position =
+            builder.createCompositeConstruct(type_float4, id_vector_temp);
+        id_vector_temp.clear();
+        id_vector_temp.push_back(const_member_out_gl_per_vertex_position);
+        builder.createStore(
+            line_quad_vertex_position,
+            builder.createAccessChain(spv::StorageClassOutput, out_gl_per_vertex, id_vector_temp));
+        // Clip distances.
+        if (clip_distance_count) {
+          id_vector_temp.clear();
+          id_vector_temp.push_back(const_line_vertex_index);
+          id_vector_temp.push_back(const_member_in_gl_per_vertex_clip_distance);
+          spv::Id line_vertex_clip_distances = builder.createLoad(
+              builder.createAccessChain(spv::StorageClassInput, in_gl_per_vertex, id_vector_temp),
+              spv::NoPrecision);
+          id_vector_temp.clear();
+          id_vector_temp.push_back(const_member_out_gl_per_vertex_clip_distance);
+          builder.createStore(line_vertex_clip_distances,
+                              builder.createAccessChain(spv::StorageClassOutput, out_gl_per_vertex,
+                                                        id_vector_temp));
+        }
+        // Emit the vertex.
+        builder.createNoResultOp(spv::OpEmitVertex);
+      }
+      builder.createNoResultOp(spv::OpEndPrimitive);
+    } break;
+
     default:
       assert_unhandled_case(key.type);
   }
@@ -3176,13 +3375,28 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   // unsupported behavior that may be dangerous/crashing because pipelines can
   // be created from the disk storage.
 
+  // One line per pipeline filled most of a log (loading the storage creates
+  // every stored pipeline), so only the first ones are at info level; the
+  // "Pipeline cache: N created" line counts the rest. D3D12 logs them at debug.
+  constexpr uint32_t kPipelineInfoLines = 32;
+  static std::atomic<uint32_t> pipeline_lines{0};
+  const uint32_t pipeline_line = pipeline_lines.fetch_add(1, std::memory_order_relaxed) + 1;
+  const auto pipeline_line_level =
+      pipeline_line <= kPipelineInfoLines ? spdlog::level::info : spdlog::level::debug;
   if (creation_arguments.pixel_shader) {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}, PS {:016X}",
-                creation_arguments.vertex_shader->shader().ucode_data_hash(),
-                creation_arguments.pixel_shader->shader().ucode_data_hash());
+    REX_LOG_IMPL(::rex::log::gpu(), pipeline_line_level,
+                 "Creating graphics pipeline state with VS {:016X}, PS {:016X}",
+                 creation_arguments.vertex_shader->shader().ucode_data_hash(),
+                 creation_arguments.pixel_shader->shader().ucode_data_hash());
   } else {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}",
-                creation_arguments.vertex_shader->shader().ucode_data_hash());
+    REX_LOG_IMPL(::rex::log::gpu(), pipeline_line_level,
+                 "Creating graphics pipeline state with VS {:016X}",
+                 creation_arguments.vertex_shader->shader().ucode_data_hash());
+  }
+  if (pipeline_line == kPipelineInfoLines) {
+    REXGPU_INFO(
+        "Further \"Creating graphics pipeline state\" lines are at debug level "
+        "(log_level = \"debug\" shows them)");
   }
 
   const PipelineDescription& description = creation_arguments.pipeline->first;
@@ -3386,6 +3600,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       return false;
   }
   input_assembly_state.primitiveRestartEnable = description.primitive_restart ? VK_TRUE : VK_FALSE;
+#if REX_PLATFORM_MAC
+  // Metal can't disable restart for strips, and MoltenVK then creates no pipeline. A strip that
+  // doesn't use restart has no all-ones indices, so leaving it on changes nothing.
+  if (input_assembly_state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ||
+      input_assembly_state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+    input_assembly_state.primitiveRestartEnable = VK_TRUE;
+  }
+#endif  // REX_PLATFORM_MAC
 
   VkPipelineViewportStateCreateInfo viewport_state;
   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;

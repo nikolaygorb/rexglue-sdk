@@ -152,6 +152,8 @@ class Runtime {
 
   // Setup the runtime environment
   // config.tool_mode: If true, skips GPU initialization (for analysis tools)
+  // A failure keeps what was set up, config.graphics included, until the runtime
+  // is destroyed, so the owner can first detach what of its own uses it.
   X_STATUS Setup(RuntimeConfig config = {});
 
   // rexglue - initializes per-module function dispatch table

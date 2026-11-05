@@ -295,6 +295,7 @@ int XexModule::ApplyPatch(XexModule* module) {
 
   // Patch base XEX header
   uint32_t original_image_size = module->image_size();
+  const uint32_t original_base_address = module->base_address_;
   uint32_t header_target_size = patch_header->size_of_target_headers;
 
   if (!header_target_size) {
@@ -349,12 +350,30 @@ int XexModule::ApplyPatch(XexModule* module) {
   // Update security info context with latest security info data
   module->ReadSecurityInfo();
 
+  // image_size() uses the heap at base_address_, so move the base first.
+  rex::be<uint32_t>* base_addr_opt = nullptr;
+  if (module->GetOptHeader(XEX_HEADER_IMAGE_BASE_ADDRESS, &base_addr_opt)) {
+    module->base_address_ = *base_addr_opt;
+  }
+  const uint32_t new_base_address = module->base_address_;
+  const bool base_moved = new_base_address != original_base_address;
+
   uint32_t new_image_size = module->image_size();
 
   // Check if we need to alloc new memory for the patched xex
-  if (new_image_size > original_image_size) {
-    uint32_t size_delta = new_image_size - original_image_size;
-    uint32_t addr_new_mem = module->base_address_ + original_image_size;
+  if (base_moved || new_image_size > original_image_size) {
+    uint32_t addr_new_mem;
+    uint32_t size_delta;
+    if (base_moved) {
+      REXLOG_WARN("Patch for module {} moves its base from {:08X} to {:08X}", module->name(),
+                  original_base_address, new_base_address);
+      addr_new_mem = new_base_address;
+      // Room for the old image, trimmed below if the patched one is smaller.
+      size_delta = std::max(original_image_size, new_image_size);
+    } else {
+      addr_new_mem = new_base_address + original_image_size;
+      size_delta = new_image_size - original_image_size;
+    }
 
     bool alloc_result =
         memory()
@@ -368,6 +387,12 @@ int XexModule::ApplyPatch(XexModule* module) {
       REXLOG_ERROR("Unable to allocate XEX memory at {:08X}-{:08X}.", addr_new_mem, size_delta);
       assert_always();
       return 6;
+    }
+
+    // Move the image to its new base and free the old allocation.
+    if (base_moved) {
+      memory()->Copy(new_base_address, original_base_address, original_image_size);
+      memory()->LookupHeap(original_base_address)->Release(original_base_address);
     }
   }
 

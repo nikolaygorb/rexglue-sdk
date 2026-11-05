@@ -61,9 +61,9 @@ XThread::XThread(KernelState* kernel_state)
 XThread::XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_thread_startup,
                  uint32_t start_address, uint32_t start_context, uint32_t creation_flags,
                  bool guest_thread, bool main_thread, uint32_t guest_process)
-    // The main thread is the loader's, so its handle is not the title's
-    // (xenia-edge 672bc8b81).
-    : XObject(kernel_state, kObjectType, !guest_thread || main_thread),
+    // Neither the loader's main thread (xenia-edge 672bc8b81) nor a thread
+    // created for its KTHREAD pointer (flag 0x80) takes a title handle.
+    : XObject(kernel_state, kObjectType, !guest_thread || main_thread || (creation_flags & 0x80)),
       thread_id_(++next_xthread_id_),
       guest_thread_(guest_thread),
       main_thread_(main_thread),
@@ -1027,6 +1027,8 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
     uint8_t previous = guest_thread->suspend_count;
     if (previous > 0) {
       guest_thread->suspend_count--;
+    } else {
+      early_resume_ = true;
     }
     if (out_suspend_count) {
       *out_suspend_count = previous;
@@ -1054,6 +1056,15 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
 
 X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   auto guest_thread = guest_object<X_KTHREAD>();
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+  {
+    // A resume kept for a self-suspend is older than this suspend: it must not
+    // skip a later self-suspend after this one is resumed. (Windows uses it up
+    // here too, through the count wrapping.)
+    std::lock_guard<std::mutex> lock(suspend_mutex_);
+    early_resume_ = false;
+  }
+#endif
   uint8_t previous_suspend_count =
       reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)->fetch_add(1);
   if (out_suspend_count) {
@@ -1073,6 +1084,13 @@ uint32_t XThread::SelfSuspend() {
   auto guest_thread = guest_object<X_KTHREAD>();
   std::unique_lock<std::mutex> lock(suspend_mutex_);
   uint32_t previous = guest_thread->suspend_count;
+  // A worker that suspends itself after its work can be resumed for more before
+  // the suspend. Lost, it sleeps for good and its owner waits on it. Windows keeps
+  // such a resume through the count wrapping to 255 and back in Suspend.
+  if (early_resume_ && previous == 0) {
+    early_resume_ = false;
+    return previous;
+  }
   guest_thread->suspend_count++;
   suspend_cv_.wait(lock, [guest_thread]() { return guest_thread->suspend_count == 0; });
   return previous;

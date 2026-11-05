@@ -86,3 +86,50 @@ TEST_CASE("Pulse with nobody waiting does nothing", "[thread]") {
   manual->Pulse();
   CHECK(rex::thread::Wait(manual.get(), false, 0ms) == WaitResult::kTimeout);
 }
+
+TEST_CASE("Set and Reset in a row release a thread waiting on a manual-reset event", "[thread]") {
+  auto event = Event::CreateManualResetEvent(false);
+  WaitResult result = WaitResult::kFailed;
+  std::thread waiter([&] { result = rex::thread::Wait(event.get(), false, kWaitTimeout); });
+  std::this_thread::sleep_for(kSettle);
+  event->Set();
+  event->Reset();
+  waiter.join();
+  CHECK(result == WaitResult::kSuccess);
+}
+
+TEST_CASE("Set of an auto-reset event goes to the thread already waiting", "[thread]") {
+  auto event = Event::CreateAutoResetEvent(false);
+  WaitResult result = WaitResult::kFailed;
+  std::thread waiter([&] { result = rex::thread::Wait(event.get(), false, kWaitTimeout); });
+  std::this_thread::sleep_for(kSettle);
+  event->Set();
+  CHECK(rex::thread::Wait(event.get(), false, 0ms) == WaitResult::kTimeout);
+  waiter.join();
+  CHECK(result == WaitResult::kSuccess);
+}
+
+TEST_CASE("Set after the waiter timed out leaves an auto-reset event signalled", "[thread]") {
+  auto event = Event::CreateAutoResetEvent(false);
+  CHECK(rex::thread::Wait(event.get(), false, 1ms) == WaitResult::kTimeout);
+  event->Set();
+  CHECK(rex::thread::Wait(event.get(), false, 0ms) == WaitResult::kSuccess);
+}
+
+TEST_CASE("SignalAndWait waits from before it signals", "[thread]") {
+  auto go = Event::CreateAutoResetEvent(false);
+  auto back = Event::CreateAutoResetEvent(false);
+  // Released by the signal, this thread answers and tries to take its own answer back.
+  bool released = false, stolen = true;
+  std::thread partner([&] {
+    released = rex::thread::Wait(go.get(), false, kWaitTimeout) == WaitResult::kSuccess;
+    back->Set();
+    stolen = rex::thread::Wait(back.get(), false, 0ms) == WaitResult::kSuccess;
+  });
+  std::this_thread::sleep_for(kSettle);
+  CHECK(rex::thread::SignalAndWait(go.get(), back.get(), false, kWaitTimeout) ==
+        WaitResult::kSuccess);
+  partner.join();
+  CHECK(released);
+  CHECK_FALSE(stolen);
+}

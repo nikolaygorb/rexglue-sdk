@@ -38,6 +38,24 @@
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
+// Idea from the WWE 2K14 recomp project (vulkan_texture_load_direct, session
+// 7c): every reload of a texture resolved at a resolution scale untiles into
+// the shared scratch buffer, copies that into the image, and has a barrier
+// between the two.
+REXCVAR_DEFINE_BOOL(vulkan_texture_load_direct, false, "GPU/Vulkan",
+                    "At a resolution scale, load single-level 32bpb and 64bpb textures that "
+                    "resolves wrote straight into their image from the load shader, without the "
+                    "scratch buffer and the copy. Their images get the storage usage, which can "
+                    "cost texture compression on some GPUs")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(vulkan_texture_load_direct_verify, 0, "GPU/Vulkan",
+                     "With vulkan_texture_load_direct: for up to this many direct loads a frame, "
+                     "also load through the scratch buffer (the picture shows that one) and "
+                     "compare the two byte for byte once the GPU is done, logging differences. "
+                     "Diagnostic: costs GPU time and memory")
+    .range(0, 64)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 // Generated with `xb buildshaders`.
@@ -48,8 +66,10 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/texture_load_16bpb_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_32bpb_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_32bpb_scaled_cs.h"
+#include "../shaders/vulkan_spirv/texture_load_32bpb_scaled_direct_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_64bpb_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_64bpb_scaled_cs.h"
+#include "../shaders/vulkan_spirv/texture_load_64bpb_scaled_direct_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_8bpb_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_8bpb_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_bgrg8_rgb8_cs.h"
@@ -530,6 +550,14 @@ VulkanTextureCache::~VulkanTextureCache() {
   if (load_pipeline_layout_ != VK_NULL_HANDLE) {
     dfn.vkDestroyPipelineLayout(device, load_pipeline_layout_, nullptr);
   }
+  for (VkPipeline direct_load_pipeline : direct_load_pipelines_) {
+    if (direct_load_pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, direct_load_pipeline, nullptr);
+    }
+  }
+  if (direct_load_pipeline_layout_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineLayout(device, direct_load_pipeline_layout_, nullptr);
+  }
   if (shared_memory_persistent_descriptor_pool_ != VK_NULL_HANDLE) {
     dfn.vkDestroyDescriptorPool(device, shared_memory_persistent_descriptor_pool_, nullptr);
   }
@@ -537,6 +565,23 @@ VulkanTextureCache::~VulkanTextureCache() {
   // Textures memory is allocated using the Vulkan Memory Allocator, destroy all
   // textures before destroying VMA.
   DestroyAllTextures(true);
+
+  // After the textures, which free their direct load descriptors into them.
+  for (VkDescriptorPool direct_load_descriptor_pool : direct_load_descriptor_pools_) {
+    dfn.vkDestroyDescriptorPool(device, direct_load_descriptor_pool, nullptr);
+  }
+  if (direct_load_descriptor_set_layout_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorSetLayout(device, direct_load_descriptor_set_layout_, nullptr);
+  }
+  direct_load_verifications_.push_back(direct_load_verification_pending_);
+  for (const DirectLoadVerification& verification : direct_load_verifications_) {
+    for (size_t i = 0; i < verification.buffers.size(); ++i) {
+      if (verification.buffers[i] != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(vma_allocator_, verification.buffers[i], verification.allocations[i]);
+      }
+    }
+  }
+  direct_load_verifications_.clear();
   for (const ReplacementStagingBuffer& staging : replacement_staging_buffers_) {
     vmaDestroyBuffer(vma_allocator_, staging.buffer, staging.allocation);
   }
@@ -572,6 +617,10 @@ void VulkanTextureCache::CompletedSubmissionUpdated(uint64_t completed_submissio
     }
     vmaDestroyBuffer(vma_allocator_, staging_it->buffer, staging_it->allocation);
     staging_it = replacement_staging_buffers_.erase(staging_it);
+  }
+
+  if (!direct_load_verifications_.empty()) {
+    CompareDirectLoadVerification(completed_submission_index);
   }
 }
 
@@ -613,6 +662,7 @@ void VulkanTextureCache::BeginFrame() {
   TextureCache::BeginFrame();
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
+  direct_load_verifications_in_frame_ = 0;
 }
 
 void VulkanTextureCache::EndFrame() {
@@ -1217,12 +1267,12 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     width *= draw_resolution_scale_x();
     height *= draw_resolution_scale_y();
   }
-  return CreateVulkanTexture(key, width, height, key.mip_max_level + 1);
+  return CreateVulkanTexture(key, width, height, key.mip_max_level + 1, GetDirectLoadKind(key));
 }
 
-std::unique_ptr<VulkanTextureCache::VulkanTexture> VulkanTextureCache::CreateVulkanTexture(
-    TextureKey key, uint32_t width, uint32_t height, uint32_t mip_levels) {
-  VkFormat formats[] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+void VulkanTextureCache::GetTextureImageFormats(TextureKey key, VkFormat (&formats)[2]) const {
+  formats[0] = VK_FORMAT_UNDEFINED;
+  formats[1] = VK_FORMAT_UNDEFINED;
   const HostFormatPair& host_format = GetHostFormatPair(key);
   if (host_format.format_signed.format == VK_FORMAT_UNDEFINED) {
     // Only the unsigned format may be available, if at all.
@@ -1243,6 +1293,19 @@ std::unique_ptr<VulkanTextureCache::VulkanTexture> VulkanTextureCache::CreateVul
         formats[1] = host_format.format_signed.format;
       }
     }
+  }
+}
+
+std::unique_ptr<VulkanTextureCache::VulkanTexture> VulkanTextureCache::CreateVulkanTexture(
+    TextureKey key, uint32_t width, uint32_t height, uint32_t mip_levels, int direct_load_kind) {
+  // The image's format, the other one of a mutable signed / unsigned pair, and
+  // the direct load view's.
+  VkFormat formats[3] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+  {
+    VkFormat image_formats[2];
+    GetTextureImageFormats(key, image_formats);
+    formats[0] = image_formats[0];
+    formats[1] = image_formats[1];
   }
   if (formats[0] == VK_FORMAT_UNDEFINED) {
     unsupported_format_features_used_[uint32_t(key.format)] |= kUnsupportedResourceBit;
@@ -1281,14 +1344,23 @@ std::unique_ptr<VulkanTextureCache::VulkanTexture> VulkanTextureCache::CreateVul
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
   image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  uint32_t view_format_count = formats[1] != VK_FORMAT_UNDEFINED ? 2 : 1;
+  if (direct_load_kind >= 0) {
+    // Written through an unsigned integer view of the same size, whose
+    // format supports storage where the image's may not (extended usage).
+    // The transfer source is for vulkan_texture_load_direct_verify.
+    image_create_info.flags |=
+        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    formats[view_format_count++] = kDirectLoadViewFormats[direct_load_kind];
+  }
   VkImageFormatListCreateInfo image_format_list_create_info;
-  if (formats[1] != VK_FORMAT_UNDEFINED &&
-      vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
+  if (view_format_count > 1 && vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
     image_create_info_last->pNext = &image_format_list_create_info;
     image_create_info_last = reinterpret_cast<VkImageCreateInfo*>(&image_format_list_create_info);
     image_format_list_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
     image_format_list_create_info.pNext = nullptr;
-    image_format_list_create_info.viewFormatCount = 2;
+    image_format_list_create_info.viewFormatCount = view_format_count;
     image_format_list_create_info.pViewFormats = formats;
   }
 
@@ -1300,7 +1372,11 @@ std::unique_ptr<VulkanTextureCache::VulkanTexture> VulkanTextureCache::CreateVul
     return nullptr;
   }
 
-  return std::unique_ptr<VulkanTexture>(new VulkanTexture(*this, key, image, allocation));
+  std::unique_ptr<VulkanTexture> texture(new VulkanTexture(*this, key, image, allocation));
+  if (direct_load_kind >= 0) {
+    texture->set_direct_load();
+  }
+  return texture;
 }
 
 bool VulkanTextureCache::CanCreateReplacementTexture(TextureKey key) const {
@@ -1477,6 +1553,44 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     }
     load_shader_info_float_convert = &GetLoadShaderInfo(load_shader_float_convert);
   }
+
+  // vulkan_texture_load_direct: the base straight into the image. A packed
+  // base (a small texture in a mip tail) goes through the scratch buffer.
+  // With vulkan_texture_load_direct_verify, the load is also done through the
+  // scratch buffer below, after the direct one, so the image ends up with the
+  // usual result, and both are read back for CompareDirectLoadVerification.
+  bool direct_load_verify = false;
+  if (vulkan_texture.direct_load() && load_base && pipeline_float_convert == VK_NULL_HANDLE &&
+      vulkan_texture.guest_layout().packed_level != 0 &&
+      (load_shader == kLoadShaderIndex32bpb || load_shader == kLoadShaderIndex64bpb)) {
+    DirectLoadKind direct_load_kind =
+        load_shader == kLoadShaderIndex32bpb ? kDirectLoad32bpb : kDirectLoad64bpb;
+    if (int32_t(direct_load_verifications_in_frame_) <
+        REXCVAR_GET(vulkan_texture_load_direct_verify)) {
+      if (LoadTextureDataDirect(vulkan_texture, direct_load_kind, load_shader_info)) {
+        ++direct_load_verifications_in_frame_;
+        direct_load_verify = ReadBackDirectLoadVerification(
+            vulkan_texture, direct_load_kind == kDirectLoad32bpb ? 4 : 8, 1);
+      }
+    } else if (LoadTextureDataDirect(vulkan_texture, direct_load_kind, load_shader_info)) {
+      return true;
+    }
+  }
+  // The buffers of a verification whose second half isn't recorded (a failure
+  // below) are freed with it once the submission is done, not compared.
+  struct DirectLoadVerificationScope {
+    VulkanTextureCache& cache;
+    bool active;
+    ~DirectLoadVerificationScope() {
+      if (!active) {
+        return;
+      }
+      cache.direct_load_verification_pending_.submission_index =
+          cache.command_processor_.GetCurrentSubmission();
+      cache.direct_load_verifications_.push_back(cache.direct_load_verification_pending_);
+      cache.direct_load_verification_pending_ = DirectLoadVerification();
+    }
+  } direct_load_verification_scope{*this, direct_load_verify};
 
   // Get the guest layout.
   const texture_util::TextureGuestLayout& guest_layout = vulkan_texture.guest_layout();
@@ -2067,6 +2181,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
   }
 
+  if (direct_load_verify) {
+    ReadBackDirectLoadVerification(vulkan_texture,
+                                   load_shader == kLoadShaderIndex32bpb ? 4 : 8, 0);
+  }
+
   return true;
 }
 
@@ -2325,6 +2444,12 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
   }
+  if (direct_load_descriptor_set_ != VK_NULL_HANDLE) {
+    dfn.vkFreeDescriptorSets(device, direct_load_descriptor_pool_, 1, &direct_load_descriptor_set_);
+  }
+  if (direct_load_view_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, direct_load_view_, nullptr);
+  }
   VmaAllocationInfo allocation_info;
   vmaGetAllocationInfo(vulkan_texture_cache.vma_allocator_, allocation_, &allocation_info);
   device_memory::Get().Freed(device_memory::Use::kTexture, allocation_info.memoryType,
@@ -2403,6 +2528,16 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
         view_create_info.subresourceRange.layerCount = 1;
       }
       break;
+  }
+  // An image with the extended usage (vulkan_texture_load_direct) passes all
+  // its usages to its views, and the storage one may not be supported by this
+  // format: the view is only sampled.
+  VkImageViewUsageCreateInfo view_usage_create_info;
+  if (direct_load_) {
+    view_usage_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+    view_usage_create_info.pNext = nullptr;
+    view_usage_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    view_create_info.pNext = &view_usage_create_info;
   }
   VkImageView view;
   if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &view) != VK_SUCCESS) {
@@ -3705,6 +3840,82 @@ bool VulkanTextureCache::Initialize() {
     }
   }
 
+  // vulkan_texture_load_direct. Without what it needs, loads go through the
+  // scratch buffer as usual.
+  if (IsDrawResolutionScaled() && REXCVAR_GET(vulkan_texture_load_direct)) {
+    const char* direct_load_unavailable = nullptr;
+    if (device_properties.apiVersion < VK_API_VERSION_1_1) {
+      // VK_IMAGE_CREATE_EXTENDED_USAGE_BIT and VkImageViewUsageCreateInfo.
+      direct_load_unavailable = "Vulkan 1.1 is required";
+    } else {
+      for (VkFormat view_format : kDirectLoadViewFormats) {
+        VkFormatProperties view_format_properties;
+        ifn.vkGetPhysicalDeviceFormatProperties(physical_device, view_format,
+                                                &view_format_properties);
+        if (!(view_format_properties.optimalTilingFeatures &
+              VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+          direct_load_unavailable = "no storage image support for its view formats";
+        }
+      }
+    }
+    if (!direct_load_unavailable) {
+      VkDescriptorSetLayoutBinding direct_load_binding;
+      direct_load_binding.binding = 0;
+      direct_load_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      direct_load_binding.descriptorCount = 1;
+      direct_load_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      direct_load_binding.pImmutableSamplers = nullptr;
+      VkDescriptorSetLayoutCreateInfo direct_load_set_layout_create_info = {};
+      direct_load_set_layout_create_info.sType =
+          VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+      direct_load_set_layout_create_info.bindingCount = 1;
+      direct_load_set_layout_create_info.pBindings = &direct_load_binding;
+      // Set 0 is the image instead of the destination buffer, set 1 the
+      // source as for the other load shaders.
+      VkDescriptorSetLayout direct_load_set_layouts[kLoadDescriptorSetCount] = {};
+      if (dfn.vkCreateDescriptorSetLayout(device, &direct_load_set_layout_create_info, nullptr,
+                                          &direct_load_descriptor_set_layout_) != VK_SUCCESS) {
+        direct_load_unavailable = "failed to create its descriptor set layout";
+      } else {
+        direct_load_set_layouts[kLoadDescriptorSetIndexDestination] =
+            direct_load_descriptor_set_layout_;
+        direct_load_set_layouts[kLoadDescriptorSetIndexSource] =
+            load_descriptor_set_layout_storage_buffer;
+        VkPipelineLayoutCreateInfo direct_load_pipeline_layout_create_info =
+            load_pipeline_layout_create_info;
+        direct_load_pipeline_layout_create_info.pSetLayouts = direct_load_set_layouts;
+        if (dfn.vkCreatePipelineLayout(device, &direct_load_pipeline_layout_create_info, nullptr,
+                                       &direct_load_pipeline_layout_) != VK_SUCCESS) {
+          direct_load_unavailable = "failed to create its pipeline layout";
+        }
+      }
+    }
+    if (!direct_load_unavailable) {
+      const std::pair<const uint32_t*, size_t> direct_load_shader_code[] = {
+          {shaders::texture_load_32bpb_scaled_direct_cs,
+           sizeof(shaders::texture_load_32bpb_scaled_direct_cs)},
+          {shaders::texture_load_64bpb_scaled_direct_cs,
+           sizeof(shaders::texture_load_64bpb_scaled_direct_cs)},
+      };
+      for (size_t i = 0; i < kDirectLoadKindCount; ++i) {
+        direct_load_pipelines_[i] = ui::vulkan::util::CreateComputePipeline(
+            vulkan_device, direct_load_pipeline_layout_, direct_load_shader_code[i].first,
+            direct_load_shader_code[i].second);
+        if (direct_load_pipelines_[i] == VK_NULL_HANDLE) {
+          direct_load_unavailable = "failed to create its pipelines";
+        }
+      }
+    }
+    if (direct_load_unavailable) {
+      REXGPU_WARN("vulkan_texture_load_direct is off: {}", direct_load_unavailable);
+    } else {
+      direct_load_enabled_ = true;
+      REXGPU_INFO(
+          "vulkan_texture_load_direct: resolution-scaled 32bpb and 64bpb textures are loaded "
+          "straight into their images");
+    }
+  }
+
   // Use true null descriptors when supported; otherwise, keep compatibility
   // fallback null images.
   if (device_properties.nullDescriptor) {
@@ -3987,6 +4198,431 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
       access_mask = VK_ACCESS_SHADER_READ_BIT;
       layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       break;
+    case VulkanTexture::Usage::kComputeWrite:
+      stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      access_mask = VK_ACCESS_SHADER_WRITE_BIT;
+      layout = VK_IMAGE_LAYOUT_GENERAL;
+      break;
+    case VulkanTexture::Usage::kTransferSource:
+      stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      access_mask = VK_ACCESS_TRANSFER_READ_BIT;
+      layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      break;
+  }
+}
+
+void VulkanTextureCache::TransitionTextureUsage(VulkanTexture& texture,
+                                                VulkanTexture::Usage new_usage) {
+  texture.MarkAsUsed();
+  VulkanTexture::Usage old_usage = texture.SetUsage(new_usage);
+  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+  VkAccessFlags src_access_mask, dst_access_mask;
+  VkImageLayout old_layout, new_layout;
+  GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+  GetTextureUsageMasks(new_usage, dst_stage_mask, dst_access_mask, new_layout);
+  // Not skipped when the usage stays the same: two writes in a row (two loads
+  // in one submission) must be ordered.
+  command_processor_.PushImageMemoryBarrier(
+      texture.image(), ui::vulkan::util::InitializeSubresourceRange(), src_stage_mask,
+      dst_stage_mask, src_access_mask, dst_access_mask, old_layout, new_layout,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+}
+
+int VulkanTextureCache::GetDirectLoadKind(TextureKey key) {
+  if (!direct_load_enabled_ || !key.scaled_resolve || !key.tiled ||
+      key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
+      key.mip_max_level != 0) {
+    return -1;
+  }
+  const FormatInfo* format_info = FormatInfo::Get(key.format);
+  if (format_info->block_width != 1 || format_info->block_height != 1) {
+    return -1;
+  }
+  // The host format loads use, as LoadTextureDataFromResidentMemoryImpl
+  // chooses it.
+  const HostFormatPair& host_format_pair = GetHostFormatPair(key);
+  bool host_format_is_signed;
+  if (IsSignedVersionSeparateForFormat(key)) {
+    host_format_is_signed = bool(key.signed_separate);
+  } else {
+    host_format_is_signed = host_format_pair.format_unsigned.load_shader == kLoadShaderIndexUnknown;
+  }
+  const HostFormat& host_format =
+      host_format_is_signed ? host_format_pair.format_signed : host_format_pair.format_unsigned;
+  if (host_format.block_compressed) {
+    return -1;
+  }
+  int kind;
+  uint32_t texel_size;
+  switch (host_format.load_shader) {
+    case kLoadShaderIndex32bpb:
+      kind = kDirectLoad32bpb;
+      texel_size = 4;
+      break;
+    case kLoadShaderIndex64bpb:
+      kind = kDirectLoad64bpb;
+      texel_size = 8;
+      break;
+    default:
+      return -1;
+  }
+  // Every view format of the image must be of the view format's size, or the
+  // bits wouldn't map one to one.
+  auto host_texel_size = [](VkFormat format) -> uint32_t {
+    switch (format) {
+      case VK_FORMAT_R8G8B8A8_UNORM:
+      case VK_FORMAT_R8G8B8A8_SNORM:
+      case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+      case VK_FORMAT_R16G16_UNORM:
+      case VK_FORMAT_R16G16_SNORM:
+      case VK_FORMAT_R16G16_SFLOAT:
+      case VK_FORMAT_R32_SFLOAT:
+        return 4;
+      case VK_FORMAT_R16G16B16A16_UNORM:
+      case VK_FORMAT_R16G16B16A16_SNORM:
+      case VK_FORMAT_R16G16B16A16_SFLOAT:
+      case VK_FORMAT_R32G32_SFLOAT:
+        return 8;
+      default:
+        return 0;
+    }
+  };
+  VkFormat image_formats[2];
+  GetTextureImageFormats(key, image_formats);
+  if (image_formats[0] == VK_FORMAT_UNDEFINED ||
+      host_texel_size(image_formats[0]) != texel_size ||
+      (image_formats[1] != VK_FORMAT_UNDEFINED &&
+       host_texel_size(image_formats[1]) != texel_size) ||
+      !IsDirectLoadImageSupported(image_formats[0])) {
+    return -1;
+  }
+  return kind;
+}
+
+bool VulkanTextureCache::IsDirectLoadImageSupported(VkFormat format) {
+  auto it = direct_load_image_support_.find(format);
+  if (it != direct_load_image_support_.end()) {
+    return it->second;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  VkImageFormatProperties image_format_properties;
+  bool supported =
+      vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceImageFormatProperties(
+          vulkan_device->physical_device(), format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+          VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT,
+          &image_format_properties) == VK_SUCCESS;
+  if (!supported) {
+    REXGPU_INFO("vulkan_texture_load_direct: format {} can't have the storage usage, loaded "
+                "through the scratch buffer",
+                uint32_t(format));
+  }
+  direct_load_image_support_.emplace(format, supported);
+  return supported;
+}
+
+bool VulkanTextureCache::EnsureDirectLoadBindings(VulkanTexture& texture, DirectLoadKind kind) {
+  if (texture.direct_load_descriptor_set() != VK_NULL_HANDLE) {
+    return true;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  // Only the storage usage for the view: the image's other usages may not be
+  // supported by the unsigned integer format.
+  VkImageViewUsageCreateInfo view_usage_create_info = {};
+  view_usage_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+  view_usage_create_info.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+  VkImageViewCreateInfo view_create_info = {};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.pNext = &view_usage_create_info;
+  view_create_info.image = texture.image();
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_create_info.format = kDirectLoadViewFormats[kind];
+  view_create_info.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                 VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+  view_create_info.subresourceRange =
+      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
+  VkImageView view;
+  if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &view) != VK_SUCCESS) {
+    REXGPU_ERROR("vulkan_texture_load_direct: failed to create a storage view of a texture");
+    return false;
+  }
+
+  VkDescriptorSetAllocateInfo set_allocate_info = {};
+  set_allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_allocate_info.descriptorSetCount = 1;
+  set_allocate_info.pSetLayouts = &direct_load_descriptor_set_layout_;
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  // Sets of destroyed textures go back to their pools, so every pool is tried
+  // before a new one is made.
+  for (VkDescriptorPool existing_pool : direct_load_descriptor_pools_) {
+    set_allocate_info.descriptorPool = existing_pool;
+    if (dfn.vkAllocateDescriptorSets(device, &set_allocate_info, &set) == VK_SUCCESS) {
+      pool = existing_pool;
+      break;
+    }
+  }
+  if (pool == VK_NULL_HANDLE) {
+    constexpr uint32_t kSetsPerPool = 256;
+    VkDescriptorPoolSize pool_size;
+    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    pool_size.descriptorCount = kSetsPerPool;
+    VkDescriptorPoolCreateInfo pool_create_info = {};
+    pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_create_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pool_create_info.maxSets = kSetsPerPool;
+    pool_create_info.poolSizeCount = 1;
+    pool_create_info.pPoolSizes = &pool_size;
+    VkDescriptorPool new_pool;
+    if (dfn.vkCreateDescriptorPool(device, &pool_create_info, nullptr, &new_pool) == VK_SUCCESS) {
+      direct_load_descriptor_pools_.push_back(new_pool);
+      set_allocate_info.descriptorPool = new_pool;
+      if (dfn.vkAllocateDescriptorSets(device, &set_allocate_info, &set) == VK_SUCCESS) {
+        pool = new_pool;
+      }
+    }
+  }
+  if (pool == VK_NULL_HANDLE) {
+    REXGPU_ERROR("vulkan_texture_load_direct: failed to allocate a storage image descriptor");
+    dfn.vkDestroyImageView(device, view, nullptr);
+    return false;
+  }
+
+  // The image is in the general layout while the load shader writes it.
+  VkDescriptorImageInfo image_info;
+  image_info.sampler = VK_NULL_HANDLE;
+  image_info.imageView = view;
+  image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+  VkWriteDescriptorSet write = {};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = set;
+  write.dstBinding = 0;
+  write.dstArrayElement = 0;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  write.pImageInfo = &image_info;
+  dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+
+  texture.SetDirectLoadBindings(view, pool, set);
+  return true;
+}
+
+bool VulkanTextureCache::LoadTextureDataDirect(VulkanTexture& texture, DirectLoadKind kind,
+                                               const LoadShaderInfo& load_shader_info) {
+  VkPipeline pipeline = direct_load_pipelines_[kind];
+  if (pipeline == VK_NULL_HANDLE || !EnsureDirectLoadBindings(texture, kind)) {
+    return false;
+  }
+  TextureKey texture_key = texture.key();
+  assert_true(texture_key.scaled_resolve);
+  const texture_util::TextureGuestLayout& guest_layout = texture.guest_layout();
+  const uint32_t scale_x = draw_resolution_scale_x();
+  const uint32_t scale_y = draw_resolution_scale_y();
+
+  // The source: the base's range of the scaled resolve buffer, as for a load
+  // through the scratch buffer.
+  uint32_t source_start_unscaled = texture_key.base_page << 12;
+  uint32_t guest_size = texture.GetGuestBaseSize();
+  if (!EnsureScaledResolveMemoryCommitted(source_start_unscaled, guest_size) ||
+      !MakeScaledResolveRangeCurrent(source_start_unscaled, guest_size)) {
+    return false;
+  }
+  VkBuffer scaled_buffer = GetCurrentScaledResolveBuffer();
+  if (scaled_buffer == VK_NULL_HANDLE) {
+    return false;
+  }
+  VkDescriptorSet descriptor_set_source = command_processor_.AllocateSingleTransientDescriptor(
+      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
+  if (descriptor_set_source == VK_NULL_HANDLE) {
+    return false;
+  }
+  const uint32_t scale_area = scale_x * scale_y;
+  VkDescriptorBufferInfo source_buffer_info;
+  source_buffer_info.buffer = scaled_buffer;
+  source_buffer_info.offset =
+      uint64_t(source_start_unscaled) * scale_area - GetCurrentScaledResolveBufferBaseOffset();
+  // Shaders read up to 16 bytes at once.
+  source_buffer_info.range = rex::align(uint64_t(guest_size) * scale_area, uint64_t(16));
+  VkWriteDescriptorSet source_write = {};
+  source_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  source_write.dstSet = descriptor_set_source;
+  source_write.dstBinding = 0;
+  source_write.dstArrayElement = 0;
+  source_write.descriptorCount = 1;
+  source_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  source_write.pBufferInfo = &source_buffer_info;
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1, &source_write, 0,
+                                                    nullptr);
+
+  // Nothing can fail from here on. The whole level is written, so a texture
+  // never loaded before starts from the undefined layout. The scaled resolve
+  // buffers are made visible to compute shader reads by the barrier after
+  // each resolve.
+  TransitionTextureUsage(texture, VulkanTexture::Usage::kComputeWrite);
+
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  command_processor_.BindExternalComputePipeline(pipeline);
+  VkDescriptorSet descriptor_set_dest = texture.direct_load_descriptor_set();
+  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                         direct_load_pipeline_layout_,
+                                         kLoadDescriptorSetIndexDestination, 1,
+                                         &descriptor_set_dest, 0, nullptr);
+  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                         direct_load_pipeline_layout_,
+                                         kLoadDescriptorSetIndexSource, 1, &descriptor_set_source,
+                                         0, nullptr);
+
+  // As the load through the scratch buffer sets them for the base, without
+  // the host layout, which the direct shader doesn't use.
+  const FormatInfo* guest_format_info = FormatInfo::Get(texture_key.format);
+  const uint32_t width = texture_key.GetWidth();
+  const uint32_t height = texture_key.GetHeight();
+  LoadConstants load_constants = {};
+  load_constants.is_tiled_3d_endian_scale =
+      uint32_t(texture_key.tiled) | (uint32_t(texture.force_load_3d_tiling()) << 1) |
+      (uint32_t(texture_key.endianness) << 2) | (scale_x << 4) | (scale_y << 7);
+  load_constants.guest_offset = 0;
+  load_constants.guest_pitch_aligned =
+      guest_layout.base.row_pitch_bytes / guest_format_info->bytes_per_block();
+  load_constants.guest_z_stride_block_rows_aligned = guest_layout.base.z_slice_stride_block_rows;
+  // 1x1 blocks (GetDirectLoadKind): the image's size.
+  load_constants.size_blocks[0] = width * scale_x;
+  load_constants.size_blocks[1] = height * scale_y;
+  load_constants.size_blocks[2] = 1;
+  load_constants.host_offset = 0;
+  load_constants.host_pitch = 0;
+  load_constants.height_texels = height;
+  command_buffer.CmdVkPushConstants(direct_load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                    sizeof(load_constants), &load_constants);
+
+  // The same blocks per thread as the 32bpb and 64bpb load shaders.
+  uint32_t guest_x_blocks_per_group_log2 = load_shader_info.GetGuestXBlocksPerGroupLog2();
+  uint32_t group_count_x =
+      (load_constants.size_blocks[0] + ((UINT32_C(1) << guest_x_blocks_per_group_log2) - 1)) >>
+      guest_x_blocks_per_group_log2;
+  uint32_t group_count_y =
+      (load_constants.size_blocks[1] + ((UINT32_C(1) << kLoadGuestYBlocksPerGroupLog2) - 1)) >>
+      kLoadGuestYBlocksPerGroupLog2;
+  command_processor_.SubmitBarriers(true);
+  command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
+  return true;
+}
+
+bool VulkanTextureCache::ReadBackDirectLoadVerification(VulkanTexture& texture,
+                                                        uint32_t bytes_per_texel,
+                                                        uint32_t index) {
+  TextureKey texture_key = texture.key();
+  const uint32_t width = texture_key.GetWidth() * draw_resolution_scale_x();
+  const uint32_t height = texture_key.GetHeight() * draw_resolution_scale_y();
+  DirectLoadVerification& verification = direct_load_verification_pending_;
+  assert_true(verification.buffers[index] == VK_NULL_HANDLE);
+
+  VkBufferCreateInfo buffer_create_info = {};
+  buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_create_info.size = VkDeviceSize(width) * height * bytes_per_texel;
+  buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VmaAllocationCreateInfo allocation_create_info = {};
+  allocation_create_info.flags =
+      VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+  if (vmaCreateBuffer(vma_allocator_, &buffer_create_info, &allocation_create_info,
+                      &verification.buffers[index], &verification.allocations[index],
+                      nullptr) != VK_SUCCESS) {
+    verification.buffers[index] = VK_NULL_HANDLE;
+    REXGPU_ERROR("vulkan_texture_load_direct_verify: failed to create a readback buffer");
+    return false;
+  }
+  verification.key = texture_key;
+  verification.width = width;
+  verification.height = height;
+  verification.bytes_per_texel = bytes_per_texel;
+
+  TransitionTextureUsage(texture, VulkanTexture::Usage::kTransferSource);
+  command_processor_.SubmitBarriers(true);
+  VkBufferImageCopy* region =
+      command_processor_.deferred_command_buffer().CmdCopyImageToBufferEmplace(
+          texture.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, verification.buffers[index], 1);
+  region->bufferOffset = 0;
+  // Rows of texels without padding.
+  region->bufferRowLength = 0;
+  region->bufferImageHeight = 0;
+  region->imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region->imageSubresource.mipLevel = 0;
+  region->imageSubresource.baseArrayLayer = 0;
+  region->imageSubresource.layerCount = 1;
+  region->imageOffset = {0, 0, 0};
+  region->imageExtent = {width, height, 1};
+  // Read by the host once the submission is done (CompletedSubmissionUpdated).
+  command_processor_.PushBufferMemoryBarrier(
+      verification.buffers[index], 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+  command_processor_.SubmitBarriers(true);
+  return true;
+}
+
+void VulkanTextureCache::CompareDirectLoadVerification(uint64_t completed_submission_index) {
+  auto it = direct_load_verifications_.begin();
+  while (it != direct_load_verifications_.end()) {
+    if (it->submission_index > completed_submission_index) {
+      ++it;
+      continue;
+    }
+    if (it->buffers[0] != VK_NULL_HANDLE && it->buffers[1] != VK_NULL_HANDLE) {
+      const uint8_t* data[2];
+      for (size_t i = 0; i < 2; ++i) {
+        vmaInvalidateAllocation(vma_allocator_, it->allocations[i], 0, VK_WHOLE_SIZE);
+        VmaAllocationInfo allocation_info;
+        vmaGetAllocationInfo(vma_allocator_, it->allocations[i], &allocation_info);
+        data[i] = static_cast<const uint8_t*>(allocation_info.pMappedData);
+      }
+      if (data[0] && data[1]) {
+        const uint32_t texel_count = it->width * it->height;
+        const uint32_t bpt = it->bytes_per_texel;
+        uint32_t differing = 0;
+        uint32_t first_differing = 0;
+        for (uint32_t i = 0; i < texel_count; ++i) {
+          if (std::memcmp(data[0] + size_t(i) * bpt, data[1] + size_t(i) * bpt, bpt)) {
+            if (!differing) {
+              first_differing = i;
+            }
+            ++differing;
+          }
+        }
+        ++direct_load_verified_count_;
+        if (differing) {
+          ++direct_load_mismatch_count_;
+          if (direct_load_mismatch_count_ <= 32) {
+            uint64_t texels[2] = {};
+            for (size_t i = 0; i < 2; ++i) {
+              std::memcpy(&texels[i], data[i] + size_t(first_differing) * bpt, bpt);
+            }
+            REXGPU_WARN(
+                "vulkan_texture_load_direct_verify: {} {}x{} at 0x{:08X}: {} of {} texels "
+                "differ, the first at ({}, {}): 0x{:X} through the scratch buffer, 0x{:X} "
+                "directly",
+                FormatInfo::Get(it->key.format)->name, it->width, it->height,
+                it->key.base_page << 12, differing, texel_count, first_differing % it->width,
+                first_differing / it->width, texels[0], texels[1]);
+          }
+        }
+        if (direct_load_verified_count_ % 100 == 1) {
+          REXGPU_INFO("vulkan_texture_load_direct_verify: {} loads compared, {} differ",
+                      direct_load_verified_count_, direct_load_mismatch_count_);
+        }
+      }
+    }
+    for (size_t i = 0; i < it->buffers.size(); ++i) {
+      if (it->buffers[i] != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(vma_allocator_, it->buffers[i], it->allocations[i]);
+      }
+    }
+    it = direct_load_verifications_.erase(it);
   }
 }
 

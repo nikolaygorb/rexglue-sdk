@@ -114,6 +114,10 @@ VkResult VulkanGPUCompletionTimeline::AcquireFenceAndSubmit(const uint32_t queue
 
 void VulkanGPUCompletionTimeline::UpdateCompletedSubmission() {
   while (!pending_submission_fences_.empty()) {
+    if (submitted_limit_ && pending_submission_fences_.front().first >
+                                submitted_limit_->load(std::memory_order_acquire)) {
+      break;
+    }
     const VkResult fence_status = vulkan_device_->functions().vkGetFenceStatus(
         vulkan_device_->device(), pending_submission_fences_.front().second);
     if (fence_status != VK_SUCCESS) {

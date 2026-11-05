@@ -92,7 +92,15 @@ class VulkanQueryPool {
   // Clears every dirty free slot with as few fills as possible. Must be
   // recorded outside a render pass.
   void FlushCounterClears(DeferredCommandBuffer& deferred_command_buffer);
-  void RecordResolveBatch(VkCommandBuffer command_buffer);
+  // The queries to resolve at the end of a submission. Taken out on the thread
+  // that uses the pool, so another one can record them (threaded submission).
+  struct ResolveBatch {
+    std::vector<uint32_t> indices;
+    std::vector<uint32_t> counter_indices;
+  };
+  void TakeResolveBatch(ResolveBatch& batch);
+  // Uses the scratch vectors below: one thread at a time.
+  void RecordResolveBatch(VkCommandBuffer command_buffer, ResolveBatch& batch);
 
   void InvalidateReadback();
 

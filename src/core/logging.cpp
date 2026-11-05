@@ -57,6 +57,13 @@ REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in s
     .range(0, 60)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_UINT32(log_file_max_mb, 50, "Log",
+                      "Size in MB at which the log file rolls over (0 = no limit). The first "
+                      "part is kept as <name>.1.log (the start of the session), the latest "
+                      "earlier part as <name>.2.log")
+    .range(0, 1u << 20)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 
 namespace {
@@ -72,15 +79,22 @@ spdlog::sink_ptr g_early_sink;
 // sink opens the file through std::filesystem::path and, like spdlog's basic
 // file sink, appends and lets other processes read the file while it is
 // written.
+//
+// With a size limit the file rolls over: a session stuck logging the same
+// error wrote gigabytes. The first part becomes <name>.1.log and is kept (it
+// has the start of the session: version, settings, graphics device); every
+// later part replaces <name>.2.log. So a session takes at most three times the
+// limit.
 class PathFileSink final : public spdlog::sinks::base_sink<std::mutex> {
  public:
-  explicit PathFileSink(const std::filesystem::path& path) {
+  PathFileSink(const std::filesystem::path& path, uint64_t max_bytes)
+      : path_(path), max_bytes_(max_bytes) {
     rex::filesystem::CreateParentFolder(path);
-#if REX_PLATFORM_WIN32
-    file_ = _wfsopen(path.c_str(), L"ab", _SH_DENYNO);
-#else
-    file_ = std::fopen(path.c_str(), "ab");
-#endif
+    file_ = Open(false);
+    if (file_ && std::fseek(file_, 0, SEEK_END) == 0) {
+      const long size = std::ftell(file_);
+      written_ = size > 0 ? uint64_t(size) : 0;
+    }
   }
   ~PathFileSink() override {
     if (file_) {
@@ -96,6 +110,10 @@ class PathFileSink final : public spdlog::sinks::base_sink<std::mutex> {
     spdlog::memory_buf_t formatted;
     formatter_->format(msg, formatted);
     std::fwrite(formatted.data(), 1, formatted.size(), file_);
+    written_ += formatted.size();
+    if (max_bytes_ && written_ >= max_bytes_) {
+      RollOver();
+    }
   }
   void flush_() override {
     if (file_) {
@@ -104,6 +122,50 @@ class PathFileSink final : public spdlog::sinks::base_sink<std::mutex> {
   }
 
  private:
+  FILE* Open(bool truncate) const {
+#if REX_PLATFORM_WIN32
+    return _wfsopen(path_.c_str(), truncate ? L"wb" : L"ab", _SH_DENYNO);
+#else
+    return std::fopen(path_.c_str(), truncate ? "wb" : "ab");
+#endif
+  }
+
+  std::filesystem::path PartPath(int part) const {
+    std::filesystem::path part_path = path_;
+    part_path.replace_extension();
+    part_path += fmt::format(".{}", part);
+    part_path += path_.extension();
+    return part_path;
+  }
+
+  void RollOver() {
+    std::fclose(file_);
+    const std::filesystem::path part_path = PartPath(rolls_ == 0 ? 1 : 2);
+    std::error_code ec;
+    std::filesystem::remove(part_path, ec);
+    std::filesystem::rename(path_, part_path, ec);
+    // A file another program holds without delete sharing (a log viewer on
+    // Windows) cannot be moved: it starts over instead, so it stays bounded.
+    file_ = Open(true);
+    written_ = 0;
+    ++rolls_;
+    if (!file_) {
+      return;
+    }
+    const std::string note =
+        ec ? fmt::format("[log reached log_file_max_mb and could not be moved ({}); earlier "
+                         "lines are lost]\n",
+                         ec.message())
+           : fmt::format("[log reached log_file_max_mb; earlier lines are in {}]\n",
+                         rex::path_to_utf8(part_path.filename()));
+    std::fwrite(note.data(), 1, note.size(), file_);
+    written_ += note.size();
+  }
+
+  std::filesystem::path path_;
+  uint64_t max_bytes_;
+  uint64_t written_ = 0;
+  uint32_t rolls_ = 0;
   FILE* file_ = nullptr;
 };
 
@@ -325,7 +387,7 @@ void InitLogging(const LogConfig& config) {
     resolved_path = NextSequentialLogPath(log_dir, config.app_name);
   }
   if (!resolved_path.empty()) {
-    auto sink = CreateFileSink(resolved_path);
+    auto sink = CreateFileSink(resolved_path, config.file_max_bytes);
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;
@@ -509,8 +571,8 @@ void RegisterLogLevelCallback() {
   });
 }
 
-spdlog::sink_ptr CreateFileSink(const std::filesystem::path& path) {
-  return std::make_shared<PathFileSink>(path);
+spdlog::sink_ptr CreateFileSink(const std::filesystem::path& path, uint64_t max_bytes) {
+  return std::make_shared<PathFileSink>(path, max_bytes);
 }
 
 void AddSink(spdlog::sink_ptr sink) {
@@ -642,6 +704,7 @@ void ApplyLogCvarOverrides(LogConfig& config) {
   if (rex::cvar::HasNonDefaultValue("log_flush_interval")) {
     config.flush_interval = std::chrono::seconds(REXCVAR_GET(log_flush_interval));
   }
+  config.file_max_bytes = uint64_t(REXCVAR_GET(log_file_max_mb)) * 1024 * 1024;
 }
 
 const LogConfig& LoggingConfig() {

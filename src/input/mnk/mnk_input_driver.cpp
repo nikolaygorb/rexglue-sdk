@@ -398,7 +398,11 @@ namespace {
 // combination can claim its key from the plain binds of it (BindClaims).
 class BindMatcher {
  public:
-  explicit BindMatcher(const bool (&key_down)[256]) : claims_(key_down, LiveModifiers(key_down)) {
+  explicit BindMatcher(const bool (&key_down)[256]) : BindMatcher(key_down, key_down) {}
+  // Modifiers from modifiers_down: a modifier tapped between two polls doesn't
+  // make a held combination claim its key for a poll.
+  BindMatcher(const bool (&key_down)[256], const bool (&modifiers_down)[256])
+      : claims_(key_down, LiveModifiers(modifiers_down)) {
     for (const PadBind& bind : PadBinds()) {
       ForEachBindToken(bind.keys, [this](BindToken t) { claims_.Claim(t); });
     }
@@ -409,6 +413,17 @@ class BindMatcher {
     bool pressed = false;
     ForEachBindToken(bind, [&](BindToken t) { pressed = pressed || claims_.Fires(t); });
     return pressed;
+  }
+
+  // The newest press among the bind's keys that fire, 0 when none does.
+  uint32_t NewestPress(const std::string& bind, const uint32_t (&press_seq)[256]) const {
+    uint32_t newest = 0;
+    ForEachBindToken(bind, [&](BindToken t) {
+      if (claims_.Fires(t)) {
+        newest = std::max(newest, press_seq[t.key]);
+      }
+    });
+    return newest;
   }
 
  private:
@@ -476,16 +491,34 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
                           has_focus_ && is_active());
 
   if (!is_active() || !has_focus_) {
+    std::lock_guard lock(state_mutex_);
+    // Keys tapped while an overlay has the input (the one closing it) are not
+    // for the title.
+    std::memset(key_tapped_, 0, sizeof(key_tapped_));
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
-      std::lock_guard lock(state_mutex_);
       out_state->packet_number = PacketNumberForLocked(out_state->gamepad);
     }
     return X_ERROR_SUCCESS;
   }
 
   std::lock_guard lock(state_mutex_);
-  const BindMatcher binds_held(key_down_);
+  // A key pressed and released between two polls counts as held for one, or
+  // the title never sees a quick tap.
+  bool keys_seen[256];
+  for (size_t i = 0; i < 256; i++) {
+    keys_seen[i] = key_down_[i] || key_tapped_[i];
+  }
+  std::memset(key_tapped_, 0, sizeof(key_tapped_));
+  const BindMatcher binds_held(keys_seen, key_down_);
+  // Of two opposite stick keys the one pressed last wins, as a stick goes
+  // straight from one side to the other; cancelling to the centre turned a
+  // quick left-then-right into no input.
+  auto stick_axis = [&](const std::string& negative, const std::string& positive) {
+    const uint32_t n = binds_held.NewestPress(negative, key_press_seq_);
+    const uint32_t p = binds_held.NewestPress(positive, key_press_seq_);
+    return p > n ? 1.0f : (n > p ? -1.0f : 0.0f);
+  };
 
   uint16_t buttons = 0;
   if (binds_held.Pressed(REXCVAR_GET(keybind_a)))
@@ -531,30 +564,19 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   last_poll_ = now;
   dt = std::clamp(dt, 0.0f, 0.1f);
 
-  float lx_target = 0.0f;
-  float ly_target = 0.0f;
-  if (binds_held.Pressed(REXCVAR_GET(keybind_lstick_left)))
-    lx_target -= 1.0f;
-  if (binds_held.Pressed(REXCVAR_GET(keybind_lstick_right)))
-    lx_target += 1.0f;
-  if (binds_held.Pressed(REXCVAR_GET(keybind_lstick_up)))
-    ly_target += 1.0f;
-  if (binds_held.Pressed(REXCVAR_GET(keybind_lstick_down)))
-    ly_target -= 1.0f;
+  const float lx_target =
+      stick_axis(REXCVAR_GET(keybind_lstick_left), REXCVAR_GET(keybind_lstick_right));
+  const float ly_target =
+      stick_axis(REXCVAR_GET(keybind_lstick_down), REXCVAR_GET(keybind_lstick_up));
   const float ramp = static_cast<float>(REXCVAR_GET(mnk_stick_ramp));
   int32_t lx = static_cast<int32_t>(RampStickAxis(left_stick_x_, lx_target, dt, ramp) * INT16_MAX);
   int32_t ly = static_cast<int32_t>(RampStickAxis(left_stick_y_, ly_target, dt, ramp) * INT16_MAX);
 
-  int32_t rx = 0;
-  int32_t ry = 0;
-  if (binds_held.Pressed(REXCVAR_GET(keybind_rstick_left)))
-    rx -= INT16_MAX;
-  if (binds_held.Pressed(REXCVAR_GET(keybind_rstick_right)))
-    rx += INT16_MAX;
-  if (binds_held.Pressed(REXCVAR_GET(keybind_rstick_up)))
-    ry += INT16_MAX;
-  if (binds_held.Pressed(REXCVAR_GET(keybind_rstick_down)))
-    ry -= INT16_MAX;
+  int32_t rx = static_cast<int32_t>(
+      stick_axis(REXCVAR_GET(keybind_rstick_left), REXCVAR_GET(keybind_rstick_right)) *
+      INT16_MAX);
+  int32_t ry = static_cast<int32_t>(
+      stick_axis(REXCVAR_GET(keybind_rstick_down), REXCVAR_GET(keybind_rstick_up)) * INT16_MAX);
 
   // The cursor stays captured without mnk_mouse_to_stick (the title reads the
   // mouse itself); only the stick emulation is off then.
@@ -820,6 +842,11 @@ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
 
 void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
   if (vk < 256) {
+    // Auto-repeat neither taps nor reorders.
+    if (down && !key_down_[vk]) {
+      key_tapped_[vk] = true;
+      key_press_seq_[vk] = ++press_seq_;
+    }
     key_down_[vk] = down;
   }
 }
@@ -954,6 +981,7 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   {
     std::lock_guard lock(state_mutex_);
     std::memset(key_down_, 0, sizeof(key_down_));
+    std::memset(key_tapped_, 0, sizeof(key_tapped_));
     // Releases landing on another window never arrive here as key-ups.
     RefreshBoundKeystrokesLocked();
     for (uint16_t vk : raw_keys_down_) {

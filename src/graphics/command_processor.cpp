@@ -30,6 +30,7 @@
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
+#include <rex/graphics/shared_memory.h>
 #include <rex/graphics/util/display_transfer.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -44,6 +45,11 @@
 #include <rex/thread.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+
+REXCVAR_DEFINE_INT32(frame_stats_interval, 0, "GPU",
+                     "Log guest frame pacing (fps and frame time percentiles between swaps) "
+                     "every this many seconds; 0 = off")
+    .range(0, 3600);
 
 REXCVAR_DEFINE_BOOL(gpu_plain_register_ranges, true, "GPU",
                     "Store a range of registers that only keep their value (render state, no side "
@@ -281,6 +287,7 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       kernel_state_(kernel_state),
       graphics_system_(graphics_system),
       register_file_(graphics_system_->register_file()),
+      trace_writer_(graphics_system->memory()->physical_membase()),
       worker_running_(true),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
       vblank_event_(rex::thread::Event::CreateAutoResetEvent(false)),
@@ -1647,6 +1654,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   const uint32_t writeback_stride = read_ptr_update_freq_ * uint32_t(sizeof(uint32_t));
   auto remaining = reader.read_count();
   auto remaining_at_writeback = remaining;
+  // The guest wrote what these commands read before handing them over.
+  OnGuestMemorySyncPoint();
   do {
     ProcessResolveFetches();
     if (!ExecutePacket(&reader)) {
@@ -1696,9 +1705,10 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   } while (reader.read_count());
 }
 
-void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
-  // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+void CommandProcessor::ExecutePacket(const void* data, uint32_t count) {
+  // The ring buffer only reads, but takes a non-const pointer.
+  memory::RingBuffer reader(const_cast<uint8_t*>(static_cast<const uint8_t*>(data)),
+                            count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
     if (!ExecutePacket(&reader)) {
@@ -1707,6 +1717,93 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+}
+
+void CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
+  // Claimed first, so two requests can't both write the path.
+  TraceState expected = TraceState::kDisabled;
+  if (!trace_state_.compare_exchange_strong(expected, TraceState::kClaimed,
+                                            std::memory_order_acquire)) {
+    REXGPU_WARN("GPU trace: a trace is already being recorded");
+    return;
+  }
+  trace_frame_path_ = root_path;
+  trace_state_.store(TraceState::kRequested, std::memory_order_release);
+}
+
+void CommandProcessor::RestoreRegisters(uint32_t first_register, const uint32_t* values,
+                                        uint32_t count) {
+  if (first_register >= RegisterFile::kRegisterCount) {
+    return;
+  }
+  count = std::min(count, uint32_t(RegisterFile::kRegisterCount) - first_register);
+  // Copied, not written: the side effects of the writes already happened when
+  // the trace was recorded, and a fresh command processor considers everything
+  // derived from the registers out of date anyway.
+  std::memcpy(register_file_->values + first_register, values, sizeof(uint32_t) * count);
+}
+
+void CommandProcessor::RestoreGammaRamp(const reg::DC_LUT_30_COLOR* table_256_entry,
+                                        const reg::DC_LUT_PWL_DATA* pwl_rgb,
+                                        uint32_t rw_component) {
+  std::memcpy(gamma_ramp_256_entry_table_, table_256_entry, sizeof(gamma_ramp_256_entry_table_));
+  std::memcpy(gamma_ramp_pwl_rgb_, pwl_rgb, sizeof(gamma_ramp_pwl_rgb_));
+  gamma_ramp_rw_component_ = rw_component;
+  display_gamma_ramp_256_entry_table_stale_ = true;
+  display_gamma_ramp_pwl_stale_ = true;
+  OnGammaRamp256EntryTableValueWritten();
+  OnGammaRampPWLValueWritten();
+}
+
+void CommandProcessor::RestoreShader(xenos::ShaderType shader_type,
+                                     const uint32_t* ucode_big_endian, uint32_t dword_count) {
+  Shader* shader = LoadShader(shader_type, 0, ucode_big_endian, dword_count);
+  if (shader_type == xenos::ShaderType::kVertex) {
+    active_vertex_shader_ = shader;
+  } else if (shader_type == xenos::ShaderType::kPixel) {
+    active_pixel_shader_ = shader;
+  }
+}
+
+void CommandProcessor::InitializeTrace() {
+  trace_writer_.WriteRegisters(0, register_file_->values, RegisterFile::kRegisterCount);
+  trace_writer_.WriteGammaRamp(gamma_ramp_256_entry_table_, &gamma_ramp_pwl_rgb_[0][0],
+                               gamma_ramp_rw_component_);
+  // A frame may draw with the shaders a previous one loaded.
+  if (active_vertex_shader_) {
+    trace_writer_.WriteShader(uint32_t(xenos::ShaderType::kVertex),
+                              active_vertex_shader_->ucode_dwords(),
+                              uint32_t(active_vertex_shader_->ucode_dword_count()));
+  }
+  if (active_pixel_shader_) {
+    trace_writer_.WriteShader(uint32_t(xenos::ShaderType::kPixel),
+                              active_pixel_shader_->ucode_dwords(),
+                              uint32_t(active_pixel_shader_->ucode_dword_count()));
+  }
+}
+
+void CommandProcessor::OnTraceSwap() {
+  if (trace_writer_.is_open()) {
+    trace_writer_.WriteSwap();
+    trace_writer_.Close();
+    trace_state_.store(TraceState::kDisabled, std::memory_order_release);
+    return;
+  }
+  // A trace starts at the beginning of a frame. Acquire: the request thread
+  // wrote trace_frame_path_ before kRequested; while it is still kClaimed, wait
+  // for the next swap.
+  if (trace_state_.load(std::memory_order_acquire) != TraceState::kRequested) {
+    return;
+  }
+  const uint32_t title_id =
+      kernel_state_ && kernel_state_->GetExecutableModule() ? kernel_state_->title_id() : 0;
+  auto path = trace_frame_path_ / fmt::format("{:08X}_{}.{}", title_id, counter_, kTraceExtension);
+  if (!trace_writer_.Open(path, title_id)) {
+    trace_state_.store(TraceState::kDisabled, std::memory_order_release);
+    return;
+  }
+  trace_state_.store(TraceState::kRecording, std::memory_order_release);
+  InitializeTrace();
 }
 
 namespace {
@@ -1720,6 +1817,46 @@ __attribute__((noinline, cold)) void WarnUninitializedPacket() {
   REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
 }
 }  // namespace
+
+inline bool CommandProcessor::DispatchPacket(memory::RingBuffer* reader, uint32_t packet) {
+  switch (packet >> 30) {
+    case 0x03:
+      return ExecutePacketType3(reader, packet);
+    case 0x00:
+      return ExecutePacketType0(reader, packet);
+    default:
+      return ExecutePacketType1(reader, packet);
+  }
+}
+
+bool CommandProcessor::ExecutePacketTraced(memory::RingBuffer* reader, uint32_t packet) {
+  const uint32_t packet_type = packet >> 30;
+  const uint32_t data_dwords = packet_type == 0x01 ? 2 : ((packet >> 16) & 0x3FFF) + 1;
+  // An indirect buffer isn't recorded itself: the packets it runs are.
+  const uint32_t opcode = (packet >> 8) & 0x7F;
+  const bool indirect =
+      packet_type == 0x03 && (opcode == PM4_INDIRECT_BUFFER || opcode == PM4_INDIRECT_BUFFER_PFD);
+  const bool recording = trace_writer_.is_open() && !indirect &&
+                         reader->read_count() >= data_dwords * sizeof(uint32_t);
+  if (recording) {
+    trace_packet_.resize(1 + data_dwords);
+    trace_packet_[0] = rex::byte_swap(packet);
+    memory::RingBuffer peek = *reader;
+    for (uint32_t i = 1; i <= data_dwords; ++i) {
+      trace_packet_[i] = rex::byte_swap(peek.ReadAndSwap<uint32_t>());
+    }
+    trace_writer_.WritePacketStart(trace_packet_.data(), 1 + data_dwords);
+  }
+  const bool result = DispatchPacket(reader, packet);
+  if (recording) {
+    trace_writer_.WritePacketEnd();
+  }
+  if (trace_swap_executed_) {
+    trace_swap_executed_ = false;
+    OnTraceSwap();
+  }
+  return result;
+}
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   uint32_t packet = reader->ReadAndSwap<uint32_t>();
@@ -1737,14 +1874,10 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
     WarnUninitializedPacket();
   }
 
-  switch (packet >> 30) {
-    case 0x03:
-      return ExecutePacketType3(reader, packet);
-    case 0x00:
-      return ExecutePacketType0(reader, packet);
-    default:
-      return ExecutePacketType1(reader, packet);
+  if (trace_state_.load(std::memory_order_relaxed) != TraceState::kDisabled) [[unlikely]] {
+    return ExecutePacketTraced(reader, packet);
   }
+  return DispatchPacket(reader, packet);
 }
 
 bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
@@ -1971,6 +2104,20 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
   }
 
+  switch (opcode) {
+    case PM4_WAIT_REG_MEM:
+    case PM4_REG_TO_MEM:
+    case PM4_MEM_WRITE:
+    case PM4_COND_WRITE:
+    case PM4_EVENT_WRITE_SHD:
+    case PM4_EVENT_WRITE_EXT:
+    case PM4_INTERRUPT:
+      OnGuestMemorySyncPoint();
+      break;
+    default:
+      break;
+  }
+
   assert_true(reader->read_offset() ==
               (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity());
   return result;
@@ -2084,6 +2231,37 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 #endif
   rex::perf::Profiler::Flip();
 
+  SharedMemory* stats_shared_memory = GetSharedMemoryForStats();
+  if (int32_t interval = REXCVAR_GET(frame_stats_interval); interval > 0) {
+    if (stats_shared_memory) {
+      stats_shared_memory->SetUploadStatsEnabled(true);
+    }
+    uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    if (frame_stats_last_swap_tick_) {
+      uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
+      frame_stats_.Add(double(now - frame_stats_last_swap_tick_) * 1000.0 / double(freq));
+      if (frame_stats_.window_seconds() >= double(interval)) {
+        FrameStats::Summary summary = frame_stats_.Take();
+        REXGPU_INFO("Frame pacing: {}", FrameStats::Format(summary));
+        if (stats_shared_memory) {
+          REXGPU_INFO("Shared memory uploads: {}",
+                      stats_shared_memory->FormatUploadStats(stats_shared_memory->TakeUploadStats(),
+                                                             summary.frames));
+        }
+      }
+    }
+    frame_stats_last_swap_tick_ = now;
+  } else if (frame_stats_last_swap_tick_) {
+    // Switched off while running: start over when it is switched on again, so
+    // no frame time spans the off period and no partial window carries over.
+    frame_stats_last_swap_tick_ = 0;
+    frame_stats_.Take();
+    if (stats_shared_memory) {
+      stats_shared_memory->SetUploadStatsEnabled(false);
+      stats_shared_memory->TakeUploadStats();
+    }
+  }
+
   // Xenia-specific VdSwap hook.
   // VdSwap will post this to tell us we need to swap the screen/fire an
   // interrupt.
@@ -2099,6 +2277,9 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   UpdateDisplayOutputTransfer();
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  if (trace_state_.load(std::memory_order_relaxed) != TraceState::kDisabled) {
+    trace_swap_executed_ = true;
+  }
 
   // counter_ is the vblank counter (advanced by MarkVblank), not a swap counter:
   // counting swaps too makes the guest see extra vblanks and run fast when
@@ -2171,6 +2352,9 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
+    if (!matched && trace_playback_) {
+      break;
+    }
     if (!matched) {
       // Wait.
       if (wait >= 0x100) {
@@ -2201,6 +2385,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
   } while (!matched);
 
+  // Once, with the value that ended the wait, not on every poll.
+  if (is_memory) {
+    trace_writer_.WriteMemoryRead(poll_reg_addr & ~uint32_t(0x3), sizeof(uint32_t));
+  }
   return true;
 }
 
@@ -2278,6 +2466,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
     // Memory.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
+    trace_writer_.WriteMemoryRead(poll_reg_addr, sizeof(uint32_t));
     value = memory::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
   } else {
@@ -2643,6 +2832,7 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
   uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
   size_dwords &= 0xFFF;
   uint32_t type = (offset_type >> 16) & 0xFF;
+  trace_writer_.WriteMemoryRead(address, size_dwords * sizeof(uint32_t));
   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
   switch (type) {
     case 0:  // ALU
@@ -2688,6 +2878,7 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
+  trace_writer_.WriteMemoryRead(addr, size_dwords * sizeof(uint32_t));
   auto shader =
       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
   switch (shader_type) {

@@ -14,6 +14,8 @@
 #pragma once
 
 #include <bit>
+#include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -147,8 +149,6 @@ constexpr uint32_t kRoundMask = 0x03;
 struct FPSCRRegister {
   uint32_t csr;
 
-  static constexpr size_t HostToGuest[] = {kRoundNearest, kRoundDown, kRoundUp, kRoundTowardZero};
-
   using Platform = platform::FPSCRPlatform;
   static constexpr size_t RoundShift = Platform::RoundShift;
   static constexpr size_t RoundMaskVal = Platform::RoundMaskVal;
@@ -175,7 +175,146 @@ struct FPSCRRegister {
   // What a guest write can change.
   static constexpr uint32_t kExceptionBits = kOX | kUX | kZX | kXX | kVXCauses;
 
+  // NI, non-IEEE mode (ReXGlue fork): while set, scalar arithmetic flushes
+  // denormals as on Xenon, by staying in the host's flush mode (the one VMX
+  // code runs in). Read and written with RN.
+  static constexpr uint32_t kNI = 0x00000004;
+  uint32_t ni = 0;
+
+  // FR, FI and FPRF (C and FPCC) (ReXGlue fork). Kept as the guest wrote
+  // them; with the codegen option fpscr_result_bits the arithmetic sets them
+  // as Xenon's does (setArithmeticResult), and compares set FPCC.
+  static constexpr uint32_t kFR = 0x00040000;
+  static constexpr uint32_t kFI = 0x00020000;
+  static constexpr uint32_t kFPRF = 0x0001F000;
+  static constexpr uint32_t kFPCC = 0x0000F000;
+  static constexpr uint32_t kResultBits = kFR | kFI | kFPRF;
+  uint32_t result_bits = 0;
+  // Whether the host's inexact flag was set before the instruction that
+  // beginResult / endInexact measure.
+  bool inexact_held = false;
+
+  inline void storeResultBitsFromGuest(uint32_t value, uint32_t mask) noexcept {
+    mask &= kResultBits;
+    result_bits = (result_bits & ~mask) | (value & mask);
+  }
+
+  // Compiler barrier around every access to the host's control and status
+  // registers. Recompiled functions take the context as __restrict, so the
+  // compiler assumes ldmxcsr / msr fpcr / mrs fpsr cannot touch it: it moved
+  // floating-point arithmetic on context registers across a rounding or flush
+  // mode change, and reused a result computed under the previous mode (the
+  // default floating-point model the titles' generated code builds with does
+  // not order arithmetic against the host environment). This asm takes a
+  // pointer derived from the context, so every context field is observable to
+  // it: arithmetic before it stays before, arithmetic after it reloads its
+  // operands. A plain "memory" clobber is not enough, noalias memory is not
+  // reachable from it. Values held in C++ locals (the *_as_local options for
+  // f and v registers, the codegen's own temporaries) are not covered.
+  inline void fenceGuestState() const noexcept {
+    __asm__ __volatile__("" : : "r"(this) : "memory");
+  }
+
+  // fpscr_result_bits: the host's inexact flag is sticky (XX), so it is moved
+  // aside before an instruction and put back after, to see whether that
+  // instruction alone was inexact (FI).
+  inline void beginResult() noexcept {
+    fenceGuestState();
+    const uint32_t status = Platform::getstatus();
+    inexact_held = (status & Platform::StatusInexact) != 0;
+    if (inexact_held) {
+      Platform::setstatus(status & ~uint32_t(Platform::StatusInexact));
+    }
+    fenceGuestState();
+  }
+  inline bool endInexact() noexcept {
+    fenceGuestState();
+    const uint32_t status = Platform::getstatus();
+    const bool inexact = (status & Platform::StatusInexact) != 0;
+    if (inexact_held && !inexact) {
+      Platform::setstatus(status | Platform::StatusInexact);
+    }
+    inexact_held = false;
+    fenceGuestState();
+    return inexact;
+  }
+  // Around the host arithmetic that works out FR, which must not leave
+  // exception flags of its own.
+  inline uint32_t saveStatus() noexcept {
+    fenceGuestState();
+    return Platform::getstatus();
+  }
+  inline void restoreStatus(uint32_t status) noexcept {
+    fenceGuestState();
+    Platform::setstatus(status);
+    fenceGuestState();
+  }
+
+  // FPRF of a result: C, FL, FG, FE, FU. A single-precision result is
+  // denormal below FLT_MIN.
+  static inline uint32_t classifyResult(double value, bool single) noexcept {
+    if (std::isnan(value)) {
+      return 0x11;
+    }
+    const bool negative = std::signbit(value);
+    if (std::isinf(value)) {
+      return negative ? 0x09 : 0x05;
+    }
+    if (value == 0.0) {
+      return negative ? 0x12 : 0x02;
+    }
+    const double magnitude = std::fabs(value);
+    if (magnitude < (single ? double(FLT_MIN) : DBL_MIN)) {
+      return negative ? 0x18 : 0x14;
+    }
+    return negative ? 0x08 : 0x04;
+  }
+
+  inline bool isRoundingToNearest() noexcept {
+    return Platform::HostToGuest[(getcsr() & RoundMaskVal) >> RoundShift] == 0;
+  }
+
+  // FR when the instruction was inexact: rounded_away is 1 if the result is
+  // larger in magnitude than the exact one, 0 if not, -1 if not known, which
+  // the rounding mode answers for directed modes (nearest then gives 0).
+  inline bool fractionRounded(double result, bool inexact, int rounded_away) noexcept {
+    if (!inexact || std::isnan(result)) {
+      return false;
+    }
+    if (rounded_away >= 0) {
+      return rounded_away != 0;
+    }
+    switch (Platform::HostToGuest[(getcsr() & RoundMaskVal) >> RoundShift]) {
+      case 0x02:  // toward +infinity
+        return !std::signbit(result);
+      case 0x03:  // toward -infinity
+        return std::signbit(result);
+      default:
+        return false;
+    }
+  }
+
+  inline void setArithmeticResult(double result, bool single, bool inexact,
+                                  int rounded_away) noexcept {
+    result_bits = (fractionRounded(result, inexact, rounded_away) ? kFR : 0) |
+                  (inexact ? kFI : 0) | (classifyResult(result, single) << 12);
+  }
+
+  // fctiw, fctid and their z forms: FR and FI; FPRF is undefined, kept.
+  inline void setConversionResult(double result, bool inexact, int rounded_away) noexcept {
+    result_bits = (result_bits & kFPRF) |
+                  (fractionRounded(result, inexact, rounded_away) ? kFR : 0) |
+                  (inexact ? kFI : 0);
+  }
+
+  // fcmpu, fcmpo: FPCC from the CR field the compare set; C, FR and FI kept.
+  inline void setCompareResult(bool lt, bool gt, bool eq, bool un) noexcept {
+    result_bits = (result_bits & ~kFPCC) | (uint32_t(lt) << 15) | (uint32_t(gt) << 14) |
+                  (uint32_t(eq) << 13) | (uint32_t(un) << 12);
+  }
+
   inline uint32_t loadExceptionsFromHost() const noexcept {
+    fenceGuestState();
     const uint32_t status = Platform::getstatus();
     uint32_t bits = 0;
     if (status & Platform::StatusInvalid) bits |= kVX | kVXSOFT;
@@ -194,6 +333,7 @@ struct FPSCRRegister {
     if (!mask) {
       return;
     }
+    fenceGuestState();
     uint32_t status = Platform::getstatus();
     auto apply = [&](uint32_t bits, uint32_t flag) {
       if (!(mask & bits)) {
@@ -211,10 +351,12 @@ struct FPSCRRegister {
     apply(kZX, Platform::StatusDivideByZero);
     apply(kXX, Platform::StatusInexact);
     Platform::setstatus(status);
+    fenceGuestState();
   }
 
   inline uint32_t getcsr() noexcept { return Platform::getcsr(); }
   inline void setcsr(uint32_t csr) noexcept {
+    fenceGuestState();
     // Where the status flags share the register (x86 MXCSR), a cached value
     // must not bring back older flags or drop newer ones.
     if constexpr (Platform::CsrStatusMask != 0) {
@@ -230,6 +372,7 @@ struct FPSCRRegister {
     // here rather than open-coding a mask that is correct on only one of them.
     Platform::InitHostExceptions(csr);
     Platform::setcsr(csr);
+    fenceGuestState();
   }
 
   // Restoring the whole word would unmask every FP exception when csr is 0.
@@ -238,12 +381,18 @@ struct FPSCRRegister {
     setcsr(csr);
   }
 
+  // RN, NI and the result bits.
   inline uint32_t loadFromHost() noexcept {
     csr = getcsr();
-    return HostToGuest[(csr & RoundMaskVal) >> RoundShift];
+    return Platform::HostToGuest[(csr & RoundMaskVal) >> RoundShift] | (ni ? kNI : 0) |
+           result_bits;
   }
 
+  // Field 7: RN and NI. The flush mode for NI is applied by the next
+  // enableFlushMode or disableFlushMode (the codegen forgets its mode after a
+  // write of NI).
   inline void storeFromGuest(uint32_t value) noexcept {
+    ni = (value & kNI) ? 1 : 0;
     csr &= ~RoundMaskVal;
     csr |= Platform::GuestToHost[value & kRoundMask];
     setcsr(csr);
@@ -255,6 +404,10 @@ struct FPSCRRegister {
   }
 
   inline void disableFlushModeUnconditional() noexcept {
+    if (ni) [[unlikely]] {
+      enableFlushModeUnconditional();
+      return;
+    }
     csr &= ~FlushMask;
     setcsr(csr);
   }
@@ -267,6 +420,10 @@ struct FPSCRRegister {
   }
 
   inline void disableFlushMode() noexcept {
+    if (ni) [[unlikely]] {
+      enableFlushMode();
+      return;
+    }
     if ((csr & FlushMask) != 0) [[unlikely]] {
       csr &= ~FlushMask;
       setcsr(csr);
@@ -518,7 +675,7 @@ struct alignas(0x40) PPCContext {
 
   //--- Non-volatile register save/restore --------
   // Layout: r14-r31 (144) | f14-f31 (144) | v14-v31 (288) | v64-v127 (1024)
-  //       | cr2-cr4 (12) | fpscr (4).  Total: 1616 bytes.
+  //       | cr2-cr4 (12) | fpscr (16).  Total: 1628 bytes.
   static constexpr size_t kNonVolatileSaveSize =
       18 * sizeof(PPCRegister) + 18 * sizeof(PPCRegister) + 18 * sizeof(PPCVRegister) +
       64 * sizeof(PPCVRegister) + 3 * sizeof(PPCCRRegister) + sizeof(PPCFPSCRRegister);
@@ -550,6 +707,8 @@ struct alignas(0x40) PPCContext {
     src += 3 * sizeof(PPCCRRegister);
     PPCFPSCRRegister saved_fpscr;
     std::memcpy(&saved_fpscr, src, sizeof(PPCFPSCRRegister));
+    fpscr.ni = saved_fpscr.ni;
+    fpscr.result_bits = saved_fpscr.result_bits;
     fpscr.restoreGuestBits(saved_fpscr.csr);
   }
 };

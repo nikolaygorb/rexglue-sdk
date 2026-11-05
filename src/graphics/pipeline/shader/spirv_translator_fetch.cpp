@@ -27,6 +27,10 @@ namespace rex::graphics {
 
 void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
+  if (BisectSkipsInstruction()) {
+    return;
+  }
+  BisectInstructionScope bisect_scope(*this);
   UpdateInstructionPredication(instr.is_predicated, instr.predicate_condition);
 
   uint32_t used_result_components = instr.result.GetUsedResultComponents();
@@ -505,6 +509,10 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
 
 void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     const ParsedTextureFetchInstruction& instr) {
+  if (BisectSkipsInstruction()) {
+    return;
+  }
+  BisectInstructionScope bisect_scope(*this);
   UpdateInstructionPredication(instr.is_predicated, instr.predicate_condition);
 
   EnsureBuildPointAvailable();

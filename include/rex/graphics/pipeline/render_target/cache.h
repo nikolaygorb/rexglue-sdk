@@ -699,6 +699,16 @@ class RenderTargetCache {
                                             RenderTarget*& color_render_target_out,
                                             std::vector<Transfer>& color_transfers_out);
 
+  // For restoring EDRAM contents from frame traces, obtains or creates a render
+  // target at base 0 with a pitch of 1280 samples (1 sample and color only:
+  // copying between MSAA render targets and buffers isn't possible in
+  // Direct3D 12, and depth may need format conversion) and transfers the
+  // ownership of the whole EDRAM to it. nullptr if it can't be created, for
+  // instance because of host size limits.
+  RenderTarget* PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
+      xenos::ColorRenderTargetFormat color_format);
+  static constexpr uint32_t kSnapshotRestorationPitchTiles = 16;
+
   // For pixel shader interlock.
 
   virtual void RequestPixelShaderInterlockBarrier() {}

@@ -778,6 +778,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_PROPERTY_2(properties_1_2_KHR_shader_float_controls,
                             shaderDenormFlushToZeroFloat32);
     XE_UI_VULKAN_PROPERTY_2(properties_1_2_KHR_shader_float_controls, shaderRoundingModeRTEFloat32);
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2_KHR_shader_float_controls, shaderRoundingModeRTZFloat32);
   }
 
   if (ext_EXT_fragment_shader_interlock) {

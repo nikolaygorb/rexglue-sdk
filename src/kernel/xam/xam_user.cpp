@@ -868,18 +868,30 @@ u32 XamParseGamerTileKey_entry(mapped_u32 key_ptr, mapped_u32 out1_ptr, mapped_u
 u32 XamReadTileToTexture_entry(u32 unknown, u32 title_id, u64 tile_id, u32 user_index,
                                mapped_void buffer_ptr, u32 stride, u32 height, u32 overlapped_ptr) {
   // TODO(gibbed): unknown=0,2,3,9
-  if (!tile_id) {
-    return X_ERROR_INVALID_PARAMETER;
+  // Every failure is ERROR_FUNCTION_FAILED and leaves the texture untouched; the
+  // extended error says where the read stopped. Tiles read by key pass
+  // XUSER_INDEX_NONE, which isn't looked up here.
+  X_HRESULT extended_error = X_E_SUCCESS;
+  if (!IsLocalUserSignedIn(user_index)) {
+    extended_error =
+        user_index < 4 ? X_E_NO_SUCH_USER : X_HRESULT_FROM_WIN32(X_ERROR_FILE_NOT_FOUND);
+  } else if (!tile_id) {
+    extended_error = X_HRESULT_FROM_WIN32(X_ERROR_FILE_NOT_FOUND);
+  } else if (!buffer_ptr) {
+    extended_error = X_E_INVALIDARG;
   }
 
-  size_t size = size_t(stride) * size_t(height);
-  std::memset(buffer_ptr, 0xFF, size);
+  if (!extended_error) {
+    // No tiles are stored: a tile that exists reads as a white texture.
+    std::memset(buffer_ptr, 0xFF, size_t(stride) * size_t(height));
+  }
 
+  const X_RESULT result = extended_error ? X_ERROR_FUNCTION_FAILED : X_ERROR_SUCCESS;
   if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, X_ERROR_SUCCESS);
+    REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(overlapped_ptr, result, extended_error, 0);
     return X_ERROR_IO_PENDING;
   }
-  return X_ERROR_SUCCESS;
+  return result;
 }
 
 u32 XamWriteGamerTile_entry(u32 user_index, u32 title_id, u32 big_tile_id, u32 small_tile_id,

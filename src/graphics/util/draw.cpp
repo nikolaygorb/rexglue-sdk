@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <string_view>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -20,6 +22,7 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -53,6 +56,19 @@ REXCVAR_DEFINE_BOOL(depth_bias_shader_offset, false, "GPU",
                     "values that host fixed function depth bias cannot reproduce reliably. "
                     "This likely causes some minor performance penalty, but the cost should "
                     "be minimal if only a small portion of the scene is affected.");
+REXCVAR_DEFINE_STRING(depth_bias_shader_offset_scope, "auto", "GPU",
+                      "Which draws with polygon offset depth_bias_shader_offset routes through "
+                      "shader depth.\n"
+                      " auto: all of them where the host can't apply the bias in constant units "
+                      "(Direct3D 12, Direct3D 11, Vulkan without VK_EXT_depth_bias_control), "
+                      "decal-style ones otherwise (default)\n"
+                      " decals: only decal-style ones (LessEqual or GreaterEqual, color writes, "
+                      "no stencil, no alpha to coverage)\n"
+                      " all: all of them, also on Vulkan\n"
+                      "Draws routed through shader depth lose early depth testing, and with MSAA "
+                      "their depth is per pixel rather than per sample.")
+    .allowed({"auto", "decals", "all"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(window_offset_in_edram, true, "GPU",
                     "Renders every tile of a predicated tiling frame at the same position as "
@@ -66,6 +82,46 @@ REXCVAR_DEFINE_BOOL(window_offset_in_edram, true, "GPU",
                     "that would run past the target, in the viewport.");
 
 namespace rex::graphics::draw_util {
+
+namespace {
+
+// depth_bias_shader_offset_scope, parsed. Draws read only this: the settings
+// dialog may assign the string while the command processor runs.
+enum class DepthBiasScope : uint32_t { kAuto, kDecals, kAll, kUnparsed };
+
+DepthBiasScope ParseDepthBiasScope(std::string_view value) {
+  if (value == "decals") {
+    return DepthBiasScope::kDecals;
+  }
+  return value == "all" ? DepthBiasScope::kAll : DepthBiasScope::kAuto;
+}
+
+std::atomic<DepthBiasScope> depth_bias_scope{DepthBiasScope::kUnparsed};
+
+// Changes arrive here, on the thread making them. The value the flag starts
+// with may be set before this is registered, so the first use reads it.
+[[maybe_unused]] const bool depth_bias_scope_callback_registered = [] {
+  rex::cvar::RegisterChangeCallback(
+      "depth_bias_shader_offset_scope", [](std::string_view, std::string_view value) {
+        depth_bias_scope.store(ParseDepthBiasScope(value), std::memory_order_relaxed);
+      });
+  return true;
+}();
+
+DepthBiasScope GetDepthBiasScope() {
+  DepthBiasScope scope = depth_bias_scope.load(std::memory_order_relaxed);
+  if (scope != DepthBiasScope::kUnparsed) {
+    return scope;
+  }
+  DepthBiasScope expected = DepthBiasScope::kUnparsed;
+  scope = ParseDepthBiasScope(REXCVAR_GET(depth_bias_shader_offset_scope));
+  // A change made meanwhile wins.
+  return depth_bias_scope.compare_exchange_strong(expected, scope, std::memory_order_relaxed)
+             ? scope
+             : expected;
+}
+
+}  // namespace
 
 bool IsRasterizationPotentiallyDone(const RegisterFile& regs, bool primitive_polygonal) {
   // The sample counters live in the RB with depth/stencil testing.
@@ -135,22 +191,11 @@ reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs) {
 
 bool GetHostDepthPolygonOffsetIfNeeded(const RegisterFile& regs, bool primitive_polygonal,
                                        reg::RB_DEPTHCONTROL normalized_depth_control,
-                                       uint32_t normalized_color_mask,
+                                       uint32_t normalized_color_mask, bool host_bias_exact,
                                        HostDepthPolygonOffset& polygon_offset_out) {
   polygon_offset_out = {};
-  if (!REXCVAR_GET(depth_bias_shader_offset)) {
-    return false;
-  }
-
-  const xenos::CompareFunction zfunc = normalized_depth_control.zfunc;
-  // Keep this on the decal-style redraws that need it. Larger use of shader
-  // depth changes early-Z and coverage behavior in places like hair, foliage,
-  // and stencil masked effects.
-  if (!primitive_polygonal || !normalized_depth_control.z_enable ||
-      !(zfunc == xenos::CompareFunction::kLessEqual ||
-        zfunc == xenos::CompareFunction::kGreaterEqual) ||
-      !normalized_color_mask || normalized_depth_control.stencil_enable ||
-      regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable) {
+  if (!REXCVAR_GET(depth_bias_shader_offset) || !primitive_polygonal ||
+      !normalized_depth_control.z_enable) {
     return false;
   }
 
@@ -166,6 +211,38 @@ bool GetHostDepthPolygonOffsetIfNeeded(const RegisterFile& regs, bool primitive_
 
   if (!polygon_offset_out.front_scale && !polygon_offset_out.front_offset &&
       !polygon_offset_out.back_scale && !polygon_offset_out.back_offset) {
+    return false;
+  }
+
+  // Where the host bias is exact, keep this on the decal-style redraws that
+  // need it: larger use of shader depth changes early-Z and coverage behavior
+  // in places like hair, foliage, and stencil masked effects. Elsewhere, draws
+  // left out get a fixed-function bias whose unit on a float depth buffer
+  // shrinks near 0, and layered surfaces Z-fight (4D5307D3 snow over rock).
+  const DepthBiasScope scope = GetDepthBiasScope();
+  bool all_draws =
+      scope == DepthBiasScope::kAll || (scope == DepthBiasScope::kAuto && !host_bias_exact);
+  const xenos::CompareFunction zfunc = normalized_depth_control.zfunc;
+  uint32_t left_out_by = uint32_t(zfunc != xenos::CompareFunction::kLessEqual &&
+                                  zfunc != xenos::CompareFunction::kGreaterEqual) |
+                         (uint32_t(!normalized_color_mask) << 1) |
+                         (uint32_t(normalized_depth_control.stencil_enable) << 2) |
+                         (uint32_t(regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable) << 3);
+  if (left_out_by && !all_draws) {
+    // Once per reason and depth function, to find the draws that Z-fight.
+    static uint64_t logged[2] = {};
+    uint32_t key = (left_out_by << 3) | uint32_t(zfunc);
+    if (!(logged[key >> 6] & (uint64_t(1) << (key & 63)))) {
+      logged[key >> 6] |= uint64_t(1) << (key & 63);
+      REXGPU_INFO(
+          "depth_bias_shader_offset: a draw with depth bias keeps the fixed-function bias "
+          "(depth function {}{}{}{}{}); depth_bias_shader_offset_scope = \"all\" moves it into "
+          "the shader",
+          uint32_t(zfunc), (left_out_by & 1) ? ", not LessEqual or GreaterEqual" : "",
+          (left_out_by & 2) ? ", no color writes" : "", (left_out_by & 4) ? ", stencil" : "",
+          (left_out_by & 8) ? ", alpha to coverage" : "");
+    }
+    polygon_offset_out = {};
     return false;
   }
 
@@ -1068,6 +1145,9 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     REXGPU_ERROR("Unsupported resolve vertex buffer format");
     assert_always();
     return false;
+  }
+  if (TraceWriter* trace = TraceWriter::active()) {
+    trace->WriteMemoryRead(fetch.address * sizeof(uint32_t), fetch.size * sizeof(uint32_t));
   }
   const float* vertices_guest =
       reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));

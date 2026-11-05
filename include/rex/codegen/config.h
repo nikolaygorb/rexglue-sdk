@@ -99,6 +99,10 @@ struct RecompilerConfig {
   /// Scalar FP code runs in the VMX MXCSR too (denormals flushed): no mode
   /// switches between FPU and VMX code, no denormal assists on the host.
   bool fpuFlushDenormals = false;
+  /// FPSCR's FR, FI and FPRF set by every floating-point arithmetic
+  /// instruction and FPCC by compares, as on Xenon (mffs reads them). Costs
+  /// two host status register accesses and a classification per instruction.
+  bool fpscrResultBits = false;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
 
   // === Analysis tuning (optional) ===

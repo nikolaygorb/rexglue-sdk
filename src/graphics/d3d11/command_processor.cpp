@@ -197,6 +197,26 @@ bool D3D11CommandProcessor::SetupContext() {
   return true;
 }
 
+void D3D11CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) {
+  shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
+  primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
+}
+
+void D3D11CommandProcessor::InitializeTrace() {
+  CommandProcessor::InitializeTrace();
+  // No EDRAM snapshot and no download of what the GPU wrote here: the frame is
+  // replayed from empty EDRAM, and textures rendered in earlier frames are
+  // read from guest memory.
+  shared_memory_->PrepareForTraceDownload();
+  if (shared_memory_->trace_download_page_count()) {
+    REXGPU_WARN(
+        "GPU trace: Direct3D 11 doesn't record the {} KB written by the GPU before the frame, "
+        "record on Direct3D 12 or Vulkan for them",
+        uint64_t(shared_memory_->trace_download_page_count()) * rex::memory::page_size() >> 10);
+  }
+  shared_memory_->ReleaseTraceDownloadRanges();
+}
+
 void D3D11CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                     uint32_t title_id, bool blocking,
                                                     std::function<void()> completion_callback) {
@@ -595,6 +615,10 @@ void D3D11CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     CheckDeviceRemoved();
     ++frame_current_;
     frame_stats_ = FrameStats();
+    if (shared_memory_) {
+      // Frames for the upload statistics (no hot pages on Direct3D 11).
+      shared_memory_->AdvanceHotPageFrame();
+    }
     if (texture_cache_) {
       texture_cache_->stats() = D3D11TextureCache::Stats();
       texture_cache_->SetLogMissingTextures(
@@ -732,7 +756,7 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       pixel_shader && !pixel_shader->writes_depth() &&
       draw_util::GetHostDepthPolygonOffsetIfNeeded(regs, primitive_polygonal,
                                                    normalized_depth_control, normalized_color_mask,
-                                                   host_depth_polygon_offset);
+                                                   false, host_depth_polygon_offset);
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
@@ -991,7 +1015,8 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       auto shared_memory_request_range_hoisted =
           rex::thread::global_critical_region::AcquireDirect();
       for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
-        if (!shared_memory_->RequestRange(vfetch_addresses[i] << 2, vfetch_sizes[i] << 2)) {
+        if (!shared_memory_->RequestRange(vfetch_addresses[i] << 2, vfetch_sizes[i] << 2,
+                                          SharedMemory::RequestKind::kVertex)) {
           REXGPU_ERROR("Failed to request vertex buffer at 0x{:08X} (size {}) in the shared memory",
                        vfetch_addresses[i] << 2, vfetch_sizes[i] << 2);
           return false;
@@ -1012,14 +1037,16 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges) {
     if (!shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
-                                      memexport_range.size_bytes)) {
+                                      memexport_range.size_bytes,
+                                      SharedMemory::RequestKind::kMemExport)) {
       REXGPU_ERROR("Failed to request memexport stream at 0x{:08X} (size {}) in the shared memory",
                    memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
       return false;
     }
   }
   if (memexport_used && memexport_ranges.empty()) {
-    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize,
+                                      SharedMemory::RequestKind::kMemExport)) {
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved memexport destinations");
       return false;

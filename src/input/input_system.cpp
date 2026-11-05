@@ -277,12 +277,15 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
   std::lock_guard lock(devices_mutex_);
 
-  // A dialog owns the controller.
+  // A dialog owns the controller: the title sees it idle, but still learns
+  // which users have one (canary `96ce1ac47`, title 58410A24).
   if (ui_input_blockers_.load() > 0) {
+    X_INPUT_STATE discarded = {};
+    const X_RESULT connected = GetStateForUI(user_index, &discarded);
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
     }
-    return X_ERROR_SUCCESS;
+    return connected;
   }
 
   X_RESULT result = GetStateForUI(user_index, out_state);

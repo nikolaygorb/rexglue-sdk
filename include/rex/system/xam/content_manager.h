@@ -173,6 +173,8 @@ class ContentManager {
                                std::vector<uint8_t>* buffer);
   X_RESULT SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t> buffer);
+  // Empties the package but for its thumbnail.
+  X_RESULT TruncateContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT UnmountAndDeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);

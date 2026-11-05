@@ -396,6 +396,8 @@ spv::Id SpirvShaderTranslator::Depth20e4To32(SpirvBuilder& builder, spv::Id f24_
 }
 
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+  BisectOverrideColorOutput();
+
   // Loaded if needed.
   spv::Id msaa_samples = spv::NoResult;
 

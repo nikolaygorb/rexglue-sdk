@@ -86,6 +86,15 @@ class IGraphicsSystem {
     }
   }
 
+  // GPU frame traces. Recording starts at the next swap and writes into the
+  // trace_gpu_prefix directory. Playing draws a recorded frame with no title
+  // running, blocking until its swap; false if it couldn't be played.
+  virtual void RequestFrameTrace() {}
+  virtual bool PlayFrameTrace(const std::filesystem::path& path) {
+    (void)path;
+    return false;
+  }
+
   // One-shot convenience for callers that don't care about the split.
   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,
                  ui::WindowedAppContext* app_context, bool with_presentation) {

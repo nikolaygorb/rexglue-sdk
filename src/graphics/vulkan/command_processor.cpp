@@ -78,8 +78,31 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Idea from ReIGlue 0364 (FH1-ReImagined): on drivers that take a few hundred
+// milliseconds per pipeline the held picture froze while new places loaded.
+REXCVAR_DEFINE_INT32(vulkan_async_skip_incomplete_frames_ms, 0, "GPU/Vulkan",
+                     "With vulkan_async_skip_incomplete_frames: after frames have been held "
+                     "back this many milliseconds in a row, show them without the draws whose "
+                     "pipelines aren't ready (0 = hold until they are). Frames missing a "
+                     "depth-only draw or a draw of 6 vertices or fewer (full-screen passes) "
+                     "are still held")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_threaded_submission, true, "GPU/Vulkan",
+                    "Record the Vulkan command buffers from the deferred commands and submit "
+                    "them on a thread of their own instead of the GPU command processor's")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(vulkan_present_on_submission_thread, true, "GPU/Vulkan",
+                    "With vulkan_threaded_submission, do not make every swap wait for the "
+                    "submission thread to replay the frame: the presenter's step after the swap "
+                    "runs on that thread behind the frame's submission, and the next swap waits "
+                    "for it only if it has not run")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_gpu_time, true, "GPU/Vulkan",
@@ -133,6 +156,13 @@ REXCVAR_DEFINE_BOOL(vulkan_depth_bias_force_unorm, true, "GPU/Vulkan",
 namespace rex::graphics::vulkan {
 
 namespace {
+
+// Whether the depth bias is set with a constant unit on float depth buffers.
+bool IsDepthBiasForceUnorm(const ui::vulkan::VulkanDevice::Properties& device_properties) {
+  return REXCVAR_GET(vulkan_depth_bias_force_unorm) && device_properties.depthBiasControl &&
+         device_properties.leastRepresentableValueForceUnormRepresentation &&
+         device_properties.depthBiasExact;
+}
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -938,6 +968,37 @@ void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking, nullptr);
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking,
                                            std::move(completion_callback));
+}
+
+void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) {
+  shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
+  primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
+}
+
+void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot, uint32_t size) {
+  if (!BeginSubmission(true)) {
+    return;
+  }
+  render_target_cache_->RestoreEdramSnapshot(snapshot, size);
+}
+
+void VulkanCommandProcessor::InitializeTrace() {
+  CommandProcessor::InitializeTrace();
+  if (!BeginSubmission(true)) {
+    return;
+  }
+  const bool render_target_cache_submitted = render_target_cache_->InitializeTraceSubmitDownloads();
+  const bool shared_memory_submitted = shared_memory_->InitializeTraceSubmitDownloads();
+  if (!render_target_cache_submitted && !shared_memory_submitted) {
+    return;
+  }
+  AwaitAllQueueOperationsCompletion();
+  if (render_target_cache_submitted) {
+    render_target_cache_->InitializeTraceCompleteDownloads(trace_writer_);
+  }
+  if (shared_memory_submitted) {
+    shared_memory_->InitializeTraceCompleteDownloads(trace_writer_);
+  }
 }
 
 std::string VulkanCommandProcessor::GetWindowTitleText() const {
@@ -2336,11 +2397,200 @@ bool VulkanCommandProcessor::SetupContext() {
   system_constants_.zpd_counter_index = UINT32_MAX;
   zpd_counter_index_force_update_ = true;
 
+  if (REXCVAR_GET(vulkan_threaded_submission)) {
+    submission_thread_shutdown_ = false;
+    submission_thread_failed_ = false;
+    submission_thread_submitted_ = GetCurrentSubmission() - 1;
+    completion_timeline_.SetSubmittedLimit(&submission_thread_submitted_);
+    submission_thread_ = rex::thread::Thread::Create({}, [this]() { SubmissionThread(); });
+    if (submission_thread_) {
+      submission_thread_->set_name("Vulkan Submission");
+    } else {
+      REXGPU_WARN("Failed to create the Vulkan submission thread, submitting on the GPU thread");
+      completion_timeline_.SetSubmittedLimit(nullptr);
+    }
+  }
+
   return true;
+}
+
+void VulkanCommandProcessor::SubmissionThread() {
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const uint32_t queue_family = vulkan_device->queue_family_graphics_compute();
+  while (true) {
+    SubmissionJob job;
+    {
+      std::unique_lock<std::mutex> lock(submission_thread_mutex_);
+      submission_thread_request_cond_.wait(
+          lock, [this] { return submission_thread_shutdown_ || !submission_thread_jobs_.empty(); });
+      if (submission_thread_jobs_.empty()) {
+        return;
+      }
+      job = std::move(submission_thread_jobs_.front());
+      submission_thread_jobs_.pop_front();
+    }
+    if (job.callback) {
+      // After a failure the picture is not shown; the step still counts, so
+      // nobody waits for it.
+      if (!submission_thread_failed_.load(std::memory_order_relaxed)) {
+        job.callback();
+      }
+      {
+        std::lock_guard<std::mutex> lock(submission_thread_mutex_);
+        present_steps_done_.fetch_add(1, std::memory_order_release);
+      }
+      submission_thread_done_cond_.notify_all();
+      continue;
+    }
+    if (!submission_thread_failed_.load(std::memory_order_relaxed)) {
+      const char* failure = nullptr;
+      VkCommandBufferBeginInfo begin_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+      begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      if (dfn.vkResetCommandPool(device, job.command_buffer.pool, 0) != VK_SUCCESS) {
+        failure = "Failed to reset a Vulkan command pool";
+      } else if (dfn.vkBeginCommandBuffer(job.command_buffer.buffer, &begin_info) != VK_SUCCESS) {
+        failure = "Failed to begin a Vulkan command buffer";
+      } else {
+        deferred_command_buffer_.ExecuteStreams(job.command_buffer.buffer, job.streams);
+        if (host_query_pool_) {
+          host_query_pool_->RecordResolveBatch(job.command_buffer.buffer, job.resolve_batch);
+        }
+        if (dfn.vkEndCommandBuffer(job.command_buffer.buffer) != VK_SUCCESS) {
+          failure = "Failed to end a Vulkan command buffer";
+        }
+      }
+      if (!failure) {
+        VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        if (!job.wait_semaphores.empty()) {
+          submit_info.waitSemaphoreCount = uint32_t(job.wait_semaphores.size());
+          submit_info.pWaitSemaphores = job.wait_semaphores.data();
+          submit_info.pWaitDstStageMask = job.wait_stage_masks.data();
+        }
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &job.command_buffer.buffer;
+        ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+            vulkan_device->AcquireQueue(queue_family, 0);
+        if (vulkan_device->SubmitAndUpdateLost(queue_acquisition.queue(), 1, &submit_info,
+                                               job.fence) != VK_SUCCESS) {
+          failure = "Failed to submit a GPU emulation Vulkan command buffer";
+        }
+      }
+      if (failure) {
+        REXGPU_ERROR("{} (submission {}, threaded submission)", failure, job.submission);
+        submission_thread_failed_ = true;
+      }
+    }
+    if (submission_thread_failed_.load(std::memory_order_relaxed)) {
+      // The timeline waits for this fence when it is destroyed.
+      ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+          vulkan_device->AcquireQueue(queue_family, 0);
+      vulkan_device->SubmitAndUpdateLost(queue_acquisition.queue(), 0, nullptr, job.fence);
+    }
+    job.streams.main.clear();
+    job.streams.hoisted.clear();
+    {
+      std::lock_guard<std::mutex> lock(submission_thread_mutex_);
+      submission_thread_submitted_.store(job.submission, std::memory_order_release);
+      submission_thread_free_jobs_.push_back(std::move(job));
+    }
+    submission_thread_done_cond_.notify_all();
+  }
+}
+
+bool VulkanCommandProcessor::HandOverSubmission(const CommandBuffer& command_buffer,
+                                                uint64_t submission) {
+  VkResult fence_result;
+  auto fence_acquisition = completion_timeline_.AcquireFenceForSubmission(&fence_result);
+  if (!fence_acquisition.has_value()) {
+    REXGPU_ERROR("Failed to acquire a Vulkan submission fence: {}",
+                 vk::to_string(vk::Result(fence_result)));
+    return false;
+  }
+  SubmissionJob job;
+  {
+    std::lock_guard<std::mutex> lock(submission_thread_mutex_);
+    if (!submission_thread_free_jobs_.empty()) {
+      job = std::move(submission_thread_free_jobs_.back());
+      submission_thread_free_jobs_.pop_back();
+    }
+  }
+  job.submission = submission;
+  job.command_buffer = command_buffer;
+  // Marks the submission as made: the release of the acquisition on return
+  // advances the timeline, and the thread will signal the fence.
+  job.fence = fence_acquisition->GetFenceForSubmitting();
+  job.wait_semaphores = current_submission_wait_semaphores_;
+  job.wait_stage_masks = current_submission_wait_stage_masks_;
+  deferred_command_buffer_.TakeStreams(job.streams);
+  if (host_query_pool_) {
+    host_query_pool_->TakeResolveBatch(job.resolve_batch);
+  }
+  {
+    std::lock_guard<std::mutex> lock(submission_thread_mutex_);
+    submission_thread_jobs_.push_back(std::move(job));
+  }
+  submission_thread_request_cond_.notify_one();
+  return true;
+}
+
+void VulkanCommandProcessor::AwaitSubmissionThread(uint64_t submission) {
+  if (!submission_thread_ ||
+      submission_thread_submitted_.load(std::memory_order_acquire) >= submission) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(submission_thread_mutex_);
+  submission_thread_done_cond_.wait(lock, [this, submission] {
+    return submission_thread_submitted_.load(std::memory_order_acquire) >= submission;
+  });
+}
+
+void VulkanCommandProcessor::DeferPresentStep(std::function<void()> step) {
+  SubmissionJob job;
+  job.callback = std::move(step);
+  ++present_steps_queued_;
+  {
+    std::lock_guard<std::mutex> lock(submission_thread_mutex_);
+    submission_thread_jobs_.push_back(std::move(job));
+  }
+  submission_thread_request_cond_.notify_one();
+}
+
+void VulkanCommandProcessor::AwaitPresentSteps() {
+  if (present_steps_done_.load(std::memory_order_acquire) == present_steps_queued_) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(submission_thread_mutex_);
+  submission_thread_done_cond_.wait(lock, [this] {
+    return present_steps_done_.load(std::memory_order_acquire) == present_steps_queued_;
+  });
+}
+
+void VulkanCommandProcessor::ShutdownSubmissionThread() {
+  if (!submission_thread_) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(submission_thread_mutex_);
+    submission_thread_shutdown_ = true;
+  }
+  submission_thread_request_cond_.notify_all();
+  rex::thread::Wait(submission_thread_.get(), false);
+  submission_thread_.reset();
+  submission_thread_jobs_.clear();
+  submission_thread_free_jobs_.clear();
+  completion_timeline_.SetSubmittedLimit(nullptr);
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  ShutdownSubmissionThread();
+  if (present_deferred_presenter_) {
+    // The thread ran every queued step before it ended.
+    present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
+    present_deferred_presenter_ = nullptr;
+  }
 
   ShutdownGpuTime();
 
@@ -2812,6 +3062,23 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     return;
   }
 
+  // Hot reload: switching off waits for the queued steps first.
+  if (submission_thread_ && REXCVAR_GET(vulkan_present_on_submission_thread)) {
+    if (present_deferred_presenter_ != presenter) {
+      if (present_deferred_presenter_) {
+        AwaitPresentSteps();
+        present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
+      }
+      presenter->SetGuestOutputPublishDeferrer(
+          [this](std::function<void()> step) { DeferPresentStep(std::move(step)); });
+      present_deferred_presenter_ = presenter;
+    }
+  } else if (present_deferred_presenter_) {
+    AwaitPresentSteps();
+    present_deferred_presenter_->SetGuestOutputPublishDeferrer(nullptr);
+    present_deferred_presenter_ = nullptr;
+  }
+
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
@@ -2821,6 +3088,27 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   bool skip_present_due_pending_pipeline = REXCVAR_GET(async_shader_compilation) &&
                                            REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                            frame_used_pending_pipeline_;
+  if (skip_present_due_pending_pipeline) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!incomplete_frames_held_) {
+      incomplete_frames_held_ = true;
+      incomplete_frames_held_since_ = now;
+    }
+    const int32_t hold_ms = REXCVAR_GET(vulkan_async_skip_incomplete_frames_ms);
+    if (hold_ms > 0 && !frame_pending_pipeline_must_hold_ &&
+        now - incomplete_frames_held_since_ >= std::chrono::milliseconds(hold_ms)) {
+      skip_present_due_pending_pipeline = false;
+      static bool shown_incomplete_frame_logged = false;
+      if (!shown_incomplete_frame_logged) {
+        shown_incomplete_frame_logged = true;
+        REXGPU_INFO(
+            "Showing a Vulkan frame without draws whose pipelines are being created: "
+            "frames were held for vulkan_async_skip_incomplete_frames_ms");
+      }
+    }
+  } else {
+    incomplete_frames_held_ = false;
+  }
   if (skip_present_due_pending_pipeline) {
     static bool skipped_incomplete_frame_logged = false;
     if (!skipped_incomplete_frame_logged) {
@@ -2937,6 +3225,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
+  // The previous frame's step owns the presenter's mailbox until it has run; a
+  // frame later it nearly always has.
+  AwaitPresentSteps();
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
@@ -3575,6 +3866,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
         EndSubmission(true);
+        // With threaded submission, they must be in the queue, not only handed
+        // over, unless the presenter's step that needs that runs on the thread
+        // behind them.
+        if (!present_deferred_presenter_) {
+          AwaitSubmissionThread(GetCurrentSubmission() - 1);
+        }
         return true;
       });
 
@@ -3752,7 +4049,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   if (use_dynamic_rendering) {
     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
-        current_render_pass_ == VK_NULL_HANDLE) {
+        current_render_pass_ == VK_NULL_HANDLE && current_transfer_dest_view_ == VK_NULL_HANDLE) {
       return;
     }
   } else {
@@ -3773,6 +4070,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
+  current_transfer_dest_view_ = VK_NULL_HANDLE;
 
   // Shared memory uploads for the draws in this render pass may be recorded
   // here, after the barriers before it (CanHoistSharedMemoryUpload).
@@ -3851,7 +4149,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   if (use_dynamic_rendering) {
     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
-        current_render_pass_ == VK_NULL_HANDLE) {
+        current_render_pass_ == VK_NULL_HANDLE &&
+        current_transfer_dest_view_ == transfer_dest_view) {
       return;
     }
   } else {
@@ -3872,6 +4171,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
+  current_transfer_dest_view_ = transfer_dest_view;
 
   if (use_dynamic_rendering) {
     VkRenderingAttachmentInfo color_attachment = {};
@@ -4341,6 +4641,12 @@ void VulkanCommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+void VulkanCommandProcessor::OnGuestMemorySyncPoint() {
+  if (shared_memory_) {
+    shared_memory_->AdvanceHotPageSyncPoint();
+  }
+}
+
 Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                            const uint32_t* host_address, uint32_t dword_count) {
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
@@ -4479,9 +4785,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   bool apply_host_depth_polygon_offset =
       pixel_shader && !pixel_shader->writes_depth() &&
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
-      draw_util::GetHostDepthPolygonOffsetIfNeeded(regs, primitive_polygonal,
-                                                   normalized_depth_control, normalized_color_mask,
-                                                   host_depth_polygon_offset);
+      draw_util::GetHostDepthPolygonOffsetIfNeeded(
+          regs, primitive_polygonal, normalized_depth_control, normalized_color_mask,
+          IsDepthBiasForceUnorm(GetVulkanDevice()->properties()), host_depth_polygon_offset);
 
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
@@ -4697,6 +5003,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         // Pipeline not ready (still being created asynchronously) - skip the
         // draw.
         frame_used_pending_pipeline_ = true;
+        // Without these the picture is wrong as a whole (depth for later
+        // passes, a full-screen pass), not just missing an object.
+        if (!pixel_shader || !normalized_color_mask ||
+            primitive_processing_result.host_draw_vertex_count <= 6) {
+          frame_pending_pipeline_must_hold_ = true;
+        }
         OnVIZSurveyDraw(false);
         return true;
       }
@@ -4897,7 +5209,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           rex::thread::global_critical_region::AcquireDirect();
 
       for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
-        if (!shared_memory_->RequestRange(vfetch_addresses[i] << 2, vfetch_sizes[i] << 2)) {
+        if (!shared_memory_->RequestRange(vfetch_addresses[i] << 2, vfetch_sizes[i] << 2,
+                                          SharedMemory::RequestKind::kVertex)) {
           REXGPU_ERROR(
               "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
               "memory",
@@ -4913,7 +5226,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     uint32_t memexport_range_base_bytes = memexport_range.base_address_dwords << 2;
-    if (!shared_memory_->RequestRange(memexport_range_base_bytes, memexport_range.size_bytes)) {
+    if (!shared_memory_->RequestRange(memexport_range_base_bytes, memexport_range.size_bytes,
+                                      SharedMemory::RequestKind::kMemExport)) {
       REXGPU_ERROR(
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
           "shared memory",
@@ -4925,7 +5239,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         std::max(memexport_extent_end, memexport_range_base_bytes + memexport_range.size_bytes);
   }
   if (memexport_writes_possible && memexport_ranges_.empty()) {
-    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize,
+                                      SharedMemory::RequestKind::kMemExport)) {
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
@@ -6477,6 +6792,19 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(uint64_t awa
     await_submission = GetCurrentSubmission() - 1;
   }
 
+  if (submission_thread_) {
+    // Only submissions that reached the queue have a fence to wait for.
+    AwaitSubmissionThread(await_submission);
+    if (submission_thread_failed_.load(std::memory_order_acquire)) {
+      REXGPU_ERROR("Vulkan device treated as lost: threaded submission failed");
+      device_lost_ = true;
+      if (graphics_system_) {
+        graphics_system_->OnHostGpuLossFromAnyThread(true);
+      }
+      return;
+    }
+  }
+
   // A host wait for the GPU this long is logged: the queue made no progress
   // for that long (presentation holding it, for instance).
   constexpr int64_t kSlowSubmissionWaitMs = 2000;
@@ -6717,6 +7045,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
     frame_used_pending_pipeline_ = false;
+    frame_pending_pipeline_must_hold_ = false;
 
     // Reset bindings that depend on transient data.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
@@ -6912,72 +7241,87 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     assert_false(command_buffers_writable_.empty());
     CommandBuffer command_buffer = command_buffers_writable_.back();
-    if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to reset a Vulkan command pool");
-      return false;
-    }
-    VkCommandBufferBeginInfo command_buffer_begin_info;
-    command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    command_buffer_begin_info.pNext = nullptr;
-    command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    command_buffer_begin_info.pInheritanceInfo = nullptr;
-    if (dfn.vkBeginCommandBuffer(command_buffer.buffer, &command_buffer_begin_info) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to begin a Vulkan command buffer");
-      return false;
-    }
-    if (gpu_time_recording_) {
-      // The submission's queries are reset before any of them is written.
-      const GpuTimeSubmission& current = gpu_time_current_;
-      const uint32_t first_part = std::min(current.query_count, kGpuTimeQueries - current.first_query);
-      dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_time_query_pool_, current.first_query,
-                              first_part);
-      if (first_part < current.query_count) {
-        dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_time_query_pool_, 0,
-                                current.query_count - first_part);
-      }
-      // Bottom of the pipe: once everything submitted earlier is done, so the
-      // time of one submission isn't counted again in the next.
-      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                              gpu_time_query_pool_, current.start_query);
-    }
-    deferred_command_buffer_.Execute(command_buffer.buffer);
-    if (gpu_time_recording_) {
-      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                              gpu_time_query_pool_, gpu_time_current_.end_query);
-    }
-
-    // Record query resolves before submitting.
-    if (host_query_pool_) {
-      host_query_pool_->RecordResolveBatch(command_buffer.buffer);
-    }
-
-    if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to end a Vulkan command buffer");
-      return false;
-    }
-
     const uint64_t submission_index = GetCurrentSubmission();
-
-    VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    if (!current_submission_wait_semaphores_.empty()) {
-      submit_info.waitSemaphoreCount = uint32_t(current_submission_wait_semaphores_.size());
-      submit_info.pWaitSemaphores = current_submission_wait_semaphores_.data();
-      submit_info.pWaitDstStageMask = current_submission_wait_stage_masks_.data();
-    }
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &command_buffer.buffer;
-    const VkResult submit_result = completion_timeline_.AcquireFenceAndSubmit(
-        vulkan_device->queue_family_graphics_compute(), 0, 1, &submit_info);
-    if (submit_result != VK_SUCCESS) {
-      REXGPU_ERROR("Failed to submit a GPU emulation Vulkan command buffer: {}",
-                   vk::to_string(vk::Result(submit_result)));
-      if (vulkan_device->IsLost() && !device_lost_) {
-        device_lost_ = true;
-        if (graphics_system_) {
-          graphics_system_->OnHostGpuLossFromAnyThread(true);
-        }
+    // GPU time queries are recorded around the replay from this thread's state,
+    // so such a submission (a developer's capture) is made here, in queue order.
+    if (submission_thread_ && !gpu_time_recording_) {
+      if (!HandOverSubmission(command_buffer, submission_index)) {
+        return false;
       }
-      return false;
+    } else {
+      AwaitSubmissionThread(submission_index - 1);
+      if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
+        REXGPU_ERROR("Failed to reset a Vulkan command pool");
+        return false;
+      }
+      VkCommandBufferBeginInfo command_buffer_begin_info;
+      command_buffer_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      command_buffer_begin_info.pNext = nullptr;
+      command_buffer_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      command_buffer_begin_info.pInheritanceInfo = nullptr;
+      if (dfn.vkBeginCommandBuffer(command_buffer.buffer, &command_buffer_begin_info) !=
+          VK_SUCCESS) {
+        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
+        return false;
+      }
+      if (gpu_time_recording_) {
+        // The submission's queries are reset before any of them is written.
+        const GpuTimeSubmission& current = gpu_time_current_;
+        const uint32_t first_part =
+            std::min(current.query_count, kGpuTimeQueries - current.first_query);
+        dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_time_query_pool_, current.first_query,
+                                first_part);
+        if (first_part < current.query_count) {
+          dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_time_query_pool_, 0,
+                                  current.query_count - first_part);
+        }
+        // Bottom of the pipe: once everything submitted earlier is done, so the
+        // time of one submission isn't counted again in the next.
+        dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                gpu_time_query_pool_, current.start_query);
+      }
+      deferred_command_buffer_.Execute(command_buffer.buffer);
+      if (gpu_time_recording_) {
+        dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                gpu_time_query_pool_, gpu_time_current_.end_query);
+      }
+
+      // Record query resolves before submitting.
+      if (host_query_pool_) {
+        VulkanQueryPool::ResolveBatch resolve_batch;
+        host_query_pool_->TakeResolveBatch(resolve_batch);
+        host_query_pool_->RecordResolveBatch(command_buffer.buffer, resolve_batch);
+      }
+
+      if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
+        REXGPU_ERROR("Failed to end a Vulkan command buffer");
+        return false;
+      }
+
+      VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      if (!current_submission_wait_semaphores_.empty()) {
+        submit_info.waitSemaphoreCount = uint32_t(current_submission_wait_semaphores_.size());
+        submit_info.pWaitSemaphores = current_submission_wait_semaphores_.data();
+        submit_info.pWaitDstStageMask = current_submission_wait_stage_masks_.data();
+      }
+      submit_info.commandBufferCount = 1;
+      submit_info.pCommandBuffers = &command_buffer.buffer;
+      const VkResult submit_result = completion_timeline_.AcquireFenceAndSubmit(
+          vulkan_device->queue_family_graphics_compute(), 0, 1, &submit_info);
+      if (submit_result != VK_SUCCESS) {
+        REXGPU_ERROR("Failed to submit a GPU emulation Vulkan command buffer: {}",
+                     vk::to_string(vk::Result(submit_result)));
+        if (vulkan_device->IsLost() && !device_lost_) {
+          device_lost_ = true;
+          if (graphics_system_) {
+            graphics_system_->OnHostGpuLossFromAnyThread(true);
+          }
+        }
+        return false;
+      }
+      if (submission_thread_) {
+        submission_thread_submitted_.store(submission_index, std::memory_order_release);
+      }
     }
     current_submission_wait_stage_masks_.clear();
     for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
@@ -7004,6 +7348,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   if (is_closing_frame) {
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+    }
+    if (shared_memory_) {
+      shared_memory_->AdvanceHotPageFrame();
     }
     frame_open_ = false;
     // Submission already closed now, so minus 1.
@@ -7635,10 +7982,7 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     // Depth bias.
     const ui::vulkan::VulkanDevice::Properties& device_properties =
         GetVulkanDevice()->properties();
-    const bool depth_bias_force_unorm =
-        REXCVAR_GET(vulkan_depth_bias_force_unorm) && device_properties.depthBiasControl &&
-        device_properties.leastRepresentableValueForceUnormRepresentation &&
-        device_properties.depthBiasExact;
+    const bool depth_bias_force_unorm = IsDepthBiasForceUnorm(device_properties);
     float depth_bias_constant_factor, depth_bias_slope_factor;
     if (depth_bias_in_pixel_shader) {
       // Applied by the pixel shader instead.
@@ -8101,8 +8445,12 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     system_constants_.param_gen_window_offset[i] = param_gen_window_offset[i];
   }
 
-  // Point size.
-  if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {
+  // Point size, and the NDC size of a guest pixel, which the line geometry
+  // shader also uses to expand resolution-scaled lines to 1 guest pixel wide.
+  if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList ||
+      vgt_draw_initiator.prim_type == xenos::PrimitiveType::kLineList ||
+      vgt_draw_initiator.prim_type == xenos::PrimitiveType::kLineStrip ||
+      vgt_draw_initiator.prim_type == xenos::PrimitiveType::kLineLoop) {
     auto pa_su_point_minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
     auto pa_su_point_size = regs.Get<reg::PA_SU_POINT_SIZE>();
     float point_vertex_diameter_min = float(pa_su_point_minmax.min_size) * (2.0f / 16.0f);

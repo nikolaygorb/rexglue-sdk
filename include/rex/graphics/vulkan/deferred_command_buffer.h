@@ -31,6 +31,23 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
+  // The recorded commands, taken out for another thread to execute (threaded
+  // submission).
+  struct Streams {
+    std::vector<uintmax_t> main;
+    std::vector<uintmax_t> hoisted;
+  };
+  // Swaps the recorded commands with `streams` (normally empty ones, whose
+  // allocations are reused) and starts recording anew.
+  void TakeStreams(Streams& streams) {
+    command_stream_.swap(streams.main);
+    hoisted_stream_.swap(streams.hoisted);
+    Reset();
+  }
+  // Executes commands taken with TakeStreams. Touches only the replay's scratch
+  // vectors, so it may run on another thread while new commands are recorded.
+  void ExecuteStreams(VkCommandBuffer command_buffer, const Streams& streams) const;
+
   // Hoisting: commands recorded later but executed earlier, at a hoist point
   // written into the stream before (the shared memory uploads that
   // VulkanSharedMemory moves before the current render pass instead of ending
@@ -252,6 +269,21 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  VkBufferImageCopy* CmdCopyImageToBufferEmplace(VkImage src_image,
+                                                 VkImageLayout src_image_layout,
+                                                 VkBuffer dst_buffer, uint32_t region_count) {
+    const size_t header_size =
+        rex::align(sizeof(ArgsVkCopyImageToBuffer), alignof(VkBufferImageCopy));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
+        Command::kVkCopyImageToBuffer, header_size + sizeof(VkBufferImageCopy) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkCopyImageToBuffer*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_buffer = dst_buffer;
+    args.region_count = region_count;
+    return reinterpret_cast<VkBufferImageCopy*>(args_ptr + header_size);
+  }
+
   VkImageCopy* CmdCopyImageEmplace(VkImage src_image, VkImageLayout src_image_layout,
                                    VkImage dst_image, VkImageLayout dst_image_layout,
                                    uint32_t region_count) {
@@ -467,6 +499,7 @@ class DeferredCommandBuffer {
     kVkCopyBuffer,
     kVkCopyBufferToImage,
     kVkCopyImage,
+    kVkCopyImageToBuffer,
     kVkCopyQueryPoolResults,
     kVkDispatch,
     kVkDraw,
@@ -604,6 +637,15 @@ class DeferredCommandBuffer {
     VkBuffer src_buffer;
     VkImage dst_image;
     VkImageLayout dst_image_layout;
+    uint32_t region_count;
+    // Followed by aligned VkBufferImageCopy[].
+    static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkCopyImageToBuffer {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkBuffer dst_buffer;
     uint32_t region_count;
     // Followed by aligned VkBufferImageCopy[].
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
@@ -747,7 +789,25 @@ class DeferredCommandBuffer {
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
   void ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
-                     size_t stream_remaining);
+                     size_t stream_remaining, const uintmax_t* hoisted_stream) const;
+
+  struct BarrierArrays {
+    const VkMemoryBarrier* memory = nullptr;
+    const VkBufferMemoryBarrier* buffer = nullptr;
+    const VkImageMemoryBarrier* image = nullptr;
+    // Where the sample locations records start.
+    size_t end_offset_bytes = 0;
+  };
+  static BarrierArrays GetBarrierArrays(const ArgsVkPipelineBarrier& args);
+  // Commands that only set state for later draws and dispatches: a barrier
+  // may be executed before them instead of after.
+  static bool IsStateCommand(Command command);
+  // vulkan_merge_adjacent_barriers: with stream at a barrier's arguments,
+  // executes it and the barriers after it (only state commands between) as
+  // one barrier, then those state commands, and moves stream past the last
+  // barrier taken. False, with nothing executed, when nothing follows to merge.
+  bool MergeBarriersAt(VkCommandBuffer command_buffer, const uintmax_t*& stream,
+                       size_t& stream_remaining, const uintmax_t* hoisted_stream) const;
 
   const VulkanCommandProcessor& command_processor_;
 
@@ -755,9 +815,18 @@ class DeferredCommandBuffer {
   std::vector<uintmax_t> command_stream_;
   std::vector<uintmax_t> hoisted_stream_;
   std::vector<uintmax_t>* write_stream_ = &command_stream_;
-  // For rebuilding pNext chains of barriers with sample locations.
-  std::vector<VkImageMemoryBarrier> image_barriers_with_sample_locations_;
-  std::vector<VkSampleLocationsInfoEXT> barrier_sample_locations_;
+  // For rebuilding pNext chains of barriers with sample locations. Scratch of
+  // the replay, which runs on one thread at a time.
+  mutable std::vector<VkImageMemoryBarrier> image_barriers_with_sample_locations_;
+  mutable std::vector<VkSampleLocationsInfoEXT> barrier_sample_locations_;
+  // vulkan_merge_adjacent_barriers, latched per Execute, and its scratch.
+  mutable bool merge_barriers_ = false;
+  mutable std::vector<const ArgsVkPipelineBarrier*> merged_args_;
+  mutable std::vector<const uintmax_t*> merge_state_commands_;
+  mutable std::vector<VkImage> merge_images_;
+  mutable std::vector<VkMemoryBarrier> merged_memory_barriers_;
+  mutable std::vector<VkBufferMemoryBarrier> merged_buffer_barriers_;
+  mutable std::vector<VkImageMemoryBarrier> merged_image_barriers_;
 };
 
 }  // namespace rex::graphics::vulkan

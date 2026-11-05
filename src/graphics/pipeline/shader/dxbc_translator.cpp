@@ -454,7 +454,6 @@ void DxbcShaderTranslator::StartVertexOrDomainShader() {
       break;
 
     case Shader::HostVertexShaderType::kTriangleDomainCPIndexed:
-      assert_true(register_count() >= 2);
       if (register_count() >= 1) {
         // Copy the domain location to r0.xyz.
         // ZYX swizzle according to 415607E1 and 4D5307F2.
@@ -477,7 +476,6 @@ void DxbcShaderTranslator::StartVertexOrDomainShader() {
       break;
 
     case Shader::HostVertexShaderType::kTriangleDomainPatchIndexed:
-      assert_true(register_count() >= 2);
       if (register_count() >= 1) {
         // Copy the domain location to r0.xyz.
         // ZYX swizzle with r1.y == 0, according to the water shader in
@@ -520,7 +518,6 @@ void DxbcShaderTranslator::StartVertexOrDomainShader() {
       break;
 
     case Shader::HostVertexShaderType::kQuadDomainCPIndexed:
-      assert_true(register_count() >= 2);
       if (register_count() >= 1) {
         // Copy the domain location to r0.xy.
         in_domain_location_used_ |= 0b0011;
@@ -550,7 +547,6 @@ void DxbcShaderTranslator::StartVertexOrDomainShader() {
       break;
 
     case Shader::HostVertexShaderType::kQuadDomainPatchIndexed:
-      assert_true(register_count() >= 2);
       if (register_count() >= 1) {
         // Copy the domain location to r0.yz.
         // XY swizzle according to the ground shader in 4D5307F2.

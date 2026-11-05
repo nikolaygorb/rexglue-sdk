@@ -238,6 +238,19 @@ void ResetToDefault(std::string_view name);
 void ResetAllToDefaults();
 bool HasNonDefaultValue(std::string_view name);
 std::vector<std::string> ListModifiedFlags();
+
+// Replaces the home directory `home` in `value` with `~`, ignoring case and
+// the kind of slash, so a path doesn't show the user's name in a bug report.
+std::string RedactHomePath(std::string_view value, std::string_view home);
+
+// Sorted `name = value (source)` lines of the settings that were changed, or
+// of the ones that weren't. Commands are skipped and home paths redacted.
+std::vector<std::string> DescribeFlags(bool modified);
+
+// Logs the changed settings at info and the others at debug. Flags of a module
+// loaded later aren't included, so call this after the GPU plugin is loaded.
+void LogFlags();
+
 std::string SerializeToTOML();
 std::string SerializeToTOML(std::string_view category);
 

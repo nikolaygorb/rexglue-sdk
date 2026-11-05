@@ -54,6 +54,8 @@ class D3D11CommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking, std::function<void()> completion_callback) override;
 
+  void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
+
   const ui::d3d11::D3D11Provider& GetD3D11Provider() const;
   D3D11SharedMemory& shared_memory() const { return *shared_memory_; }
 
@@ -87,6 +89,7 @@ class D3D11CommandProcessor : public CommandProcessor {
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
+  void InitializeTrace() override;
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
@@ -110,6 +113,7 @@ class D3D11CommandProcessor : public CommandProcessor {
                                  std::vector<const uint8_t*>& data_out) override;
 
   void OnPrimaryBufferEnd() override;
+  SharedMemory* GetSharedMemoryForStats() const override { return shared_memory_.get(); }
 
   // Direct3D 11 has no submissions or fences, and needs none: it keeps the
   // resources the GPU uses alive, readback buffers wait for their own copies

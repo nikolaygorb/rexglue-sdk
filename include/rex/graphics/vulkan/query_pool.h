@@ -82,6 +82,9 @@ class VulkanQueryPool {
   void BeginQuery(DeferredCommandBuffer& deferred_command_buffer, uint32_t query_index,
                   bool precise) const;
   void EndQuery(DeferredCommandBuffer& deferred_command_buffer, uint32_t query_index) const;
+  // The same into a command buffer being recorded (the native renderer).
+  void BeginQuery(VkCommandBuffer command_buffer, uint32_t query_index, bool precise) const;
+  void EndQuery(VkCommandBuffer command_buffer, uint32_t query_index) const;
   void QueueQueryResolve(uint32_t query_index, bool counter = false);
   bool has_dirty_counters() const { return !counter_dirty_indices_.empty(); }
   bool IsCounterDirty(uint32_t query_index) const {

@@ -122,21 +122,19 @@ struct XenosZPDReport {
   // Writes the report to guest memory, each counter split across the A and B
   // lanes. Low 32 bits only, the hardware counters wrap and so do we.
   // GetData (usually) wakes on the ZPass lanes and QueryBatch Lock on ZPass_A
-  // or StencilFail_B, so those four are written last, in one copy.
+  // or StencilFail_B. Publish aligned lanes individually, with ZPass_A last;
+  // memcpy does not guarantee an atomic SIMD store on every host.
   void WriteTo(xenos::xe_gpu_depth_sample_counts* guest) const {
     auto lane_a = [](uint64_t count) { return uint32_t(count) - (uint32_t(count) >> 1); };
     auto lane_b = [](uint64_t count) { return uint32_t(count) >> 1; };
-    guest->Total_A = lane_a(total());
-    guest->Total_B = lane_b(total());
-    guest->ZFail_A = lane_a(z_fail);
-    guest->ZFail_B = lane_b(z_fail);
-    xenos::xe_gpu_depth_sample_counts values;
-    values.ZPass_A = lane_a(z_pass);
-    values.ZPass_B = lane_b(z_pass);
-    values.StencilFail_A = lane_a(stencil_fail);
-    values.StencilFail_B = lane_b(stencil_fail);
-    std::memcpy(&guest->ZPass_A, &values.ZPass_A,
-                sizeof(values) - offsetof(xenos::xe_gpu_depth_sample_counts, ZPass_A));
+    guest->Total_A.store(lane_a(total()), std::memory_order_release);
+    guest->Total_B.store(lane_b(total()), std::memory_order_release);
+    guest->ZFail_A.store(lane_a(z_fail), std::memory_order_release);
+    guest->ZFail_B.store(lane_b(z_fail), std::memory_order_release);
+    guest->ZPass_B.store(lane_b(z_pass), std::memory_order_release);
+    guest->StencilFail_A.store(lane_a(stencil_fail), std::memory_order_release);
+    guest->StencilFail_B.store(lane_b(stencil_fail), std::memory_order_release);
+    guest->ZPass_A.store(lane_a(z_pass), std::memory_order_release);
   }
 };
 

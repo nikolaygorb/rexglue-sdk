@@ -107,8 +107,12 @@ class VulkanInstance {
     bool ext_EXT_metal_surface = false;  // #217
 #endif
     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
+    // Required by the device's VK_EXT_full_screen_exclusive.
+    bool ext_KHR_get_surface_capabilities2 = false;  // #120
     bool ext_EXT_debug_utils = false;                          // #129
-    bool ext_KHR_portability_enumeration = false;              // #395
+    // From the validation layer, with vulkan_validation_sync.
+    bool ext_EXT_validation_features = false;      // #248
+    bool ext_KHR_portability_enumeration = false;  // #395
   };
 
   const Extensions& extensions() const { return extensions_; }

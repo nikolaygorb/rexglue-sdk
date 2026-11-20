@@ -48,6 +48,22 @@ namespace {
 //   q:      mtctr r4; bctr                    an indirect tail call
 //           0                                 padding
 //   s:      li r3,9; blr                      only reachable by a pointer
+//   n:      mflr r12; std r31,-16(r1); stwu r1,-96(r1); mr r31,r3;
+//           stw r31,0(r4); addi r1,r1,96; ld r31,-16(r1); blr
+//                                             saves and restores r31
+//   k:      stw r3,0(r12); blr                takes r12 from its caller
+//   kc:     li r12,64; b k                    sets it
+//   kp:     b k                               passes its own caller's on
+//   kv:     stw r31,0(r3); blr                takes r31 from its caller
+//   kw:     stw r31,-8(r1); blr               only spills r31
+//   kh:     stw r11,0(r3); blr                r11 from a mid-asm hook (test)
+//   kz:     lvx v1,r0,r3; blr                 a base of r0 is 0, not a read
+//   kt:     twi 31,r0,22; blr                 a trap whatever r0 holds
+//   kq:     tweqi r0,0; blr                   a trap if r0 is 0: reads it
+//   ka:     andc r31,r31,r31; stw r31,0(r3); blr   clears r31: reads nothing
+//   ke:     eqv r30,r30,r30; stw r30,0(r3); blr    sets r30 to -1: the same
+//   kx:     li r12,16; lvx128 v64,r11,r12; blr     reads r11 (a VMX128
+//                                             destination is no GPR)
 //
 //   .rodata vtable: p0, p1, h_loop
 //           table1: w1_c0, w1_c1, w1_c2, w1_c0, w1_c1, 0
@@ -61,7 +77,11 @@ constexpr uint32_t kMain = 0x82000000, kT = 0x82000018, kF = 0x82000020, kP0 = 0
                    kP1 = 0x82000034, kHLoop = 0x8200003C, kW1 = 0x82000048, kW2 = 0x8200008C,
                    kCaller = 0x820000C8, kSetjmp = 0x820000DC, kLongjmp = 0x8200013C,
                    kX = 0x8200019C, kY = 0x820001A4, kW3 = 0x820001AC,
-                   kO = 0x820001E8, kTl = 0x820001EC, kS = 0x82000218;
+                   kO = 0x820001E8, kTl = 0x820001EC, kS = 0x82000218, kN = 0x82000220,
+                   kK = 0x82000240, kKc = 0x82000248, kKp = 0x82000250, kKv = 0x82000254,
+                   kKw = 0x8200025C, kKh = 0x82000264, kKz = 0x8200026C,
+                   kKt = 0x82000274, kKq = 0x8200027C, kKa = 0x82000284,
+                   kKe = 0x82000290, kKx = 0x8200029C;
 
 const std::vector<uint32_t> kTextWords = {
     // main
@@ -115,6 +135,20 @@ const std::vector<uint32_t> kTextWords = {
     0x38800000, 0x38600000, 0x4BFFFE11, 0x38600007, 0x4E800020,
     // q, padding, s
     0x7C8903A6, 0x4E800420, 0x00000000, 0x38600009, 0x4E800020,
+    // n
+    0x7D8802A6, 0xFBE1FFF0, 0x9421FFA0, 0x7C7F1B78, 0x93E40000, 0x38210060, 0xEBE1FFF0,
+    0x4E800020,
+    // k, kc, kp
+    0x906C0000, 0x4E800020, 0x39800040, 0x4BFFFFF4, 0x4BFFFFF0,
+    // kv, kw, kh
+    0x93E30000, 0x4E800020, 0x93E1FFF8, 0x4E800020, 0x91630000, 0x4E800020,
+    // kz
+    0x7C2018CE, 0x4E800020,
+    // kt, kq
+    0x0FE00016, 0x4E800020, 0x0C800000, 0x4E800020,
+    // ka, ke, kx
+    0x7FFFF878, 0x93E30000, 0x4E800020, 0x7FDEF238, 0x93C30000, 0x4E800020,
+    0x39800010, 0x100B60CB, 0x4E800020,
 };
 
 const std::vector<uint32_t> kRodataWords = {
@@ -316,6 +350,153 @@ TEST_CASE("Analysis keeps setjmp and longjmp from the config", "[codegen][analys
   REQUIRE(error.empty());
   CHECK(ctx.Config().setJmpAddress == kCaller);
   CHECK(ctx.Config().longJmpAddress == kLongjmp);
+}
+
+TEST_CASE("Non-volatile GPRs become locals except where setjmp is called", "[codegen][analysis]") {
+  // w1 copies its index into r30 (`mr r30,r4`); caller calls the CRT setjmp,
+  // and a host longjmp back would not restore C++ locals.
+  RecompilerConfig config;
+  config.nonVolatileGprsAsLocalVariables = true;
+  auto [ctx, error] = AnalyzeSynthetic(std::move(config));
+  INFO(error);
+  REQUIRE(error.empty());
+  const std::string w1 = EmitFunction(ctx, kW1);
+  INFO(w1);
+  CHECK(w1.find("\tr30.u64 = ctx.r4.u64;") != std::string::npos);
+  CHECK(w1.find("ctx.r30") == std::string::npos);
+  CHECK_FALSE(ctx.graph.getFunction(kW1)->keepsNonVolatilesInContext());
+  CHECK(ctx.graph.getFunction(kCaller)->keepsNonVolatilesInContext());
+  CHECK(ctx.graph.getFunction(kSetjmp)->keepsNonVolatilesInContext());
+  CHECK(ctx.graph.getFunction(kLongjmp)->keepsNonVolatilesInContext());
+}
+
+TEST_CASE("A localizing function drops its saves and restores of them", "[codegen][analysis]") {
+  // n saves r31 below r1 before allocating its frame and loads it back right
+  // before blr: with r31 a local, the store holds the caller's value nobody
+  // reads and the load feeds nothing.
+  for (bool localize : {false, true}) {
+    RecompilerConfig config;
+    config.nonVolatileGprsAsLocalVariables = localize;
+    FunctionConfig n;
+    n.size = 32;
+    config.functions[kN] = n;
+    auto [ctx, error] = AnalyzeSynthetic(std::move(config));
+    INFO(error);
+    REQUIRE(error.empty());
+    const std::string code = EmitFunction(ctx, kN);
+    INFO(code);
+    REQUIRE_FALSE(code.empty());
+    CHECK((code.find("REX_STORE_U64(ctx.r1.u32 + -16") == std::string::npos) == localize);
+    CHECK((code.find("REX_LOAD_U64(ctx.r1.u32 + -16)") == std::string::npos) == localize);
+    // The body's own use of r31 stays.
+    CHECK(code.find(localize ? "\tr31.u64 = ctx.r3.u64;" : "\tctx.r31.u64 = ctx.r3.u64;") !=
+          std::string::npos);
+    CHECK(code.find(localize ? "r31.u32);" : "ctx.r31.u32);") != std::string::npos);
+  }
+}
+
+TEST_CASE("r0, r2, r11 and r12 become locals with non_argument_gpr_as_local",
+          "[codegen][analysis]") {
+  // w1 builds its table address in r12 (lis / addi) and the scaled index in r0.
+  for (bool localize : {false, true}) {
+    RecompilerConfig config;
+    config.nonArgumentGprsAsLocalVariables = localize;
+    auto [ctx, error] = AnalyzeSynthetic(std::move(config));
+    INFO(error);
+    REQUIRE(error.empty());
+    const std::string w1 = EmitFunction(ctx, kW1);
+    INFO(w1);
+    CHECK((w1.find("ctx.r12") == std::string::npos) == localize);
+    CHECK((w1.find("ctx.r0.") == std::string::npos) == localize);
+    CHECK((w1.find("\tr12.s64 = ") != std::string::npos) == localize);
+    // r30 is a non-volatile: this option leaves it in ctx.
+    CHECK(w1.find("ctx.r30.u64 = ctx.r4.u64;") != std::string::npos);
+  }
+}
+
+TEST_CASE("Non-volatile GPRs stay in ctx without the option", "[codegen][analysis]") {
+  auto [ctx, error] = AnalyzeSynthetic();
+  INFO(error);
+  REQUIRE(error.empty());
+  const std::string w1 = EmitFunction(ctx, kW1);
+  INFO(w1);
+  CHECK(w1.find("ctx.r30.u64 = ctx.r4.u64;") != std::string::npos);
+}
+
+TEST_CASE("A share_registers callee gets the caller's ctx back", "[codegen][analysis]") {
+  // main calls a; with a sharing registers, a localizing main puts whatever its
+  // own caller kept in ctx back after the call (here no register is local yet,
+  // so the block holds the call alone).
+  constexpr uint32_t kA = 0x82000010;
+  RecompilerConfig config;
+  config.nonVolatileGprsAsLocalVariables = true;
+  FunctionConfig a;
+  a.shareRegisters = true;
+  config.functions[kA] = a;
+  auto [ctx, error] = AnalyzeSynthetic(std::move(config));
+  INFO(error);
+  REQUIRE(error.empty());
+  const std::string main = EmitFunction(ctx, kMain);
+  INFO(main);
+  CHECK(main.find("\t{\n\tsub_82000010(ctx, base);\n\t}\n") != std::string::npos);
+}
+
+TEST_CASE("A function reading its caller's register shares registers", "[codegen][analysis]") {
+  // k takes r12 from its caller: kc sets it, kp passes on its own caller's. kv
+  // takes r31; kw only spills it to the stack. kh reads r11 a mid-asm hook
+  // hands back by reference. kz loads from r0|0, which is 0 (binutils names
+  // that operand a plain RA). kt traps whatever r0 holds; kq only if r0 is 0.
+  // ka and ke set r31 / r30 from themselves (andc, eqv), which reads nothing;
+  // kx reads r11 through a VMX128 load.
+  for (int mode = 0; mode < 3; ++mode) {
+    const bool localize = mode != 0;
+    const bool automatic = mode != 2;
+    RecompilerConfig config;
+    config.nonArgumentGprsAsLocalVariables = localize;
+    config.nonVolatileGprsAsLocalVariables = localize;
+    config.autoShareRegisters = automatic;
+    for (auto [address, size] : {std::pair{kK, 8u}, std::pair{kKc, 8u}, std::pair{kKp, 4u},
+                                 std::pair{kKv, 8u}, std::pair{kKw, 8u}, std::pair{kKh, 8u},
+                                 std::pair{kKz, 8u}, std::pair{kKt, 8u}, std::pair{kKq, 8u},
+                                 std::pair{kKa, 12u}, std::pair{kKe, 12u}, std::pair{kKx, 12u}}) {
+      FunctionConfig fn;
+      fn.size = size;
+      config.functions[address] = fn;
+    }
+    MidAsmHook hook;
+    hook.name = "TestHook";
+    hook.registers = {"r11"};
+    config.midAsmHooks[kKh] = hook;
+    auto [ctx, error] = AnalyzeSynthetic(std::move(config));
+    INFO(error);
+    REQUIRE(error.empty());
+    auto shares = [&](uint32_t address) {
+      const auto* node = ctx.graph.getFunction(address);
+      return node != nullptr && node->sharesRegisters();
+    };
+    const bool expected = localize && automatic;
+    CHECK(shares(kK) == expected);
+    CHECK(shares(kKp) == expected);
+    CHECK(shares(kKv) == expected);
+    CHECK(shares(kKq) == expected);
+    CHECK(shares(kKx) == expected);
+    CHECK_FALSE(shares(kKa));
+    CHECK_FALSE(shares(kKe));
+    CHECK_FALSE(shares(kKc));
+    CHECK_FALSE(shares(kKw));
+    CHECK_FALSE(shares(kKh));
+    CHECK_FALSE(shares(kKz));
+    CHECK_FALSE(shares(kKt));
+    // w1 sets r12 and r0 before it uses them; n spills r31 and sets it.
+    CHECK_FALSE(shares(kW1));
+    CHECK_FALSE(shares(kN));
+    if (expected) {
+      // kc hands its local r12 to k through ctx.
+      const std::string kc = EmitFunction(ctx, kKc);
+      INFO(kc);
+      CHECK(kc.find("\tctx.r12 = r12;\n\tsub_82000240(ctx, base);") != std::string::npos);
+    }
+  }
 }
 
 TEST_CASE("A branch is classified by the function being emitted", "[codegen][analysis]") {

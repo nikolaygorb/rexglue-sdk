@@ -24,6 +24,7 @@ struct ppc_insn;
 namespace rex::codegen {
 
 class FunctionNode;
+struct ReservationSections;
 
 struct RecompilerLocalVariables {
   bool ctr{};
@@ -98,6 +99,9 @@ struct BuilderContext {
   /// Pointer to active jump table for bctr dispatch, or nullptr
   const JumpTable* activeJumpTable = nullptr;
 
+  /// The function's lock-free reservation sections (reservation_sections.h), or nullptr
+  const ReservationSections* reservations = nullptr;
+
   /// Get the recompiler configuration
   const RecompilerConfig& config() const;
 
@@ -113,6 +117,20 @@ struct BuilderContext {
    * False when the function shares registers with an intra-function bl partner.
    */
   bool localizeNonVolatiles() const;
+
+  /// Whether r14-r31 may be localized in the current function
+  /// (non_volatile_as_local or non_volatile_gpr_as_local).
+  bool localizeNonVolatileGprs() const;
+
+  /// Whether r0, r2, r11 and r12 may be localized in the current function
+  /// (non_argument_as_local or non_argument_gpr_as_local).
+  bool localizeNonArgumentGprs() const;
+
+  /// The current instruction stores a localized r14-r31 in the prologue (the
+  /// caller's value) or loads one in the epilogue (unused before the return):
+  /// nothing to emit.
+  bool is_dead_nonvolatile_save() const;
+  bool is_dead_nonvolatile_restore() const;
 
   /**
    * @brief Get expression for general-purpose register access.

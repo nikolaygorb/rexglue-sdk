@@ -1727,6 +1727,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_SUBOPTIMAL_KHR:
       break;
     case VK_ERROR_DEVICE_LOST:
+      vulkan_device_->SetLost();
       REXLOG_ERROR(
           "VulkanPresenter: Failed to acquire the swapchain image as the "
           "device has been lost");
@@ -2402,6 +2403,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_SUBOPTIMAL_KHR:
       return PaintResult::kPresentedSuboptimal;
     case VK_ERROR_DEVICE_LOST:
+      vulkan_device_->SetLost();
       REXLOG_ERROR(
           "VulkanPresenter: Failed to present the swapchain image as the "
           "device has been lost");

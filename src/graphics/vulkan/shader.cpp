@@ -52,6 +52,10 @@ VkShaderModule VulkanShader::VulkanTranslation::GetOrCreateShaderModule() {
     MakeInvalid();
     return VK_NULL_HANDLE;
   }
+  // vkCreateShaderModule has copied the SPIR-V, the module is never made again
+  // and the Vulkan backend dumps no translations, so the binary is only memory
+  // now (about 40 KB a translation; ReIGlue 0430).
+  ReleaseTranslatedBinary();
   return shader_module_;
 }
 

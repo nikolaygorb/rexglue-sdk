@@ -813,6 +813,26 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   }
 }
 
+void SharedMemory::MakeUploadRangeValid(uint32_t start, uint32_t length) {
+  if (length && start < kBufferSize) {
+    uint32_t page_first = start >> page_size_log2_;
+    uint32_t page_last = (start + std::min(length, kBufferSize - start) - 1) >> page_size_log2_;
+    bool valid = true;
+    {
+      auto global_lock = global_critical_region_.Acquire();
+      for (uint32_t i = page_first >> 6; valid && i <= (page_last >> 6); ++i) {
+        uint64_t mask = PageBlockMask(i, page_first, page_last);
+        valid = (system_page_flags_valid_[i] & mask) == mask &&
+                !(system_page_flags_valid_and_gpu_written_[i] & mask);
+      }
+    }
+    if (valid) {
+      return;
+    }
+  }
+  MakeRangeValid(start, length, false);
+}
+
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   uint32_t bucket = range->page_first << page_size_log2_ >> watch_bucket_size_log2_;
   WatchNode* node = range->node_first;

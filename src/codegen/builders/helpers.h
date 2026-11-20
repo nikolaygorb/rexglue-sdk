@@ -19,6 +19,7 @@
 #include <rex/logging.h>
 
 #include "../codegen_logging.h"
+#include "../reservation_sections.h"
 
 #include <dis-asm.h>
 #include <ppc-inst.h>
@@ -288,21 +289,22 @@ inline const char* getStoreMacro(BuilderContext& ctx, const char* normal_macro,
 /**
  * Emit atomic load-and-reserve instruction (lwarx/ldarx pattern).
  *
- * Pattern: EA = rA + rB; reserved = *(T*)REX_RAW_ADDR(EA); rD = bswap(reserved)
+ * Pattern: EA = rA + rB; snapshot the reservation; rD = bswap(raw load)
  *
  * @param ctx The builder context
  * @param ptr_type The pointer type (e.g., "uint32_t", "uint64_t")
  * @param bswap_func The byte-swap builtin (e.g., "__builtin_bswap32")
  * @param reserved_field The reserved register field (e.g., "u32", "u64")
  */
-inline void emitAtomicLoadReserve(BuilderContext& ctx, const char* ptr_type, const char* bswap_func,
+inline void emitAtomicLoadReserve(BuilderContext& ctx, [[maybe_unused]] const char* ptr_type, const char* bswap_func,
                                   const char* reserved_field) {
   ctx.print("\t{} = ", ctx.ea());
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
   ctx.println("{}.u32;", ctx.r(ctx.insn.operands[2]));
-  ctx.println("\t{}.{} = *({}*)REX_RAW_ADDR({});", ctx.reserved(), reserved_field, ptr_type,
-              ctx.ea());
+  ctx.println("\t{}.{} = rex::ppc::LoadReserve{}(ctx.reservation, {}, REX_RAW_ADDR({}));",
+              ctx.reserved(), reserved_field, std::strcmp(reserved_field, "u32") == 0 ? 32 : 64,
+              ctx.ea(), ctx.ea());
   ctx.println("\t{}.u64 = {}({}.{});", ctx.r(ctx.insn.operands[0]), bswap_func, ctx.reserved(),
               reserved_field);
 }
@@ -310,14 +312,14 @@ inline void emitAtomicLoadReserve(BuilderContext& ctx, const char* ptr_type, con
 /**
  * Emit atomic store-conditional instruction (stwcx./stdcx. pattern).
  *
- * Pattern: EA = rA + rB; cr0 = CAS(EA, reserved, bswap(rS))
+ * Pattern: EA = rA + rB; cr0 = claim granule, CAS value, release granule
  *
  * @param ctx The builder context
  * @param ptr_type The pointer type (e.g., "uint32_t", "uint64_t")
  * @param bswap_func The byte-swap builtin (e.g., "__builtin_bswap32")
  * @param field The register field (e.g., "u32", "u64")
  */
-inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type,
+inline void emitAtomicStoreConditional(BuilderContext& ctx, [[maybe_unused]] const char* ptr_type,
                                        const char* bswap_func, const char* field) {
   ctx.print("\t{} = ", ctx.ea());
   if (ctx.insn.operands[1] != 0)
@@ -325,12 +327,10 @@ inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type
   ctx.println("{}.u32;", ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}.lt = 0;", ctx.cr(0));
   ctx.println("\t{}.gt = 0;", ctx.cr(0));
-  ctx.println(
-      "\t{}.eq = reinterpret_cast<std::atomic<{}>*>(REX_RAW_ADDR({}))"
-      "->compare_exchange_strong({}.{}, {}({}.{}), "
-      "std::memory_order_acq_rel, std::memory_order_acquire);",
-      ctx.cr(0), ptr_type, ctx.ea(), ctx.reserved(), field, bswap_func, ctx.r(ctx.insn.operands[0]),
-      field);
+  ctx.println("\t{}.eq = rex::ppc::StoreConditional{}(ctx.reservation, {}, REX_RAW_ADDR({}), {}({}.{}));",
+              ctx.cr(0), std::strcmp(field, "u32") == 0 ? 32 : 64, ctx.ea(), ctx.ea(),
+              bswap_func, ctx.r(ctx.insn.operands[0]), field);
+
 }
 
 //=============================================================================

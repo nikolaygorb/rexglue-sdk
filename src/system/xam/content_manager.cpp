@@ -21,6 +21,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
+#include <rex/logging.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
@@ -711,11 +712,16 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
   size_t remaining = entry->size();
   size_t offset = 0;
 
+  X_RESULT result = X_ERROR_SUCCESS;
   while (remaining > 0) {
     size_t bytes_read = 0;
     size_t to_read = std::min(remaining, kBufferSize);
-    in_file->ReadSync(std::span<uint8_t>(buffer.get(), to_read), offset, &bytes_read);
-    if (bytes_read == 0) {
+    status = in_file->ReadSync(std::span<uint8_t>(buffer.get(), to_read), offset, &bytes_read);
+    // A failed or empty read leaves the file short: the install fails instead
+    // of going on with a truncated file (xenia-canary 2629e3c8f).
+    if (status != X_STATUS_SUCCESS || !bytes_read) {
+      REXFS_ERROR("Failed to read {} at offset {}", entry->path(), offset);
+      result = X_ERROR_FUNCTION_FAILED;
       break;
     }
     fwrite(buffer.get(), 1, bytes_read, out_file);
@@ -725,7 +731,7 @@ static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,
 
   fclose(out_file);
   in_file->Destroy();
-  return X_ERROR_SUCCESS;
+  return result;
 }
 
 X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_path) {

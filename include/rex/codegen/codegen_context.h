@@ -57,15 +57,17 @@ struct AnalysisState {
   std::vector<FunctionEntry> analyzedFunctions;                        ///< Discovered functions
   std::unordered_map<uint32_t, std::vector<uint32_t>> chunksByParent;  ///< Chunk lookup
 
-  // Auto-detected ABI helpers (0 = not found)
-  uint32_t restGpr14Address = 0;
-  uint32_t saveGpr14Address = 0;
-  uint32_t restFpr14Address = 0;
-  uint32_t saveFpr14Address = 0;
-  uint32_t restVmx14Address = 0;
-  uint32_t saveVmx14Address = 0;
-  uint32_t restVmx64Address = 0;
-  uint32_t saveVmx64Address = 0;
+  // Auto-detected ABI helpers: the head (the _14 or _64 entry) of every copy
+  // the binary links, in address order; empty = not found. A title can link
+  // them more than once (two CRTs, or a library with its own copy).
+  std::vector<uint32_t> restGpr14Addresses;
+  std::vector<uint32_t> saveGpr14Addresses;
+  std::vector<uint32_t> restFpr14Addresses;
+  std::vector<uint32_t> saveFpr14Addresses;
+  std::vector<uint32_t> restVmx14Addresses;
+  std::vector<uint32_t> saveVmx14Addresses;
+  std::vector<uint32_t> restVmx64Addresses;
+  std::vector<uint32_t> saveVmx64Addresses;
 
   // Merged results (user hints + analysis-detected)
   std::unordered_map<uint32_t, uint32_t> invalidInstructions;  ///< addr -> size

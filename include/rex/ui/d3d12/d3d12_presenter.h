@@ -180,7 +180,12 @@ class D3D12Presenter final : public Presenter {
       // guest_output_intermediate_texture_paint_last_usage_.
       kRTVIndexGuestOutputIntermediate0 = kRTVIndexSwapChainBuffer0 + kSwapChainBufferCount,
 
-      kRTVCount = kRTVIndexGuestOutputIntermediate0 + kGuestOutputMailboxSize - 1,
+      // One RTV per intermediate texture: guest_output_intermediate_textures has
+      // kMaxGuestOutputPaintEffects - 1 entries, as the view heap below counts
+      // them. Sized by the mailbox, intermediates 2..4 had no RTV slot, and an
+      // FSR flow of more than three effects wrote RTVs past the heap end
+      // (EddieVanHelgen/rexglue-sdk f41dc33).
+      kRTVCount = kRTVIndexGuestOutputIntermediate0 + kMaxGuestOutputPaintEffects - 1,
     };
 
     enum ViewIndex : UINT {

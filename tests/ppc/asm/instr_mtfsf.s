@@ -7,7 +7,7 @@ test_mtfsf_field7:
   mffs f2
   mtfsf 0xFF, f3
   blr
-  #_ REGISTER_OUT f2 0x0000000000000003
+  #_ REGISTER_OUT f2 0xFFF8000000000003
 
 test_mtfsf_field0:
   # FM bit 7 selects field 0, which leaves RN alone
@@ -18,4 +18,4 @@ test_mtfsf_field0:
   mffs f2
   mtfsf 0xFF, f3
   blr
-  #_ REGISTER_OUT f2 0x0000000000000000
+  #_ REGISTER_OUT f2 0xFFF8000000000000

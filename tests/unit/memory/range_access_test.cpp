@@ -73,3 +73,32 @@ TEST_CASE("Empty and overflowing ranges have no access", "[memory][heap]") {
   CHECK(memory.QueryRangeAccess(0xFFFFF000, 0x2000) == PageAccess::kNoAccess);
   heap->Release(addr, nullptr);
 }
+
+// xenia-canary a078f5499: NtQueryVirtualMemory and MmQueryAddressProtect
+// report no protection for a page that is only reserved.
+TEST_CASE("QueryProtect tells a reserved page from a committed one", "[memory][heap]") {
+  auto& memory = GetTestMemory();
+  auto* heap = MutableHeap(memory.LookupHeap(0x10000000));
+  REQUIRE(heap != nullptr);
+
+  uint32_t addr = 0;
+  REQUIRE(heap->Alloc(2 * 4096, 4096, rex::memory::kMemoryAllocationReserve, kReadWrite, false,
+                      &addr));
+  REQUIRE(heap->AllocFixed(addr, 4096, 4096, rex::memory::kMemoryAllocationCommit, kReadWrite));
+
+  uint32_t protect = 0;
+  uint32_t state = 0;
+  REQUIRE(heap->QueryProtect(addr + 0x10, &protect, &state));
+  CHECK((state & rex::memory::kMemoryAllocationCommit) != 0);
+  CHECK(protect == kReadWrite);
+
+  REQUIRE(heap->QueryProtect(addr + 4096, &protect, &state));
+  CHECK((state & rex::memory::kMemoryAllocationReserve) != 0);
+  CHECK((state & rex::memory::kMemoryAllocationCommit) == 0);
+
+  // Without out_state as before.
+  REQUIRE(heap->QueryProtect(addr, &protect));
+  CHECK(protect == kReadWrite);
+
+  heap->Release(addr, nullptr);
+}

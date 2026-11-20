@@ -35,6 +35,8 @@ struct PPCCodegenFlags {
   bool cr_as_local = false;
   bool non_argument_as_local = false;
   bool non_volatile_as_local = false;
+  bool non_volatile_gpr_as_local = false;  ///< r14-r31 local (also under non_volatile_as_local)
+  bool non_argument_gpr_as_local = false;  ///< r0, r2, r11, r12 local (also non_argument_as_local)
 };
 
 /// The XEX the code was recompiled from, recorded by codegen. All zero in code

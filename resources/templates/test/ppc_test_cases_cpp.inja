@@ -36,6 +36,10 @@ TEST_CASE("{{ test.name }}", "[ppc][{{ test.category }}][{{ test.stem }}]") {
     auto& mem = get_memory();
     uint8_t* memory = mem.virtual_membase();
     PPCContext ctx{};
+    // From the reset FPSCR: round to nearest, no flush, and no exception flags
+    // left by an earlier case (they live in the host's status register).
+    ctx.fpscr.setcsr(0x1F80);
+    ctx.fpscr.restoreStatus(0);
     ctx.fpscr.loadFromHost();
 
 ## for reg in test.inputs.registers

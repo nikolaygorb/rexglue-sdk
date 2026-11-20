@@ -24,6 +24,7 @@
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/xecrypt_md5.h>
 #include <rex/kernel/xboxkrnl/xecrypt_rsa.h>
+#include <rex/kernel/xboxkrnl/xecrypt_sha2.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/hook.h>
@@ -176,12 +177,24 @@ void XeCryptSha_entry(mapped_void input_1, u32 input_1_size, mapped_void input_2
   std::copy_n(digest, std::min<size_t>(rex::countof(digest), output_size), output.as<uint8_t*>());
 }
 
-// TODO: Size of this struct hasn't been confirmed yet.
-typedef struct {
-  rex::be<uint32_t> count;     // 0x0
-  rex::be<uint32_t> state[8];  // 0x4
-  uint8_t buffer[64];          // 0x24
-} XECRYPT_SHA256_STATE;
+namespace {
+
+// Console Finals retain the byte count and pad with its low 32-bit bit count.
+// Feed the length separately so even an empty final block stays in the buffer.
+template <size_t BlockSize, typename Update>
+void PadShaInPlace(uint32_t count, Update update) {
+  constexpr size_t length_size = BlockSize / 8;
+  constexpr size_t length_start = BlockSize - length_size;
+  const size_t used = count % BlockSize;
+  const size_t offset = (used < length_start ? length_start : length_start + BlockSize) - used;
+  uint8_t padding[BlockSize + length_size] = {0x80};
+  rex::be<uint32_t> bits = count << 3;
+  std::memcpy(padding + offset + length_size - sizeof(bits), &bits, sizeof(bits));
+  update(padding, offset);
+  update(padding + offset, length_size);
+}
+
+}  // namespace
 
 void XeCryptSha256Init_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state) {
   sha_state.Zero();
@@ -212,16 +225,14 @@ void XeCryptSha256Update_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, mapped
 
 void XeCryptSha256Final_entry(ppc_ptr_t<XECRYPT_SHA256_STATE> sha_state, ppc_ptr_t<uint8_t> out,
                               u32 out_size) {
-  sha256::SHA256 sha;
-  std::copy(std::begin(sha_state->state), std::end(sha_state->state), sha.getHashValues());
-  std::copy(std::begin(sha_state->buffer), std::end(sha_state->buffer), sha.getBuffer());
-  sha.setTotalSize(sha_state->count);
-
-  uint8_t hash[32];
-  sha.getHash(hash);
-
-  std::copy_n(hash, std::min<size_t>(rex::countof(hash), out_size), static_cast<uint8_t*>(out));
-  std::copy(std::begin(hash), std::end(hash), sha_state->buffer);
+  const uint32_t count = sha_state->count;
+  PadShaInPlace<64>(count, [&](uint8_t* data, size_t size) {
+    XeCryptSha256Update_entry(sha_state, mapped_void::from_host(data), static_cast<u32>(size));
+  });
+  sha_state->count = count;
+  if (out && out_size) {
+    std::memmove(out, sha_state->state, std::min<size_t>(sizeof(sha_state->state), out_size));
+  }
 }
 
 void XeCryptSha256_entry(mapped_void input_1, u32 input_1_size, mapped_void input_2,
@@ -665,11 +676,6 @@ void XeCryptHmacMd5_entry(mapped_void key, u32 key_size, mapped_void inp_1, u32 
 // The guest SHA-512 state mirrors the private FFmpeg context (AVSHA512 in
 // libavutil/sha512.c of thirdparty/FFmpeg), which is loaded from and stored back
 // to guest memory around every call, as xenia-canary does.
-struct XECRYPT_SHA512_STATE {
-  rex::be<uint64_t> count;
-  rex::be<uint64_t> state[8];
-  uint8_t buffer[128];
-};
 
 namespace {
 
@@ -698,7 +704,7 @@ void StoreSha512(AVSHA512* sha, XECRYPT_SHA512_STATE* state) {
   const auto* ctx = reinterpret_cast<const FfmpegSha512Layout*>(sha);
   std::copy(std::begin(ctx->state), std::end(ctx->state), state->state);
   std::copy(std::begin(ctx->buffer), std::end(ctx->buffer), state->buffer);
-  state->count = ctx->count;
+  state->count = static_cast<uint32_t>(ctx->count);
 }
 
 }  // namespace
@@ -747,11 +753,14 @@ void XeCryptSha512Update_entry(ppc_ptr_t<XECRYPT_SHA512_STATE> sha_state, mapped
 
 void XeCryptSha512Final_entry(ppc_ptr_t<XECRYPT_SHA512_STATE> sha_state, ppc_ptr_t<uint8_t> out,
                               u32 out_size) {
-  auto sha = LoadSha512(sha_state);
-  uint8_t hash[64];
-  av_sha512_final(sha.get(), hash);
-  std::copy_n(hash, std::min<size_t>(sizeof(hash), out_size), static_cast<uint8_t*>(out));
-  std::copy(std::begin(hash), std::end(hash), sha_state->buffer);
+  const uint32_t count = sha_state->count;
+  PadShaInPlace<128>(count, [&](uint8_t* data, size_t size) {
+    XeCryptSha512Update_entry(sha_state, mapped_void::from_host(data), static_cast<u32>(size));
+  });
+  sha_state->count = count;
+  if (out && out_size) {
+    std::memmove(out, sha_state->state, std::min<size_t>(sizeof(sha_state->state), out_size));
+  }
 }
 
 void XeCryptDesKey_entry(ppc_ptr_t<XECRYPT_DES_STATE> state_ptr, mapped_u64 key) {

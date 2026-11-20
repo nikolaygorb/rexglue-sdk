@@ -1,0 +1,280 @@
+# ReXGlue launcher: the settings every title has.
+#
+# Staged next to each title's launcher as launcher/common.toml. The title's
+# launcher/launcher.toml adds its own rows, replaces one of these by giving a
+# row with the same key, and drops the ones it doesn't use with
+#   [common]
+#   hide = ["key", ...]
+# Row format and theme: docs/launcher.md. Values are written to the title's
+# settings/<file>.toml in place: only the changed lines differ.
+#
+# A user-facing cvar added to or renamed in the SDK gets its row here in the
+# same patch (next to docs/graphics-options.md).
+
+pages = ["Display", "Graphics", "Controls", "Game", "Advanced"]
+
+# Safe mode: a one-off start with these flags; the settings files stay as they are.
+safe_mode = [
+  "--gpu_plugin=xenos",
+  "--graphics_backend=vulkan",
+  "--resolution_scale=1",
+  "--present_effect=bilinear",
+  "--swap_post_effect=none",
+]
+
+#------------------------------------------------------------------------------
+# Display
+#------------------------------------------------------------------------------
+
+[[row]]
+page = "Display"
+key = "fullscreen"
+kind = "choice"
+label = "Screen mode"
+choices = [[true, "Fullscreen"], [false, "Windowed"]]
+default = true
+help = "Fullscreen covers the whole monitor. Windowed opens a window of the resolution below."
+
+[[row]]
+page = "Display"
+key = "monitor"
+kind = "select"
+label = "Monitor"
+source = "displays"  # the system's monitors, numbered as the game counts them
+default = 0
+help = "The monitor the game opens on. Default is the main one."
+
+[[row]]
+page = "Display"
+key = "resolution"
+kind = "select"
+label = "Resolution"
+source = "display_modes"  # the chosen monitor's full-screen sizes
+help = "The window's size, and the video mode the game is told about. The list is the chosen monitor's sizes; Default follows the game."
+
+[[row]]
+page = "Display"
+key = "vsync"
+kind = "toggle"
+label = "VSync"
+default = true
+help = "Waits for the monitor's refresh, so the picture never tears. Off answers a little sooner but can tear."
+
+#------------------------------------------------------------------------------
+# Graphics
+#------------------------------------------------------------------------------
+
+[[row]]
+page = "Graphics"
+key = "gpu_plugin"
+kind = "choice"
+label = "Renderer"
+choices = [
+  ["native", "Native", "file:rexgpu-native"],
+  ["xenos", "Emulated", "file:rexgpu-xenos"],
+]
+restart = true
+help = "Native draws the game's commands straight with Vulkan and is faster on the GPU. Emulated runs the Xbox 360 GPU emulation (Xenos): the most compatible path, and the one that can also use D3D12 or D3D11."
+
+[[row]]
+page = "Graphics"
+key = "graphics_backend"
+kind = "choice"
+label = "Graphics API"
+choices = [
+  ["any", "Auto"],
+  ["vulkan", "Vulkan"],
+  ["d3d12", "D3D12", "windows"],
+  ["d3d11", "D3D11", "windows"],
+]
+lock_if = { key = "gpu_plugin", value = "native", shows = "vulkan" }
+restart = true
+help = "Used by Emulated. Auto tries D3D12, then Vulkan. Native always renders with Vulkan; the choice here is kept for when you switch back. D3D11 is experimental."
+
+[[row]]
+page = "Graphics"
+key = "resolution_scale"
+kind = "slider"
+label = "Resolution scale"
+min = 1
+max = 4
+step = 1
+integer = true
+suffix = "×"
+default = 2
+restart = true
+help = "Draws the game at a multiple of its own 1280 × 720. 2 or 3 is typical; each step costs much more GPU time and memory."
+
+[[row]]
+page = "Graphics"
+key = "present_effect"
+kind = "choice"
+label = "Upscaler"
+choices = [["bilinear", "Off"], ["fsr", "FSR"], ["cas", "CAS"]]
+default = "fsr"
+help = "How the picture is scaled to the window. FSR 1 keeps edges sharp while scaling up, then sharpens. CAS only sharpens."
+
+[[row]]
+page = "Graphics"
+key = "present_fsr_sharpness_reduction"
+kind = "slider"
+label = "FSR softening"
+min = 0.0
+max = 2.0
+step = 0.1
+decimals = 1
+default = 0.2
+enable_if = { key = "present_effect", value = "fsr" }
+help = "How much FSR holds its sharpening back: 0 is the sharpest picture, 2 the softest."
+
+[[row]]
+page = "Graphics"
+key = "present_cas_additional_sharpness"
+kind = "slider"
+label = "CAS sharpness"
+min = 0.0
+max = 1.0
+step = 0.05
+decimals = 2
+default = 0.0
+enable_if = { key = "present_effect", value = "cas" }
+help = "Extra sharpening on top of CAS's own."
+
+[[row]]
+page = "Graphics"
+key = "swap_post_effect"
+kind = "choice"
+label = "Anti-aliasing"
+choices = [["none", "Off"], ["fxaa", "FXAA"], ["smaa", "SMAA"]]
+default = "smaa"
+restart = true
+help = "Smooths jagged edges after the frame is drawn. SMAA is sharper and better on thin lines; FXAA is lighter but slightly blurry."
+
+[[row]]
+page = "Graphics"
+key = "anisotropic_override"
+kind = "choice"
+label = "Texture filtering"
+choices = [[-1, "Game"], [2, "2×"], [3, "4×"], [4, "8×"], [5, "16×"]]
+default = 5
+help = "Keeps textures sharp on surfaces seen at a steep angle. Game leaves it to the title."
+
+#------------------------------------------------------------------------------
+# Controls
+#------------------------------------------------------------------------------
+
+[[row]]
+page = "Controls"
+key = "input_backend"
+file = "mapping"
+kind = "choice"
+label = "Gamepad driver"
+choices = [["sdl", "SDL"], ["xinput", "XInput", "windows"]]
+default = "sdl"
+restart = true
+help = "SDL works with Xbox, PlayStation, Switch and most other gamepads, all mapped to the Xbox layout. XInput sees Xbox gamepads only."
+
+[[row]]
+page = "Controls"
+key = "mnk_mode"
+file = "mapping"
+kind = "toggle"
+label = "Keyboard and mouse"
+default = true
+help = "Play with keyboard and mouse. A connected gamepad keeps working at the same time."
+
+[[row]]
+page = "Controls"
+key = "mnk_mouse"
+file = "mapping"
+kind = "toggle"
+label = "Mouse as right stick"
+default = true
+enable_if = { key = "mnk_mode", value = true }
+help = "Mouse movement drives the right stick where the game has no mouse look of its own (menus, vehicles)."
+
+[[row]]
+page = "Controls"
+kind = "button"
+label = "Key bindings"
+button = "Edit bindings…"
+action = "bindings"
+help = "Keyboard and mouse keys for every gamepad button (the keybind_* lines of settings/mapping.toml), on a picture of the pad, and the title's own PC actions."
+
+[[row]]
+page = "Controls"
+key = "max_local_users"
+kind = "choice"
+label = "Players"
+choices = [[1, "1"], [2, "2"], [3, "3"], [4, "4"]]
+default = 1
+restart = true
+help = "Local split-screen players. Players after the first sign in when their gamepad is assigned."
+
+#------------------------------------------------------------------------------
+# Advanced
+#------------------------------------------------------------------------------
+
+[[row]]
+page = "Advanced"
+key = "user_language"
+kind = "select"
+label = "Language"
+choices = [
+  [1, "English"],
+  [2, "Japanese"],
+  [3, "German"],
+  [4, "French"],
+  [5, "Spanish"],
+  [6, "Italian"],
+  [7, "Korean"],
+  [8, "Chinese (Traditional)"],
+  [9, "Portuguese"],
+  [10, "Chinese (Simplified)"],
+  [11, "Polish"],
+  [12, "Russian"],
+]
+default = 1
+restart = true
+help = "The console language the game sees. A language the game doesn't have falls back to English."
+
+[[row]]
+page = "Advanced"
+key = "async_shader_compilation"
+kind = "toggle"
+label = "Background shader compilation"
+default = true
+help = "Prepares shaders on other threads: fewer stutters, sometimes a missing effect for a moment."
+
+[[row]]
+page = "Advanced"
+key = "log_level"
+kind = "select"
+label = "Log detail"
+choices = [["error", "Errors only"], ["warn", "Warnings"], ["info", "Info"], ["debug", "Debug"], ["trace", "Trace"]]
+default = "error"
+help = "How much the game writes to its log. Errors only for playing; Info or Debug when reporting a problem."
+
+[[row]]
+page = "Advanced"
+kind = "button"
+label = "Settings files"
+button = "Open settings folder"
+action = "open_settings"
+help = "Opens the settings folder: hardware.toml and mapping.toml, with a comment on every line."
+
+[[row]]
+page = "Advanced"
+kind = "button"
+label = "Logs"
+button = "Open logs folder"
+action = "open_logs"
+help = "Opens the folder with the game's logs, for a bug report."
+
+[[row]]
+page = "Advanced"
+kind = "button"
+label = "Defaults"
+button = "Reset all settings"
+action = "reset_all"
+help = "Puts every setting back to its recommended value. Nothing is written until Save or Play."

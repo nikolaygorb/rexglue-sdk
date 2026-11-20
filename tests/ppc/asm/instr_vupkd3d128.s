@@ -97,3 +97,39 @@ test_vupkd3d128_ulong_4202020_2:
   .long 0x18781FF0
   blr
   #_ REGISTER_OUT v3 [7FC00000, 40400000, 4047FFFF, 3F80000F]
+
+# SHORT2 / SHORT4: -32768 unpacks to a quiet NaN. From upstream rexglue tests/ppc/asm/instr_vupkd3d128.s.
+test_vupkd3d128_short2_4:
+  #_ REGISTER_IN v3 [00000000, 00000000, 00000000, 80008000]
+  # vupkd3d128 v3, v3, 1
+  .long 0x18641FF0
+  blr
+  #_ REGISTER_OUT v3 [7FC00000, 7FC00000, 00000000, 3F800000]
+
+test_vupkd3d128_short2_5:
+  #_ REGISTER_IN v3 [FFFFFFFF, FFFFFFFF, FFFFFFFF, FFFFFFFF]
+  # vupkd3d128 v3, v3, 1
+  .long 0x18641FF0
+  blr
+  #_ REGISTER_OUT v3 [403FFFFF, 403FFFFF, 00000000, 3F800000]
+
+test_vupkd3d128_short4_1:
+  #_ REGISTER_IN v3 [00000000, 00000000, 00008000, 00000000]
+  # vupkd3d128 v3, v3, 4
+  .long 0x18701FF0
+  blr
+  #_ REGISTER_OUT v3 [40400000, 7FC00000, 40400000, 40400000]
+
+test_vupkd3d128_short4_2:
+  #_ REGISTER_IN v3 [00000000, 00000000, 80008000, 00000000]
+  # vupkd3d128 v3, v3, 4
+  .long 0x18701FF0
+  blr
+  #_ REGISTER_OUT v3 [7FC00000, 7FC00000, 40400000, 40400000]
+
+test_vupkd3d128_short4_3:
+  #_ REGISTER_IN v3 [FFFFFFFF, FFFFFFFF, FFFFFFFF, FFFFFFFF]
+  # vupkd3d128 v3, v3, 4
+  .long 0x18701FF0
+  blr
+  #_ REGISTER_OUT v3 [403FFFFF, 403FFFFF, 403FFFFF, 403FFFFF]

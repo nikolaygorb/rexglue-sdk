@@ -1372,6 +1372,25 @@ dxbc::Src DxbcShaderTranslator::LoadOperand(const InstructionOperand& operand,
         index.index_ = float_constant_index;
       } else {
         assert_true(constant_register_map.float_dynamic_addressing);
+        if (REXCVAR_GET(clamp_relative_float_constants)) {
+          // a0 + N or aL + N clamped to the 256 constants (a0 itself only to
+          // [-256, 255]): the float constants are a root CBV, not bounds
+          // checked, and on AMD a negative byte offset wraps to base + 4 GB,
+          // a page fault removing the device (Fable II's trail effect on
+          // RDNA 3 and 4, himdo/rexglue-sdk 0fe6654).
+          uint32_t index_temp = PushSystemTemp();
+          temp_pushed_out = true;
+          dxbc::Dest index_dest(dxbc::Dest::R(index_temp, 0b0001));
+          dxbc::Src index_src(dxbc::Src::R(index_temp, dxbc::Src::kXXXX));
+          dxbc::Src relative_src =
+              operand.storage_addressing_mode == InstructionStorageAddressingMode::kLoopRelative
+                  ? dxbc::Src::R(system_temp_aL_, dxbc::Src::kXXXX)
+                  : dxbc::Src::R(system_temp_ps_pc_p0_a0_, dxbc::Src::kWWWW);
+          a_.OpIAdd(index_dest, relative_src, dxbc::Src::LI(int32_t(operand.storage_index)));
+          a_.OpIMax(index_dest, index_src, dxbc::Src::LI(0));
+          a_.OpIMin(index_dest, index_src, dxbc::Src::LI(255));
+          index = dxbc::Index(index_temp, 0);
+        }
       }
       src = dxbc::Src::CB(cbuffer_index_float_constants_,
                           uint32_t(CbufferRegister::kFloatConstants), index);

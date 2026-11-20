@@ -58,6 +58,11 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
 u32 XexGetModuleHandle_entry(mapped_string module_name, mapped_u32 hmodule_ptr);
 }  // namespace rex::kernel::xboxkrnl
 
+namespace rex::kernel::xboxkrnl {
+u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 size, u32 protect, u32 minimum, u32 maximum,
+                                     u32 alignment);
+}
+
 namespace rex {
 namespace kernel {
 namespace xam {
@@ -352,21 +357,60 @@ void XamNavigateBack_entry() {
   REX_KERNEL_STATE()->TerminateTitle();
 }
 
-u32 XamAlloc_entry(u32 unk, u32 size, mapped_u32 out_ptr) {
-  assert_true(unk == 0);
-
-  // Allocate from the heap. Not sure why XAM does this specially, perhaps
-  // it keeps stuff in a separate heap?
-  uint32_t ptr = REX_KERNEL_MEMORY()->SystemHeapAlloc(size);
-  *out_ptr = ptr;
-
-  return X_ERROR_SUCCESS;
+u32 XamAlloc_entry(u32 flags, u32 size, mapped_u32 out_ptr) {
+  if (!out_ptr)
+    return X_E_INVALIDARG;
+  *out_ptr = 0;
+  constexpr uint32_t kWorkspace = 0x10000000, kSystem = 0x04000000, kNoZero = 0x00100000;
+  if (flags && !(flags & (kWorkspace | kSystem)))
+    return X_E_UNEXPECTED;
+  if ((flags & kSystem) && size > 0x10000000)
+    return X_E_OUTOFMEMORY;
+  const uint32_t address = flags & kSystem
+                               ? REX_KERNEL_MEMORY()->SystemHeapAlloc(std::max(uint32_t(size), 1u))
+                               : REX_KERNEL_STATE()->AllocWorkspace(size, !(flags & kNoZero));
+  if (!address)
+    return X_E_OUTOFMEMORY;
+  *out_ptr = address;
+  return X_E_SUCCESS;
 }
 
-u32 XamFree_entry(mapped_u32 ptr) {
-  REX_KERNEL_MEMORY()->SystemHeapFree(ptr.guest_address());
+u32 XamAllocEx_entry(u32 attributes, u32 flags, u32 size, mapped_u32 out_ptr) {
+  if (!(flags & 0x40000000))
+    return XamAlloc_entry(flags, size, out_ptr);
+  if (!out_ptr)
+    return X_E_INVALIDARG;
+  *out_ptr = 0;
+  if (!size || size > 0x1FFFFFFF)
+    return X_E_OUTOFMEMORY;
+  const uint32_t mode = (attributes >> 28) & 3;
+  uint32_t alignment_shift = (attributes >> 24) & 15;
+  if (!alignment_shift)
+    alignment_shift = 12;
+  const uint32_t protection[] = {X_PAGE_READWRITE | X_PAGE_WRITECOMBINE | X_MEM_LARGE_PAGES,
+                                 X_PAGE_READWRITE | X_PAGE_NOCACHE, X_PAGE_READWRITE,
+                                 X_PAGE_READWRITE | X_PAGE_WRITECOMBINE};
+  const uint32_t address = xboxkrnl::MmAllocatePhysicalMemoryEx_entry(
+      0, size, protection[mode], 0, UINT32_MAX, 1u << alignment_shift);
+  if (!address)
+    return X_E_OUTOFMEMORY;
+  if (attributes & 0x40000000)
+    REX_KERNEL_MEMORY()->Zero(address, size);
+  *out_ptr = address;
+  return X_E_SUCCESS;
+}
 
-  return X_ERROR_SUCCESS;
+void XamFree_entry(mapped_u32 ptr) {
+  const uint32_t address = ptr.guest_address();
+  if (!address || REX_KERNEL_STATE()->FreeWorkspace(address))
+    return;
+  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  auto* heap = REX_KERNEL_MEMORY()->LookupHeap(address);
+  memory::HeapAllocationInfo info{};
+  if (heap && heap->QueryRegionInfo(address, &info) && info.allocation_base == address &&
+      (info.state & memory::kMemoryAllocationReserve)) {
+    heap->Release(address);
+  }
 }
 
 u32 XamQueryLiveHiveW_entry(mapped_wstring name, mapped_void out_buf, u32 out_size,
@@ -593,7 +637,7 @@ u32 XGetOverlappedExtendedError_entry(ppc_ptr_t<XAM_OVERLAPPED> overlapped_ptr) 
   if (!overlapped_ptr) {
     return XThread::GetLastError();
   }
-  if (overlapped_ptr->result == X_ERROR_IO_PENDING) {
+  if (XOverlappedGetResult(overlapped_ptr.host_address()) == X_ERROR_IO_PENDING) {
     return X_ERROR_IO_INCOMPLETE;
   }
   return overlapped_ptr->extended_error;
@@ -771,6 +815,7 @@ REX_EXPORT(__imp__XamLoaderLaunchTitle, rex::kernel::xam::XamLoaderLaunchTitle_e
 REX_EXPORT(__imp__XamLoaderTerminateTitle, rex::kernel::xam::XamLoaderTerminateTitle_entry)
 REX_EXPORT(__imp__XamNavigateBack, rex::kernel::xam::XamNavigateBack_entry)
 REX_EXPORT(__imp__XamAlloc, rex::kernel::xam::XamAlloc_entry)
+REX_EXPORT(__imp__XamAllocEx, rex::kernel::xam::XamAllocEx_entry)
 REX_EXPORT(__imp__XamFree, rex::kernel::xam::XamFree_entry)
 REX_EXPORT(__imp__XamQueryLiveHiveW, rex::kernel::xam::XamQueryLiveHiveW_entry)
 REX_EXPORT(__imp__XamLoaderGetDvdTrayState, rex::kernel::xam::XamLoaderGetDvdTrayState_entry)

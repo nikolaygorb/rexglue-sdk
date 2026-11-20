@@ -121,6 +121,31 @@ namespace rex::cvar {
 
 std::vector<std::string> Init(int argc, char** argv);
 void LoadConfig(const std::filesystem::path& config_path);
+
+// What LoadConfig ran into, for the app to log once logging is up
+// (LoadConfig runs before the log opens). A setting written more than once
+// (an old line left above a new one) is read with the last value winning and
+// reported as kDuplicates; a file that still can't be parsed is left unused
+// (defaults apply), copied to `<config>.bad` first so the next save doesn't
+// destroy the player's edits, and reported as kUnreadable with the parser's
+// line and message (Perfect Dark XBLA PC Recomp 3bc95e0).
+struct ConfigLoadReport {
+  enum class Kind { kNone, kDuplicates, kUnreadable };
+  Kind kind = Kind::kNone;
+  std::filesystem::path path;
+  std::vector<std::string> duplicate_keys;  // kDuplicates: each key once, in file order
+  int line = 0;                             // kUnreadable: 1-based, 0 if unknown
+  std::string error;                        // kUnreadable: the parser's message
+  std::filesystem::path bad_copy;           // kUnreadable: empty if the copy failed
+};
+// One entry per LoadConfig call that found a problem since the start.
+std::vector<ConfigLoadReport> GetConfigLoadReports();
+
+// The config text with every key set more than once in the same table kept at
+// its last line only; `dropped` gets each such key once, in file order. The
+// text is unchanged when nothing repeats.
+std::string DropEarlierConfigDuplicates(const std::string& text,
+                                        std::vector<std::string>& dropped);
 void ApplyEnvironment();
 void FinalizeInit();
 bool IsFinalized();

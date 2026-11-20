@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <bit>
 #include <compare>
 #include <concepts>
@@ -67,6 +68,24 @@ struct endian_store {
       return value;
     }
     return rex::byte_swap(value);
+  }
+
+  // Preserve the guest layout while publishing host completion words.
+  T load(std::memory_order order) const {
+    static_assert(std::atomic_ref<T>::is_always_lock_free);
+    assert_true(reinterpret_cast<uintptr_t>(&value) % std::atomic_ref<T>::required_alignment == 0);
+    const T raw = std::atomic_ref<const T>(value).load(order);
+    if constexpr (std::endian::native == E)
+      return raw;
+    return rex::byte_swap(raw);
+  }
+
+  void store(T src, std::memory_order order) {
+    static_assert(std::atomic_ref<T>::is_always_lock_free);
+    assert_true(reinterpret_cast<uintptr_t>(&value) % std::atomic_ref<T>::required_alignment == 0);
+    if constexpr (std::endian::native != E)
+      src = rex::byte_swap(src);
+    std::atomic_ref<T>(value).store(src, order);
   }
 
   endian_store<T, E>& operator+=(int a) {

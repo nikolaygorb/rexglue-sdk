@@ -28,6 +28,23 @@ TEST_CASE("xeObStripDosDevicesPrefix drops a leading DOS devices directory", "[k
   std::string inner = "game:\\??\\file.bin";
   xeObStripDosDevicesPrefix(inner);
   REQUIRE(inner == "game:\\??\\file.bin");
+
+  // \System??\ in any case (xenia-edge d4c0f95a2).
+  for (const char* prefix : {"\\System??\\", "\\system??\\", "\\SYSTEM??\\"}) {
+    std::string system = std::string(prefix) + "game:\\file.bin";
+    xeObStripDosDevicesPrefix(system);
+    REQUIRE(system == "game:\\file.bin");
+  }
+  std::string short_name = "\\System??";
+  xeObStripDosDevicesPrefix(short_name);
+  REQUIRE(short_name == "\\System??");
+  std::string one_mark = "\\System?\\game:";
+  xeObStripDosDevicesPrefix(one_mark);
+  REQUIRE(one_mark == "\\System?\\game:");
+  // Bytes after the prefix are kept as they are.
+  std::string bytes = "\\System??\\\xFF\xFE";
+  xeObStripDosDevicesPrefix(bytes);
+  REQUIRE(bytes == "\xFF\xFE");
 }
 
 TEST_CASE("xeObSymbolicLinkName gives one name for every spelling", "[kernel][ob]") {

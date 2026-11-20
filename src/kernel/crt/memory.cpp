@@ -57,16 +57,26 @@ static void* native_memset_vmx(void* dst, int val, size_t n) {
 // Secure variants (return errno_t)
 // ---------------------------------------------------------------------------
 
-static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t count) {
-  if (!dst || !src || count > dstsz)
-    return 22;  // EINVAL
+static int native_memcpy_s(void* dst, uint32_t dstsz, const void* src, uint32_t count) {
+  if (!count)
+    return 0;
+  if (!dst)
+    return 22;
+  if (!src || dstsz < count) {
+    std::memset(dst, 0, dstsz);
+    return src ? 34 : 22;
+  }
   std::memcpy(dst, src, count);
   return 0;
 }
 
-static int native_memmove_s(void* dst, size_t dstsz, const void* src, size_t count) {
-  if (!dst || !src || count > dstsz)
-    return 22;  // EINVAL
+static int native_memmove_s(void* dst, uint32_t dstsz, const void* src, uint32_t count) {
+  if (!count)
+    return 0;
+  if (!dst || !src)
+    return 22;
+  if (dstsz < count)
+    return 34;
   std::memmove(dst, src, count);
   return 0;
 }

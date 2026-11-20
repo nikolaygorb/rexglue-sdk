@@ -41,6 +41,7 @@ class HostPathEntry : public Entry {
   std::unique_ptr<memory::MappedMemory> OpenMapped(memory::MappedMemory::Mode mode, size_t offset,
                                                    size_t length) override;
   void update() override;
+  bool is_empty_folder() const override;
   bool has_open_files() const override;
   void RetainFile() override { open_files_.fetch_add(1); }
   // The last handle closing deletes an entry set for deletion.
@@ -48,6 +49,7 @@ class HostPathEntry : public Entry {
   bool SetCreateTimestamp(uint64_t timestamp) override;
   bool SetAccessTimestamp(uint64_t timestamp) override;
   bool SetWriteTimestamp(uint64_t timestamp) override;
+  bool SetAttributes(uint32_t attributes) override;
 
  private:
   friend class HostPathDevice;

@@ -39,6 +39,7 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/atomic.h>
 #include <rex/thread/mutex.h>
+#include <rex/thread/guest_spinlock.h>
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -95,30 +96,18 @@ X_STATUS OpenNamedObject(KernelState* kernel_state, uint32_t obj_attributes_ptr,
   if (name.empty()) {
     return X_STATUS_SUCCESS;
   }
-  auto object_table = kernel_state->object_table();
-  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
-  if (XFAILED(object_table->GetObjectByName(name, &handle))) {
-    return X_STATUS_SUCCESS;
-  }
-  const bool open_if = obj_attributes->attributes & kObjOpenIf;
-  auto object = object_table->LookupObject<XObject>(handle);
-  if (object && open_if && object->type() == T::kObjectType) {
-    // The lookup's handle reference is the caller's.
-    if (handle_ptr) {
-      *handle_ptr = handle;
-    } else {
-      object_table->ReleaseHandle(handle);
-    }
-    return X_STATUS_OBJECT_NAME_EXISTS;
-  }
-  object_table->ReleaseHandle(handle);
-  if (!object) {
+  X_HANDLE handle = 0;
+  X_STATUS result = kernel_state->object_table()->OpenNamedHandle(
+      name, T::kObjectType, (obj_attributes->attributes & kObjOpenIf) != 0, &handle);
+  if (result == X_STATUS_OBJECT_NAME_NOT_FOUND) {
     return X_STATUS_SUCCESS;
   }
   if (handle_ptr) {
-    *handle_ptr = 0;
+    *handle_ptr = handle;
+  } else if (handle) {
+    kernel_state->object_table()->ReleaseHandle(handle);
   }
-  return open_if ? X_STATUS_OBJECT_TYPE_MISMATCH : X_STATUS_OBJECT_NAME_COLLISION;
+  return result;
 }
 
 u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 thread_id_ptr,
@@ -303,7 +292,7 @@ u32 KeSetAffinityThread_entry(mapped_void thread_ptr, u32 affinity,
   // Windows NT, stores the previous affinity via the pointer provided as an
   // argument, not in the return value - the return value is used for the
   // result.
-  if (!affinity) {
+  if (!affinity || (affinity & ~0x3Fu)) {
     return X_STATUS_INVALID_PARAMETER;
   }
   auto thread = XObject::GetNativeObject<XThread>(REX_KERNEL_STATE(), thread_ptr);
@@ -312,10 +301,11 @@ u32 KeSetAffinityThread_entry(mapped_void thread_ptr, u32 affinity,
                         thread_ptr.guest_address());
     return X_STATUS_INVALID_HANDLE;
   }
-  if (previous_affinity_ptr) {
-    *previous_affinity_ptr = uint32_t(1) << thread->active_cpu();
-  }
-  thread->SetAffinity(affinity);
+  const uint32_t previous = uint32_t(1) << thread->active_cpu();
+  if (!thread->SetAffinity(affinity))
+    return X_STATUS_INVALID_PARAMETER;
+  if (previous_affinity_ptr)
+    *previous_affinity_ptr = previous;
   REXKRNL_IMPORT_RESULT("KeSetAffinityThread", "0x0");
   return X_STATUS_SUCCESS;
 }
@@ -402,8 +392,9 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
   XThread* thread = XThread::GetCurrentThread();
 
   thread->DeliverKernelAPCs();
-  if (alertable) {
+  if (alertable && thread->HasPendingUserApc()) {
     thread->DeliverAPCs();
+    return X_STATUS_USER_APC;
   }
 
   // TODO(Ecredes): Verify whether a null interval should be treated as zero.
@@ -605,6 +596,7 @@ u32 NtClearEvent_entry(u32 handle) {
 
 // https://msdn.microsoft.com/en-us/library/windows/hardware/ff552150(v=vs.85).aspx
 void KeInitializeSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 count, u32 limit) {
+  semaphore_ptr.Zero();
   semaphore_ptr->header.type = 5;  // SemaphoreObject
   semaphore_ptr->header.signal_state = (uint32_t)count;
   semaphore_ptr->limit = (uint32_t)limit;
@@ -682,7 +674,7 @@ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previ
   } else {
     result = X_STATUS_INVALID_HANDLE;
   }
-  if (previous_count_ptr) {
+  if (previous_count_ptr && result == X_STATUS_SUCCESS) {
     *previous_count_ptr = (uint32_t)previous_count;
   }
 
@@ -739,6 +731,9 @@ u32 NtReleaseMutant_entry(u32 mutant_handle, u32 unknown) {
 
 u32 NtCreateTimer_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_ptr, u32 timer_type) {
   // timer_type = NotificationTimer (0) or SynchronizationTimer (1)
+  if (timer_type > 1) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
 
   // Check for an existing timer with the same name.
   if (X_STATUS result = OpenNamedObject<XTimer>(
@@ -969,16 +964,14 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
   const uint32_t self = rex::byte_swap(pcr_addr);
   assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
-  while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
-    rex::thread::MaybeYield();
-  }
+  rex::thread::AcquireGuestSpinLock(&lock->prcb_of_owner.value, self);
   return old_irql;
 }
 
 void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, uint32_t old_irql,
                            bool change_irql) {
   assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r13.u64));
-  rex::thread::atomic_store_release(0u, &lock->prcb_of_owner.value);
+  rex::thread::ReleaseGuestSpinLock(&lock->prcb_of_owner.value);
   if (change_irql && old_irql < IRQL_DISPATCH) {
     xeKfLowerIrql(ctx, static_cast<unsigned char>(old_irql));
   }
@@ -1416,10 +1409,9 @@ void ExReleaseReadWriteLock_entry(ppc_ptr_t<X_ERWLOCK> lock_ptr) {
       xeKeReleaseSemaphore(&lock_ptr->reader_semaphore, 1, readers_waiting_count, 0);
       return;
     }
-  }
-
-  auto readers_entry_count = --lock_ptr->readers_entry_count;
-  if (readers_entry_count) {
+  } else if (--lock_ptr->readers_entry_count) {
+    // Other readers still hold the lock. An exclusive owner has no reader
+    // count to decrement and must wake the waiting writer directly.
     xeKeKfReleaseSpinLock(ctx, &lock_ptr->spin_lock, old_irql);
     return;
   }

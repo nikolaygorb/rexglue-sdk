@@ -579,6 +579,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // function so it doesn't have to handle this case.
     if (used_result_components) {
       StoreResult(instr.result, const_float_vectors_0_[used_result_component_count - 1]);
+    } else if (instr.result.GetUsedWriteMask()) {
+      // Only constant 0 / 1 components, stored as the DXBC translator does:
+      // else the register kept what it held (ReIGlue 0439: FM4 tracks'
+      // shadow fetches made constant 1 drew in shadow on Vulkan).
+      StoreResult(instr.result, spv::NoResult);
     }
     return;
   }
@@ -1123,7 +1128,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // This affects both size and offset calculations.
     spv::Id is_texture_resolved = spv::NoResult;
     if (REXCVAR_GET(draw_resolution_scaled_texture_offsets) &&
-        (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1)) {
+        (draw_resolution_scale4_x_ > 4 || draw_resolution_scale4_y_ > 4)) {
       // Load textures_resolved from system constants.
       id_vector_temp_.clear();
       id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantTexturesResolutionScaled));
@@ -1147,17 +1152,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     // The size must be scaled so that coordinate normalization and offset
     // calculations use the correct host dimensions.
     if (is_texture_resolved != spv::NoResult && size_needed_components) {
-      if (size[0] != spv::NoResult && draw_resolution_scale_x_ > 1) {
+      if (size[0] != spv::NoResult && draw_resolution_scale4_x_ > 4) {
         spv::Id scaled_size_x = builder_->createNoContractionBinOp(
             spv::OpFMul, type_float_, size[0],
-            builder_->makeFloatConstant(float(draw_resolution_scale_x_)));
+            builder_->makeFloatConstant(float(draw_resolution_scale4_x_) * 0.25f));
         size[0] = builder_->createTriOp(spv::OpSelect, type_float_, is_texture_resolved,
                                         scaled_size_x, size[0]);
       }
-      if (size[1] != spv::NoResult && draw_resolution_scale_y_ > 1) {
+      if (size[1] != spv::NoResult && draw_resolution_scale4_y_ > 4) {
         spv::Id scaled_size_y = builder_->createNoContractionBinOp(
             spv::OpFMul, type_float_, size[1],
-            builder_->makeFloatConstant(float(draw_resolution_scale_y_)));
+            builder_->makeFloatConstant(float(draw_resolution_scale4_y_) * 0.25f));
         size[1] = builder_->createTriOp(spv::OpSelect, type_float_, is_texture_resolved,
                                         scaled_size_y, size[1]);
       }
@@ -1250,10 +1255,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           // textures, since size below is in host texels. Done before the
           // offset add so the offset stays at 1 host texel rather than being
           // multiplied with the coord.
-          if (is_texture_resolved != spv::NoResult && ((i == 0 && draw_resolution_scale_x_ > 1) ||
-                                                       (i == 1 && draw_resolution_scale_y_ > 1))) {
-            float scale =
-                (i == 0) ? float(draw_resolution_scale_x_) : float(draw_resolution_scale_y_);
+          if (is_texture_resolved != spv::NoResult &&
+              ((i == 0 && draw_resolution_scale4_x_ > 4) ||
+               (i == 1 && draw_resolution_scale4_y_ > 4))) {
+            float scale = float(i == 0 ? draw_resolution_scale4_x_ : draw_resolution_scale4_y_) *
+                          0.25f;
             spv::Id scaled_coord = builder_->createNoContractionBinOp(
                 spv::OpFMul, type_float_, coordinate_ref, builder_->makeFloatConstant(scale));
             coordinate_ref = builder_->createTriOp(spv::OpSelect, type_float_, is_texture_resolved,
@@ -1432,11 +1438,28 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                 builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, z_stacked, z_offset);
           }
           // Clamp the layer index to a valid range so an Inf or NaN coordinate
-          // does not select an undefined array layer.
-          z_stacked = builder_->createTriBuiltinCall(
+          // does not select an undefined array layer. A stack repeating on its
+          // layer axis (stacked_texture_layer_wrap) wraps it into [0, layers]
+          // instead, NaN still giving 0; the linear filter between layers then
+          // blends the last layer into the first.
+          spv::Id z_clamped = builder_->createTriBuiltinCall(
               type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, z_stacked, const_float_0_,
               builder_->createNoContractionBinOp(spv::OpFSub, type_float_, z_size,
                                                  builder_->makeFloatConstant(1.0f)));
+          spv::Id z_wrapped = builder_->createNoContractionBinOp(
+              spv::OpFSub, type_float_, z_stacked,
+              builder_->createNoContractionBinOp(
+                  spv::OpFMul, type_float_, z_size,
+                  builder_->createUnaryBuiltinCall(
+                      type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
+                      builder_->createNoContractionBinOp(spv::OpFDiv, type_float_, z_stacked,
+                                                         z_size))));
+          z_wrapped = builder_->createTriBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                     GLSLstd450NClamp, z_wrapped, const_float_0_,
+                                                     z_size);
+          z_stacked = builder_->createTriOp(spv::OpSelect, type_float_,
+                                            LoadStackedLayerWrap(fetch_constant_index), z_wrapped,
+                                            z_clamped);
           builder_->createBranch(&block_dimension_merge);
           // Select one of the two.
           builder_->setBuildPoint(&block_dimension_merge);
@@ -2099,6 +2122,13 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               }
             }
             spv::Id layer_coordinate = coordinates[2];
+            // A stack wrapping its layers (normalized coordinates only, wrapped
+            // into [0, layers] above): the layer before the first is the last,
+            // the one after the last the first.
+            spv::Id layer_wrap = spv::NoResult;
+            if (!instr.attributes.unnormalized_coordinates && size[2] != spv::NoResult) {
+              layer_wrap = LoadStackedLayerWrap(fetch_constant_index);
+            }
             // Linear filtering may be needed either based on a dynamic
             // condition (the filtering mode is taken from the fetch constant,
             // or it's different for magnification and minification), or on a
@@ -2126,10 +2156,22 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             // previously).
             spv::Id layer_0_coordinate = builder_->createUnaryBuiltinCall(
                 type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor, layer_coordinate);
+            spv::Id layer_0_coordinate_sampled = layer_0_coordinate;
+            if (layer_wrap != spv::NoResult) {
+              layer_0_coordinate_sampled = builder_->createTriOp(
+                  spv::OpSelect, type_float_,
+                  builder_->createBinOp(
+                      spv::OpLogicalAnd, type_bool_, layer_wrap,
+                      builder_->createBinOp(spv::OpFOrdLessThan, type_bool_, layer_0_coordinate,
+                                            const_float_0_)),
+                  builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, layer_0_coordinate,
+                                                     size[2]),
+                  layer_0_coordinate);
+            }
             id_vector_temp_.clear();
             id_vector_temp_.push_back(coordinates[0]);
             id_vector_temp_.push_back(coordinates[1]);
-            id_vector_temp_.push_back(layer_0_coordinate);
+            id_vector_temp_.push_back(layer_0_coordinate_sampled);
             texture_parameters.coords =
                 builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
             SampleTexture(texture_parameters, image_operands_mask, image_2d_array_or_cube_unsigned,
@@ -2154,6 +2196,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               }
               spv::Id layer_1_coordinate = builder_->createBinOp(
                   spv::OpFAdd, type_float_, layer_0_coordinate, builder_->makeFloatConstant(1.0f));
+              if (layer_wrap != spv::NoResult) {
+                layer_1_coordinate = builder_->createTriOp(
+                    spv::OpSelect, type_float_,
+                    builder_->createBinOp(spv::OpLogicalAnd, type_bool_, layer_wrap,
+                                          builder_->createBinOp(spv::OpFOrdGreaterThanEqual,
+                                                                type_bool_, layer_1_coordinate,
+                                                                size[2])),
+                    builder_->createNoContractionBinOp(spv::OpFSub, type_float_,
+                                                       layer_1_coordinate, size[2]),
+                    layer_1_coordinate);
+              }
               id_vector_temp_.clear();
               id_vector_temp_.push_back(coordinates[0]);
               id_vector_temp_.push_back(coordinates[1]);
@@ -2864,6 +2917,21 @@ void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& textu
     (i ? result_signed_out : result_unsigned_out) =
         sign_if.createMergePhi(sign_result, const_float4_0_);
   }
+}
+
+spv::Id SpirvShaderTranslator::LoadStackedLayerWrap(uint32_t fetch_constant_index) {
+  assert_true(fetch_constant_index < 32);
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantTexturesStackedLayerWrap));
+  spv::Id textures_stacked_layer_wrap = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                  id_vector_temp_),
+      spv::NoPrecision);
+  return builder_->createBinOp(
+      spv::OpINotEqual, type_bool_,
+      builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, textures_stacked_layer_wrap,
+                            builder_->makeUintConstant(UINT32_C(1) << fetch_constant_index)),
+      const_uint_0_);
 }
 
 spv::Id SpirvShaderTranslator::QueryTextureLod(spv::Builder::TextureParameters& texture_parameters,

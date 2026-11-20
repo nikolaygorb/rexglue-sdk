@@ -19,6 +19,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/ui/d3d12/dred.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -58,31 +59,7 @@ void LogPresentDeviceLoss(ID3D12Device* device, HRESULT present_result) {
   REXLOG_ERROR("D3D12 Present lost the device: result 0x{:08X}, removed reason 0x{:08X}",
                static_cast<unsigned>(present_result),
                static_cast<unsigned>(device->GetDeviceRemovedReason()));
-  Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred;
-  if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
-    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
-    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
-      for (const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode; node;
-           node = node->pNext) {
-        if (!node->pLastBreadcrumbValue || !node->pCommandHistory ||
-            *node->pLastBreadcrumbValue == 0) {
-          continue;
-        }
-        uint32_t last = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
-        REXLOG_ERROR("DRED breadcrumb: completed {} of {} ops", last, node->BreadcrumbCount);
-        uint32_t end = std::min(last + 1, node->BreadcrumbCount);
-        for (uint32_t i = last > 3 ? last - 3 : 0; i < end; ++i) {
-          REXLOG_ERROR("  [{}] op type {}{}", i, static_cast<int>(node->pCommandHistory[i]),
-                       i == last ? " <-- FAULT" : "");
-        }
-      }
-    }
-    D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
-    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) &&
-        page_fault.PageFaultVA != 0) {
-      REXLOG_ERROR("DRED page fault at VA 0x{:016X}", page_fault.PageFaultVA);
-    }
-  }
+  LogDredDeviceLoss(device);
   rex::FlushLogging();
 }
 }  // namespace

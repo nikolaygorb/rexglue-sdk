@@ -214,6 +214,7 @@ Entry* VirtualFileSystem::CreatePath(const std::string_view path, uint32_t attri
 }
 
 bool VirtualFileSystem::DeletePath(const std::string_view path) {
+  auto global_lock = global_critical_region_.Acquire();
   auto entry = ResolvePath(path);
   if (!entry) {
     return false;
@@ -223,6 +224,13 @@ bool VirtualFileSystem::DeletePath(const std::string_view path) {
     // Can't delete root.
     return false;
   }
+  if ((entry->attributes() & kFileAttributeDirectory) && !entry->is_empty_folder()) {
+    return false;
+  }
+  if (entry->has_open_files()) {
+    entry->SetForDeletion(true);
+    return true;
+  }
   return parent->Delete(entry);
 }
 
@@ -230,6 +238,8 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
                                      FileDisposition creation_disposition, uint32_t desired_access,
                                      bool is_directory, bool is_non_directory, File** out_file,
                                      FileAction* out_action) {
+  // Keep entries alive from resolution through the file's RetainFile call.
+  auto global_lock = global_critical_region_.Acquire();
   // TODO(gibbed): should 'is_directory' remain as a bool or should it be
   // flipped to a generic FileAttributeFlags?
 
@@ -252,13 +262,21 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   auto base_path = rex::string::utf8_find_base_guest_path(path);
   if (!base_path.empty()) {
     parent_entry = !root_entry ? ResolvePath(base_path) : root_entry->ResolvePath(base_path);
-    if (!parent_entry) {
+    if (parent_entry && !(parent_entry->attributes() & kFileAttributeDirectory)) {
       *out_action = FileAction::kDoesNotExist;
       return X_STATUS_OBJECT_PATH_NOT_FOUND;
     }
-
-    auto file_name = rex::string::utf8_find_name_from_guest_path(path);
-    entry = parent_entry->GetChild(file_name);
+    if (parent_entry) {
+      auto file_name = rex::string::utf8_find_name_from_guest_path(path);
+      entry = parent_entry->GetChild(file_name);
+    } else {
+      // A device root may have no mounted parent device.
+      entry = !root_entry ? ResolvePath(path) : nullptr;
+      if (!entry) {
+        *out_action = FileAction::kDoesNotExist;
+        return X_STATUS_OBJECT_PATH_NOT_FOUND;
+      }
+    }
   } else if (path.empty() && root_entry) {
     // An empty relative path is the root entry itself. Replacing it would
     // delete what the root handle still refers to.
@@ -364,7 +382,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   }
   if (!entry) {
     // Create if needed (either new or as a replacement).
-    entry = CreatePath(path, !is_directory ? kFileAttributeNormal : kFileAttributeDirectory);
+    const uint32_t attributes = is_directory ? kFileAttributeDirectory : kFileAttributeNormal;
+    entry = parent_entry ? parent_entry->CreateEntry(
+                               rex::string::utf8_find_name_from_guest_path(path), attributes)
+                         : CreatePath(path, attributes);
     if (!entry) {
       return X_STATUS_ACCESS_DENIED;
     }

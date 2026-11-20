@@ -284,8 +284,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // UINT32_MAX when the draw is outside an active ZPD segment, which is used
     // as a skip writing sentinel to the counter buffer.
     uint32_t zpd_counter_index;
+    // One bit per texture fetch constant: a stacked texture whose layer
+    // coordinate wraps instead of being clamped (stacked_texture_layer_wrap,
+    // texture_util::IsStackedLayerWrapped).
+    uint32_t textures_stacked_layer_wrap;
     // Align for std140.
-    uint32_t color_exp_bias_padding[3];
+    uint32_t color_exp_bias_padding[2];
 
     float color_exp_bias[4];
 
@@ -462,7 +466,20 @@ class SpirvShaderTranslator : public ShaderTranslator {
         precise_interpolation_(REXCVAR_GET(precise_interpolation)),
         draw_resolution_scale_x_(draw_resolution_scale_x ? draw_resolution_scale_x : 1),
         draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1),
+        draw_resolution_scale4_x_(draw_resolution_scale_x_ * 4),
+        draw_resolution_scale4_y_(draw_resolution_scale_y_ * 4),
         edram_tile_count_(edram_tile_count) {}
+
+  // A draw resolution scale in quarters (4 = 1x, 6 = 1.5x), for a renderer
+  // with host render targets that scales by fractions (the native renderer);
+  // call before translating. The pixel position (ps_param_gen), the memory
+  // export of one host pixel per guest pixel and the texel steps of
+  // resolution-scaled textures follow it. Not for fragment shader interlock,
+  // whose EDRAM layout takes the whole scale given at construction.
+  void SetDrawResolutionScale4(uint32_t scale4_x, uint32_t scale4_y) {
+    draw_resolution_scale4_x_ = scale4_x >= 4 ? scale4_x : 4;
+    draw_resolution_scale4_y_ = scale4_y >= 4 ? scale4_y : 4;
+  }
 
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
@@ -828,6 +845,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
                           spv::Id is_all_signed);
 
   spv::Id LoadMsaaSamplesFromFlags();
+  // Whether the stacked texture of the fetch constant wraps its layer
+  // coordinate (a bool from textures_stacked_layer_wrap).
+  spv::Id LoadStackedLayerWrap(uint32_t fetch_constant_index);
   // Whether it's possible and worth skipping running the translated shader for
   // 2x2 quads.
   bool FSI_IsDepthStencilEarly() const {
@@ -876,17 +896,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool native_2x_msaa_with_attachments_;
   bool native_2x_msaa_no_attachments_;
 
-  // Scale of the draw being translated. All position-dependent paths use
-  // these. Only fetch offset scaling uses draw_resolution_scale_x_/y_ directly.
-  uint32_t GetCurrentDrawResolutionScaleX() const {
+  // Scale of the draw being translated, in quarters (SetDrawResolutionScale4).
+  // All position-dependent paths use these. Only fetch offset scaling uses
+  // draw_resolution_scale4_x_/y_ directly (it follows the textures' scale),
+  // and interlock's EDRAM layout the whole draw_resolution_scale_x_/y_.
+  uint32_t GetCurrentDrawResolutionScale4X() const {
     return is_pixel_shader() && GetSpirvShaderModification().pixel.resolution_scale_native
-               ? 1
-               : draw_resolution_scale_x_;
+               ? 4
+               : draw_resolution_scale4_x_;
   }
-  uint32_t GetCurrentDrawResolutionScaleY() const {
+  uint32_t GetCurrentDrawResolutionScale4Y() const {
     return is_pixel_shader() && GetSpirvShaderModification().pixel.resolution_scale_native
-               ? 1
-               : draw_resolution_scale_y_;
+               ? 4
+               : draw_resolution_scale4_y_;
   }
 
   // For safety with different drivers (even though fragment shader interlock in
@@ -905,6 +927,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool precise_interpolation_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  // In quarters: draw_resolution_scale_x_ * 4 unless SetDrawResolutionScale4.
+  uint32_t draw_resolution_scale4_x_;
+  uint32_t draw_resolution_scale4_y_;
   uint32_t edram_tile_count_;
 
   // Is currently writing the empty depth-only pixel shader, such as for depth
@@ -1014,6 +1039,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdram32bppTilePitchDwordsScaled,
     kSystemConstantEdramDepthBaseDwordsScaled,
     kSystemConstantZpdCounterIndex,
+    kSystemConstantTexturesStackedLayerWrap,
     kSystemConstantColorExpBias,
     kSystemConstantEdramPolyOffsetFrontScale,
     kSystemConstantEdramPolyOffsetBackScale,

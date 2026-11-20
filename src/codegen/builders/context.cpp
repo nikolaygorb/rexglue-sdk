@@ -16,6 +16,7 @@
 
 #include <rex/codegen/binary_view.h>
 #include <rex/logging.h>
+#include <rex/memory/utils.h>
 
 #include "../codegen_logging.h"
 #include <rex/system/export_resolver.h>
@@ -44,15 +45,135 @@ const FunctionGraph& BuilderContext::graph() const {
 
 // Localizing a non-volatile assumes the function owns it across its whole body.
 // An SEH funclet does not: it inherits its owner's live registers through ctx.
+// A function calling setjmp and the save / restore helpers keep theirs in ctx
+// too (FunctionGraph::markContextNonVolatiles).
 bool BuilderContext::localizeNonVolatiles() const {
-  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
+  return config().nonVolatileRegistersAsLocalVariables && !fn.keepsNonVolatilesInContext();
+}
+
+bool BuilderContext::localizeNonVolatileGprs() const {
+  const auto& cfg = config();
+  return (cfg.nonVolatileRegistersAsLocalVariables || cfg.nonVolatileGprsAsLocalVariables) &&
+         !fn.keepsNonVolatilesInContext();
+}
+
+// r0, r2, r11 and r12 carry values into a few callees outside the ABI: the
+// frame pointer of an SEH funclet's owner (r12), the save area of a save /
+// restore helper (r12, r11), the frame size of __chkstk (r12), a tail
+// fragment's running value (r11). Those callees keep them in ctx like their
+// non-volatiles, and a localizing caller syncs them across the call.
+bool BuilderContext::localizeNonArgumentGprs() const {
+  const auto& cfg = config();
+  return (cfg.nonArgumentRegistersAsLocalVariables || cfg.nonArgumentGprsAsLocalVariables) &&
+         !fn.keepsNonVolatilesInContext();
+}
+
+//=============================================================================
+// Dead saves and restores of localized non-volatile GPRs
+//=============================================================================
+// In a function holding r14-r31 in locals, the prologue's stores of them hold
+// the caller's values, which the function has no copy of (its locals start at
+// zero) and no one reads back for the caller; the epilogue's loads of them
+// feed nothing before the return. The guest accesses are volatile, so the
+// host compiler keeps both. They are recognized from the instruction words:
+// a store of rN (N >= 14) through r1 in the entry run made of mflr into a
+// volatile GPR, stores through r1 and calls to the save helpers (the frame is
+// not allocated yet, nothing has written a non-volatile); a load of rN through
+// r1 followed only by loads through r1, mtlr from another register and
+// addi r1,r1,d up to a blr or a branch to a restore helper.
+
+namespace {
+
+constexpr size_t kMaxSaveRestoreScan = 48;
+
+uint32_t PrimaryOpcode(uint32_t word) {
+  return word >> 26;
+}
+uint32_t FieldD(uint32_t word) {  // rD / rS
+  return (word >> 21) & 31;
+}
+uint32_t FieldA(uint32_t word) {
+  return (word >> 16) & 31;
+}
+bool IsStoreThroughR1(uint32_t word) {  // std, stw, stfd
+  const uint32_t op = PrimaryOpcode(word);
+  return FieldA(word) == 1 && ((op == 62 && (word & 3) == 0) || op == 36 || op == 54);
+}
+bool IsLoadThroughR1(uint32_t word) {  // ld, lwz, lfd
+  const uint32_t op = PrimaryOpcode(word);
+  return FieldA(word) == 1 && ((op == 58 && (word & 3) == 0) || op == 32 || op == 50);
+}
+bool IsMflr(uint32_t word) {
+  return (word & 0xFC1FFFFF) == 0x7C0802A6;
+}
+bool IsMtlr(uint32_t word) {
+  return (word & 0xFC1FFFFF) == 0x7C0803A6;
+}
+// b / bl with AA = 0 to a function whose name starts with prefix.
+bool BranchesToHelper(const FunctionGraph& graph, uint32_t word, uint32_t address, bool link,
+                      std::string_view prefix) {
+  if (PrimaryOpcode(word) != 18 || (word & 3) != (link ? 1u : 0u))
+    return false;
+  int32_t offset = static_cast<int32_t>(word & 0x03FFFFFC);
+  if (offset & 0x02000000)
+    offset -= 0x04000000;
+  const auto* target = graph.getFunction(address + static_cast<uint32_t>(offset));
+  return target && std::string_view(target->name()).substr(0, prefix.size()) == prefix;
+}
+
+}  // namespace
+
+bool BuilderContext::is_dead_nonvolatile_save() const {
+  const uint32_t word = rex::memory::load_and_swap<uint32_t>(data);
+  if (!localizeNonVolatileGprs() || FieldD(word) < 14 || PrimaryOpcode(word) == 54 ||
+      !IsStoreThroughR1(word) || base < fn.base() || (base - fn.base()) / 4 > kMaxSaveRestoreScan)
+    return false;
+  const auto* entry = emitCtx.binary.translate(fn.base());
+  if (!entry)
+    return false;
+  for (uint32_t address = fn.base(); address < base; address += 4) {
+    if (config().midAsmHooks.count(address))
+      return false;
+    const uint32_t prior = rex::memory::load_and_swap<uint32_t>(entry + (address - fn.base()));
+    const bool allowed = (IsMflr(prior) && FieldD(prior) < 14) || IsStoreThroughR1(prior) ||
+                         BranchesToHelper(graph(), prior, address, true, "__savegprlr_") ||
+                         BranchesToHelper(graph(), prior, address, true, "__savefpr_");
+    if (!allowed)
+      return false;
+  }
+  return !config().midAsmHooks.count(base);
+}
+
+bool BuilderContext::is_dead_nonvolatile_restore() const {
+  const uint32_t word = rex::memory::load_and_swap<uint32_t>(data);
+  const uint32_t reg = FieldD(word);
+  if (!localizeNonVolatileGprs() || reg < 14 || PrimaryOpcode(word) == 50 || !IsLoadThroughR1(word))
+    return false;
+  for (size_t i = 0; i <= kMaxSaveRestoreScan; ++i) {
+    const uint32_t address = base + static_cast<uint32_t>(i * 4);
+    if (address >= fn.end() || config().midAsmHooks.count(address))
+      return false;
+    if (i == 0)
+      continue;
+    const auto* bytes = emitCtx.binary.translate(address);
+    if (!bytes)
+      return false;
+    const uint32_t next = rex::memory::load_and_swap<uint32_t>(bytes);
+    if (next == 0x4E800020 ||  // blr
+        BranchesToHelper(graph(), next, address, false, "__restgprlr_"))
+      return true;
+    const bool allowed = IsLoadThroughR1(next) || (IsMtlr(next) && FieldD(next) != reg) ||
+                         (PrimaryOpcode(next) == 14 && FieldD(next) == 1 && FieldA(next) == 1);
+    if (!allowed)
+      return false;
+  }
+  return false;
 }
 
 std::string BuilderContext::r(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables &&
-       (index == 0 || index == 2 || index == 11 || index == 12)) ||
-      (localizeNonVolatiles() && index >= 14)) {
+  if ((localizeNonArgumentGprs() && (index == 0 || index == 2 || index == 11 || index == 12)) ||
+      (localizeNonVolatileGprs() && index >= 14)) {
     locals.r[index] = true;
     return fmt::format("r{}", index);
   }
@@ -175,13 +296,13 @@ const CallTarget* BuilderContext::findCallTarget(uint32_t site) const {
 void BuilderContext::emit_function_call(uint32_t address) {
   const auto& cfg = config();
 
-  if (address == cfg.longJmpAddress) {
+  if (cfg.isLongJmp(address)) {
     // Use custom ppc_longjmp that uses guest address as key (not for storage)
     println("\tppc_longjmp({}.u32, {}.s32);", r(3), r(4));
     return;
   }
 
-  if (address == cfg.setJmpAddress) {
+  if (cfg.isSetJmp(address)) {
     // Save PPCContext for restoration after longjmp
     println("\t{} = ctx;", env());
     // Use custom ppc_setjmp that uses guest address as key
@@ -198,31 +319,51 @@ void BuilderContext::emit_function_call(uint32_t address) {
       auto* targetFn = target->asFunction();
       const auto& name = targetFn->name();
 
-      // Handle save/restore helpers. Gated on the global setting, not this
-      // function's: the helper bodies are emitted under it too, so once they
-      // spill to locals they are no-ops that scribble zeros on the caller's
-      // frame. A share_registers function still has to elide them.
-      if (cfg.nonVolatileRegistersAsLocalVariables &&
-          (name.find("__rest") == 0 || name.find("__save") == 0)) {
-        // print nothing - these are handled by local variable tracking
-        return;
+      // Save/restore helpers. The helper bodies keep their registers in ctx
+      // (FunctionGraph::markContextNonVolatiles), so they save and restore for
+      // the functions that keep theirs there (funclets, setjmp callers); a
+      // function holding the registers in locals has nothing in ctx to save.
+      if (IsSaveRestoreHelperName(name)) {
+        const bool gpr = name.find("gprlr_") != std::string::npos;
+        if (gpr ? localizeNonVolatileGprs() : localizeNonVolatiles())
+          return;  // print nothing - handled by local variable tracking
       }
 
       // An SEH funclet runs on its owner's frame and reads whatever non-volatiles
       // the owner left live, so hand it the localized copies through ctx and take
       // them back afterwards. Only registers already localized here can be live at
       // this point, so that set is the whole live-in the funclet can see.
-      if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
-        for (size_t i = 14; i < 32; ++i) {
+      // What ctx held there belongs to a caller that keeps its own non-volatiles
+      // in ctx (a setjmp caller, a funclet), so it is put back afterwards.
+      // r0, r2, r11 and r12 go the same way into a funclet or a helper that is
+      // still called; they are volatile, so the callee's values are what the
+      // guest sees after the call and nothing is put back.
+      constexpr size_t kNonArgument[] = {0, 2, 11, 12};
+      const bool syncNonVolatiles = targetFn->sharesRegisters() && localizeNonVolatileGprs();
+      const bool syncNonArguments =
+          (targetFn->sharesRegisters() || IsSaveRestoreHelperName(name)) &&
+          localizeNonArgumentGprs();
+      if (syncNonVolatiles || syncNonArguments) {
+        println("\t{{");
+        for (size_t i = 14; syncNonVolatiles && i < 32; ++i) {
           if (locals.r[i])
-            println("\tctx.r{} = r{};", i, i);
+            println("\tconst PPCRegister caller_r{0} = ctx.r{0}; ctx.r{0} = r{0};", i);
+        }
+        for (size_t i : kNonArgument) {
+          if (syncNonArguments && locals.r[i])
+            println("\tctx.r{0} = r{0};", i);
         }
         emitCtx.reference(name);
         println("\t{}(ctx, base);", name);
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("\tr{} = ctx.r{};", i, i);
+        for (size_t i : kNonArgument) {
+          if (syncNonArguments && locals.r[i])
+            println("\tr{0} = ctx.r{0};", i);
         }
+        for (size_t i = 14; syncNonVolatiles && i < 32; ++i) {
+          if (locals.r[i])
+            println("\tr{0} = ctx.r{0}; ctx.r{0} = caller_r{0};", i);
+        }
+        println("\t}}");
         return;
       }
 
@@ -495,6 +636,8 @@ void BuilderContext::emit_load_d_form(const char* load_macro, const char* dest_t
                                       bool check_mmio) {
   // D-form: rD = LOAD(rA + D) where operands[0]=rD, operands[1]=D, operands[2]=rA
   // load_macro should be like "REX_LOAD_U8" - we replace REX_LOAD with REX_MM_LOAD for MMIO
+  if (is_dead_nonvolatile_restore())
+    return;
   const char* macro = load_macro;
   static char mm_macro[64];
   if (check_mmio && mmio_check_d_form()) {
@@ -535,6 +678,8 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
                                        bool check_mmio) {
   // D-form: STORE(rA + D, rS) where operands[0]=rS, operands[1]=D, operands[2]=rA
   // store_macro should be like "REX_STORE_U8" - we replace REX_STORE with REX_MM_STORE for MMIO
+  if (is_dead_nonvolatile_save())
+    return;
   const char* macro = store_macro;
   static char mm_macro[64];
   if (check_mmio && mmio_check_d_form()) {

@@ -52,7 +52,7 @@ class WildcardEngine {
   bool Match(const std::string_view str) const;
 
  private:
-  std::vector<WildcardRule> rules_;
+  std::string pattern_;
   void PreparePattern(const std::string_view pattern);
 };
 

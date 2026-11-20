@@ -82,6 +82,8 @@ TEST_CASE("Host deletion waits for the last open handle", "[filesystem][vfs]") {
     REQUIRE_FALSE(directory->Delete());
     REQUIRE(std::filesystem::exists(temporary.path / "dir" / "inner.tmp"));
     file.reset();
+    REQUIRE_FALSE(directory->Delete());
+    REQUIRE(inner->Delete());
     REQUIRE(directory->Delete());
     REQUIRE_FALSE(std::filesystem::exists(temporary.path / "dir"));
     REQUIRE(device.ResolvePath("dir") == nullptr);

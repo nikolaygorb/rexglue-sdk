@@ -1851,39 +1851,111 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
     *out_region_size = (base_page_entry.region_page_count << page_size_shift_);
   }
 
+  return ReleasePages(base_page_number, base_page_entry.region_page_count);
+}
+
+bool BaseHeap::ReleaseRange(uint32_t address, uint32_t size) {
+  // Global critical region before heap_mutex_ - see
+  // AcquireHostPageReconcileLock for why the order matters.
+  auto global_lock = AcquireHostPageReconcileLock();
+  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+
+  if (address < heap_base_) {
+    return false;
+  }
+  uint32_t start_page_number = (address - heap_base_) >> page_size_shift_;
+  uint32_t page_count = get_page_count(size, page_size_, page_size_shift_);
+  if (start_page_number >= page_table_.size() || !page_count ||
+      page_count > page_table_.size() - start_page_number) {
+    return false;
+  }
+  auto start_page_entry = page_table_[start_page_number];
+  uint32_t region_start = start_page_entry.base_address;
+  uint32_t region_end = region_start + start_page_entry.region_page_count;
+  uint32_t end_page_number = start_page_number + page_count;
+  if (!start_page_entry.state || end_page_number > region_end) {
+    return false;
+  }
+  if (heap_base_ == 0x00000000 && start_page_number == 0) {
+    REXSYS_ERROR("BaseHeap::ReleaseRange: Attempt to free 0!");
+    return false;
+  }
+
+  // The pages either side become regions of their own.
+  for (uint32_t page_number = region_start; page_number < start_page_number; ++page_number) {
+    page_table_[page_number].region_page_count = start_page_number - region_start;
+  }
+  for (uint32_t page_number = end_page_number; page_number < region_end; ++page_number) {
+    page_table_[page_number].base_address = end_page_number;
+    page_table_[page_number].region_page_count = region_end - end_page_number;
+  }
+
+  return ReleasePages(start_page_number, page_count);
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> BaseHeap::TakeUninitializedRuns(uint32_t address,
+                                                                           uint32_t size) {
+  std::vector<std::pair<uint32_t, uint32_t>> runs;
+  if (address < heap_base_ || address - heap_base_ >= heap_size_) {
+    return runs;
+  }
+  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  uint32_t page_number = (address - heap_base_) >> page_size_shift_;
+  const uint32_t end_page_number =
+      std::min(uint32_t(page_table_.size()),
+               page_number + get_page_count(size, page_size_, page_size_shift_));
+  for (; page_number < end_page_number; ++page_number) {
+    auto& page_entry = page_table_[page_number];
+    if (page_entry.initialized) {
+      continue;
+    }
+    page_entry.initialized = 1;
+    const uint32_t page_address = heap_base_ + (page_number << page_size_shift_);
+    if (!runs.empty() && runs.back().first + runs.back().second == page_address) {
+      runs.back().second += page_size_;
+    } else {
+      runs.emplace_back(page_address, page_size_);
+    }
+  }
+  return runs;
+}
+
+bool BaseHeap::ReleasePages(uint32_t start_page_number, uint32_t page_count) {
   // Release from host not needed as mapping reserves the range for us.
   // TODO(benvanik): protect with NOACCESS?
   /*BOOL result = VirtualFree(
-      TranslateRelative(base_page_number << page_size_shift_), 0, MEM_RELEASE);
+      TranslateRelative(start_page_number << page_size_shift_), 0, MEM_RELEASE);
   if (!result) {
     PLOGE("BaseHeap::Release failed due to host VirtualFree failure");
     return false;
   }*/
   // Instead, we just protect it, if we can.
   if (page_size_ == rex::memory::page_size() ||
-      ((base_page_entry.region_page_count << page_size_shift_) % rex::memory::page_size() == 0 &&
-       ((base_page_number << page_size_shift_) % rex::memory::page_size() == 0))) {
+      ((page_count << page_size_shift_) % rex::memory::page_size() == 0 &&
+       ((start_page_number << page_size_shift_) % rex::memory::page_size() == 0))) {
     // TODO(benvanik): figure out why games are using memory after releasing
     // it. It's possible this is some virtual/physical stuff where the GPU
     // still can access it.
     if (REXCVAR_GET(protect_on_release)) {
-      if (!rex::memory::Protect(TranslateRelative(base_page_number << page_size_shift_),
-                                base_page_entry.region_page_count << page_size_shift_,
+      if (!rex::memory::Protect(TranslateRelative(start_page_number << page_size_shift_),
+                                page_count << page_size_shift_,
                                 rex::memory::PageAccess::kNoAccess, nullptr)) {
         REXSYS_WARN("BaseHeap::Release failed due to host VirtualProtect failure");
       }
     }
   }
 
-  // Perform table change.
-  uint32_t end_page_number = base_page_number + base_page_entry.region_page_count - 1;
-  for (uint32_t page_number = base_page_number; page_number <= end_page_number; ++page_number) {
+  // Perform table change. The initialized bit stays: the page keeps its data.
+  uint32_t end_page_number = start_page_number + page_count - 1;
+  for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
+    const uint32_t initialized = page_entry.initialized;
     page_entry.qword = 0;
+    page_entry.initialized = initialized;
     unreserved_page_count_++;
   }
 
-  if (!SyncHostPageAccess(base_page_number, end_page_number)) {
+  if (!SyncHostPageAccess(start_page_number, end_page_number)) {
     return false;
   }
 
@@ -1978,7 +2050,8 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
   return true;
 }
 
-bool BaseHeap::QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info) {
+bool BaseHeap::QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info,
+                               uint32_t max_region_size) {
   uint32_t start_page_number = (base_address - heap_base_) >> page_size_shift_;
   if (start_page_number > page_table_.size()) {
     REXSYS_ERROR("BaseHeap::QueryRegionInfo base page out of range");
@@ -2015,6 +2088,9 @@ bool BaseHeap::QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_in
         break;
       }
       out_info->region_size += page_size_;
+      if (out_info->region_size >= max_region_size) {
+        break;
+      }
     }
   } else {
     // Free region.
@@ -2026,6 +2102,9 @@ bool BaseHeap::QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_in
         break;
       }
       out_info->region_size += page_size_;
+      if (out_info->region_size >= max_region_size) {
+        break;
+      }
     }
   }
   return true;
@@ -2058,16 +2137,22 @@ bool BaseHeap::QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size) {
   return true;
 }
 
-bool BaseHeap::QueryProtect(uint32_t address, uint32_t* out_protect) {
+bool BaseHeap::QueryProtect(uint32_t address, uint32_t* out_protect, uint32_t* out_state) {
   uint32_t page_number = (address - heap_base_) >> page_size_shift_;
-  if (page_number > page_table_.size()) {
+  if (page_number >= page_table_.size()) {
     REXSYS_ERROR("BaseHeap::QueryProtect base page out of range");
     *out_protect = 0;
+    if (out_state) {
+      *out_state = 0;
+    }
     return false;
   }
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
   auto page_entry = page_table_[page_number];
   *out_protect = page_entry.current_protect;
+  if (out_state) {
+    *out_state = page_entry.state;
+  }
   return true;
 }
 
@@ -2170,7 +2255,7 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
   // Global critical region before heap_mutex_ - see
   // AcquireHostPageReconcileLock for why the order matters.
   auto global_lock = AcquireHostPageReconcileLock();
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  std::unique_lock<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
   uint32_t parent_heap_start = GetPhysicalAddress(heap_base_);
@@ -2191,6 +2276,14 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
     return false;
   }
   *out_address = address;
+  // Taken from free memory: nothing in it is the guest's yet.
+  heap_lock.unlock();
+  if (global_lock.owns_lock()) {
+    global_lock.unlock();
+  }
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    InvalidateGpuCopies(address, size);
+  }
   return true;
 }
 
@@ -2204,13 +2297,18 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
   // AcquireHostPageReconcileLock for why the order matters. Always taken here:
   // it also guards the read watches restored at the end.
   auto global_lock = global_critical_region_.Acquire();
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  std::unique_lock<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
   // NOTE: this can potentially overwrite heap contents if there are already
   // committed pages in the requested physical range.
   // TODO(benvanik): flag for ensure-not-committed?
   uint32_t parent_base_address = GetPhysicalAddress(base_address);
+  // The pages this commit commits anew, before it.
+  std::vector<std::pair<uint32_t, uint32_t>> newly_committed;
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    newly_committed = UncommittedPhysicalRanges(parent_base_address, size);
+  }
   if (!parent_heap_->AllocFixed(parent_base_address, size, alignment, allocation_type, protect)) {
     REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
     return false;
@@ -2236,6 +2334,12 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
         ToPageAccess(protect) != rex::memory::PageAccess::kNoAccess);
   }
 
+  heap_lock.unlock();
+  global_lock.unlock();
+  const uint32_t physical_heap_start = GetPhysicalAddress(heap_base_);
+  for (const std::pair<uint32_t, uint32_t>& range : newly_committed) {
+    InvalidateGpuCopies(heap_base_ + range.first - physical_heap_start, range.second);
+  }
   return true;
 }
 
@@ -2251,7 +2355,7 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
   // Global critical region before heap_mutex_ - see
   // AcquireHostPageReconcileLock for why the order matters.
   auto global_lock = AcquireHostPageReconcileLock();
-  std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+  std::unique_lock<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
   low_address = std::max(heap_base_, low_address);
@@ -2274,7 +2378,46 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
     return false;
   }
   *out_address = address;
+  // Taken from free memory: nothing in it is the guest's yet.
+  heap_lock.unlock();
+  if (global_lock.owns_lock()) {
+    global_lock.unlock();
+  }
+  if (allocation_type & memory::kMemoryAllocationCommit) {
+    InvalidateGpuCopies(address, size);
+  }
   return true;
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> PhysicalHeap::UncommittedPhysicalRanges(
+    uint32_t physical_address, uint32_t size) const {
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  const uint32_t parent_page_size = parent_heap_->page_size();
+  const uint32_t first = physical_address & ~(parent_page_size - 1);
+  const uint64_t end = uint64_t(physical_address) + size;
+  for (uint64_t page = first; page < end; page += parent_page_size) {
+    // No access: not committed (or committed with no access, which holds
+    // nothing the guest can have used either).
+    if (parent_heap_->QueryRangeAccess(uint32_t(page), uint32_t(page + parent_page_size - 1)) !=
+        rex::memory::PageAccess::kNoAccess) {
+      continue;
+    }
+    if (!ranges.empty() && uint64_t(ranges.back().first) + ranges.back().second == page) {
+      ranges.back().second += parent_page_size;
+    } else {
+      ranges.emplace_back(uint32_t(page), parent_page_size);
+    }
+  }
+  return ranges;
+}
+
+// The GPU may have read a range while the guest had it free or read-only.
+// Such pages carry no write watch, so once the guest commits them its writes
+// would never reach the GPU's copy (Fable II's Bink frame buffers, freed and
+// allocated again every frame: a blank frame every other one). Like a Protect
+// to writable (invalidate_unwatched), without changing the protection.
+void PhysicalHeap::InvalidateGpuCopies(uint32_t address, uint32_t size) {
+  TriggerCallbacks(global_critical_region_.Acquire(), address, size, true, true, false, true);
 }
 
 bool PhysicalHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t allocation_type,

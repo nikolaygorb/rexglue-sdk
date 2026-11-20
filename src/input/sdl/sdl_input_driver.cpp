@@ -18,6 +18,7 @@
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
@@ -223,7 +224,8 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 
       // Load custom controller mappings if available
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
-        std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
+        // UTF-8, as SDL_AddGamepadMappingsFromFile takes it.
+        std::filesystem::path mappings_path = rex::to_path(REXCVAR_GET(hid_mappings_file));
         if (!std::filesystem::exists(mappings_path)) {
           REXLOG_WARN("SDL GameControllerDB: file '{}' does not exist.",
                       REXCVAR_GET(hid_mappings_file));

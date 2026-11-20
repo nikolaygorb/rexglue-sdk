@@ -10,9 +10,12 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <mutex>
 
 #include <fmt/format.h>
@@ -223,24 +226,13 @@ void XThread::set_name(const std::string_view name) {
   }
 }
 
-static uint8_t next_cpu = 0;
 static uint8_t GetFakeCpuNumber(uint8_t proc_mask) {
-  // NOTE: proc_mask is logical processors, not physical processors or cores.
-  if (!proc_mask) {
-    next_cpu = (next_cpu + 1) % 6;
-    return next_cpu;  // is this reasonable?
-    // TODO(Triang3l): Does the following apply here?
-    // https://docs.microsoft.com/en-us/windows/win32/dxtecharts/coding-for-multiple-cores
-    // "On Xbox 360, you must explicitly assign software threads to a particular
-    //  hardware thread by using XSetThreadProcessor. Otherwise, all child
-    //  threads will stay on the same hardware thread as the parent."
+  if (proc_mask) {
+    // Highest bit wins, as in the later console-derived upstream correction.
+    return static_cast<uint8_t>(std::bit_width(proc_mask) - 1);
   }
-  assert_false(proc_mask & 0xC0);
-
-  uint8_t cpu_number = 7 - rex::lzcnt(proc_mask);
-  assert_true(1 << cpu_number == proc_mask);
-  assert_true(cpu_number < 6);
-  return cpu_number;
+  auto* creator = XThread::IsInThread() ? XThread::GetCurrentThread() : nullptr;
+  return creator && creator->is_guest_thread() ? creator->active_cpu() : 0;
 }
 
 void XThread::InitializeGuestObject() {
@@ -367,6 +359,8 @@ void XThread::FreeStack() {
 }
 
 X_STATUS XThread::Create() {
+  if ((creation_params_.creation_flags >> 24) & ~0x3Fu)
+    return X_STATUS_INVALID_PARAMETER;
   // Thread kernel object.
   if (!CreateNative<X_KTHREAD>()) {
     REXSYS_WARN("Unable to allocate thread object");
@@ -395,7 +389,10 @@ X_STATUS XThread::Create() {
   uint32_t tls_slots = kDefaultTlsSlotCount;
   uint32_t tls_extended_size = 0;
   if (tls_header && tls_header->slot_count) {
-    tls_slots = tls_header->slot_count;
+    const uint32_t raw_slots = tls_header->slot_count;
+    if (raw_slots > 256)
+      return X_STATUS_INVALID_PARAMETER;
+    tls_slots = (raw_slots + 3u) & ~3u;
     tls_extended_size = tls_header->data_size;
   }
 
@@ -537,6 +534,14 @@ X_STATUS XThread::Exit(int exit_code) {
   // into pthread_exit(). Otherwise ReleaseHandle() below may delete `this`
   // while this method is still running.
   auto self = retain_object(this);
+
+  // The thread's pending requests complete before it exits, checked every
+  // 100 ms: a title that waits for the thread before reading a request's
+  // status block sees it finished (xenia-edge 896b71158, DOAX2 settings
+  // saves). Shutdown drops queued requests.
+  while (posted_io_.load(std::memory_order_acquire) && !kernel_state()->io_stopped()) {
+    rex::thread::Sleep(std::chrono::milliseconds(100));
+  }
 
   // Mark as terminated before running down APCs.
   auto kthread = guest_object<X_KTHREAD>();
@@ -764,7 +769,12 @@ void XThread::DeliverAPCs() {
 }
 
 bool XThread::HasPendingUserApc() {
-  return !guest_object<X_KTHREAD>()->apc_lists[1].empty(memory());
+  auto* ctx = thread_state_->context();
+  auto* kthread = guest_object<X_KTHREAD>();
+  auto old_irql = kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kthread->apc_lock);
+  const bool pending = kthread->apc_disable_count == 0 && !kthread->apc_lists[1].empty(memory());
+  kernel::xboxkrnl::xeKeKfReleaseSpinLock(ctx, &kthread->apc_lock, old_irql);
+  return pending;
 }
 
 bool XThread::HasDeliverableKernelApc() {
@@ -934,8 +944,11 @@ void XThread::SetPriority(int32_t increment) {
   }
 }
 
-void XThread::SetAffinity(uint32_t affinity) {
-  SetActiveCpu(GetFakeCpuNumber(affinity));
+bool XThread::SetAffinity(uint32_t affinity) {
+  if (!affinity || (affinity & ~0x3Fu))
+    return false;
+  SetActiveCpu(GetFakeCpuNumber(static_cast<uint8_t>(affinity)));
+  return true;
 }
 
 uint8_t XThread::active_cpu() const {
@@ -986,7 +999,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
 }
 
 bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
-  if (slot * 4 > tls_total_size_) {
+  if (slot >= (tls_total_size_ - (tls_dynamic_address_ - tls_static_address_)) / 4) {
     return false;
   }
 
@@ -996,7 +1009,7 @@ bool XThread::GetTLSValue(uint32_t slot, uint32_t* value_out) {
 }
 
 bool XThread::SetTLSValue(uint32_t slot, uint32_t value) {
-  if (slot * 4 >= tls_total_size_) {
+  if (slot >= (tls_total_size_ - (tls_dynamic_address_ - tls_static_address_)) / 4) {
     return false;
   }
 
@@ -1098,31 +1111,44 @@ uint32_t XThread::SelfSuspend() {
 #endif
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
-  int64_t timeout_ticks = interval;
-  uint32_t timeout_ms;
+  // The interval is in 100 ns ticks: negative is relative, positive an absolute
+  // guest system time (FILETIME, from 1601).
+  const int64_t timeout_ticks = static_cast<int64_t>(interval);
+  uint64_t delay_ticks = 0;
   if (timeout_ticks > 0) {
-    // Absolute time, based on January 1, 1601.
-    // TODO(benvanik): convert time to relative time.
-    assert_always();
-    timeout_ms = 0;
+    // Absolute: a time that has passed returns at once. It asserted and did not
+    // wait before (xenia-canary 391816907).
+    const uint64_t now = chrono::Clock::QueryGuestSystemTime();
+    const uint64_t due = static_cast<uint64_t>(timeout_ticks);
+    delay_ticks = due > now ? due - now : 0;
   } else if (timeout_ticks < 0) {
-    // Relative time.
-    timeout_ms = uint32_t(-timeout_ticks / 10000);  // Ticks -> MS
-  } else {
-    timeout_ms = 0;
+    delay_ticks = timeout_ticks == std::numeric_limits<int64_t>::min()
+                      ? static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+                      : static_cast<uint64_t>(-timeout_ticks);
   }
-  timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
+  // In microseconds, rounded up. A delay under a millisecond was truncated to
+  // 0 ms and became a yield, so a title polling with short delays spun a core
+  // (Burnout's audio worker in Xerenge, 3ec89b4); it now sleeps, at least the
+  // 100 us below which the host sleeps yield instead. A delay of 0 still yields.
+  // At most the 2^32 - 1 ms the old millisecond count could hold.
+  constexpr uint64_t kMaxDelayUs = uint64_t(std::numeric_limits<uint32_t>::max()) * 1000;
+  uint64_t delay_us = std::min(delay_ticks / 10 + (delay_ticks % 10 != 0), kMaxDelayUs);
+  if (delay_us) {
+    delay_us = std::clamp(chrono::Clock::ScaleGuestDurationMicros(delay_us), uint64_t(100),
+                          kMaxDelayUs);
+  }
+  const auto delay = std::chrono::microseconds(delay_us);
   CheckTitleTermination();
   if (alertable) {
+    if (HasPendingUserApc())
+      return X_STATUS_USER_APC;
     // Woken for a kernel APC, which runs before the delay goes on for the rest
     // of its time. Only a user APC ends it (edge 7598c1779).
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    const auto deadline = std::chrono::steady_clock::now() + delay;
     while (true) {
       const auto now = std::chrono::steady_clock::now();
-      auto remaining = deadline > now ? std::chrono::duration_cast<std::chrono::milliseconds>(
-                                            deadline - now)
-                                      : std::chrono::milliseconds(0);
+      auto remaining = deadline > now ? std::chrono::ceil<std::chrono::microseconds>(deadline - now)
+                                      : std::chrono::microseconds(0);
       auto result = rex::thread::AlertableSleep(remaining);
       CheckTitleTermination();
       if (result != rex::thread::SleepResult::kAlerted) {
@@ -1133,14 +1159,14 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
       }
     }
   } else {
-    if (timeout_ms == 0) {
+    if (delay_us == 0) {
       if (priority_ <= rex::thread::ThreadPriority::kBelowNormal) {
         rex::thread::Sleep(std::chrono::microseconds(100));
       } else {
         rex::thread::MaybeYield();
       }
     } else {
-      rex::thread::Sleep(std::chrono::milliseconds(timeout_ms));
+      rex::thread::Sleep(delay);
     }
     CheckTitleTermination();
   }
@@ -1293,7 +1319,7 @@ static void SaveContext(const PPCContext* ctx, ThreadSavedState& state) {
 
 // Load ThreadSavedState into PPCContext
 static void LoadContext(PPCContext* ctx, const ThreadSavedState& state) {
-  ctx->lr = state.context.lr;
+  ctx->lr = static_cast<uint32_t>(state.context.lr);
   ctx->ctr.u64 = state.context.ctr;
 
   // GPRs

@@ -322,7 +322,7 @@ bool D3D12SharedMemory::UploadRanges(
         REXGPU_ERROR("Shared memory: Failed to get an upload buffer");
         return false;
       }
-      MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      MakeUploadRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size));
       CopyPagesForUpload(upload_buffer_mapping, upload_range_start,
                          uint32_t(upload_buffer_size >> page_size_log2()));
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),

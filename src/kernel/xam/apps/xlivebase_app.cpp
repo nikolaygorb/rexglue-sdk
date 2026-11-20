@@ -10,6 +10,10 @@
  */
 
 #include <rex/kernel/xam/apps/xlivebase_app.h>
+
+#include <mutex>
+#include <unordered_set>
+
 #include <rex/logging.h>
 #include <rex/thread.h>
 
@@ -106,10 +110,27 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return X_E_SUCCESS;
     }
   }
-  REXKRNL_ERROR(
-      "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
-      "arg2={:08X}",
-      app_id(), message, buffer_ptr, buffer_length);
+  // Once per message id at error level, then at debug: a title polling an
+  // unimplemented message every frame (Perfect Dark Zero: 0005800E) would
+  // otherwise write and flush a log line a frame on its own thread.
+  static std::mutex logged_mutex;
+  static std::unordered_set<uint32_t> logged;
+  bool first;
+  {
+    std::lock_guard<std::mutex> lock(logged_mutex);
+    first = logged.insert(message).second;
+  }
+  if (first) {
+    REXKRNL_ERROR(
+        "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
+        "arg2={:08X} (logged once per message; later ones at debug level)",
+        app_id(), message, buffer_ptr, buffer_length);
+  } else {
+    REXKRNL_DEBUG(
+        "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
+        "arg2={:08X}",
+        app_id(), message, buffer_ptr, buffer_length);
+  }
   return X_E_FAIL;
 }
 

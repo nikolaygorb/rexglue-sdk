@@ -17,7 +17,9 @@
 
 #include <rex/assert.h>
 #include <rex/math.h>
+#include <rex/ui/gpu_breadcrumbs.h>
 #include <rex/ui/vulkan/api.h>
+#include <rex/ui/vulkan/device.h>
 
 namespace rex::graphics::vulkan {
 
@@ -27,8 +29,32 @@ class DeferredCommandBuffer {
  public:
   DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                         size_t initial_size_bytes = 1024 * 1024);
+  // For a user other than VulkanCommandProcessor (the native renderer): the
+  // commands are replayed with this device's functions.
+  explicit DeferredCommandBuffer(const ui::vulkan::VulkanDevice* vulkan_device,
+                                 size_t initial_size_bytes = 1024 * 1024);
 
   void Reset();
+  void CmdBreadcrumb(uint32_t sequence) {
+    if (sequence) *reinterpret_cast<uint32_t*>(WriteCommand(Command::kBreadcrumb, sizeof(uint32_t))) = sequence;
+  }
+  // Device-loss breadcrumbs (ReIGlue 1100): the second marker, written by the
+  // GPU once the work recorded before the draw numbered `sequence` finished.
+  void CmdSetupBreadcrumb(uint32_t sequence) {
+    if (sequence) {
+      *reinterpret_cast<uint32_t*>(WriteCommand(Command::kSetupBreadcrumb, sizeof(uint32_t))) =
+          sequence;
+    }
+  }
+  // Counts the commands written to the main stream by kind while on (with
+  // device-loss breadcrumbs); TakeBreadcrumbWork returns the counts since its
+  // last call and starts again. The hoisted stream is not counted.
+  void SetCountBreadcrumbWork(bool count) { count_breadcrumb_work_ = count; }
+  ui::GpuBreadcrumbWork TakeBreadcrumbWork() {
+    const ui::GpuBreadcrumbWork work = breadcrumb_work_;
+    breadcrumb_work_ = ui::GpuBreadcrumbWork();
+    return work;
+  }
   void Execute(VkCommandBuffer command_buffer);
 
   // The recorded commands, taken out for another thread to execute (threaded
@@ -223,6 +249,22 @@ class DeferredCommandBuffer {
                 sizeof(VkImageSubresourceRange) * range_count);
   }
 
+  void CmdVkClearDepthStencilImage(VkImage image, VkImageLayout image_layout,
+                                   const VkClearDepthStencilValue* depth_stencil,
+                                   uint32_t range_count, const VkImageSubresourceRange* ranges) {
+    const size_t header_size =
+        rex::align(sizeof(ArgsVkClearDepthStencilImage), alignof(VkImageSubresourceRange));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkClearDepthStencilImage,
+                     header_size + sizeof(VkImageSubresourceRange) * range_count));
+    auto& args = *reinterpret_cast<ArgsVkClearDepthStencilImage*>(args_ptr);
+    args.image = image;
+    args.image_layout = image_layout;
+    args.depth_stencil = *depth_stencil;
+    args.range_count = range_count;
+    std::memcpy(args_ptr + header_size, ranges, sizeof(VkImageSubresourceRange) * range_count);
+  }
+
   VkBufferCopy* CmdCopyBufferEmplace(VkBuffer src_buffer, VkBuffer dst_buffer,
                                      uint32_t region_count) {
     const size_t header_size = rex::align(sizeof(ArgsVkCopyBuffer), alignof(VkBufferCopy));
@@ -298,6 +340,63 @@ class DeferredCommandBuffer {
     args.region_count = region_count;
     return reinterpret_cast<VkImageCopy*>(args_ptr + header_size);
   }
+
+  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
+                      VkImageLayout dst_image_layout, uint32_t region_count,
+                      const VkImageCopy* regions) {
+    std::memcpy(CmdCopyImageEmplace(src_image, src_image_layout, dst_image, dst_image_layout,
+                                    region_count),
+                regions, sizeof(VkImageCopy) * region_count);
+  }
+
+  void CmdVkResolveImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
+                         VkImageLayout dst_image_layout, uint32_t region_count,
+                         const VkImageResolve* regions) {
+    const size_t header_size = rex::align(sizeof(ArgsVkResolveImage), alignof(VkImageResolve));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
+        Command::kVkResolveImage, header_size + sizeof(VkImageResolve) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkResolveImage*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region_count = region_count;
+    std::memcpy(args_ptr + header_size, regions, sizeof(VkImageResolve) * region_count);
+  }
+
+  void CmdVkBlitImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
+                      VkImageLayout dst_image_layout, uint32_t region_count,
+                      const VkImageBlit* regions, VkFilter filter) {
+    const size_t header_size = rex::align(sizeof(ArgsVkBlitImage), alignof(VkImageBlit));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkBlitImage, header_size + sizeof(VkImageBlit) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkBlitImage*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region_count = region_count;
+    args.filter = filter;
+    std::memcpy(args_ptr + header_size, regions, sizeof(VkImageBlit) * region_count);
+  }
+
+  // data_size: at most 65536, a multiple of 4 (as vkCmdUpdateBuffer).
+  void CmdVkUpdateBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize data_size,
+                         const void* data) {
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkUpdateBuffer, sizeof(ArgsVkUpdateBuffer) + size_t(data_size)));
+    auto& args = *reinterpret_cast<ArgsVkUpdateBuffer*>(args_ptr);
+    args.dst_buffer = dst_buffer;
+    args.dst_offset = dst_offset;
+    args.data_size = data_size;
+    std::memcpy(args_ptr + sizeof(ArgsVkUpdateBuffer), data, size_t(data_size));
+  }
+
+  // VK_KHR_push_descriptor. The writes' image, buffer or texel buffer view
+  // arrays are copied; their pNext must be null.
+  void CmdVkPushDescriptorSetKHR(VkPipelineBindPoint pipeline_bind_point, VkPipelineLayout layout,
+                                 uint32_t set, uint32_t descriptor_write_count,
+                                 const VkWriteDescriptorSet* descriptor_writes);
 
   void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage, VkQueryPool query_pool,
                            uint32_t query) {
@@ -488,6 +587,8 @@ class DeferredCommandBuffer {
 
  private:
   enum class Command {
+    kBreadcrumb,
+    kSetupBreadcrumb,
     kVkBeginRenderPass,
     kVkBeginQuery,
     kVkBindDescriptorSets,
@@ -523,6 +624,11 @@ class DeferredCommandBuffer {
     kVkSetStencilWriteMask,
     kVkSetViewport,
     kVkWriteTimestamp,
+    kVkResolveImage,
+    kVkBlitImage,
+    kVkUpdateBuffer,
+    kVkPushDescriptorSetKHR,
+    kVkClearDepthStencilImage,
     kHoistedCommands,
   };
 
@@ -774,6 +880,72 @@ class DeferredCommandBuffer {
     uint32_t query;
   };
 
+  struct ArgsVkClearDepthStencilImage {
+    VkImage image;
+    VkImageLayout image_layout;
+    VkClearDepthStencilValue depth_stencil;
+    uint32_t range_count;
+    // Followed by aligned VkImageSubresourceRange[].
+  };
+
+  struct ArgsVkResolveImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    uint32_t region_count;
+    // Followed by aligned VkImageResolve[].
+    static_assert(alignof(VkImageResolve) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkBlitImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    uint32_t region_count;
+    VkFilter filter;
+    // Followed by aligned VkImageBlit[].
+    static_assert(alignof(VkImageBlit) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkUpdateBuffer {
+    VkBuffer dst_buffer;
+    VkDeviceSize dst_offset;
+    VkDeviceSize data_size;
+    // Followed by data_size bytes.
+  };
+
+  struct ArgsVkPushDescriptorSetKHR {
+    VkPipelineBindPoint pipeline_bind_point;
+    VkPipelineLayout layout;
+    uint32_t set;
+    uint32_t descriptor_write_count;
+    // Followed by descriptor_write_count aligned ArgsPushDescriptorWrite
+    // records, each followed by its aligned info array.
+  };
+
+  enum class PushDescriptorInfo : uint32_t {
+    kImage,
+    kBuffer,
+    kTexelBufferView,
+  };
+
+  struct ArgsPushDescriptorWrite {
+    uint32_t dst_binding;
+    uint32_t dst_array_element;
+    uint32_t descriptor_count;
+    VkDescriptorType descriptor_type;
+    PushDescriptorInfo info;
+    // Followed by aligned VkDescriptorImageInfo[], VkDescriptorBufferInfo[] or
+    // VkBufferView[] (descriptor_count of them).
+    static_assert(alignof(VkDescriptorImageInfo) <= alignof(uintmax_t));
+    static_assert(alignof(VkDescriptorBufferInfo) <= alignof(uintmax_t));
+    static_assert(alignof(VkBufferView) <= alignof(uintmax_t));
+  };
+  static PushDescriptorInfo GetPushDescriptorInfo(VkDescriptorType type);
+  static size_t GetPushDescriptorInfoSize(PushDescriptorInfo info);
+
   struct ArgsHoistedCommands {
     // Range of hoisted_stream_, in elements.
     size_t begin;
@@ -802,6 +974,9 @@ class DeferredCommandBuffer {
   // Commands that only set state for later draws and dispatches: a barrier
   // may be executed before them instead of after.
   static bool IsStateCommand(Command command);
+  // vulkan_tight_render_area: the render area a pass's draws and clears need.
+  static VkRect2D PassRenderArea(const uintmax_t* stream, size_t stream_remaining,
+                                 const VkRect2D& full, VkRect2D scissor, bool has_scissor);
   // vulkan_merge_adjacent_barriers: with stream at a barrier's arguments,
   // executes it and the barriers after it (only state commands between) as
   // one barrier, then those state commands, and moves stream past the last
@@ -809,24 +984,38 @@ class DeferredCommandBuffer {
   bool MergeBarriersAt(VkCommandBuffer command_buffer, const uintmax_t*& stream,
                        size_t& stream_remaining, const uintmax_t* hoisted_stream) const;
 
-  const VulkanCommandProcessor& command_processor_;
+  const ui::vulkan::VulkanDevice::Functions& functions() const;
+
+  // One of them: the command processor's device is looked up at replay (it
+  // may not exist yet when this is constructed).
+  const VulkanCommandProcessor* command_processor_ = nullptr;
+  const ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
   std::vector<uintmax_t> hoisted_stream_;
   std::vector<uintmax_t>* write_stream_ = &command_stream_;
+  bool count_breadcrumb_work_ = false;
+  ui::GpuBreadcrumbWork breadcrumb_work_;
+  void CountBreadcrumbWork(Command command);
   // For rebuilding pNext chains of barriers with sample locations. Scratch of
   // the replay, which runs on one thread at a time.
   mutable std::vector<VkImageMemoryBarrier> image_barriers_with_sample_locations_;
   mutable std::vector<VkSampleLocationsInfoEXT> barrier_sample_locations_;
   // vulkan_merge_adjacent_barriers, latched per Execute, and its scratch.
   mutable bool merge_barriers_ = false;
+  // vulkan_tight_render_area, and the scissor 0 the replay last set.
+  mutable bool tight_render_area_ = false;
+  mutable VkRect2D tight_scissor_ = {};
+  mutable bool tight_has_scissor_ = false;
   mutable std::vector<const ArgsVkPipelineBarrier*> merged_args_;
   mutable std::vector<const uintmax_t*> merge_state_commands_;
   mutable std::vector<VkImage> merge_images_;
   mutable std::vector<VkMemoryBarrier> merged_memory_barriers_;
   mutable std::vector<VkBufferMemoryBarrier> merged_buffer_barriers_;
   mutable std::vector<VkImageMemoryBarrier> merged_image_barriers_;
+  // Push descriptor writes rebuilt at replay.
+  mutable std::vector<VkWriteDescriptorSet> push_descriptor_writes_;
 };
 
 }  // namespace rex::graphics::vulkan

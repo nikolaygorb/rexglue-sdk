@@ -13,6 +13,7 @@
 
 #include <cstring>
 
+#include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
@@ -20,6 +21,11 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/thread.h>
+
+REXCVAR_DEFINE_BOOL(trace_replay_edram, true, "GPU/Trace",
+                    "In a GPU trace replay, restore the EDRAM the frame started with (what the "
+                    "previous frame left in it); off: start with it empty, for comparing a "
+                    "renderer that can't restore it (tools/gpu_traces/bisect_draws.py)");
 
 namespace rex::graphics {
 
@@ -71,12 +77,30 @@ bool TracePlayer::PlayOnWorkerThread(TraceReader& reader) {
       case TraceCommandType::kMemoryRead:
         if (command.size && command.address < 0x20000000 &&
             command.size <= 0x20000000 - command.address) {
+          // The title isn't loaded, so nothing allocated these pages: the
+          // shared memory refuses to upload unallocated ones (an invalid fetch
+          // constant otherwise) and the draws would fail. Committed first, as
+          // the title had them.
+          memory::VirtualHeap* physical_heap = memory->GetPhysicalHeap();
+          uint32_t page_mask = physical_heap->page_size() - 1;
+          uint32_t first = command.address & ~page_mask;
+          uint32_t last = (command.address + command.size - 1) | page_mask;
+          if (physical_heap->QueryRangeAccess(first, last) != rex::memory::PageAccess::kReadWrite &&
+              !physical_heap->AllocFixed(
+                  first, last - first + 1, page_mask + 1,
+                  memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                  memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
+            REXGPU_WARN("GPU trace: can't allocate the memory at {:08X} ({} bytes)",
+                        command.address, command.size);
+          }
           std::memcpy(memory->TranslatePhysical(command.address), data, command.size);
           command_processor->TracePlaybackWroteMemory(command.address, command.size);
         }
         break;
       case TraceCommandType::kEdramSnapshot:
-        command_processor->RestoreEdramSnapshot(data, command.size);
+        if (REXCVAR_GET(trace_replay_edram)) {
+          command_processor->RestoreEdramSnapshot(data, command.size);
+        }
         break;
       case TraceCommandType::kRegisters:
         command_processor->RestoreRegisters(command.address,
@@ -105,6 +129,10 @@ bool TracePlayer::PlayOnWorkerThread(TraceReader& reader) {
     }
   }
 
+  REXGPU_INFO("GPU trace: {} draws in the frame", command_processor->trace_playback_draws());
+  // occlusion_query_log: every report of the frame in the log, before the
+  // process exits.
+  command_processor->RetireZPDReportsForTrace();
   command_processor->set_trace_playback(false);
   if (reader.failed()) {
     REXGPU_ERROR("GPU trace: the file is truncated");

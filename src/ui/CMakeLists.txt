@@ -2,6 +2,7 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    displays.cpp
     graphics_upload_buffer_pool.cpp
     gpu_trace_replay.cpp
     graphics_util.cpp

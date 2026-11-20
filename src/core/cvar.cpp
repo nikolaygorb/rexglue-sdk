@@ -76,20 +76,72 @@ std::unordered_map<std::string, PendingValues>& GetPendingValuesStorage() {
   return pending;
 }
 
-// The settings file's own lines (name -> value as the file has it), from the
-// last LoadConfig or SaveConfig. A value from the command line or the
-// environment is a one-off for that run, so the save writes the file's value
-// for that flag instead; lines for names nobody registered in this run (a
-// plugin not loaded, another program's settings) are written back as they
-// were instead of being dropped.
+// A settings file's own lines (name -> value as the file has it). A value from
+// the command line or the environment is a one-off for that run, so a save
+// leaves the file's line for that flag as it is; lines for names nobody
+// registered in this run (a plugin not loaded, another program's settings)
+// stay in the file.
 struct ConfigLine {
   std::string value;
   bool is_string = false;  // a TOML string (quoted) in the file
 };
 
-std::unordered_map<std::string, ConfigLine>& GetConfigLinesStorage() {
-  static std::unordered_map<std::string, ConfigLine> lines;
-  return lines;
+// One settings file read by LoadConfig (or written whole by SaveConfig).
+struct ConfigFile {
+  std::filesystem::path path;
+  std::string key;  // ConfigFileKey(path)
+  std::unordered_map<std::string, ConfigLine> lines;
+  bool unreadable = false;  // LoadConfig could not parse it
+};
+
+// The settings files in the order their values were applied: a file loaded
+// again moves to the end. A title loads several (hardware.toml, then
+// mapping.toml); a name's line in a later file won over an earlier one.
+std::vector<ConfigFile>& GetConfigFilesStorage() {
+  static std::vector<ConfigFile> files;
+  return files;
+}
+
+// The same file reached through different spellings of its path gets one key.
+std::string ConfigFileKey(const std::filesystem::path& path) {
+  std::error_code ec;
+  std::filesystem::path full = std::filesystem::weakly_canonical(path, ec);
+  if (ec) {
+    full = std::filesystem::absolute(path, ec);
+    if (ec) {
+      full = path;
+    }
+  }
+  std::string key = rex::path_to_utf8(full.lexically_normal());
+#ifdef _WIN32
+  for (char& c : key) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+#endif
+  return key;
+}
+
+// The line of the file whose value for `name` was applied last. Called with
+// the registry lock held.
+const ConfigLine* FindConfigLine(const std::string& name) {
+  const auto& files = GetConfigFilesStorage();
+  for (auto it = files.rbegin(); it != files.rend(); ++it) {
+    auto line = it->lines.find(name);
+    if (line != it->lines.end()) {
+      return &line->second;
+    }
+  }
+  return nullptr;
+}
+
+// Makes `path` the most recently applied settings file with these lines.
+void RecordConfigFile(const std::filesystem::path& path,
+                      std::unordered_map<std::string, ConfigLine> lines, bool unreadable) {
+  std::string key = ConfigFileKey(path);
+  std::lock_guard lock(GetRegistryMutex());
+  auto& files = GetConfigFilesStorage();
+  std::erase_if(files, [&](const ConfigFile& file) { return file.key == key; });
+  files.push_back(ConfigFile{path, std::move(key), std::move(lines), unreadable});
 }
 
 // The value each flag got from the command line or the environment (in the
@@ -134,13 +186,14 @@ bool ApplyFromSource(FlagEntry& entry, std::string_view value, Source source) {
   return true;
 }
 
-// Recursively apply TOML values
-void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
+// Recursively apply TOML values; `lines` receives the file's values by name.
+void ApplyTomlTable(const toml::table& table, const std::string& prefix,
+                    std::unordered_map<std::string, ConfigLine>& lines) {
   for (const auto& [key, value] : table) {
     std::string full_key = prefix.empty() ? std::string(key) : prefix + "_" + std::string(key);
 
     if (value.is_table()) {
-      ApplyTomlTable(*value.as_table(), full_key);
+      ApplyTomlTable(*value.as_table(), full_key, lines);
     } else {
       std::string value_str;
       if (value.is_boolean()) {
@@ -156,10 +209,7 @@ void ApplyTomlTable(const toml::table& table, const std::string& prefix) {
         continue;
       }
 
-      {
-        std::lock_guard lock(GetRegistryMutex());
-        GetConfigLinesStorage()[full_key] = ConfigLine{value_str, value.is_string()};
-      }
+      lines[full_key] = ConfigLine{value_str, value.is_string()};
 
       if (GetFlagInfo(full_key) == nullptr) {
         std::lock_guard lock(GetRegistryMutex());
@@ -700,14 +750,14 @@ std::string TomlString(const std::string& value) {
   return out.str();
 }
 
-// The settings file's lines: each registered flag that differs from its
-// default (a command-line or environment value replaced by the file's own,
-// see GetConfigLinesStorage), then, for the whole file only, the file's lines
-// for names nobody registered. `written` receives what was serialized.
+// A whole settings file's lines: each registered flag that differs from its
+// default (a command-line or environment value replaced by the settings
+// files' own, see ConfigLine), then, for the whole file only, the settings
+// files' lines for names nobody registered. `written` receives what was
+// serialized.
 // Called with the registry lock held.
 std::string SerializeLines(const std::string_view* category,
                            std::unordered_map<std::string, ConfigLine>* written) {
-  const auto& lines = GetConfigLinesStorage();
   std::string result;
   auto add = [&](const std::string& name, const std::string& value, bool is_string) {
     result += name + " = " + (is_string ? TomlString(value) : value) + "\n";
@@ -726,9 +776,9 @@ std::string SerializeLines(const std::string_view* category,
       if (one_off == GetOneOffValuesStorage().end() || one_off->second == value) {
         // Still the run's one-off value (a launcher's flag, a test switch):
         // the file keeps what it had.
-        auto it = lines.find(entry.name);
-        if (it != lines.end() && it->second.value != entry.default_value) {
-          add(entry.name, it->second.value, is_string);
+        const ConfigLine* line = FindConfigLine(entry.name);
+        if (line && line->value != entry.default_value) {
+          add(entry.name, line->value, is_string);
         }
         continue;
       }
@@ -739,12 +789,18 @@ std::string SerializeLines(const std::string_view* category,
     }
   }
   if (!category) {
-    std::vector<std::pair<std::string, ConfigLine>> unknown;
-    for (const auto& [name, line] : lines) {
-      if (GetRegistryIndex().find(name) == GetRegistryIndex().end()) {
-        unknown.emplace_back(name, line);
+    // Every settings file's lines for names nobody registered, a later file's
+    // line over an earlier one's.
+    std::unordered_map<std::string, ConfigLine> unknown_by_name;
+    for (const auto& file : GetConfigFilesStorage()) {
+      for (const auto& [name, line] : file.lines) {
+        if (GetRegistryIndex().find(name) == GetRegistryIndex().end()) {
+          unknown_by_name[name] = line;
+        }
       }
     }
+    std::vector<std::pair<std::string, ConfigLine>> unknown(unknown_by_name.begin(),
+                                                            unknown_by_name.end());
     std::sort(unknown.begin(), unknown.end(),
               [](const auto& x, const auto& y) { return x.first < y.first; });
     for (const auto& [name, line] : unknown) {
@@ -800,12 +856,11 @@ bool SetDefaultValue(std::string_view name, std::string_view value) {
 
 std::optional<std::string> GetConfigFileValue(std::string_view name) {
   std::lock_guard lock(GetRegistryMutex());
-  const auto& lines = GetConfigLinesStorage();
-  auto it = lines.find(std::string(name));
-  if (it == lines.end()) {
+  const ConfigLine* line = FindConfigLine(std::string(name));
+  if (!line) {
     return std::nullopt;
   }
-  return it->second.value;
+  return line->value;
 }
 
 void RegisterChangeCallback(std::string_view name, ChangeCallback callback) {
@@ -861,10 +916,16 @@ std::vector<std::string> Init(int argc, char** argv) {
           },
           entry.description);
     } else {
+      // A switch given twice is legal and the last one wins. CLI11's default
+      // policy (Throw) made it throw in the callback stage, which skipped every
+      // flag registered after it (wwe2k14-recomp full/117).
       app.add_option_function<std::string>(
-          "--" + entry.name,
-          [&entry](const std::string& val) { ApplyFromSource(entry, val, Source::kCommandLine); },
-          entry.description);
+             "--" + entry.name,
+             [&entry](const std::string& val) {
+               ApplyFromSource(entry, val, Source::kCommandLine);
+             },
+             entry.description)
+          ->multi_option_policy(CLI::MultiOptionPolicy::TakeLast);
     }
   }
 
@@ -905,6 +966,257 @@ std::vector<std::string> Init(int argc, char** argv) {
   return positional;
 }
 
+namespace {
+std::mutex g_config_reports_mutex;
+std::vector<ConfigLoadReport> g_config_reports;
+
+// The bare key a `key = value` line sets (empty for anything else: comments,
+// table headers, continuation lines). Keys as SaveConfig writes them: letters,
+// digits, '_', '-' and '.'.
+std::string_view ConfigLineKey(std::string_view line) {
+  size_t i = 0;
+  while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
+    ++i;
+  }
+  const size_t start = i;
+  while (i < line.size() && (std::isalnum(static_cast<unsigned char>(line[i])) ||
+                             line[i] == '_' || line[i] == '-' || line[i] == '.')) {
+    ++i;
+  }
+  if (i == start) {
+    return {};
+  }
+  const size_t end = i;
+  while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) {
+    ++i;
+  }
+  if (i >= line.size() || line[i] != '=') {
+    return {};
+  }
+  return line.substr(start, end - start);
+}
+}  // namespace
+
+std::string DropEarlierConfigDuplicates(const std::string& text,
+                                        std::vector<std::string>& dropped) {
+  std::vector<std::string_view> lines;
+  for (size_t pos = 0; pos <= text.size();) {
+    const size_t newline = text.find('\n', pos);
+    const size_t end = newline == std::string::npos ? text.size() : newline;
+    lines.push_back(std::string_view(text).substr(pos, end - pos));
+    if (newline == std::string::npos) {
+      break;
+    }
+    pos = newline + 1;
+  }
+  // "table\nkey" -> its last line. Each [[array]] element is its own table.
+  std::unordered_map<std::string, size_t> last;
+  std::vector<std::string> keys(lines.size());
+  std::string table;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const std::string_view line = lines[i];
+    const size_t first = line.find_first_not_of(" \t");
+    if (first != std::string_view::npos && line[first] == '[') {
+      table = std::string(line.substr(first));
+      if (line.substr(first, 2) == "[[") {
+        table += fmt::format("#{}", i);
+      }
+      continue;
+    }
+    const std::string_view key = ConfigLineKey(line);
+    if (key.empty()) {
+      continue;
+    }
+    keys[i] = table + "\n" + std::string(key);
+    last[keys[i]] = i;
+  }
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (!keys[i].empty() && last[keys[i]] != i) {
+      std::string key = keys[i].substr(keys[i].find('\n') + 1);
+      if (std::find(dropped.begin(), dropped.end(), key) == dropped.end()) {
+        dropped.push_back(std::move(key));
+      }
+      continue;
+    }
+    out.append(lines[i]);
+    if (i + 1 < lines.size()) {
+      out.push_back('\n');
+    }
+  }
+  return out;
+}
+
+namespace {
+
+// Where the value of a `key = value` line that starts at `start` ends: after a
+// quoted string, or before a `#` comment outside quotes (arrays and inline
+// tables included), trailing spaces excluded. npos for a multi-line string
+// whose closing delimiter is on a later line.
+size_t ConfigValueEnd(std::string_view line, size_t start) {
+  const std::string_view rest = line.substr(start);
+  if (rest.starts_with("\"\"\"") || rest.starts_with("'''")) {
+    const size_t close = line.find(rest.substr(0, 3), start + 3);
+    return close == std::string_view::npos ? std::string_view::npos : close + 3;
+  }
+  char quote = 0;
+  size_t end = line.size();
+  for (size_t i = start; i < line.size(); ++i) {
+    const char c = line[i];
+    if (quote) {
+      if (quote == '"' && c == '\\') {
+        ++i;
+      } else if (c == quote) {
+        quote = 0;
+      }
+    } else if (c == '"' || c == '\'') {
+      quote = c;
+    } else if (c == '#') {
+      end = i;
+      break;
+    }
+  }
+  while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t')) {
+    --end;
+  }
+  return end;
+}
+
+bool IsConfigTableHeader(std::string_view line) {
+  const size_t first = line.find_first_not_of(" \t");
+  return first != std::string_view::npos && line[first] == '[';
+}
+
+std::string_view WithoutCarriageReturn(std::string_view line) {
+  if (!line.empty() && line.back() == '\r') {
+    line.remove_suffix(1);
+  }
+  return line;
+}
+
+}  // namespace
+
+std::string EditConfigText(std::string_view text, const std::vector<ConfigEdit>& edits) {
+  const bool crlf = text.find("\r\n") != std::string_view::npos;
+  const bool ends_with_newline = !text.empty() && text.back() == '\n';
+  std::vector<std::string> lines;
+  for (size_t pos = 0; pos < text.size();) {
+    const size_t newline = text.find('\n', pos);
+    const size_t end = newline == std::string_view::npos ? text.size() : newline;
+    lines.emplace_back(text.substr(pos, end - pos));  // a CR stays at the end of its line
+    pos = newline == std::string_view::npos ? text.size() : newline + 1;
+  }
+  size_t root_end = lines.size();
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (IsConfigTableHeader(lines[i])) {
+      root_end = i;
+      break;
+    }
+  }
+
+  std::vector<std::pair<std::string, std::string>> added;  // name, value
+  for (const ConfigEdit& edit : edits) {
+    // The last line of the root table for the name: the one the loader uses.
+    size_t found = SIZE_MAX;
+    for (size_t i = 0; i < root_end; ++i) {
+      if (ConfigLineKey(WithoutCarriageReturn(lines[i])) == edit.name) {
+        found = i;
+      }
+    }
+    if (found == SIZE_MAX) {
+      auto it = std::find_if(added.begin(), added.end(),
+                             [&](const auto& line) { return line.first == edit.name; });
+      if (it != added.end()) {
+        it->second = edit.value;
+      } else {
+        added.emplace_back(edit.name, edit.value);
+      }
+      continue;
+    }
+    std::string& line = lines[found];
+    const bool cr = !line.empty() && line.back() == '\r';
+    const std::string_view view = WithoutCarriageReturn(line);
+    const size_t eq = view.find('=');
+    const size_t value_start = view.find_first_not_of(" \t", eq + 1);
+    std::string replaced;
+    if (value_start == std::string_view::npos) {
+      replaced = std::string(view.substr(0, eq + 1)) + " " + edit.value;
+    } else {
+      size_t value_end = ConfigValueEnd(view, value_start);
+      std::string suffix;
+      if (value_end != std::string_view::npos) {
+        suffix = std::string(view.substr(value_end));
+      } else {
+        // A multi-line string: drop its other lines, keep what follows it.
+        const std::string delimiter(view.substr(value_start, 3));
+        size_t last = found + 1;
+        while (last < root_end && lines[last].find(delimiter) == std::string::npos) {
+          ++last;
+        }
+        if (last < root_end) {
+          const std::string_view closing = WithoutCarriageReturn(lines[last]);
+          suffix = std::string(closing.substr(closing.find(delimiter) + 3));
+          ++last;
+          lines.erase(lines.begin() + static_cast<std::ptrdiff_t>(found + 1),
+                      lines.begin() + static_cast<std::ptrdiff_t>(last));
+          root_end -= last - (found + 1);
+        }
+        // Never closed: only this line is replaced.
+      }
+      replaced = std::string(view.substr(0, value_start)) + edit.value + suffix;
+    }
+    if (cr) {
+      replaced.push_back('\r');
+    }
+    lines[found] = std::move(replaced);
+  }
+
+  bool added_at_end = false;
+  if (!added.empty()) {
+    std::vector<std::string> new_lines;
+    for (const auto& [name, value] : added) {
+      new_lines.push_back(name + " = " + value + (crlf ? "\r" : ""));
+    }
+    size_t insert_at = lines.size();
+    if (root_end < lines.size()) {
+      // Before the first table: after the root's last setting.
+      insert_at = root_end;
+      for (size_t i = root_end; i-- > 0;) {
+        if (!ConfigLineKey(WithoutCarriageReturn(lines[i])).empty()) {
+          insert_at = i + 1;
+          break;
+        }
+      }
+      if (IsConfigTableHeader(lines[insert_at])) {
+        new_lines.push_back(crlf ? "\r" : "");
+      }
+    } else {
+      added_at_end = true;
+    }
+    lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(insert_at), new_lines.begin(),
+                 new_lines.end());
+  }
+
+  std::string out;
+  out.reserve(text.size() + 64 * added.size());
+  for (size_t i = 0; i < lines.size(); ++i) {
+    out += lines[i];
+    if (i + 1 < lines.size()) {
+      out.push_back('\n');
+    }
+  }
+  if (!lines.empty() && (ends_with_newline || added_at_end)) {
+    out.push_back('\n');
+  }
+  return out;
+}
+
+std::vector<ConfigLoadReport> GetConfigLoadReports() {
+  std::lock_guard lock(g_config_reports_mutex);
+  return g_config_reports;
+}
+
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
     REXLOG_DEBUG("Config file not found: {}", rex::path_to_utf8(config_path));
@@ -922,15 +1234,56 @@ void LoadConfig(const std::filesystem::path& config_path) {
       return;
     }
     const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-    auto config = toml::parse(text, name);
-    {
-      std::lock_guard lock(GetRegistryMutex());
-      GetConfigLinesStorage().clear();  // this file's lines from now on
+    file.close();
+    auto apply = [&](const toml::table& config) {
+      std::unordered_map<std::string, ConfigLine> lines;
+      ApplyTomlTable(config, "", lines);
+      RecordConfigFile(config_path, std::move(lines), /*unreadable=*/false);
+    };
+    try {
+      apply(toml::parse(text, name));
+      REXLOG_DEBUG("Loaded config from {}", name);
+      return;
+    } catch (const toml::parse_error& err) {
+      ConfigLoadReport report;
+      report.path = config_path;
+      // A setting written twice is the usual hand-edit mistake (and an error
+      // in TOML): read the file with the last value of each.
+      std::vector<std::string> dropped;
+      const std::string deduplicated = DropEarlierConfigDuplicates(text, dropped);
+      bool recovered = false;
+      if (!dropped.empty()) {
+        try {
+          apply(toml::parse(deduplicated, name));
+          recovered = true;
+          report.kind = ConfigLoadReport::Kind::kDuplicates;
+          report.duplicate_keys = std::move(dropped);
+          REXLOG_WARN("Config {}: settings written more than once, the last value used", name);
+        } catch (const toml::parse_error&) {
+        }
+      }
+      if (!recovered) {
+        // Unreadable: defaults apply, and the next save replaces the file, so
+        // keep the player's copy first.
+        report.kind = ConfigLoadReport::Kind::kUnreadable;
+        report.line = static_cast<int>(err.source().begin.line);
+        report.error = std::string(err.description());
+        std::filesystem::path bad_copy = config_path;
+        bad_copy += ".bad";
+        std::error_code copy_ec;
+        std::filesystem::copy_file(config_path, bad_copy,
+                                   std::filesystem::copy_options::overwrite_existing, copy_ec);
+        if (!copy_ec) {
+          report.bad_copy = std::move(bad_copy);
+        }
+        RecordConfigFile(config_path, {}, /*unreadable=*/true);
+        REXLOG_ERROR("Failed to parse config {}: {}", name, err.what());
+      }
+      std::lock_guard lock(g_config_reports_mutex);
+      g_config_reports.push_back(std::move(report));
     }
-    ApplyTomlTable(config, "");
-    REXLOG_DEBUG("Loaded config from {}", name);
-  } catch (const toml::parse_error& err) {
-    REXLOG_ERROR("Failed to parse config {}: {}", name, err.what());
+  } catch (const std::exception& e) {
+    REXLOG_ERROR("Failed to read config {}: {}", name, e.what());
   }
 }
 
@@ -973,7 +1326,87 @@ bool IsFinalized() {
   return g_finalized;
 }
 
-void SaveConfig(const std::filesystem::path& config_path) {
+namespace {
+
+// A value as a save writes it after `=`: a string quoted and escaped, a double
+// in its shortest form ("0.3" rather than std::to_string's "0.300000").
+std::string FormatConfigValue(const FlagEntry& entry, const std::string& value) {
+  if (entry.type == FlagType::String) {
+    return TomlString(value);
+  }
+  if (entry.type == FlagType::Double) {
+    double parsed = 0;
+    if (ParseDouble(value, parsed)) {
+      std::string text = fmt::format("{}", parsed);
+      if (text.find_first_of(".eEin") == std::string::npos) {
+        text += ".0";  // stays a TOML float
+      }
+      return text;
+    }
+  }
+  return value;
+}
+
+// Whether the file's value (as LoadConfig read it) is the flag's value.
+bool SameConfigValue(const FlagEntry& entry, const std::string& file_value,
+                     const std::string& value) {
+  if (file_value == value) {
+    return true;
+  }
+  if (entry.type == FlagType::Double) {
+    double a = 0;
+    double b = 0;
+    return ParseDouble(file_value, a) && ParseDouble(value, b) && a == b;
+  }
+  return false;
+}
+
+// Writes to a temporary sibling and renames it over `path`, so an interrupted
+// write (crash, power loss, full disk) cannot leave a truncated file behind.
+// Binary, so the line endings are the content's own.
+bool WriteConfigFile(const std::filesystem::path& path, const std::string& content) {
+  try {
+    if (path.has_parent_path()) {
+      // A failure here shows up as the open failure below.
+      std::error_code create_ec;
+      std::filesystem::create_directories(path.parent_path(), create_ec);
+    }
+    std::filesystem::path temp_path = path;
+    temp_path += ".tmp";
+    {
+      std::ofstream file(temp_path, std::ios::binary | std::ios::trunc);
+      if (!file) {
+        REXLOG_ERROR("SaveConfig: failed to open {}", rex::path_to_utf8(temp_path));
+        return false;
+      }
+      file << content;
+      file.flush();
+      if (!file) {
+        REXLOG_ERROR("SaveConfig: failed to write {}", rex::path_to_utf8(temp_path));
+        std::error_code remove_ec;
+        std::filesystem::remove(temp_path, remove_ec);
+        return false;
+      }
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp_path, path, ec);
+    if (ec) {
+      REXLOG_ERROR("SaveConfig: failed to replace {}: {}", rex::path_to_utf8(path), ec.message());
+      std::error_code remove_ec;
+      std::filesystem::remove(temp_path, remove_ec);
+      return false;
+    }
+    return true;
+  } catch (const std::exception& e) {
+    REXLOG_ERROR("SaveConfig: {}", e.what());
+    return false;
+  }
+}
+
+// A path no settings file was read from (a new file, an export, a file that
+// could not be parsed): written whole, every setting that differs from its
+// default.
+void SaveWholeConfig(const std::filesystem::path& config_path) {
   std::string content;
   std::unordered_map<std::string, ConfigLine> written;
   {
@@ -984,51 +1417,108 @@ void SaveConfig(const std::filesystem::path& config_path) {
     REXLOG_DEBUG("SaveConfig: no modified flags to save");
     return;
   }
+  if (!WriteConfigFile(config_path, "# Auto-generated cvar configuration\n" + content)) {
+    return;
+  }
+  // The file now has these lines; a later save in this run edits them.
+  RecordConfigFile(config_path, std::move(written), /*unreadable=*/false);
+  REXLOG_INFO("Saved config to {}", rex::path_to_utf8(config_path));
+}
 
-  try {
-    if (config_path.has_parent_path()) {
-      // A failure here shows up as the open failure below.
-      std::error_code create_ec;
-      std::filesystem::create_directories(config_path.parent_path(), create_ec);
-    }
-    // Write to a temporary sibling and rename it over the target, so an
-    // interrupted write (crash, power loss, full disk) cannot leave a truncated
-    // config behind.
-    std::filesystem::path temp_path = config_path;
-    temp_path += ".tmp";
-    {
-      std::ofstream file(temp_path, std::ios::trunc);
-      if (!file) {
-        REXLOG_ERROR("SaveConfig: failed to open {}", rex::path_to_utf8(temp_path));
-        return;
-      }
-      file << "# Auto-generated cvar configuration\n";
-      file << content;
-      file.flush();
-      if (!file) {
-        REXLOG_ERROR("SaveConfig: failed to write {}", rex::path_to_utf8(temp_path));
-        std::error_code remove_ec;
-        std::filesystem::remove(temp_path, remove_ec);
-        return;
+}  // namespace
+
+void SaveConfig(const std::filesystem::path& config_path) {
+  const std::string target_key = ConfigFileKey(config_path);
+  struct FileEdits {
+    std::filesystem::path path;
+    std::string key;
+    std::vector<ConfigEdit> edits;
+    std::vector<std::pair<std::string, ConfigLine>> lines;
+  };
+  std::vector<FileEdits> files_edits;
+  {
+    std::lock_guard lock(GetRegistryMutex());
+    const auto& files = GetConfigFilesStorage();
+    size_t target = SIZE_MAX;
+    for (size_t i = 0; i < files.size(); ++i) {
+      if (files[i].key == target_key && !files[i].unreadable) {
+        target = i;
       }
     }
-    std::error_code ec;
-    std::filesystem::rename(temp_path, config_path, ec);
-    if (ec) {
-      REXLOG_ERROR("SaveConfig: failed to replace {}: {}", rex::path_to_utf8(config_path),
-                   ec.message());
-      std::error_code remove_ec;
-      std::filesystem::remove(temp_path, remove_ec);
-      return;
+    if (target != SIZE_MAX) {
+      for (const ConfigFile& file : files) {
+        files_edits.push_back(FileEdits{file.path, file.key, {}, {}});
+      }
+      for (const FlagEntry& entry : GetRegistryStorage()) {
+        if (entry.type == FlagType::Command) {
+          continue;
+        }
+        const std::string value = entry.getter();
+        if (IsOneOffSource(entry.source)) {
+          auto one_off = GetOneOffValuesStorage().find(entry.name);
+          if (one_off == GetOneOffValuesStorage().end() || one_off->second == value) {
+            continue;  // the run's one-off value: the files keep theirs
+          }
+        }
+        // The file whose line for the flag was applied last gets the change;
+        // a flag no file has goes to config_path.
+        size_t owner = target;
+        bool has_line = false;
+        for (size_t i = files.size(); i-- > 0;) {
+          auto line = files[i].lines.find(entry.name);
+          if (line != files[i].lines.end()) {
+            has_line = true;
+            owner = SameConfigValue(entry, line->second.value, value) ? SIZE_MAX : i;
+            break;
+          }
+        }
+        if (owner == SIZE_MAX || (!has_line && value == entry.default_value)) {
+          continue;
+        }
+        files_edits[owner].edits.push_back(ConfigEdit{entry.name, FormatConfigValue(entry, value)});
+        files_edits[owner].lines.emplace_back(
+            entry.name, ConfigLine{value, entry.type == FlagType::String});
+      }
+    }
+  }
+  if (files_edits.empty()) {
+    SaveWholeConfig(config_path);
+    return;
+  }
+
+  // Each file is edited in place: only the changed lines and the added ones
+  // differ, comments, order, other keys and tables stay as they are.
+  size_t saved = 0;
+  for (FileEdits& file_edits : files_edits) {
+    if (file_edits.edits.empty()) {
+      continue;
+    }
+    std::string text;
+    {
+      std::ifstream file(file_edits.path, std::ios::binary);
+      if (file) {
+        text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+      }
+    }
+    if (!WriteConfigFile(file_edits.path, EditConfigText(text, file_edits.edits))) {
+      continue;
     }
     {
-      // The file now has these lines; a later save in this run starts from them.
       std::lock_guard lock(GetRegistryMutex());
-      GetConfigLinesStorage() = std::move(written);
+      for (ConfigFile& file : GetConfigFilesStorage()) {
+        if (file.key == file_edits.key) {
+          for (auto& [name, line] : file_edits.lines) {
+            file.lines[name] = std::move(line);
+          }
+        }
+      }
     }
-    REXLOG_INFO("Saved config to {}", rex::path_to_utf8(config_path));
-  } catch (const std::exception& e) {
-    REXLOG_ERROR("SaveConfig: {}", e.what());
+    saved += file_edits.edits.size();
+    REXLOG_INFO("Saved {} setting(s) to {}", file_edits.edits.size(),
+                rex::path_to_utf8(file_edits.path));
+  }
+  if (saved == 0) {
+    REXLOG_DEBUG("SaveConfig: no changed settings to save");
   }
 }
 
@@ -1046,8 +1536,12 @@ void ResetAllForTesting() {
   ResetAllToDefaults();
   ClearPendingRestartFlags();
   GetPendingValuesStorage().clear();
-  GetConfigLinesStorage().clear();
+  GetConfigFilesStorage().clear();
   GetOneOffValuesStorage().clear();
+  {
+    std::lock_guard lock(g_config_reports_mutex);
+    g_config_reports.clear();
+  }
   g_init_done = false;
   g_finalized = false;
 }

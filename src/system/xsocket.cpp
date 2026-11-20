@@ -10,8 +10,10 @@
  */
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/memory/utils.h>
 #include <rex/platform.h>
@@ -20,6 +22,12 @@
 // #include <rex/system/xnet.h>
 
 #include <rex/net/socket.h>
+
+REXCVAR_DEFINE_BOOL(net_lan, true, "Network",
+                    "Networking for system link / LAN play. Off: every socket the title binds to "
+                    "all interfaces is bound to the loopback address (127.0.0.1) instead, so local "
+                    "sockets still work, nothing listens on the network and Windows asks no "
+                    "firewall question");
 
 // Standard socket types used by Xbox API emulation
 #if REX_PLATFORM_WIN32
@@ -147,6 +155,21 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+  // net_lan off: a socket bound to every interface is bound to the loopback
+  // address instead (the caller's copy of the guest's address is changed).
+  if (!REXCVAR_GET(net_lan) && name && name->sin_family == AF_INET && name->sin_addr == 0) {
+    // be<> stores it in network order.
+    name->sin_addr = uint32_t(INADDR_LOOPBACK);
+  }
+  // be<> holds the port in network order; read and written as a number.
+  if (name) {
+    const uint16_t port = name->sin_port;
+    const uint16_t host_port = HostPortForBind(port);
+    if (host_port != port) {
+      name->sin_port = host_port;
+      REXSYS_WARN("XSocket::Bind: port {} needs privileges, bound to port {}", port, host_port);
+    }
+  }
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
@@ -213,7 +236,29 @@ int XSocket::Shutdown(int how) {
   return shutdown(native_handle_, how);
 }
 
+bool XSocket::UnboundDatagramReceive() {
+  if (type_ != X_SOCK_DGRAM || bound_seen_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  sockaddr_in host = {};
+  socklen_t host_len = sizeof(host);
+  if (getsockname(native_handle_, reinterpret_cast<sockaddr*>(&host), &host_len) == 0 &&
+      host.sin_port != 0) {
+    bound_seen_.store(true, std::memory_order_relaxed);
+    return false;
+  }
+#if REX_PLATFORM_WIN32
+  WSASetLastError(WSAEINVAL);
+#else
+  errno = EINVAL;
+#endif
+  return true;
+}
+
 int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+  if (UnboundDatagramReceive()) {
+    return -1;
+  }
   return recv(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags);
 }
 
@@ -241,6 +286,10 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
     }
   }
   */
+
+  if (UnboundDatagramReceive()) {
+    return -1;
+  }
 
   sockaddr_in nfrom;
   socklen_t nfromlen = sizeof(sockaddr_in);

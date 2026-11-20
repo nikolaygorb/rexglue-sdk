@@ -315,7 +315,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void SetScissor(const VkRect2D& scissor);
 
   // Returns the text to display in the GPU backend name in the window title.
-  std::string GetWindowTitleText() const;
+  std::string GetWindowTitleText() const override;
 
  protected:
   bool SetupContext() override;
@@ -329,6 +329,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnPrimaryBufferEnd() override;
   void OnGuestMemorySyncPoint() override;
   SharedMemory* GetSharedMemoryForStats() const override { return shared_memory_.get(); }
+  // frame_stats_interval: the graphics card time of the submissions (as
+  // vulkan_gpu_time), submissions, draw render passes and pipeline binds.
+  void CollectRendererFrameCounters(RendererFrameCounters& counters) override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -339,6 +342,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  // Device-loss breadcrumbs: the work recorded with a resolve (ReIGlue 1100).
+  ui::GpuBreadcrumbDetails ResolveBreadcrumbDetails();
   void InitializeTrace() override;
 
   bool CanReadBackResolvesNow() const override { return true; }
@@ -370,6 +375,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     VkFence fence = VK_NULL_HANDLE;
     std::vector<VkSemaphore> wait_semaphores;
     std::vector<VkPipelineStageFlags> wait_stage_masks;
+    // The submission's timestamp queries, written around the replay.
+    GpuTimeRange gpu_time;
     // Instead of a submission: work to run on the thread after the jobs before
     // it, the presenter's publish step.
     std::function<void()> callback;
@@ -744,12 +751,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   // a ring of timestamp queries, used in submission order and freed in
   // completion order. Each submission has a start and an end timestamp, and
   // one where the section changed after commands of the old one were
-  // recorded; the time up to each belongs to the section it ended.
+  // recorded; the time up to each belongs to the section it ended. For
+  // frame_stats_interval (any build) only the start and the end are written.
   void InitializeGpuTime();
   void ShutdownGpuTime();
   bool AllocateGpuTimeQuery(uint32_t& query_out);
   void BeginGpuTimeSubmission();
   void ReadGpuTimes();
+  // The open submission's queries, for whichever thread records its command
+  // buffer (recorded = false: not timed).
+  GpuTimeRange GetGpuTimeRange() const;
+  // Around the replay of the deferred commands: the reset of the range and
+  // the start timestamp, then the end timestamp.
+  void RecordGpuTimeStart(VkCommandBuffer command_buffer, const GpuTimeRange& range) const;
+  void RecordGpuTimeEnd(VkCommandBuffer command_buffer, const GpuTimeRange& range) const;
   static constexpr uint32_t kGpuTimeQueries = 4096;
   VkQueryPool gpu_time_query_pool_ = VK_NULL_HANDLE;
   double gpu_time_ns_per_tick_ = 0.0;
@@ -771,8 +786,50 @@ class VulkanCommandProcessor : public CommandProcessor {
     GpuSection last = GpuSection::kOther;  // the section the end timestamp ends
     std::vector<GpuTimeMark> marks;
   };
+  // vulkan_gpu_time in a perf counter build: the time by kind, for the
+  // counters (otherwise only the totals for frame_stats_interval).
+  bool gpu_time_for_counters_ = false;
   // gpu_time_current_ belongs to the open submission.
   bool gpu_time_recording_ = false;
+  // frame_stats_interval: since the last CollectRendererFrameCounters.
+  uint64_t stats_gpu_ticks_ = 0;
+  uint64_t stats_submissions_ = 0;
+  uint64_t stats_render_passes_ = 0;
+  uint64_t stats_pipeline_binds_ = 0;
+  // frame_stats_interval: IssueDraw's host ticks by phase since the last
+  // CollectRendererFrameCounters, for comparing with the native renderer's
+  // line on the same scene (its views, samplers, layouts and descriptors are
+  // in descriptors here, UpdateBindings; its pass is barriers and the render
+  // pass here).
+  enum class DrawPhase : uint32_t {
+    // Shader analysis, modifications, translations, memory export ranges.
+    kShaders,
+    // Primitive processing (indices).
+    kIndices,
+    // Vertex and memory export ranges requested in the shared memory.
+    kVertexData,
+    // TextureCache::RequestTextures (loads).
+    kTextures,
+    // RenderTargetCache::Update (EDRAM transfers, clears).
+    kTargets,
+    // ConfigurePipeline, the pipeline and its layout bound.
+    kPipeline,
+    // Query segment, viewport, dynamic state, system constants.
+    kState,
+    // UpdateBindings: constants, texture views, samplers, descriptor sets.
+    kDescriptors,
+    // Memory export snapshot, the shared memory barrier, barriers and the
+    // render pass.
+    kPass,
+    // The draw recorded and what follows it.
+    kRecord,
+    kCount,
+  };
+  uint64_t stats_draw_phase_ticks_[size_t(DrawPhase::kCount)] = {};
+  // One draw in kDrawPhaseSampleRate timed by phase (DrawPhaseTimer), its
+  // ticks counted that many times.
+  static constexpr uint32_t kDrawPhaseSampleRate = 8;
+  uint32_t stats_draw_phase_sample_ = 0;
   GpuTimeSubmission gpu_time_current_;
   std::deque<GpuTimeSubmission> gpu_time_submitted_;
   std::vector<uint64_t> gpu_time_stamps_;  // reused by ReadGpuTimes
@@ -828,6 +885,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
   bool frame_open_ = false;
+  // gpu_elide_unchanged_registers, read when a frame opens.
+  bool elide_unchanged_registers_ = true;
   // Tracks whether any draw in the current frame was skipped because its
   // graphics pipeline was still being created, so the output is incomplete.
   bool frame_used_pending_pipeline_ = false;

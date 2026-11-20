@@ -10,7 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <mutex>
+#include <rex/thread/mutex.h>
 
 #include <rex/system/xobject.h>
 #include <rex/system/xtypes.h>
@@ -47,7 +47,7 @@ class XSemaphore : public XObject {
   void SyncFromGuest() override;
 
  private:
-  // Writes host_count_ to the guest header (under count_lock_).
+  // Writes host_count_ to the guest header (under global_critical_region_).
   void WriteGuestCount();
 
   std::unique_ptr<rex::thread::Semaphore> semaphore_;
@@ -55,7 +55,9 @@ class XSemaphore : public XObject {
 
   // The guest header's count follows the host semaphore, so a title that reads
   // or writes it directly sees the same (canary dcf2994ea).
-  std::mutex count_lock_;
+  // The memory watch handler and SyncFromGuest's callers take this region too.
+  // A private mutex would invert that order when a guest header access faults.
+  rex::thread::global_critical_region global_critical_region_;
   int32_t host_count_ = 0;
 };
 

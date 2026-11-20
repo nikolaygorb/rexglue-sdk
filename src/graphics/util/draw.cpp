@@ -123,6 +123,16 @@ DepthBiasScope GetDepthBiasScope() {
 
 }  // namespace
 
+bool IsDepthTestNeverPassing(const RegisterFile& regs) {
+  xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  if (edram_mode != xenos::EdramMode::kColorDepth && edram_mode != xenos::EdramMode::kDepthOnly) {
+    return false;
+  }
+  auto depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
+  return depth_control.z_enable && depth_control.zfunc == xenos::CompareFunction::kNever &&
+         !depth_control.stencil_enable;
+}
+
 bool IsRasterizationPotentiallyDone(const RegisterFile& regs, bool primitive_polygonal) {
   // The sample counters live in the RB with depth/stencil testing.
   // kNoOperation and kCopy don't count. D3D sits in kCopy during
@@ -838,6 +848,19 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_su
   scissor_out.offset[1] = uint32_t(tl_y);
   scissor_out.extent[0] = uint32_t(br_x - tl_x);
   scissor_out.extent[1] = uint32_t(br_y - tl_y);
+}
+
+bool IsAsyncPipelineWaitNeededForDraw(const RegisterFile& regs) {
+  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  uint32_t pitch_pixels = rb_surface_info.surface_pitch;
+  if (!pitch_pixels) {
+    return false;
+  }
+  uint32_t msaa_samples_x_log2 = uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t pitch_tiles_at_32bpp =
+      ((pitch_pixels << msaa_samples_x_log2) + (xenos::kEdramTileWidthSamples - 1)) /
+      xenos::kEdramTileWidthSamples;
+  return pitch_tiles_at_32bpp <= kAsyncPipelineWaitMaxPitchTiles;
 }
 
 int32_t GetWindowOffsetTiles(const RegisterFile& regs,

@@ -468,6 +468,10 @@ int print_insn_ia64             (bfd_vma, disassemble_info*);
 
 int decode_insn_ppc(bfd_vma, disassemble_info*, ppc_insn*);
 
+/* Operand INDEX of OPCODE (as in ppc_insn.operands): 1 a GPR, 2 a GPR where
+   0 stands for the value 0 (RA0), 0 anything else. */
+int ppc_operand_gpr_kind(const powerpc_opcode*, int index);
+
 #if 0
 /* Fetch the disassembler for a given BFD, if that support is available.  */
 disassembler_ftype disassembler(bfd *);

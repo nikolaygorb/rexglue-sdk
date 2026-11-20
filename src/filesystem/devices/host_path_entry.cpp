@@ -159,11 +159,9 @@ std::unique_ptr<Entry> HostPathEntry::CreateEntryInternal(const std::string_view
       return nullptr;
     }
   } else {
-    auto file = rex::filesystem::OpenFile(full_path, "wb");
-    if (!file) {
+    if (!rex::filesystem::CreateNewFile(full_path)) {
       return nullptr;
     }
-    fclose(file);
   }
   rex::filesystem::FileInfo file_info;
   if (!rex::filesystem::GetInfo(full_path, &file_info)) {
@@ -172,13 +170,18 @@ std::unique_ptr<Entry> HostPathEntry::CreateEntryInternal(const std::string_view
   return std::unique_ptr<Entry>(HostPathEntry::Create(device_, this, full_path, file_info));
 }
 
+bool HostPathEntry::is_empty_folder() const {
+  std::error_code error;
+  const bool empty = std::filesystem::is_empty(host_path_, error);
+  return !error && empty;
+}
+
 bool HostPathEntry::DeleteEntryInternal(Entry* entry) {
   auto full_path = host_path_ / rex::to_path(entry->name());
   std::error_code ec;  // avoid exception on remove/remove_all failure
   if (entry->attributes() & kFileAttributeDirectory) {
-    // Delete entire directory and contents.
-    auto removed = std::filesystem::remove_all(full_path, ec);
-    if (removed < 1 || removed == static_cast<std::uintmax_t>(-1)) {
+      // remove also refuses children created after the cached list was read.
+      if (!std::filesystem::remove(full_path, ec)) {
       return false;
     }
   } else {
@@ -202,7 +205,14 @@ X_STATUS HostPathEntry::RenameEntryInternal(Entry* new_parent, const std::string
     return X_STATUS_ACCESS_DENIED;
   }
 
-  host_path_ = new_host_path;
+  const auto update_host_paths = [](auto&& self, HostPathEntry* parent,
+                                    const std::filesystem::path& path) -> void {
+    parent->host_path_ = path;
+    for (const auto& child : parent->children_) {
+      self(self, static_cast<HostPathEntry*>(child.get()), path / rex::to_path(child->name()));
+    }
+  };
+  update_host_paths(update_host_paths, this, new_host_path);
   return X_STATUS_SUCCESS;
 }
 
@@ -243,6 +253,16 @@ bool HostPathEntry::SetWriteTimestamp(uint64_t timestamp) {
     return false;
   }
   write_timestamp_ = timestamp;
+  return true;
+}
+
+bool HostPathEntry::SetAttributes(uint32_t attributes) {
+  if (device_->is_read_only()) {
+    return false;
+  }
+  // Kept on the entry only, so a title can't make the host's own file
+  // read-only, hidden or system (xenia-canary e70915a98).
+  attributes_ = (attributes_ & kFileAttributeDirectory) | (attributes & ~kFileAttributeDirectory);
   return true;
 }
 

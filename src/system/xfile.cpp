@@ -54,6 +54,11 @@ void XFile::set_position(uint64_t value) {
   position_ = value;
 }
 
+X_STATUS XFile::Flush() {
+  std::lock_guard lock(file_lock_);
+  return file_->Flush();
+}
+
 X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t length,
                                const std::string_view file_name, bool restart) {
   std::lock_guard<std::mutex> lock(file_lock_);
@@ -61,6 +66,8 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
 
   rex::filesystem::Entry* entry = nullptr;
 
+  const bool first_query = !find_started_;
+  find_started_ = true;
   if (!file_name.empty()) {
     // Only queries in the current directory are supported for now.
     assert_true(rex::string::utf8_find_any_of(file_name, "\\") == std::string_view::npos);
@@ -80,15 +87,15 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
 
     entry = file_->entry()->IterateChildren(find_engine_, &find_index_);
     if (!entry) {
-      return X_STATUS_NO_MORE_FILES;
+      return first_query ? X_STATUS_NO_SUCH_FILE : X_STATUS_NO_MORE_FILES;
     }
   }
 
+  entry->update();
   auto end = reinterpret_cast<uint8_t*>(out_info) + length;
   const auto& entry_name = entry->name();
   if (reinterpret_cast<uint8_t*>(&out_info->file_name[0]) + entry_name.size() > end) {
-    assert_always("Buffer overflow?");
-    return X_STATUS_NO_SUCH_FILE;
+    return X_STATUS_BUFFER_OVERFLOW;
   }
 
   out_info->next_entry_offset = 0;

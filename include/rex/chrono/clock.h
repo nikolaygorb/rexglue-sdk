@@ -81,6 +81,8 @@ class Clock {
 
   // Scales a time duration in milliseconds, from guest time.
   static uint32_t ScaleGuestDurationMillis(uint32_t guest_ms);
+  // Scales a time duration in microseconds, from guest time.
+  static uint64_t ScaleGuestDurationMicros(uint64_t guest_us);
   // Scales a time duration in 100ns ticks like FILETIME, from guest time.
   static int64_t ScaleGuestDurationFileTime(int64_t guest_file_time);
   // Scales a time duration represented as a timeval, from guest time.

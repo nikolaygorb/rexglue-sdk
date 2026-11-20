@@ -15,6 +15,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/d3d12/dred.h>
 #include <rex/ui/gpu_vendor.h>
 #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
@@ -252,7 +253,8 @@ bool D3D12Provider::Initialize() {
 
   // Enable DRED (Device Removed Extended Data) for diagnosing GPU crashes. It does not need the
   // debug layer.
-  if (REXCVAR_GET(d3d12_debug) || REXCVAR_GET(d3d12_dred)) {
+  if (REXCVAR_GET(d3d12_debug) || REXCVAR_GET(d3d12_dred) ||
+      REXCVAR_GET(gpu_device_lost_breadcrumbs)) {
     Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dred_settings;
     if (SUCCEEDED(pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
       dred_settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
@@ -597,6 +599,67 @@ void D3D12Provider::LogD3D12DebugMessages() const {
 
   info_queue->ClearStoredMessages();
   info_queue->Release();
+}
+
+
+namespace {
+const char* DredOperationName(D3D12_AUTO_BREADCRUMB_OP op) {
+  switch (op) {
+    case D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED: return "DrawInstanced";
+    case D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED: return "DrawIndexedInstanced";
+    case D3D12_AUTO_BREADCRUMB_OP_DISPATCH: return "Dispatch";
+    case D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT: return "ExecuteIndirect";
+    case D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER: return "ResourceBarrier";
+    case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION: return "CopyBufferRegion";
+    case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION: return "CopyTextureRegion";
+    case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE: return "ResolveSubresource";
+    case D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW: return "ClearRenderTargetView";
+    case D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW: return "ClearDepthStencilView";
+    default: return "other";
+  }
+}
+bool IsDredDraw(D3D12_AUTO_BREADCRUMB_OP op) {
+  return op == D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED ||
+         op == D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED ||
+         op == D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT;
+}
+}  // namespace
+
+void LogDredDeviceLoss(ID3D12Device* device) {
+  Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred)))) return;
+  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs{};
+  if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+    uint32_t nodes = 0;
+    for (auto* node = breadcrumbs.pHeadAutoBreadcrumbNode; node && nodes++ < 64; node = node->pNext) {
+      if (!node->pLastBreadcrumbValue || !node->pCommandHistory) continue;
+      const uint32_t completed = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
+      REXLOG_ERROR("DRED list {}: {} of {} operations completed",
+                   node->pCommandListDebugNameA ? node->pCommandListDebugNameA : "unnamed",
+                   completed, node->BreadcrumbCount);
+      uint32_t draw = 0;
+      const uint32_t end = completed < node->BreadcrumbCount ? completed + 1 : completed;
+      for (uint32_t i = 0; i < end; ++i) {
+        const auto op = node->pCommandHistory[i];
+        if (IsDredDraw(op)) ++draw;
+        if (i + 4 < completed) continue;
+        REXLOG_ERROR("  [{}] {} (op {}, draw {}){}", i, DredOperationName(op), int(op), draw,
+                     i == completed ? " <-- first unconfirmed" : "");
+      }
+    }
+  }
+  D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+  if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)) && fault.PageFaultVA) {
+    REXLOG_ERROR("DRED page fault at VA 0x{:016X}", fault.PageFaultVA);
+    auto allocations = [](const char* state, const D3D12_DRED_ALLOCATION_NODE* node) {
+      for (uint32_t i = 0; node && i < 32; ++i, node = node->pNext) {
+        REXLOG_ERROR("  {} allocation {} (type {})", state,
+                     node->ObjectNameA ? node->ObjectNameA : "unnamed", int(node->AllocationType));
+      }
+    };
+    allocations("existing", fault.pHeadExistingAllocationNode);
+    allocations("recently freed", fault.pHeadRecentFreedAllocationNode);
+  }
 }
 
 }  // namespace rex::ui::d3d12

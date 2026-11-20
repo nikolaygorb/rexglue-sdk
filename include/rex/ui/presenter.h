@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/ui/present_rate_limiter.h>
 #include <rex/math.h>
 #include <rex/platform.h>
 #include <rex/types.h>
@@ -853,6 +854,7 @@ class Presenter {
   // kPresentedSuboptimal rather than kNotPresentedConnectionOutdated, the image
   // has been successfully sent to the OS presentation at least.
   PaintResult PaintAndPresent(bool execute_ui_drawers);
+  PresentRateLimiter host_frame_limiter_;
 
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
 
@@ -864,7 +866,7 @@ class Presenter {
     // sync in the presentation already as that might result in inconsistent
     // frame pacing and potentially skipped vertical sync intervals.
     return !ui_drawers_.empty() && paint_mode_ != PaintMode::kNone &&
-           !surface_paint_connection_has_implicit_vsync_;
+           (!surface_paint_connection_has_implicit_vsync_ || REXCVAR_GET(host_frame_limit) > 0);
   }
   void UpdateUITicksNeededFromUIThread();
   void WaitForUITickFromUIThread();

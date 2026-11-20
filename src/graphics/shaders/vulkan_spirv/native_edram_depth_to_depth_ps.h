@@ -1,0 +1,458 @@
+// Generated with `xb buildshaders`.
+#if 0
+; SPIR-V
+; Version: 1.0
+; Generator: Khronos Glslang Reference Front End; 11
+; Bound: 25246
+; Schema: 0
+               OpCapability Shader
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Fragment %main "main" %gl_FragCoord %gl_FragDepth
+               OpExecutionMode %main OriginUpperLeft
+               OpExecutionMode %main DepthReplacing
+               OpSource GLSL 460
+               OpSourceExtension "GL_EXT_samplerless_texture_functions"
+               OpSourceExtension "GL_GOOGLE_cpp_style_line_directive"
+               OpSourceExtension "GL_GOOGLE_include_directive"
+               OpName %main "main"
+               OpName %Constants "Constants"
+               OpMemberName %Constants 0 "dst_base"
+               OpMemberName %Constants 1 "dst_pitch_tiles"
+               OpMemberName %Constants 2 "dst_format"
+               OpMemberName %Constants 3 "src_base"
+               OpMemberName %Constants 4 "src_pitch_tiles"
+               OpMemberName %Constants 5 "src_format"
+               OpMemberName %Constants 6 "swap_halves"
+               OpMemberName %Constants 7 "stencil_bit"
+               OpMemberName %Constants 8 "scales"
+               OpMemberName %Constants 9 "tile_width"
+               OpMemberName %Constants 10 "tile_count"
+               OpName %c "c"
+               OpName %gl_FragCoord "gl_FragCoord"
+               OpName %src_depth "src_depth"
+               OpName %src_stencil "src_stencil"
+               OpName %gl_FragDepth "gl_FragDepth"
+               OpDecorate %Constants Block
+               OpMemberDecorate %Constants 0 Offset 0
+               OpMemberDecorate %Constants 1 Offset 4
+               OpMemberDecorate %Constants 2 Offset 8
+               OpMemberDecorate %Constants 3 Offset 12
+               OpMemberDecorate %Constants 4 Offset 16
+               OpMemberDecorate %Constants 5 Offset 20
+               OpMemberDecorate %Constants 6 Offset 24
+               OpMemberDecorate %Constants 7 Offset 28
+               OpMemberDecorate %Constants 8 Offset 32
+               OpMemberDecorate %Constants 9 Offset 36
+               OpMemberDecorate %Constants 10 Offset 40
+               OpDecorate %gl_FragCoord BuiltIn FragCoord
+               OpDecorate %src_depth Binding 0
+               OpDecorate %src_depth DescriptorSet 0
+               OpDecorate %src_stencil Binding 1
+               OpDecorate %src_stencil DescriptorSet 0
+               OpDecorate %gl_FragDepth BuiltIn FragDepth
+       %void = OpTypeVoid
+       %1282 = OpTypeFunction %void
+      %float = OpTypeFloat 32
+       %uint = OpTypeInt 32 0
+    %float_0 = OpConstant %float 0
+%float_1_99999988 = OpConstant %float 1.99999988
+%uint_947912704 = OpConstant %uint 947912704
+       %bool = OpTypeBool
+%uint_8388607 = OpConstant %uint 8388607
+%uint_8388608 = OpConstant %uint 8388608
+   %uint_113 = OpConstant %uint 113
+        %int = OpTypeInt 32 1
+     %int_23 = OpConstant %int 23
+    %uint_24 = OpConstant %uint 24
+%uint_3355443200 = OpConstant %uint 3355443200
+     %uint_3 = OpConstant %uint 3
+      %int_3 = OpConstant %int 3
+     %uint_1 = OpConstant %uint 1
+%uint_16777215 = OpConstant %uint 16777215
+%uint_1048575 = OpConstant %uint 1048575
+     %int_20 = OpConstant %int 20
+     %uint_0 = OpConstant %uint 0
+%float_5_82076609en11 = OpConstant %float 5.82076609e-11
+    %float_1 = OpConstant %float 1
+   %float_15 = OpConstant %float 15
+  %Constants = OpTypeStruct %uint %uint %uint %uint %uint %uint %uint %uint %uint %uint %uint
+%_ptr_PushConstant_Constants = OpTypePointer PushConstant %Constants
+          %c = OpVariable %_ptr_PushConstant_Constants PushConstant
+      %int_8 = OpConstant %int 8
+%_ptr_PushConstant_uint = OpTypePointer PushConstant %uint
+   %uint_255 = OpConstant %uint 255
+     %v2uint = OpTypeVector %uint 2
+    %v4float = OpTypeVector %float 4
+%_ptr_Input_v4float = OpTypePointer Input %v4float
+%gl_FragCoord = OpVariable %_ptr_Input_v4float Input
+    %v2float = OpTypeVector %float 2
+      %int_9 = OpConstant %int 9
+    %uint_16 = OpConstant %uint 16
+     %uint_4 = OpConstant %uint 4
+      %int_0 = OpConstant %int 0
+      %int_1 = OpConstant %int 1
+     %int_10 = OpConstant %int 10
+     %uint_2 = OpConstant %uint 2
+      %int_6 = OpConstant %int 6
+      %v2int = OpTypeVector %int 2
+      %int_4 = OpConstant %int 4
+        %150 = OpTypeImage %float 2D 0 0 0 1 Unknown
+%_ptr_UniformConstant_150 = OpTypePointer UniformConstant %150
+  %src_depth = OpVariable %_ptr_UniformConstant_150 UniformConstant
+      %int_5 = OpConstant %int 5
+%float_16777215 = OpConstant %float 16777215
+        %148 = OpTypeImage %uint 2D 0 0 0 1 Unknown
+%_ptr_UniformConstant_148 = OpTypePointer UniformConstant %148
+%src_stencil = OpVariable %_ptr_UniformConstant_148 UniformConstant
+     %v4uint = OpTypeVector %uint 4
+      %int_7 = OpConstant %int 7
+      %int_2 = OpConstant %int 2
+%_ptr_Output_float = OpTypePointer Output %float
+%gl_FragDepth = OpVariable %_ptr_Output_float Output
+       %1891 = OpConstantComposite %v2uint %uint_4 %uint_4
+       %1849 = OpConstantComposite %v2uint %uint_2 %uint_2
+       %1828 = OpConstantComposite %v2uint %uint_1 %uint_1
+%float_5_96046519en08 = OpConstant %float 5.96046519e-08
+%float_9_53674316en07 = OpConstant %float 9.53674316e-07
+       %main = OpFunction %void None %1282
+      %23915 = OpLabel
+       %9675 = OpAccessChain %_ptr_PushConstant_uint %c %int_8
+      %14043 = OpLoad %uint %9675
+      %17939 = OpBitwiseAnd %uint %14043 %uint_255
+      %22596 = OpShiftRightLogical %uint %14043 %int_8
+      %19590 = OpLoad %v4float %gl_FragCoord
+       %9372 = OpVectorShuffle %v2float %19590 %19590 0 1
+       %6778 = OpConvertFToU %v2uint %9372
+      %18578 = OpAccessChain %_ptr_PushConstant_uint %c %int_9
+      %13987 = OpLoad %uint %18578
+       %9671 = OpCompositeConstruct %v2uint %13987 %uint_16
+      %24141 = OpCompositeConstruct %v2uint %17939 %17939
+      %16502 = OpIMul %v2uint %9671 %24141
+      %10185 = OpUDiv %v2uint %16502 %1891
+      %24744 = OpUDiv %v2uint %6778 %10185
+      %20616 = OpAccessChain %_ptr_PushConstant_uint %c %int_0
+      %11092 = OpLoad %uint %20616
+      %21795 = OpCompositeExtract %uint %24744 1
+       %6464 = OpAccessChain %_ptr_PushConstant_uint %c %int_1
+      %15306 = OpLoad %uint %6464
+       %6538 = OpIMul %uint %21795 %15306
+       %6858 = OpIAdd %uint %11092 %6538
+      %23925 = OpCompositeExtract %uint %24744 0
+       %8789 = OpIAdd %uint %6858 %23925
+       %9786 = OpAccessChain %_ptr_PushConstant_uint %c %int_10
+      %23366 = OpLoad %uint %9786
+      %23025 = OpUMod %uint %8789 %23366
+      %14208 = OpIMul %v2uint %24744 %10185
+      %19430 = OpISub %v2uint %6778 %14208
+       %6711 = OpCompositeConstruct %v2uint %22596 %22596
+      %25245 = OpIMul %v2uint %9671 %6711
+       %7242 = OpUDiv %v2uint %25245 %1891
+      %11458 = OpINotEqual %bool %22596 %17939
+               OpSelectionMerge %21648 None
+               OpBranchConditional %11458 %20882 %21648
+      %20882 = OpLabel
+      %12020 = OpIMul %v2uint %19430 %1849
+      %23015 = OpIAdd %v2uint %12020 %1828
+      %18780 = OpIMul %v2uint %23015 %6711
+      %24580 = OpIMul %uint %17939 %uint_2
+       %8052 = OpCompositeConstruct %v2uint %24580 %24580
+      %11111 = OpUDiv %v2uint %18780 %8052
+               OpBranch %21648
+      %21648 = OpLabel
+      %19748 = OpPhi %v2uint %19430 %23915 %11111 %20882
+       %6744 = OpAccessChain %_ptr_PushConstant_uint %c %int_6
+      %20703 = OpLoad %uint %6744
+      %12913 = OpINotEqual %bool %20703 %uint_0
+               OpSelectionMerge %19649 None
+               OpBranchConditional %12913 %9741 %19649
+       %9741 = OpLabel
+      %19610 = OpCompositeExtract %uint %19748 0
+      %10692 = OpCompositeExtract %uint %7242 0
+      %21877 = OpShiftRightLogical %uint %10692 %int_1
+       %8102 = OpIAdd %uint %19610 %21877
+      %20008 = OpUMod %uint %8102 %10692
+      %18037 = OpCompositeInsert %v2uint %20008 %19748 0
+               OpBranch %19649
+      %19649 = OpLabel
+       %8925 = OpPhi %v2uint %19748 %21648 %18037 %9741
+      %21791 = OpIAdd %uint %23025 %23366
+      %13079 = OpAccessChain %_ptr_PushConstant_uint %c %int_3
+      %24672 = OpLoad %uint %13079
+      %21063 = OpISub %uint %21791 %24672
+      %11398 = OpUMod %uint %21063 %23366
+      %17707 = OpAccessChain %_ptr_PushConstant_uint %c %int_4
+       %8363 = OpLoad %uint %17707
+      %21729 = OpUMod %uint %11398 %8363
+       %7460 = OpUDiv %uint %11398 %8363
+      %19019 = OpCompositeConstruct %v2uint %21729 %7460
+       %9545 = OpIMul %v2uint %19019 %7242
+      %22855 = OpIAdd %v2uint %9545 %8925
+      %20608 = OpBitcast %v2int %22855
+       %7315 = OpLoad %150 %src_depth
+      %24440 = OpImageFetch %v4float %7315 %20608 Lod %int_0
+      %22117 = OpCompositeExtract %float %24440 0
+       %8779 = OpAccessChain %_ptr_PushConstant_uint %c %int_5
+      %10993 = OpLoad %uint %8779
+      %21106 = OpIEqual %bool %10993 %uint_1
+               OpSelectionMerge %20117 None
+               OpBranchConditional %21106 %20096 %14089
+      %20096 = OpLabel
+      %15353 = OpExtInst %float %1 FClamp %22117 %float_0 %float_1_99999988
+       %9736 = OpBitcast %uint %15353
+      %17874 = OpULessThan %bool %9736 %uint_947912704
+               OpSelectionMerge %24463 None
+               OpBranchConditional %17874 %10602 %16891
+      %10602 = OpLabel
+      %18003 = OpBitwiseAnd %uint %9736 %uint_8388607
+      %19952 = OpBitwiseOr %uint %18003 %uint_8388608
+      %11750 = OpShiftRightLogical %uint %9736 %int_23
+      %12122 = OpISub %uint %uint_113 %11750
+      %16181 = OpExtInst %uint %1 UMin %12122 %uint_24
+      %25241 = OpShiftRightLogical %uint %19952 %16181
+               OpBranch %24463
+      %16891 = OpLabel
+      %22028 = OpIAdd %uint %9736 %uint_3355443200
+               OpBranch %24463
+      %24463 = OpLabel
+      %11376 = OpPhi %uint %25241 %10602 %22028 %16891
+      %21167 = OpIAdd %uint %11376 %uint_3
+      %12860 = OpShiftRightLogical %uint %11376 %int_3
+      %23677 = OpBitwiseAnd %uint %12860 %uint_1
+       %9641 = OpIAdd %uint %21167 %23677
+      %22959 = OpShiftRightLogical %uint %9641 %int_3
+      %22841 = OpBitwiseAnd %uint %22959 %uint_16777215
+               OpBranch %20117
+      %14089 = OpLabel
+       %6646 = OpExtInst %float %1 FClamp %22117 %float_0 %float_1
+      %10923 = OpFMul %float %6646 %float_16777215
+      %16544 = OpExtInst %float %1 Round %10923
+      %11498 = OpConvertFToU %uint %16544
+               OpBranch %20117
+      %20117 = OpLabel
+      %16156 = OpPhi %uint %22841 %24463 %11498 %14089
+      %12607 = OpShiftLeftLogical %uint %16156 %int_8
+      %20606 = OpLoad %148 %src_stencil
+      %20784 = OpImageFetch %v4uint %20606 %20608 Lod %int_0
+      %20590 = OpCompositeExtract %uint %20784 0
+      %23197 = OpBitwiseAnd %uint %20590 %uint_255
+      %19270 = OpBitwiseOr %uint %12607 %23197
+      %22048 = OpAccessChain %_ptr_PushConstant_uint %c %int_7
+       %7819 = OpLoad %uint %22048
+      %12914 = OpINotEqual %bool %7819 %uint_0
+               OpSelectionMerge %15698 None
+               OpBranchConditional %12914 %10089 %15698
+      %10089 = OpLabel
+      %23719 = OpBitwiseAnd %uint %19270 %7819
+      %24109 = OpIEqual %bool %23719 %uint_0
+               OpBranch %15698
+      %15698 = OpLabel
+      %10924 = OpPhi %bool %12914 %20117 %24109 %10089
+               OpSelectionMerge %9209 None
+               OpBranchConditional %10924 %21473 %9209
+      %21473 = OpLabel
+               OpKill
+       %9209 = OpLabel
+      %21818 = OpAccessChain %_ptr_PushConstant_uint %c %int_2
+      %20067 = OpLoad %uint %21818
+      %21107 = OpIEqual %bool %20067 %uint_1
+               OpSelectionMerge %23106 None
+               OpBranchConditional %21107 %11505 %8488
+      %11505 = OpLabel
+      %20480 = OpShiftRightLogical %uint %19270 %int_8
+      %12028 = OpBitwiseAnd %uint %20480 %uint_1048575
+       %7955 = OpShiftRightLogical %uint %20480 %int_20
+       %9119 = OpIEqual %bool %7955 %uint_0
+               OpSelectionMerge %8495 None
+               OpBranchConditional %9119 %24437 %10229
+      %24437 = OpLabel
+      %24670 = OpConvertUToF %float %12028
+      %20349 = OpFMul %float %24670 %float_5_82076609en11
+               OpBranch %8495
+      %10229 = OpLabel
+      %18355 = OpConvertUToF %float %12028
+      %19454 = OpFMul %float %18355 %float_9_53674316en07
+      %17799 = OpFAdd %float %float_1 %19454
+      %13697 = OpConvertUToF %float %7955
+      %17869 = OpFSub %float %13697 %float_15
+      %22591 = OpExtInst %float %1 Exp2 %17869
+       %8923 = OpFMul %float %17799 %22591
+               OpBranch %8495
+       %8495 = OpLabel
+      %10540 = OpPhi %float %20349 %24437 %8923 %10229
+               OpBranch %23106
+       %8488 = OpLabel
+      %17723 = OpShiftRightLogical %uint %19270 %int_8
+      %18632 = OpConvertUToF %float %17723
+       %9083 = OpFMul %float %18632 %float_5_96046519en08
+               OpBranch %23106
+      %23106 = OpLabel
+       %7466 = OpPhi %float %10540 %8495 %9083 %8488
+       %7605 = OpExtInst %float %1 FClamp %7466 %float_0 %float_1
+               OpStore %gl_FragDepth %7605
+               OpReturn
+               OpFunctionEnd
+#endif
+
+const uint32_t native_edram_depth_to_depth_ps[] = {
+    0x07230203, 0x00010000, 0x0008000B, 0x0000629E, 0x00000000, 0x00020011, 0x00000001, 0x0006000B,
+    0x00000001, 0x4C534C47, 0x6474732E, 0x3035342E, 0x00000000, 0x0003000E, 0x00000000, 0x00000001,
+    0x0007000F, 0x00000004, 0x0000161F, 0x6E69616D, 0x00000000, 0x00000C93, 0x000011F3, 0x00030010,
+    0x0000161F, 0x00000007, 0x00030010, 0x0000161F, 0x0000000C, 0x00030003, 0x00000002, 0x000001CC,
+    0x000B0004, 0x455F4C47, 0x735F5458, 0x6C706D61, 0x656C7265, 0x745F7373, 0x75747865, 0x665F6572,
+    0x74636E75, 0x736E6F69, 0x00000000, 0x000A0004, 0x475F4C47, 0x4C474F4F, 0x70635F45, 0x74735F70,
+    0x5F656C79, 0x656E696C, 0x7269645F, 0x69746365, 0x00006576, 0x00080004, 0x475F4C47, 0x4C474F4F,
+    0x6E695F45, 0x64756C63, 0x69645F65, 0x74636572, 0x00657669, 0x00040005, 0x0000161F, 0x6E69616D,
+    0x00000000, 0x00050005, 0x000004B6, 0x736E6F43, 0x746E6174, 0x00000073, 0x00060006, 0x000004B6,
+    0x00000000, 0x5F747364, 0x65736162, 0x00000000, 0x00070006, 0x000004B6, 0x00000001, 0x5F747364,
+    0x63746970, 0x69745F68, 0x0073656C, 0x00060006, 0x000004B6, 0x00000002, 0x5F747364, 0x6D726F66,
+    0x00007461, 0x00060006, 0x000004B6, 0x00000003, 0x5F637273, 0x65736162, 0x00000000, 0x00070006,
+    0x000004B6, 0x00000004, 0x5F637273, 0x63746970, 0x69745F68, 0x0073656C, 0x00060006, 0x000004B6,
+    0x00000005, 0x5F637273, 0x6D726F66, 0x00007461, 0x00060006, 0x000004B6, 0x00000006, 0x70617773,
+    0x6C61685F, 0x00736576, 0x00060006, 0x000004B6, 0x00000007, 0x6E657473, 0x5F6C6963, 0x00746962,
+    0x00050006, 0x000004B6, 0x00000008, 0x6C616373, 0x00007365, 0x00060006, 0x000004B6, 0x00000009,
+    0x656C6974, 0x6469775F, 0x00006874, 0x00060006, 0x000004B6, 0x0000000A, 0x656C6974, 0x756F635F,
+    0x0000746E, 0x00030005, 0x000010B5, 0x00000063, 0x00060005, 0x00000C93, 0x465F6C67, 0x43676172,
+    0x64726F6F, 0x00000000, 0x00050005, 0x00000F93, 0x5F637273, 0x74706564, 0x00000068, 0x00050005,
+    0x00000EE7, 0x5F637273, 0x6E657473, 0x006C6963, 0x00060005, 0x000011F3, 0x465F6C67, 0x44676172,
+    0x68747065, 0x00000000, 0x00030047, 0x000004B6, 0x00000002, 0x00050048, 0x000004B6, 0x00000000,
+    0x00000023, 0x00000000, 0x00050048, 0x000004B6, 0x00000001, 0x00000023, 0x00000004, 0x00050048,
+    0x000004B6, 0x00000002, 0x00000023, 0x00000008, 0x00050048, 0x000004B6, 0x00000003, 0x00000023,
+    0x0000000C, 0x00050048, 0x000004B6, 0x00000004, 0x00000023, 0x00000010, 0x00050048, 0x000004B6,
+    0x00000005, 0x00000023, 0x00000014, 0x00050048, 0x000004B6, 0x00000006, 0x00000023, 0x00000018,
+    0x00050048, 0x000004B6, 0x00000007, 0x00000023, 0x0000001C, 0x00050048, 0x000004B6, 0x00000008,
+    0x00000023, 0x00000020, 0x00050048, 0x000004B6, 0x00000009, 0x00000023, 0x00000024, 0x00050048,
+    0x000004B6, 0x0000000A, 0x00000023, 0x00000028, 0x00040047, 0x00000C93, 0x0000000B, 0x0000000F,
+    0x00040047, 0x00000F93, 0x00000021, 0x00000000, 0x00040047, 0x00000F93, 0x00000022, 0x00000000,
+    0x00040047, 0x00000EE7, 0x00000021, 0x00000001, 0x00040047, 0x00000EE7, 0x00000022, 0x00000000,
+    0x00040047, 0x000011F3, 0x0000000B, 0x00000016, 0x00020013, 0x00000008, 0x00030021, 0x00000502,
+    0x00000008, 0x00030016, 0x0000000D, 0x00000020, 0x00040015, 0x0000000B, 0x00000020, 0x00000000,
+    0x0004002B, 0x0000000D, 0x00000A0C, 0x00000000, 0x0004002B, 0x0000000D, 0x00000015, 0x3FFFFFFF,
+    0x0004002B, 0x0000000B, 0x000006C4, 0x38800000, 0x00020014, 0x00000009, 0x0004002B, 0x0000000B,
+    0x00000995, 0x007FFFFF, 0x0004002B, 0x0000000B, 0x00000998, 0x00800000, 0x0004002B, 0x0000000B,
+    0x00000B5D, 0x00000071, 0x00040015, 0x0000000C, 0x00000020, 0x00000001, 0x0004002B, 0x0000000C,
+    0x00000A50, 0x00000017, 0x0004002B, 0x0000000B, 0x00000A52, 0x00000018, 0x0004002B, 0x0000000B,
+    0x00000770, 0xC8000000, 0x0004002B, 0x0000000B, 0x00000A13, 0x00000003, 0x0004002B, 0x0000000C,
+    0x00000A14, 0x00000003, 0x0004002B, 0x0000000B, 0x00000A0D, 0x00000001, 0x0004002B, 0x0000000B,
+    0x00000923, 0x00FFFFFF, 0x0004002B, 0x0000000B, 0x00000708, 0x000FFFFF, 0x0004002B, 0x0000000C,
+    0x00000A47, 0x00000014, 0x0004002B, 0x0000000B, 0x00000A0A, 0x00000000, 0x0004002B, 0x0000000D,
+    0x000003EB, 0x2E800000, 0x0004002B, 0x0000000D, 0x0000008A, 0x3F800000, 0x0004002B, 0x0000000D,
+    0x000001C1, 0x41700000, 0x000D001E, 0x000004B6, 0x0000000B, 0x0000000B, 0x0000000B, 0x0000000B,
+    0x0000000B, 0x0000000B, 0x0000000B, 0x0000000B, 0x0000000B, 0x0000000B, 0x0000000B, 0x00040020,
+    0x00000733, 0x00000009, 0x000004B6, 0x0004003B, 0x00000733, 0x000010B5, 0x00000009, 0x0004002B,
+    0x0000000C, 0x00000A23, 0x00000008, 0x00040020, 0x00000288, 0x00000009, 0x0000000B, 0x0004002B,
+    0x0000000B, 0x00000144, 0x000000FF, 0x00040017, 0x00000011, 0x0000000B, 0x00000002, 0x00040017,
+    0x0000001D, 0x0000000D, 0x00000004, 0x00040020, 0x0000029A, 0x00000001, 0x0000001D, 0x0004003B,
+    0x0000029A, 0x00000C93, 0x00000001, 0x00040017, 0x00000013, 0x0000000D, 0x00000002, 0x0004002B,
+    0x0000000C, 0x00000A26, 0x00000009, 0x0004002B, 0x0000000B, 0x00000A3A, 0x00000010, 0x0004002B,
+    0x0000000B, 0x00000A16, 0x00000004, 0x0004002B, 0x0000000C, 0x00000A0B, 0x00000000, 0x0004002B,
+    0x0000000C, 0x00000A0E, 0x00000001, 0x0004002B, 0x0000000C, 0x00000A29, 0x0000000A, 0x0004002B,
+    0x0000000B, 0x00000A10, 0x00000002, 0x0004002B, 0x0000000C, 0x00000A1D, 0x00000006, 0x00040017,
+    0x00000012, 0x0000000C, 0x00000002, 0x0004002B, 0x0000000C, 0x00000A17, 0x00000004, 0x00090019,
+    0x00000096, 0x0000000D, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000,
+    0x00040020, 0x00000313, 0x00000000, 0x00000096, 0x0004003B, 0x00000313, 0x00000F93, 0x00000000,
+    0x0004002B, 0x0000000C, 0x00000A1A, 0x00000005, 0x0004002B, 0x0000000D, 0x0000019A, 0x4B7FFFFF,
+    0x00090019, 0x00000094, 0x0000000B, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001,
+    0x00000000, 0x00040020, 0x00000311, 0x00000000, 0x00000094, 0x0004003B, 0x00000311, 0x00000EE7,
+    0x00000000, 0x00040017, 0x00000017, 0x0000000B, 0x00000004, 0x0004002B, 0x0000000C, 0x00000A20,
+    0x00000007, 0x0004002B, 0x0000000C, 0x00000A11, 0x00000002, 0x00040020, 0x0000028A, 0x00000003,
+    0x0000000D, 0x0004003B, 0x0000028A, 0x000011F3, 0x00000003, 0x0005002C, 0x00000011, 0x00000763,
+    0x00000A16, 0x00000A16, 0x0005002C, 0x00000011, 0x00000739, 0x00000A10, 0x00000A10, 0x0005002C,
+    0x00000011, 0x00000724, 0x00000A0D, 0x00000A0D, 0x0004002B, 0x0000000D, 0x00000B3D, 0x33800001,
+    0x0004002B, 0x0000000D, 0x00000972, 0x35800000, 0x00050036, 0x00000008, 0x0000161F, 0x00000000,
+    0x00000502, 0x000200F8, 0x00005D6B, 0x00050041, 0x00000288, 0x000025CB, 0x000010B5, 0x00000A23,
+    0x0004003D, 0x0000000B, 0x000036DB, 0x000025CB, 0x000500C7, 0x0000000B, 0x00004613, 0x000036DB,
+    0x00000144, 0x000500C2, 0x0000000B, 0x00005844, 0x000036DB, 0x00000A23, 0x0004003D, 0x0000001D,
+    0x00004C86, 0x00000C93, 0x0007004F, 0x00000013, 0x0000249C, 0x00004C86, 0x00004C86, 0x00000000,
+    0x00000001, 0x0004006D, 0x00000011, 0x00001A7A, 0x0000249C, 0x00050041, 0x00000288, 0x00004892,
+    0x000010B5, 0x00000A26, 0x0004003D, 0x0000000B, 0x000036A3, 0x00004892, 0x00050050, 0x00000011,
+    0x000025C7, 0x000036A3, 0x00000A3A, 0x00050050, 0x00000011, 0x00005E4D, 0x00004613, 0x00004613,
+    0x00050084, 0x00000011, 0x00004076, 0x000025C7, 0x00005E4D, 0x00050086, 0x00000011, 0x000027C9,
+    0x00004076, 0x00000763, 0x00050086, 0x00000011, 0x000060A8, 0x00001A7A, 0x000027C9, 0x00050041,
+    0x00000288, 0x00005088, 0x000010B5, 0x00000A0B, 0x0004003D, 0x0000000B, 0x00002B54, 0x00005088,
+    0x00050051, 0x0000000B, 0x00005523, 0x000060A8, 0x00000001, 0x00050041, 0x00000288, 0x00001940,
+    0x000010B5, 0x00000A0E, 0x0004003D, 0x0000000B, 0x00003BCA, 0x00001940, 0x00050084, 0x0000000B,
+    0x0000198A, 0x00005523, 0x00003BCA, 0x00050080, 0x0000000B, 0x00001ACA, 0x00002B54, 0x0000198A,
+    0x00050051, 0x0000000B, 0x00005D75, 0x000060A8, 0x00000000, 0x00050080, 0x0000000B, 0x00002255,
+    0x00001ACA, 0x00005D75, 0x00050041, 0x00000288, 0x0000263A, 0x000010B5, 0x00000A29, 0x0004003D,
+    0x0000000B, 0x00005B46, 0x0000263A, 0x00050089, 0x0000000B, 0x000059F1, 0x00002255, 0x00005B46,
+    0x00050084, 0x00000011, 0x00003780, 0x000060A8, 0x000027C9, 0x00050082, 0x00000011, 0x00004BE6,
+    0x00001A7A, 0x00003780, 0x00050050, 0x00000011, 0x00001A37, 0x00005844, 0x00005844, 0x00050084,
+    0x00000011, 0x0000629D, 0x000025C7, 0x00001A37, 0x00050086, 0x00000011, 0x00001C4A, 0x0000629D,
+    0x00000763, 0x000500AB, 0x00000009, 0x00002CC2, 0x00005844, 0x00004613, 0x000300F7, 0x00005490,
+    0x00000000, 0x000400FA, 0x00002CC2, 0x00005192, 0x00005490, 0x000200F8, 0x00005192, 0x00050084,
+    0x00000011, 0x00002EF4, 0x00004BE6, 0x00000739, 0x00050080, 0x00000011, 0x000059E7, 0x00002EF4,
+    0x00000724, 0x00050084, 0x00000011, 0x0000495C, 0x000059E7, 0x00001A37, 0x00050084, 0x0000000B,
+    0x00006004, 0x00004613, 0x00000A10, 0x00050050, 0x00000011, 0x00001F74, 0x00006004, 0x00006004,
+    0x00050086, 0x00000011, 0x00002B67, 0x0000495C, 0x00001F74, 0x000200F9, 0x00005490, 0x000200F8,
+    0x00005490, 0x000700F5, 0x00000011, 0x00004D24, 0x00004BE6, 0x00005D6B, 0x00002B67, 0x00005192,
+    0x00050041, 0x00000288, 0x00001A58, 0x000010B5, 0x00000A1D, 0x0004003D, 0x0000000B, 0x000050DF,
+    0x00001A58, 0x000500AB, 0x00000009, 0x00003271, 0x000050DF, 0x00000A0A, 0x000300F7, 0x00004CC1,
+    0x00000000, 0x000400FA, 0x00003271, 0x0000260D, 0x00004CC1, 0x000200F8, 0x0000260D, 0x00050051,
+    0x0000000B, 0x00004C9A, 0x00004D24, 0x00000000, 0x00050051, 0x0000000B, 0x000029C4, 0x00001C4A,
+    0x00000000, 0x000500C2, 0x0000000B, 0x00005575, 0x000029C4, 0x00000A0E, 0x00050080, 0x0000000B,
+    0x00001FA6, 0x00004C9A, 0x00005575, 0x00050089, 0x0000000B, 0x00004E28, 0x00001FA6, 0x000029C4,
+    0x00060052, 0x00000011, 0x00004675, 0x00004E28, 0x00004D24, 0x00000000, 0x000200F9, 0x00004CC1,
+    0x000200F8, 0x00004CC1, 0x000700F5, 0x00000011, 0x000022DD, 0x00004D24, 0x00005490, 0x00004675,
+    0x0000260D, 0x00050080, 0x0000000B, 0x0000551F, 0x000059F1, 0x00005B46, 0x00050041, 0x00000288,
+    0x00003317, 0x000010B5, 0x00000A14, 0x0004003D, 0x0000000B, 0x00006060, 0x00003317, 0x00050082,
+    0x0000000B, 0x00005247, 0x0000551F, 0x00006060, 0x00050089, 0x0000000B, 0x00002C86, 0x00005247,
+    0x00005B46, 0x00050041, 0x00000288, 0x0000452B, 0x000010B5, 0x00000A17, 0x0004003D, 0x0000000B,
+    0x000020AB, 0x0000452B, 0x00050089, 0x0000000B, 0x000054E1, 0x00002C86, 0x000020AB, 0x00050086,
+    0x0000000B, 0x00001D24, 0x00002C86, 0x000020AB, 0x00050050, 0x00000011, 0x00004A4B, 0x000054E1,
+    0x00001D24, 0x00050084, 0x00000011, 0x00002549, 0x00004A4B, 0x00001C4A, 0x00050080, 0x00000011,
+    0x00005947, 0x00002549, 0x000022DD, 0x0004007C, 0x00000012, 0x00005080, 0x00005947, 0x0004003D,
+    0x00000096, 0x00001C93, 0x00000F93, 0x0007005F, 0x0000001D, 0x00005F78, 0x00001C93, 0x00005080,
+    0x00000002, 0x00000A0B, 0x00050051, 0x0000000D, 0x00005665, 0x00005F78, 0x00000000, 0x00050041,
+    0x00000288, 0x0000224B, 0x000010B5, 0x00000A1A, 0x0004003D, 0x0000000B, 0x00002AF1, 0x0000224B,
+    0x000500AA, 0x00000009, 0x00005272, 0x00002AF1, 0x00000A0D, 0x000300F7, 0x00004E95, 0x00000000,
+    0x000400FA, 0x00005272, 0x00004E80, 0x00003709, 0x000200F8, 0x00004E80, 0x0008000C, 0x0000000D,
+    0x00003BF9, 0x00000001, 0x0000002B, 0x00005665, 0x00000A0C, 0x00000015, 0x0004007C, 0x0000000B,
+    0x00002608, 0x00003BF9, 0x000500B0, 0x00000009, 0x000045D2, 0x00002608, 0x000006C4, 0x000300F7,
+    0x00005F8F, 0x00000000, 0x000400FA, 0x000045D2, 0x0000296A, 0x000041FB, 0x000200F8, 0x0000296A,
+    0x000500C7, 0x0000000B, 0x00004653, 0x00002608, 0x00000995, 0x000500C5, 0x0000000B, 0x00004DF0,
+    0x00004653, 0x00000998, 0x000500C2, 0x0000000B, 0x00002DE6, 0x00002608, 0x00000A50, 0x00050082,
+    0x0000000B, 0x00002F5A, 0x00000B5D, 0x00002DE6, 0x0007000C, 0x0000000B, 0x00003F35, 0x00000001,
+    0x00000026, 0x00002F5A, 0x00000A52, 0x000500C2, 0x0000000B, 0x00006299, 0x00004DF0, 0x00003F35,
+    0x000200F9, 0x00005F8F, 0x000200F8, 0x000041FB, 0x00050080, 0x0000000B, 0x0000560C, 0x00002608,
+    0x00000770, 0x000200F9, 0x00005F8F, 0x000200F8, 0x00005F8F, 0x000700F5, 0x0000000B, 0x00002C70,
+    0x00006299, 0x0000296A, 0x0000560C, 0x000041FB, 0x00050080, 0x0000000B, 0x000052AF, 0x00002C70,
+    0x00000A13, 0x000500C2, 0x0000000B, 0x0000323C, 0x00002C70, 0x00000A14, 0x000500C7, 0x0000000B,
+    0x00005C7D, 0x0000323C, 0x00000A0D, 0x00050080, 0x0000000B, 0x000025A9, 0x000052AF, 0x00005C7D,
+    0x000500C2, 0x0000000B, 0x000059AF, 0x000025A9, 0x00000A14, 0x000500C7, 0x0000000B, 0x00005939,
+    0x000059AF, 0x00000923, 0x000200F9, 0x00004E95, 0x000200F8, 0x00003709, 0x0008000C, 0x0000000D,
+    0x000019F6, 0x00000001, 0x0000002B, 0x00005665, 0x00000A0C, 0x0000008A, 0x00050085, 0x0000000D,
+    0x00002AAB, 0x000019F6, 0x0000019A, 0x0006000C, 0x0000000D, 0x000040A0, 0x00000001, 0x00000001,
+    0x00002AAB, 0x0004006D, 0x0000000B, 0x00002CEA, 0x000040A0, 0x000200F9, 0x00004E95, 0x000200F8,
+    0x00004E95, 0x000700F5, 0x0000000B, 0x00003F1C, 0x00005939, 0x00005F8F, 0x00002CEA, 0x00003709,
+    0x000500C4, 0x0000000B, 0x0000313F, 0x00003F1C, 0x00000A23, 0x0004003D, 0x00000094, 0x0000507E,
+    0x00000EE7, 0x0007005F, 0x00000017, 0x00005130, 0x0000507E, 0x00005080, 0x00000002, 0x00000A0B,
+    0x00050051, 0x0000000B, 0x0000506E, 0x00005130, 0x00000000, 0x000500C7, 0x0000000B, 0x00005A9D,
+    0x0000506E, 0x00000144, 0x000500C5, 0x0000000B, 0x00004B46, 0x0000313F, 0x00005A9D, 0x00050041,
+    0x00000288, 0x00005620, 0x000010B5, 0x00000A20, 0x0004003D, 0x0000000B, 0x00001E8B, 0x00005620,
+    0x000500AB, 0x00000009, 0x00003272, 0x00001E8B, 0x00000A0A, 0x000300F7, 0x00003D52, 0x00000000,
+    0x000400FA, 0x00003272, 0x00002769, 0x00003D52, 0x000200F8, 0x00002769, 0x000500C7, 0x0000000B,
+    0x00005CA7, 0x00004B46, 0x00001E8B, 0x000500AA, 0x00000009, 0x00005E2D, 0x00005CA7, 0x00000A0A,
+    0x000200F9, 0x00003D52, 0x000200F8, 0x00003D52, 0x000700F5, 0x00000009, 0x00002AAC, 0x00003272,
+    0x00004E95, 0x00005E2D, 0x00002769, 0x000300F7, 0x000023F9, 0x00000000, 0x000400FA, 0x00002AAC,
+    0x000053E1, 0x000023F9, 0x000200F8, 0x000053E1, 0x000100FC, 0x000200F8, 0x000023F9, 0x00050041,
+    0x00000288, 0x0000553A, 0x000010B5, 0x00000A11, 0x0004003D, 0x0000000B, 0x00004E63, 0x0000553A,
+    0x000500AA, 0x00000009, 0x00005273, 0x00004E63, 0x00000A0D, 0x000300F7, 0x00005A42, 0x00000000,
+    0x000400FA, 0x00005273, 0x00002CF1, 0x00002128, 0x000200F8, 0x00002CF1, 0x000500C2, 0x0000000B,
+    0x00005000, 0x00004B46, 0x00000A23, 0x000500C7, 0x0000000B, 0x00002EFC, 0x00005000, 0x00000708,
+    0x000500C2, 0x0000000B, 0x00001F13, 0x00005000, 0x00000A47, 0x000500AA, 0x00000009, 0x0000239F,
+    0x00001F13, 0x00000A0A, 0x000300F7, 0x0000212F, 0x00000000, 0x000400FA, 0x0000239F, 0x00005F75,
+    0x000027F5, 0x000200F8, 0x00005F75, 0x00040070, 0x0000000D, 0x0000605E, 0x00002EFC, 0x00050085,
+    0x0000000D, 0x00004F7D, 0x0000605E, 0x000003EB, 0x000200F9, 0x0000212F, 0x000200F8, 0x000027F5,
+    0x00040070, 0x0000000D, 0x000047B3, 0x00002EFC, 0x00050085, 0x0000000D, 0x00004BFE, 0x000047B3,
+    0x00000972, 0x00050081, 0x0000000D, 0x00004587, 0x0000008A, 0x00004BFE, 0x00040070, 0x0000000D,
+    0x00003581, 0x00001F13, 0x00050083, 0x0000000D, 0x000045CD, 0x00003581, 0x000001C1, 0x0006000C,
+    0x0000000D, 0x0000583F, 0x00000001, 0x0000001D, 0x000045CD, 0x00050085, 0x0000000D, 0x000022DB,
+    0x00004587, 0x0000583F, 0x000200F9, 0x0000212F, 0x000200F8, 0x0000212F, 0x000700F5, 0x0000000D,
+    0x0000292C, 0x00004F7D, 0x00005F75, 0x000022DB, 0x000027F5, 0x000200F9, 0x00005A42, 0x000200F8,
+    0x00002128, 0x000500C2, 0x0000000B, 0x0000453B, 0x00004B46, 0x00000A23, 0x00040070, 0x0000000D,
+    0x000048C8, 0x0000453B, 0x00050085, 0x0000000D, 0x0000237B, 0x000048C8, 0x00000B3D, 0x000200F9,
+    0x00005A42, 0x000200F8, 0x00005A42, 0x000700F5, 0x0000000D, 0x00001D2A, 0x0000292C, 0x0000212F,
+    0x0000237B, 0x00002128, 0x0008000C, 0x0000000D, 0x00001DB5, 0x00000001, 0x0000002B, 0x00001D2A,
+    0x00000A0C, 0x0000008A, 0x0003003E, 0x000011F3, 0x00001DB5, 0x000100FD, 0x00010038,
+};

@@ -14,16 +14,24 @@
 #include <string>
 #include <string_view>
 
+#include <rex/string.h>
 #include <rex/string/utf8.h>
 
 namespace rex::kernel::xboxkrnl {
 
 // Drops a leading \??\, the DOS devices directory the ObDosDevices root also
-// names, so \??\game:\file is game:\file.
+// names, or \System??\ in any case, so both \??\game:\file and
+// \System??\game:\file are game:\file. IsValidPath rejects '?', so a name
+// under \System??\ was not found before.
 inline void xeObStripDosDevicesPrefix(std::string& path) {
   // Bytes, as a guest name need not be valid UTF-8.
+  constexpr std::string_view kSystemDosDevices = "\\System??\\";
   if (path.starts_with("\\??\\")) {
     path.erase(0, 4);
+  } else if (path.size() >= kSystemDosDevices.size() &&
+             !rex::string::compare_case_n(path.c_str(), kSystemDosDevices.data(),
+                                          kSystemDosDevices.size())) {
+    path.erase(0, kSystemDosDevices.size());
   }
 }
 
@@ -31,9 +39,6 @@ inline void xeObStripDosDevicesPrefix(std::string& path) {
 inline std::string xeObSymbolicLinkName(const std::string_view name) {
   auto path = rex::string::utf8_canonicalize_guest_path(name);
   xeObStripDosDevicesPrefix(path);
-  if (rex::string::utf8_starts_with_case(path, "\\System??\\")) {
-    path.erase(0, 10);
-  }
   return path;
 }
 

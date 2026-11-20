@@ -101,6 +101,13 @@ inline bool IsPrimitivePolygonal(const RegisterFile& regs) {
 // game, of course).
 bool IsRasterizationPotentiallyDone(const RegisterFile& regs, bool primitive_polygonal);
 
+// The depth test is on with the NEVER function and the stencil test off, in an
+// EDRAM mode that tests depth: no sample passes, so the draw changes nothing in
+// the EDRAM and counts no samples. The pixel shader still runs on the console
+// (no early per-sample depth), so a draw exporting to memory has an effect.
+// (Upstream rexglue 11539bc1.)
+bool IsDepthTestNeverPassing(const RegisterFile& regs);
+
 // VIZ_QUERY survey geometry, killed after hi-Z on real hardware. Drawn only to
 // count coverage for its ID: no pixel shader, no color, depth/stencil writes.
 bool IsVIZSurveyDraw(const RegisterFile& regs);
@@ -352,6 +359,13 @@ struct Scissor {
 };
 void GetScissor(const RegisterFile& regs, Scissor& scissor_out, bool clamp_to_surface_pitch = true,
                 bool window_offset_in_edram = false);
+
+// Whether a draw must wait for its pipeline being created asynchronously
+// instead of being skipped: the surface is at most this wide (160 pixels
+// without MSAA). Small surfaces mostly hold data kept past the frame, like 1x1
+// eye adaptation history, which a skipped draw leaves wrong for good.
+inline constexpr uint32_t kAsyncPipelineWaitMaxPitchTiles = 2;
+bool IsAsyncPipelineWaitNeededForDraw(const RegisterFile& regs);
 
 // Returns the window offset in 32bpp tiles, doubled for 64bpp color, when it
 // can be moved into the render target bases. The vertices and scissor can then

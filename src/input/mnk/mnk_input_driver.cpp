@@ -503,11 +503,18 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   }
 
   std::lock_guard lock(state_mutex_);
+  // A wheel notch's key held long enough and seen by a poll goes up first.
+  ReleaseWheelLocked();
   // A key pressed and released between two polls counts as held for one, or
   // the title never sees a quick tap.
   bool keys_seen[256];
   for (size_t i = 0; i < 256; i++) {
     keys_seen[i] = key_down_[i] || key_tapped_[i];
+  }
+  for (size_t i = 0; i < 2; i++) {
+    if (wheel_release_ns_[i]) {
+      wheel_polled_[i] = true;
+    }
   }
   std::memset(key_tapped_, 0, sizeof(key_tapped_));
   const BindMatcher binds_held(keys_seen, key_down_);
@@ -973,6 +980,54 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   }
 }
 
+namespace {
+
+// The wheel's keys (keybinds.cpp: WheelUp, WheelDown) and how long a notch
+// holds one at least.
+constexpr uint16_t kVkWheel[2] = {0x0E, 0x0F};
+constexpr int64_t kWheelPressNs = 80'000'000;
+
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+}  // namespace
+
+void MnkInputDriver::ReleaseWheelLocked() {
+  const int64_t now = SteadyNowNs();
+  bool released = false;
+  for (size_t i = 0; i < 2; i++) {
+    if (wheel_release_ns_[i] && wheel_polled_[i] && now >= wheel_release_ns_[i]) {
+      wheel_release_ns_[i] = 0;
+      wheel_polled_[i] = false;
+      SetKeyState(kVkWheel[i], false);
+      released = true;
+    }
+  }
+  if (released) {
+    RefreshBoundKeystrokesLocked();
+  }
+}
+
+void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
+  if (!IsEnabled() || !has_focus_ || !e.scroll_y()) {
+    return;
+  }
+  std::lock_guard lock(state_mutex_);
+  if (IsPassthroughEnabled()) {
+    return;
+  }
+  // Up (away from the user) is positive.
+  const size_t i = e.scroll_y() > 0 ? 0 : 1;
+  SetKeyState(kVkWheel[i], true);
+  // Another notch while held extends the press (one press for a quick turn).
+  wheel_release_ns_[i] = SteadyNowNs() + kWheelPressNs;
+  wheel_polled_[i] = false;
+  RefreshBoundKeystrokesLocked();
+}
+
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   has_focus_ = false;
   // Withdraw the request too, or an update queued before the focus loss grabs
@@ -982,6 +1037,8 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
     std::lock_guard lock(state_mutex_);
     std::memset(key_down_, 0, sizeof(key_down_));
     std::memset(key_tapped_, 0, sizeof(key_tapped_));
+    std::memset(wheel_release_ns_, 0, sizeof(wheel_release_ns_));
+    std::memset(wheel_polled_, 0, sizeof(wheel_polled_));
     // Releases landing on another window never arrive here as key-ups.
     RefreshBoundKeystrokesLocked();
     for (uint16_t vk : raw_keys_down_) {

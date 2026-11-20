@@ -14,11 +14,14 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 #include "platform_win.h"
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
 
 #include <spdlog/spdlog.h>
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/thread/timer_queue.h>
 
 #define LOG_LASTERROR() \
   { spdlog::error("Win32 Error 0x{:08X} in {}(...)", GetLastError(), __FUNCTION__); }
@@ -198,9 +201,47 @@ class Win32Handle : public T {
   HANDLE handle_ = nullptr;
 };
 
+namespace {
+using NtWaitForSingleObjectFn = LONG(NTAPI*)(HANDLE handle, BOOLEAN alertable,
+                                             PLARGE_INTEGER timeout);
+NtWaitForSingleObjectFn GetNtWaitForSingleObject() {
+  static const auto fn = [] {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll ? reinterpret_cast<NtWaitForSingleObjectFn>(
+                       reinterpret_cast<void*>(GetProcAddress(ntdll, "NtWaitForSingleObject")))
+                 : nullptr;
+  }();
+  return fn;
+}
+}  // namespace
+
 WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::milliseconds timeout) {
   HANDLE handle = wait_handle->native_handle();
-  DWORD result = WaitForSingleObjectEx(handle, DWORD(timeout.count()), is_alertable ? TRUE : FALSE);
+  const DWORD timeout_dw = DWORD(timeout.count());
+  DWORD result;
+  // Windows restarts a relative timeout in full when the waiting thread is
+  // suspended and resumed, so a guest thread suspended past its timeout waited
+  // the whole time again: wait until an absolute due time instead
+  // (xenia-canary b1fa39d1c). Alertable waits keep WaitForSingleObjectEx, as
+  // canary does, for its handling of the activation context around APCs.
+  NtWaitForSingleObjectFn nt_wait = (!is_alertable && timeout_dw && timeout_dw != INFINITE)
+                                        ? GetNtWaitForSingleObject()
+                                        : nullptr;
+  if (nt_wait) {
+    FILETIME now;
+    GetSystemTimePreciseAsFileTime(&now);
+    LARGE_INTEGER due_time;
+    // Positive: an absolute system time in 100 ns units.
+    due_time.QuadPart =
+        int64_t((uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime) +
+        10000LL * int64_t(timeout_dw);
+    const LONG status = nt_wait(handle, FALSE, &due_time);
+    // STATUS_WAIT_0, STATUS_ABANDONED_WAIT_0 and STATUS_TIMEOUT have the values
+    // of WAIT_OBJECT_0, WAIT_ABANDONED and WAIT_TIMEOUT; errors are negative.
+    result = status < 0 ? WAIT_FAILED : DWORD(status);
+  } else {
+    result = WaitForSingleObjectEx(handle, timeout_dw, is_alertable ? TRUE : FALSE);
+  }
   switch (result) {
     case WAIT_OBJECT_0:
       return WaitResult::kSuccess;
@@ -240,6 +281,8 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
 std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wait_handle_count,
                                            bool wait_all, bool is_alertable,
                                            std::chrono::milliseconds timeout) {
+  if (!wait_handle_count)
+    return {WaitResult::kSuccess, 0};
   std::vector<HANDLE> handles(wait_handle_count);
   for (size_t i = 0; i < wait_handle_count; ++i) {
     handles[i] = wait_handles[i]->native_handle();
@@ -336,7 +379,8 @@ class Win32Timer : public Win32Handle<Timer> {
 
  public:
   explicit Win32Timer(HANDLE handle) : Win32Handle(handle) {}
-  ~Win32Timer() = default;
+  // The repeating item uses the handle, so it is stopped first.
+  ~Win32Timer() override { DisarmRepeating(); }
 
   // SetWaitableTimer treats a negative due time as relative, so a past
   // absolute one is clamped to fire at once.
@@ -352,6 +396,7 @@ class Win32Timer : public Win32Handle<Timer> {
     return SetOnceAt(std::chrono::clock_cast<WClock_>(due_time), std::move(opt_callback));
   }
   bool SetOnceAt(WClock_::time_point due_time, std::function<void()> opt_callback) override {
+    DisarmRepeating();
     std::lock_guard<std::mutex> lock(mutex_);
     callback_ = std::move(opt_callback);
     LARGE_INTEGER due_time_li;
@@ -364,28 +409,72 @@ class Win32Timer : public Win32Handle<Timer> {
 
   bool SetRepeatingAfter(rex::chrono::hundrednanoseconds rel_time, std::chrono::milliseconds period,
                          std::function<void()> opt_callback = nullptr) override {
-    return SetRepeatingAt(WClock_::now() + rel_time, period, std::move(opt_callback));
-  }
-  bool SetRepeatingAt(GClock_::time_point due_time, std::chrono::milliseconds period,
-                      std::function<void()> opt_callback = nullptr) {
-    return SetRepeatingAt(std::chrono::clock_cast<WClock_>(due_time), period,
-                          std::move(opt_callback));
+    return SetRepeatingAt(GClock_::now() + rel_time, period, std::move(opt_callback));
   }
   bool SetRepeatingAt(WClock_::time_point due_time, std::chrono::milliseconds period,
                       std::function<void()> opt_callback) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    callback_ = std::move(opt_callback);
-    LARGE_INTEGER due_time_li;
-    due_time_li.QuadPart = AbsoluteDueTime(due_time);
-    auto completion_routine =
-        callback_ ? reinterpret_cast<PTIMERAPCROUTINE>(CompletionRoutine) : NULL;
-    return SetWaitableTimer(handle_, &due_time_li, int32_t(period.count()), completion_routine,
-                            this, FALSE)
-               ? true
-               : false;
+    return SetRepeatingAt(std::chrono::clock_cast<GClock_>(due_time), period,
+                          std::move(opt_callback));
+  }
+  // A periodic waitable timer re-arms from when it fired, rounded up to the
+  // clock tick, so a 16 ms period fired every 31.25 ms on the default 15.625 ms
+  // tick, whatever resolution was requested, and a title pacing itself with one
+  // ran at half speed (xenia-canary f8e4e6bb5). The timer queue schedules each
+  // fire one period after the previous due time instead, as on POSIX. A fire
+  // signals the waitable timer and, as SetWaitableTimer's completion routine
+  // did, queues the callback as an APC to the thread that set the timer, which
+  // runs it in an alertable wait.
+  bool SetRepeatingAt(GClock_::time_point due_time, std::chrono::milliseconds period,
+                      std::function<void()> opt_callback) override {
+    DisarmRepeating();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      callback_ = nullptr;
+      // Unsignaled until the first fire.
+      if (!CancelWaitableTimer(handle_)) {
+        return false;
+      }
+    }
+
+    std::shared_ptr<void> setting_thread;
+    if (opt_callback) {
+      HANDLE thread = nullptr;
+      if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &thread,
+                           0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        return false;
+      }
+      setting_thread = std::shared_ptr<void>(thread, CloseHandle);
+    }
+
+    auto active = std::make_shared<std::atomic<bool>>(true);
+    HANDLE timer_handle = handle_;
+    auto fire = [timer_handle, setting_thread, active,
+                 callback = std::move(opt_callback)](void*) {
+      // A due time in the past signals at once.
+      LARGE_INTEGER past;
+      past.QuadPart = 0;
+      SetWaitableTimer(timer_handle, &past, 0, nullptr, nullptr, FALSE);
+      if (callback) {
+        // Each APC owns its copy: the timer may be reset or destroyed before
+        // the setting thread runs it, and one queued before a Cancel or a new
+        // Set is dropped.
+        auto* apc = new RepeatingApcData{callback, active};
+        if (!QueueUserAPC(RepeatingApc, static_cast<HANDLE>(setting_thread.get()),
+                          reinterpret_cast<ULONG_PTR>(apc))) {
+          delete apc;
+        }
+      }
+    };
+
+    auto wait_item = QueueTimerRecurring(std::move(fire), nullptr, due_time, period);
+    std::lock_guard<std::mutex> lock(repeating_mutex_);
+    repeating_item_ = std::move(wait_item);
+    repeating_active_ = std::move(active);
+    return true;
   }
 
   bool Cancel() override {
+    DisarmRepeating();
     // Reset the callback immediately so that any completions don't call it.
     std::lock_guard<std::mutex> lock(mutex_);
     callback_ = nullptr;
@@ -403,8 +492,40 @@ class Win32Timer : public Win32Handle<Timer> {
     callback();
   }
 
+  struct RepeatingApcData {
+    std::function<void()> callback;
+    std::shared_ptr<std::atomic<bool>> active;
+  };
+
+  static void CALLBACK RepeatingApc(ULONG_PTR parameter) {
+    std::unique_ptr<RepeatingApcData> apc(reinterpret_cast<RepeatingApcData*>(parameter));
+    if (apc->active->load(std::memory_order_acquire)) {
+      apc->callback();
+    }
+  }
+
+  // Waits for a fire running on the timer queue's thread.
+  void DisarmRepeating() {
+    std::weak_ptr<TimerQueueWaitItem> item;
+    {
+      std::lock_guard<std::mutex> lock(repeating_mutex_);
+      item = std::move(repeating_item_);
+      repeating_item_.reset();
+      if (repeating_active_) {
+        repeating_active_->store(false, std::memory_order_release);
+        repeating_active_.reset();
+      }
+    }
+    if (auto locked_item = item.lock()) {
+      locked_item->Disarm();
+    }
+  }
+
   std::mutex mutex_;
   std::function<void()> callback_;
+  std::mutex repeating_mutex_;
+  std::weak_ptr<TimerQueueWaitItem> repeating_item_;
+  std::shared_ptr<std::atomic<bool>> repeating_active_;
 };
 
 std::unique_ptr<Timer> Timer::CreateManualResetTimer() {
@@ -463,9 +584,15 @@ class Win32Thread : public Win32Handle<Thread> {
     delete apc_data;
   }
 
-  void QueueUserCallback(std::function<void()> callback) override {
+  bool QueueUserCallback(std::function<void()> callback) override {
     auto apc_data = new ApcData({std::move(callback)});
-    QueueUserAPC(DispatchApc, handle_, reinterpret_cast<ULONG_PTR>(apc_data));
+    if (!QueueUserAPC(DispatchApc, handle_, reinterpret_cast<ULONG_PTR>(apc_data))) {
+      const DWORD error = GetLastError();
+      delete apc_data;
+      spdlog::warn("QueueUserAPC failed ({})", error);
+      return false;
+    }
+    return true;
   }
 
   bool Resume(uint32_t* out_previous_suspend_count = nullptr) override {

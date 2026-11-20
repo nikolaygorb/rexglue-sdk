@@ -426,20 +426,28 @@ bool build_vupklpx(BuilderContext& ctx) {
 //=============================================================================
 // VSCR
 //=============================================================================
-// Only SAT is tracked (ctx.vscr_sat). NJ is reported as set, the Xenon reset
-// value; vector floating point does not change with it here.
+// SAT (ctx.vscr_sat) and NJ (ctx.fpscr.vector_ieee, inverted: the Xenon
+// resets with NJ set). With NJ clear the vector code runs without the flush
+// mode, keeping denormals (FPSCRRegister::enableFlushMode).
 
 bool build_mfvscr(BuilderContext& ctx) {
   emitVec(ctx, {
                    "$0.u32[3] = $0.u32[2] = $0.u32[1] = 0;",
-                   "$0.u32[0] = 0x00010000u | (ctx.vscr_sat & 1u);",
+                   "$0.u32[0] = (ctx.fpscr.vector_ieee ? 0u : 0x00010000u) | "
+                   "(ctx.vscr_sat & 1u);",
                });
   return true;
 }
 
 bool build_mtvscr(BuilderContext& ctx) {
-  // mtvscr vB: the VSCR is guest word 3 (host word 0).
-  emitVec(ctx, {"ctx.vscr_sat = uint8_t($0.u32[0] & 1u);"});
+  // mtvscr vB: the VSCR is guest word 3 (host word 0). After a write of NJ
+  // the vector mode follows it at the next switch, so the code must not
+  // assume the mode it had.
+  emitVec(ctx, {
+                   "ctx.vscr_sat = uint8_t($0.u32[0] & 1u);",
+                   "ctx.fpscr.vector_ieee = uint8_t(($0.u32[0] & 0x00010000u) == 0);",
+               });
+  ctx.csrState = CSRState::Unknown;
   return true;
 }
 

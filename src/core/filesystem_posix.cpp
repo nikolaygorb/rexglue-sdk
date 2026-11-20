@@ -168,6 +168,14 @@ static uint64_t convertUnixtimeToWinFiletime(time_t unixtime) {
   return (uint64_t(unixtime) * 10000000) + 116444736000000000ULL;
 }
 
+bool CreateNewFile(const std::filesystem::path& path) {
+  const int file = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0664);
+  if (file < 0)
+    return false;
+  close(file);
+  return true;
+}
+
 bool CreateEmptyFile(const std::filesystem::path& path) {
   int file = creat(path.c_str(), 0774);
   if (file >= 0) {
@@ -209,7 +217,7 @@ class PosixFileHandle : public FileHandle {
     return true;
   }
   bool SetLength(size_t length) override { return ftruncate(handle_, length) >= 0 ? true : false; }
-  void Flush() override { fsync(handle_); }
+  bool Flush() override { return fsync(handle_) == 0; }
 
  private:
   int handle_ = -1;

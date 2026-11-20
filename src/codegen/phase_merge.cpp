@@ -72,6 +72,15 @@ void mergeAndSeal(CodegenContext& ctx) {
   if (sharedRegs > 0) {
     REXCODEGEN_DEBUG("Analyze: {} functions share registers with an SEH funclet", sharedRegs);
   }
+  size_t contextRegs =
+      graph.markContextNonVolatiles([&](uint32_t a) { return ctx.Config().isSetJmp(a); },
+                                    [&](uint32_t a) { return ctx.Config().isLongJmp(a); },
+                                    ctx.Config().generateExceptionHandlers);
+  if (contextRegs > 0) {
+    REXCODEGEN_DEBUG("Analyze: {} functions keep their non-volatiles in ctx (setjmp, helpers)",
+                     contextRegs);
+  }
+  MarkCallerRegisterReaders(graph, binary, ctx.Config());
 
   size_t totalSealed = graph.sealAllReady();
   size_t stillPending = graph.pendingCount();

@@ -86,6 +86,8 @@ struct RecompilerConfig {
   /// Every TOML that fed this config, in load order. LoadFromTable() gets a
   /// parsed table, so a manifest-embedded entry omits the manifest itself.
   std::vector<std::string> loadedFiles;
+  /// Unknown keys and wrong TOML node types, including included files.
+  std::vector<std::string> keyWarnings;
 
   // === Code generation options (optional) ===
   bool skipLr = false;
@@ -93,9 +95,25 @@ struct RecompilerConfig {
   bool xerAsLocalVariable = false;
   bool reservedRegisterAsLocalVariable = false;
   bool skipMsr = false;
+  /// An interrupts-off section that is one atomic read-modify-write runs
+  /// without the global lock (`lock_free_reservations`; ReIGlue 0470).
+  bool lockFreeReservations = true;
+  /// vmsum3fp128 / vmsum4fp128 through the fast float64 sum (vec_msum3_fast),
+  /// 1 ulp off the console in most cases, instead of the console's fixed point
+  /// sum (`fast_dot_products`; docs/codegen-vector-math.md).
+  bool fastDotProducts = false;
   bool crRegistersAsLocalVariables = false;
   bool nonArgumentRegistersAsLocalVariables = false;
   bool nonVolatileRegistersAsLocalVariables = false;
+  /// r14-r31 only (f14-f31 and the VMX non-volatiles stay in ctx, so floating-
+  /// point code keeps its ordering against FPSCR mode changes).
+  bool nonVolatileGprsAsLocalVariables = false;
+  /// r0, r2, r11 and r12 only (f0 and v32-v63, which non_argument_as_local
+  /// localizes too, stay in ctx for the same reason).
+  bool nonArgumentGprsAsLocalVariables = false;
+  /// With registers as locals: every function reading one its caller set
+  /// (before any path of its own sets it) becomes share_registers by itself.
+  bool autoShareRegisters = true;
   /// Scalar FP code runs in the VMX MXCSR too (denormals flushed): no mode
   /// switches between FPU and VMX code, no denormal assists on the host.
   bool fpuFlushDenormals = false;
@@ -103,6 +121,13 @@ struct RecompilerConfig {
   /// instruction and FPCC by compares, as on Xenon (mffs reads them). Costs
   /// two host status register accesses and a classification per instruction.
   bool fpscrResultBits = false;
+  /// Xenon's single-precision arithmetic with a denormal double operand
+  /// (fadds, fsubs, fmuls and the single multiply-adds answer with the
+  /// default QNaN; fdivs and fsqrts keep the double result): checked on every
+  /// such instruction (rex::ppc::fp_single_denormal_operand). false drops the
+  /// check: the instruction rounds as any other. About 7.5 % fewer
+  /// instructions in FP-heavy code (docs/codegen-performance.md).
+  bool singleDenormalOperandQuirk = true;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
 
   // === Analysis tuning (optional) ===
@@ -118,8 +143,21 @@ struct RecompilerConfig {
   std::unordered_map<uint32_t, FunctionConfig> functions;  ///< Function/chunk configuration
   std::unordered_map<uint32_t, JumpTable> switchTables;
   std::unordered_map<uint32_t, MidAsmHook> midAsmHooks;
+  // TOML keys longjmp_address / setjmp_address: an address, or an array of
+  // every address the title calls it at (a second copy of the CRT's, or the
+  // incremental linker's thunks to it; upstream rexglue PR #599). The scalar
+  // is the first; the sets hold the others.
   uint32_t longJmpAddress = 0;
   uint32_t setJmpAddress = 0;
+  std::unordered_set<uint32_t> longJmpAddresses;
+  std::unordered_set<uint32_t> setJmpAddresses;
+
+  bool isLongJmp(uint32_t address) const {
+    return address != 0 && (address == longJmpAddress || longJmpAddresses.contains(address));
+  }
+  bool isSetJmp(uint32_t address) const {
+    return address != 0 && (address == setJmpAddress || setJmpAddresses.contains(address));
+  }
 
   // === rexcrt: CRT function address overrides ===
   // Maps function name -> guest address (e.g. "CreateFileA" -> 0x8248B780)

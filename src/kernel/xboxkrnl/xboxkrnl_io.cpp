@@ -322,11 +322,20 @@ static X_STATUS CompleteRead(object_ref<XFile> file, object_ref<XEvent> ev, uint
       ev->Reset();
     }
     file->BeginAsyncIo();
-    if (status_block) {
-      status_block->status = X_STATUS_PENDING;
-      status_block->information = 0;
+    // The status block keeps what the caller left there until the request
+    // completes (xenia-edge f2da83314).
+    if (thread) {
+      thread->AddPostedIo();
     }
-    REX_KERNEL_STATE()->PostIo([complete]() { complete(true); });
+    if (!REX_KERNEL_STATE()->PostIo([complete, thread]() {
+          complete(true);
+          if (thread) {
+            thread->RemovePostedIo();
+          }
+        }) &&
+        thread) {
+      thread->RemovePostedIo();
+    }
     return X_STATUS_PENDING;
   }
   X_STATUS result = complete(false);
@@ -527,7 +536,9 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
     return X_STATUS_INVALID_HANDLE;
   }
 
-  uint64_t timeout_ticks = timeout ? static_cast<uint32_t>(*timeout)
+  // All 64 bits: a relative timeout (negative) cut to 32 bits became a huge
+  // positive (absolute) time and waited for weeks.
+  uint64_t timeout_ticks = timeout ? static_cast<uint64_t>(*timeout)
                                    : static_cast<uint64_t>(std::numeric_limits<int64_t>::min());
   XIOCompletion::IONotification notification;
   if (port->WaitForNotification(timeout_ticks, &notification)) {
@@ -593,8 +604,16 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
     return X_STATUS_SUCCESS;
   }
 
-  REXKRNL_IMPORT_RESULT("NtQueryFullAttributesFile", "X_STATUS_NO_SUCH_FILE");
-  return X_STATUS_NO_SUCH_FILE;
+  // A missing last component is a missing name, a missing directory or link
+  // before it a missing path, the same split opens make: titles get
+  // ERROR_FILE_NOT_FOUND or ERROR_PATH_NOT_FOUND from RtlNtStatusToDosError.
+  auto base_path = rex::string::utf8_find_base_guest_path(target_path);
+  if (!base_path.empty() && !REX_KERNEL_FS()->ResolvePath(base_path)) {
+    REXKRNL_IMPORT_RESULT("NtQueryFullAttributesFile", "X_STATUS_OBJECT_PATH_NOT_FOUND");
+    return X_STATUS_OBJECT_PATH_NOT_FOUND;
+  }
+  REXKRNL_IMPORT_RESULT("NtQueryFullAttributesFile", "X_STATUS_OBJECT_NAME_NOT_FOUND");
+  return X_STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
 u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine,
@@ -640,7 +659,8 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
 }
 
 u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
-  auto result = X_STATUS_SUCCESS;
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  const X_STATUS result = file ? file->Flush() : X_STATUS_INVALID_HANDLE;
 
   if (io_status_block_ptr) {
     io_status_block_ptr->status = result;
@@ -690,12 +710,19 @@ u32 NtOpenSymbolicLinkObject_entry(mapped_u32 handle_out,
 }
 
 // https://docs.microsoft.com/en-us/windows/win32/devnotes/ntquerysymboliclinkobject
-u32 NtQuerySymbolicLinkObject_entry(u32 handle, ppc_ptr_t<X_ANSI_STRING> target) {
+u32 NtQuerySymbolicLinkObject_entry(u32 handle, ppc_ptr_t<X_ANSI_STRING> target,
+                                   mapped_u32 returned_length_ptr) {
   auto symlink = REX_KERNEL_OBJECTS()->LookupObject<XSymbolicLink>(handle);
   if (!symlink) {
     return X_STATUS_NO_SUCH_FILE;
   }
-  auto length = std::min(static_cast<size_t>(target->maximum_length), symlink->target().size());
+  const uint32_t length = static_cast<uint32_t>(symlink->target().size());
+  if (returned_length_ptr) {
+    *returned_length_ptr = length;
+  }
+  if (length > target->maximum_length) {
+    return X_STATUS_BUFFER_TOO_SMALL;
+  }
   if (length > 0) {
     auto target_buf = REX_KERNEL_MEMORY()->TranslateVirtual(target->pointer);
     std::memcpy(target_buf, symlink->target().c_str(), length);
@@ -718,6 +745,11 @@ u32 NtDeviceIoControlFile_entry(u32 handle, u32 event_handle, u32 apc_routine, u
                                 u32 io_status_block, u32 io_control_code, mapped_void input_buffer,
                                 u32 input_buffer_len, mapped_void output_buffer,
                                 u32 output_buffer_len) {
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XObject>(handle);
+  if (!file)
+    return X_STATUS_INVALID_HANDLE;
+  if (file->type() != XFile::kObjectType)
+    return X_STATUS_OBJECT_TYPE_MISMATCH;
   // Called by XMountUtilityDrive cache-mounting code
   // (checks if the returned values look valid, values below seem to pass the
   // checks)

@@ -12,6 +12,7 @@
  */
 
 #include <rex/graphics/pipeline/texture/replacement.h>
+#include <toml++/toml.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -67,6 +68,12 @@ REXCVAR_DEFINE_INT32(texture_replacement_memory_limit, 4096, "GPU",
                      "images are uploaded as they are, so this is about their GPU memory too). A "
                      "texture that would go beyond it is loaded from the guest's data instead. "
                      "0 = no limit");
+
+REXCVAR_DEFINE_INT32(texture_replacement_preload_memory_limit, 256, "GPU",
+                     "CPU staging budget in MB for packs with preload=true in pack.toml; "
+                     "0 disables preload. Images leave staging when first used.")
+    .range(0, 16384)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(texture_replacement_dump_path, "", "GPU",
                       "Folder to write the guest textures that could be replaced to, as a pack "
@@ -382,6 +389,69 @@ bool Index::Load(const std::filesystem::path& folder, bool strict_alpha, std::st
   }
   folders_.push_back(folder);
   strict_alpha_.push_back(strict_alpha);
+  std::string manifest, manifest_error;
+  const bool preload = ReadTextFile(folder / "pack.toml", 64 * 1024, manifest, manifest_error) &&
+                       ManifestPreload(manifest);
+  preload_.push_back(preload);
+  return true;
+}
+
+bool ManifestPreload(std::string_view text) {
+  try {
+    return toml::parse(text)["preload"].value<bool>().value_or(false);
+  } catch (const toml::parse_error&) {
+    return false;
+  }
+}
+
+std::vector<std::pair<uint64_t, IndexEntry>> Index::PreloadList() const {
+  std::vector<std::pair<uint64_t, IndexEntry>> result;
+  for (const auto& entry : entries_) {
+    if (preload_[entry.second.pack]) result.push_back(entry);
+  }
+  std::ranges::sort(result, {}, &std::pair<uint64_t, IndexEntry>::first);
+  return result;
+}
+
+uint64_t GetPreloadMemoryLimitBytes() {
+  return uint64_t(std::max(0, REXCVAR_GET(texture_replacement_preload_memory_limit))) << 20;
+}
+
+void PreloadCache::Load(const Index& index, uint64_t budget_bytes) {
+  images_.clear();
+  bytes_ = 0;
+  if (!budget_bytes) return;
+  for (const auto& [key, entry] : index.PreloadList()) {
+    const auto path = index.FilePath(entry);
+    if (!IsInsideFolder(index.folder(entry.pack), path)) continue;
+    Image image;
+    std::string error;
+    if (bytes_ < budget_bytes &&
+        LoadDds(path, entry.format, entry.width, entry.height, kMaxImageLevels,
+                kMaxImageWidthHeight, budget_bytes - bytes_, image, error)) {
+      bytes_ += image.data.size();
+      images_.emplace(key, std::move(image));
+    }
+  }
+}
+
+bool PreloadCache::Take(uint64_t key, uint32_t width, uint32_t height, uint32_t levels,
+                        uint32_t max_side, uint64_t max_bytes, Image& out) {
+  auto found = images_.find(key);
+  if (found == images_.end()) return false;
+  Image image = std::move(found->second);
+  bytes_ -= image.data.size();
+  images_.erase(found);
+  if (image.width > max_side || image.height > max_side) return false;
+  const size_t count = std::min<size_t>(image.levels.size(),
+      GetReplacementLevelCount(width, height, levels, image.width, image.height));
+  if (!count) return false;
+  image.levels.resize(count);
+  const auto& last = image.levels.back();
+  const size_t size = last.offset + size_t(last.row_bytes) * last.row_count;
+  if (max_bytes && size > max_bytes) return false;
+  image.data.resize(size);
+  out = std::move(image);
   return true;
 }
 

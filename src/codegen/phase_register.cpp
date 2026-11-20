@@ -353,18 +353,67 @@ std::optional<ParsedExceptionInfo> parseExceptionInfo(const BinaryView& binary,
 // Helper Detection
 //=============================================================================
 
+// Every copy of the save/restore helpers (millicode) the binary links. A copy
+// counts only when its whole run matches: each register's instruction, then
+// the tail, so a lone `std r14,-152(r1)` in ordinary code is not taken for
+// one. A title can link the helpers twice (two CRTs, or a library with its
+// own copy), and its .pdata names the entries of each (upstream rexglue PR
+// #598). If no run of a kind matches in full, the first match of its head
+// is taken, as before.
 void detectSaveRestoreHelpers(const BinaryView& binary, AnalysisState& state) {
-  struct HelperPattern {
-    uint32_t pattern;
-    uint32_t* state_addr;
-    const char* name;
+  struct Word {
+    uint32_t value;
+    uint32_t mask;
+  };
+  struct HelperKind {
+    const char* name;  // of the head, for the log
+    std::vector<uint32_t>* heads;
+    std::vector<Word> words;
+    size_t headWords;  // the words the first-match fallback compares
+    uint32_t fallback = 0;
   };
 
-  HelperPattern patterns[] = {
-      {0xe9c1ff68, &state.restGpr14Address, "__restgprlr_14"},
-      {0xf9c1ff68, &state.saveGpr14Address, "__savegprlr_14"},
-      {0xc9ccff70, &state.restFpr14Address, "__restfpr_14"},
-      {0xd9ccff70, &state.saveFpr14Address, "__savefpr_14"},
+  constexpr uint32_t kBlr = 0x4E800020;
+  constexpr uint32_t kAll = 0xFFFFFFFF;
+  // 18 instructions, one per register from r14 / f14: the register field and
+  // the displacement step by one and by 8.
+  auto scalarRun = [](uint32_t head, std::initializer_list<uint32_t> tail) {
+    std::vector<Word> words;
+    for (uint32_t i = 0; i < 18; ++i)
+      words.push_back({head + (i << 21) + i * 8, kAll});
+    for (uint32_t t : tail)
+      words.push_back({t, kAll});
+    return words;
+  };
+  // `li r11,-16*n` then the vector store or load, one pair per register, then
+  // blr. VMX128 (v64-v127) spreads the register number over two fields, so
+  // only the first one is compared in full.
+  auto vectorRun = [](uint32_t count, uint32_t li, uint32_t vector, bool vmx128) {
+    std::vector<Word> words;
+    constexpr uint32_t kVmx128Register = (31u << 21) | (3u << 2);
+    for (uint32_t i = 0; i < count; ++i) {
+      words.push_back({li + i * 16, kAll});
+      if (vmx128)
+        words.push_back({vector, i == 0 ? kAll : ~kVmx128Register});
+      else
+        words.push_back({vector + (i << 21), kAll});
+    }
+    words.push_back({kBlr, kAll});
+    return words;
+  };
+
+  HelperKind kinds[] = {
+      // ld rN; lwz r12,-8(r1); mtlr r12; blr
+      {"__restgprlr_14", &state.restGpr14Addresses,
+       scalarRun(0xE9C1FF68, {0x8181FFF8, 0x7D8803A6, kBlr}), 1},
+      // std rN; stw r12,-8(r1); blr
+      {"__savegprlr_14", &state.saveGpr14Addresses, scalarRun(0xF9C1FF68, {0x9181FFF8, kBlr}), 1},
+      {"__restfpr_14", &state.restFpr14Addresses, scalarRun(0xC9CCFF70, {kBlr}), 1},
+      {"__savefpr_14", &state.saveFpr14Addresses, scalarRun(0xD9CCFF70, {kBlr}), 1},
+      {"__restvmx_14", &state.restVmx14Addresses, vectorRun(18, 0x3960FEE0, 0x7DCB60CE, false), 2},
+      {"__savevmx_14", &state.saveVmx14Addresses, vectorRun(18, 0x3960FEE0, 0x7DCB61CE, false), 2},
+      {"__restvmx_64", &state.restVmx64Addresses, vectorRun(64, 0x3960FC00, 0x100B60CB, true), 2},
+      {"__savevmx_64", &state.saveVmx64Addresses, vectorRun(64, 0x3960FC00, 0x100B61CB, true), 2},
   };
 
   for (const auto& section : binary.sections()) {
@@ -374,41 +423,40 @@ void detectSaveRestoreHelpers(const BinaryView& binary, AnalysisState& state) {
     const uint8_t* data = section.data;
     const size_t size = section.size;
     const size_t base = section.baseAddress;
+    auto matches = [&](size_t offset, const std::vector<Word>& words, size_t count) {
+      if (offset + count * 4 > size)
+        return false;
+      for (size_t i = 0; i < count; ++i) {
+        const uint32_t word = load_and_swap<uint32_t>(data + offset + i * 4);
+        if ((word & words[i].mask) != (words[i].value & words[i].mask))
+          return false;
+      }
+      return true;
+    };
 
     for (size_t offset = 0; offset + 4 <= size; offset += 4) {
-      uint32_t instr = load_and_swap<uint32_t>(data + offset);
-      uint32_t addr = static_cast<uint32_t>(base + offset);
-
-      for (auto& p : patterns) {
-        if (instr == p.pattern && *p.state_addr == 0) {
-          *p.state_addr = addr;
-          REXCODEGEN_DEBUG("Found {} at 0x{:08X}", p.name, addr);
+      const uint32_t instr = load_and_swap<uint32_t>(data + offset);
+      const uint32_t addr = static_cast<uint32_t>(base + offset);
+      for (auto& kind : kinds) {
+        if (instr != kind.words.front().value)
+          continue;
+        if (matches(offset, kind.words, kind.words.size())) {
+          kind.heads->push_back(addr);
+          REXCODEGEN_DEBUG("Found {} at 0x{:08X}", kind.name, addr);
+        } else if (kind.fallback == 0 && matches(offset, kind.words, kind.headWords)) {
+          kind.fallback = addr;
         }
       }
+    }
+  }
 
-      if (offset + 8 <= size) {
-        uint32_t next = load_and_swap<uint32_t>(data + offset + 4);
-
-        if (instr == 0x3960fee0) {
-          if (next == 0x7dcb60ce && state.restVmx14Address == 0) {
-            state.restVmx14Address = addr;
-            REXCODEGEN_DEBUG("Found __restvmx_14 at 0x{:08X}", addr);
-          } else if (next == 0x7dcb61ce && state.saveVmx14Address == 0) {
-            state.saveVmx14Address = addr;
-            REXCODEGEN_DEBUG("Found __savevmx_14 at 0x{:08X}", addr);
-          }
-        }
-
-        if (instr == 0x3960fc00) {
-          if (next == 0x100b60cb && state.restVmx64Address == 0) {
-            state.restVmx64Address = addr;
-            REXCODEGEN_DEBUG("Found __restvmx_64 at 0x{:08X}", addr);
-          } else if (next == 0x100b61cb && state.saveVmx64Address == 0) {
-            state.saveVmx64Address = addr;
-            REXCODEGEN_DEBUG("Found __savevmx_64 at 0x{:08X}", addr);
-          }
-        }
-      }
+  for (auto& kind : kinds) {
+    if (kind.heads->empty() && kind.fallback != 0) {
+      kind.heads->push_back(kind.fallback);
+      REXCODEGEN_WARN("{} at 0x{:08X}: its run does not match in full, taken by its head", kind.name,
+                      kind.fallback);
+    } else if (kind.heads->size() > 1) {
+      REXCODEGEN_DEBUG("{}: {} copies", kind.name, kind.heads->size());
     }
   }
 }
@@ -479,8 +527,14 @@ void detectSetjmpLongjmp(const BinaryView& binary, RecompilerConfig& config) {
       address = entries[0];
       REXCODEGEN_DEBUG("Found {} at 0x{:08X}", key, address);
     } else if (entries.size() > 1) {
-      REXCODEGEN_WARN("{}: {} candidates in the binary; set it in the config", key,
-                      entries.size());
+      // Two copies of the CRT, or a routine of the title's own with the same
+      // stores: the config decides (an array takes several).
+      std::string list;
+      for (uint32_t entry : entries)
+        list += fmt::format("{}0x{:08X}", list.empty() ? "" : ", ", entry);
+      REXCODEGEN_WARN("{}: {} candidates in the binary ({}); set it in the config, an array "
+                      "for several",
+                      key, entries.size(), list);
     }
   };
 
@@ -580,42 +634,30 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
   }
 
   // Register save/restore helpers
-  auto registerHelpers = [&](uint32_t base14, const char* prefix, size_t stride, size_t endReg,
-                             size_t extraSize) {
-    if (base14 == 0)
-      return;
-    for (size_t i = 14; i <= endReg; i++) {
-      uint32_t addr = base14 + static_cast<uint32_t>((i - 14) * stride);
-      uint32_t size = static_cast<uint32_t>((endReg + 1 - i) * stride + extraSize);
-      graph.addFunction(addr, size, FunctionAuthority::HELPER, true);
-      graph.setFunctionName(addr, fmt::format("{}{}", prefix, i));
+  // Every copy; the entries of a second or later copy keep their names apart
+  // with their address (__savegprlr_14_82A98760). The name prefix is what
+  // marks a helper (IsSaveRestoreHelperName), so every copy is treated alike.
+  auto registerHelpers = [&](const std::vector<uint32_t>& heads, const char* prefix,
+                             size_t stride, size_t firstReg, size_t endReg, size_t extraSize) {
+    for (size_t copy = 0; copy < heads.size(); ++copy) {
+      for (size_t i = firstReg; i <= endReg; i++) {
+        uint32_t addr = heads[copy] + static_cast<uint32_t>((i - firstReg) * stride);
+        uint32_t size = static_cast<uint32_t>((endReg + 1 - i) * stride + extraSize);
+        graph.addFunction(addr, size, FunctionAuthority::HELPER, true);
+        graph.setFunctionName(addr, copy == 0 ? fmt::format("{}{}", prefix, i)
+                                              : fmt::format("{}{}_{:08X}", prefix, i, addr));
+      }
     }
   };
 
-  registerHelpers(state.restGpr14Address, "__restgprlr_", 4, 31, 12);
-  registerHelpers(state.saveGpr14Address, "__savegprlr_", 4, 31, 8);
-  registerHelpers(state.restFpr14Address, "__restfpr_", 4, 31, 4);
-  registerHelpers(state.saveFpr14Address, "__savefpr_", 4, 31, 4);
-  registerHelpers(state.restVmx14Address, "__restvmx_", 8, 31, 4);
-  registerHelpers(state.saveVmx14Address, "__savevmx_", 8, 31, 4);
-
-  // VMX 64-127
-  if (state.restVmx64Address != 0) {
-    for (size_t i = 64; i < 128; i++) {
-      uint32_t addr = state.restVmx64Address + static_cast<uint32_t>((i - 64) * 8);
-      uint32_t size = static_cast<uint32_t>((128 - i) * 8 + 4);
-      graph.addFunction(addr, size, FunctionAuthority::HELPER, true);
-      graph.setFunctionName(addr, fmt::format("__restvmx_{}", i));
-    }
-  }
-  if (state.saveVmx64Address != 0) {
-    for (size_t i = 64; i < 128; i++) {
-      uint32_t addr = state.saveVmx64Address + static_cast<uint32_t>((i - 64) * 8);
-      uint32_t size = static_cast<uint32_t>((128 - i) * 8 + 4);
-      graph.addFunction(addr, size, FunctionAuthority::HELPER, true);
-      graph.setFunctionName(addr, fmt::format("__savevmx_{}", i));
-    }
-  }
+  registerHelpers(state.restGpr14Addresses, "__restgprlr_", 4, 14, 31, 12);
+  registerHelpers(state.saveGpr14Addresses, "__savegprlr_", 4, 14, 31, 8);
+  registerHelpers(state.restFpr14Addresses, "__restfpr_", 4, 14, 31, 4);
+  registerHelpers(state.saveFpr14Addresses, "__savefpr_", 4, 14, 31, 4);
+  registerHelpers(state.restVmx14Addresses, "__restvmx_", 8, 14, 31, 4);
+  registerHelpers(state.saveVmx14Addresses, "__savevmx_", 8, 14, 31, 4);
+  registerHelpers(state.restVmx64Addresses, "__restvmx_", 8, 64, 127, 4);
+  registerHelpers(state.saveVmx64Addresses, "__savevmx_", 8, 64, 127, 4);
 
   // Register CONFIG functions
   size_t configFuncs = 0, configChunks = 0;
@@ -624,7 +666,9 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
     std::string name = cfg.name.empty() ? fmt::format("sub_{:08X}", address) : cfg.name;
     auto* node = graph.addFunction(address, size, FunctionAuthority::CONFIG, true);
     graph.setFunctionName(address, name);
-    if (node && cfg.shareRegisters) {
+    // A chunk is a piece of its parent emitted as a function of its own: it
+    // reads and writes the parent's non-volatiles, so it shares them.
+    if (node && (cfg.shareRegisters || cfg.isChunk())) {
       node->setSharesRegisters(true);
     }
     configFuncs++;
@@ -707,11 +751,20 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
           }
 
           // Compute restore helper from save helper
-          // Save helpers and restore helpers are at matching offsets from their base addresses
-          if (prologInfo.saveHelper != 0 && state.restGpr14Address != 0 &&
-              state.saveGpr14Address != 0) {
-            sehInfo.restoreHelper =
-                prologInfo.saveHelper + (state.restGpr14Address - state.saveGpr14Address);
+          // Save helpers and restore helpers are at matching offsets from their base addresses,
+          // within the copy the save helper belongs to (the n-th save run with the n-th
+          // restore run); outside every copy, the first pair's offset as before.
+          const auto& saves = state.saveGpr14Addresses;
+          const auto& rests = state.restGpr14Addresses;
+          if (prologInfo.saveHelper != 0 && !saves.empty() && !rests.empty()) {
+            size_t copy = 0;
+            for (size_t k = 0; k < saves.size() && k < rests.size(); ++k) {
+              if (prologInfo.saveHelper >= saves[k] && prologInfo.saveHelper < saves[k] + 18 * 4) {
+                copy = k;
+                break;
+              }
+            }
+            sehInfo.restoreHelper = prologInfo.saveHelper + (rests[copy] - saves[copy]);
           }
         }
       }

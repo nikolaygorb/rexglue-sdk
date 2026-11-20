@@ -10,13 +10,24 @@
  *              See LICENSE file in the project root for full license text.
  */
 
-// What SaveConfig (rex/cvar.h) writes: every flag that differs from its
-// default, except that a value given on the command line or in the
-// environment is a one-off for that run, so the file keeps its own line for
-// that flag (or none). A change made while the app runs (SetFlagByName) is
-// saved as usual, over a command-line value too. Lines of the file for flags
-// nobody registered in this run (a plugin not loaded, another program's
-// settings) are written back as they were read instead of being dropped.
+// What SaveConfig (rex/cvar.h) writes. A value given on the command line or
+// in the environment is a one-off for that run, so the files keep their own
+// line for that flag (or none); a change made while the app runs
+// (SetFlagByName) is saved as usual, over a command-line value too.
+//
+// - Saving to a settings file LoadConfig read (a title reads several, e.g.
+//   settings/hardware.toml and settings/mapping.toml) edits the files in
+//   place with EditConfigText: each changed setting goes back to the file
+//   whose line for it was applied last, one no file has (and that differs
+//   from its default) is added to the file saved to. Comments, blank lines,
+//   order, settings that didn't change, lines of flags nobody registered in
+//   this run (a plugin not loaded, another program's settings) and tables
+//   stay as they are. A setting put back to its default keeps its line, with
+//   the default value.
+// - Saving to any other path (a new file, an export, a file that could not be
+//   parsed and was kept as `.bad`) writes the whole file: every flag that
+//   differs from its default, then the settings files' lines for flags nobody
+//   registered.
 //
 // Kept out of rex/cvar.h so that adding these doesn't change a header every
 // recompiled game file includes (through rex/chrono/clock.h).
@@ -26,8 +37,27 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace rex::cvar {
+
+/// One setting for EditConfigText. `value` is the TOML text that goes after
+/// `=`: `true`, `2`, `0.5`, `"vulkan"` (a string quoted and escaped).
+struct ConfigEdit {
+  std::string name;
+  std::string value;
+};
+
+/// The text of a flat settings file with the edits applied and everything
+/// else kept byte for byte: comments, blank lines, order, other settings,
+/// tables. A setting the root table (above the first `[table]` header) has a
+/// `name = value` line for gets the new value on that line (on the last one
+/// when the name is written more than once: the one the loader uses), keeping
+/// the indentation, the spacing around `=` and a trailing comment. A setting
+/// the root has no line for is added as `name = value`: at the end of the
+/// file, or after the root's last setting when the file has tables. New lines
+/// use the file's line ending (CRLF when it has any).
+std::string EditConfigText(std::string_view text, const std::vector<ConfigEdit>& edits);
 
 /// Make `value` the default of a registered flag: the value it has while
 /// nothing else set it, the value ResetToDefault goes back to, and the value

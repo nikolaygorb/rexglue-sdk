@@ -432,7 +432,7 @@ bool VulkanSharedMemory::UploadRanges(
         successful = false;
         break;
       }
-      MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      MakeUploadRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size));
       CopyPagesForUpload(upload_buffer_mapping, upload_range_start,
                          uint32_t(upload_buffer_size >> page_size_log2()));
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {

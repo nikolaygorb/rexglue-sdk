@@ -96,7 +96,7 @@ struct XAPC {
   // KAPC is 0x28(40) bytes? (what's passed to ExAllocatePoolWithTag)
   // This is 4b shorter than NT - looks like the reserved dword at +4 is gone.
   // NOTE: stored in guest memory.
-  uint16_t type;                      // +0
+  rex::be<uint16_t> type;             // +0
   uint8_t apc_mode;                   // +2
   uint8_t enqueued;                   // +3
   rex::be<uint32_t> thread_ptr;       // +4
@@ -245,7 +245,7 @@ struct X_KTHREAD {
   rex::be<X_STATUS> wait_result;                                      // 0xA0
   uint8_t wait_irql;                                                  // 0xA4
   uint8_t unk_A5[0xB];                                                // 0xA5
-  int32_t apc_disable_count;                                          // 0xB0
+  rex::be<int32_t> apc_disable_count;                                 // 0xB0
   rex::be<int32_t> quantum;                                           // 0xB4
   uint8_t unk_B8;                                                     // 0xB8
   uint8_t unk_B9;                                                     // 0xB9
@@ -342,6 +342,11 @@ class XThread : public XObject {
   X_STATUS Exit(int exit_code);
   X_STATUS Terminate(int exit_code);
 
+  // Counts the requests this thread issued that pend on the file I/O worker,
+  // which its exit waits for (xenia-edge 896b71158).
+  void AddPostedIo() { posted_io_.fetch_add(1, std::memory_order_relaxed); }
+  void RemovePostedIo() { posted_io_.fetch_sub(1, std::memory_order_release); }
+
   virtual void Execute();
 
   rex::thread::Fiber* main_fiber() const { return main_fiber_; }
@@ -380,7 +385,7 @@ class XThread : public XObject {
   // 3 - core 1, thread 1 - user
   // 4 - core 2, thread 0 - xaudio
   // 5 - core 2, thread 1 - user
-  void SetAffinity(uint32_t affinity);
+  bool SetAffinity(uint32_t affinity);
   uint8_t active_cpu() const;
   void SetActiveCpu(uint8_t cpu_index);
 
@@ -439,6 +444,7 @@ class XThread : public XObject {
   // Atomic: written by the thread itself in Exit/Terminate, read cross-thread by
   // KernelState::TerminateTitle's cooperative drain.
   std::atomic<bool> running_{false};
+  std::atomic<uint32_t> posted_io_{0};
 
   std::string thread_name_;
   std::unique_ptr<runtime::ThreadState> thread_state_;

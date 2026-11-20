@@ -63,3 +63,31 @@ TEST_CASE("The 5.1 passthrough plays a non-finite mix as silence", "[audio]") {
   REQUIRE(output == std::vector<float>{0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f,  //
                                        0.0f, 0.25f, -1.0f, 0.0f, 0.0f, 0.0f});
 }
+
+TEST_CASE("The soft limiter is linear to its knee and rounds off above it", "[audio]") {
+  using rex::audio::conversion::soft_limit;
+  REQUIRE(soft_limit(0.5f) == 0.5f);
+  REQUIRE(soft_limit(-0.8f) == -0.8f);
+  const float loud = soft_limit(4.0f);
+  REQUIRE(loud > 0.8f);
+  REQUIRE(loud <= 1.0f);
+  REQUIRE(soft_limit(-4.0f) == -loud);
+  REQUIRE(soft_limit(kNaN) == 0.0f);
+  REQUIRE(soft_limit(kInf) == 0.0f);
+}
+
+TEST_CASE("The limited stereo fold folds as the plain one below the knee", "[audio]") {
+  const std::vector<float> silent(2, 0.0f);
+  const auto input = GuestMix({{0.25f, 0.9f}, {-0.5f, kNaN}, silent, silent, silent, silent});
+  const rex::audio::StereoFold fold = {
+      .center = 0.0f, .surround = 0.0f, .lfe = 0.0f, .scale = 1.0f};
+  std::vector<float> output(4);
+  rex::audio::conversion::sequential_6_BE_to_interleaved_2_LE_limited(output.data(), input.data(),
+                                                                      2, fold, 1.0f);
+  REQUIRE(output[0] == 0.25f);
+  REQUIRE(output[1] == -0.5f);
+  // Above the knee: rounded off (0.8 + 0.2 tanh(0.5) for 0.9); non-finite: silence.
+  REQUIRE(output[2] > 0.8f);
+  REQUIRE(output[2] < 0.9f);
+  REQUIRE(output[3] == 0.0f);
+}

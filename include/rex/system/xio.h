@@ -45,12 +45,10 @@ struct XAM_OVERLAPPED {
 };
 
 inline uint32_t XOverlappedGetResult(void* ptr) {
-  auto p = reinterpret_cast<uint32_t*>(ptr);
-  return memory::load_and_swap<uint32_t>(&p[0]);
+  return static_cast<XAM_OVERLAPPED*>(ptr)->result.load(std::memory_order_acquire);
 }
 inline void XOverlappedSetResult(void* ptr, uint32_t value) {
-  auto p = reinterpret_cast<uint32_t*>(ptr);
-  memory::store_and_swap<uint32_t>(&p[0], value);
+  static_cast<XAM_OVERLAPPED*>(ptr)->result.store(value, std::memory_order_release);
 }
 inline uint32_t XOverlappedGetLength(void* ptr) {
   auto p = reinterpret_cast<uint32_t*>(ptr);

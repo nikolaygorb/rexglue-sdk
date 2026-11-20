@@ -21,11 +21,22 @@ def main():
     parser.add_argument('--update', action='store_true',
                         help='save the frames as the references instead of comparing')
     parser.add_argument('--timeout', type=float, default=120, help='seconds per trace')
-    parser.add_argument('game_args', nargs=argparse.REMAINDER,
-                        help='after --: arguments for the game')
-    args = parser.parse_args()
-    game_args = args.game_args[1:] if args.game_args[:1] == ['--'] else args.game_args
+    # The game's arguments come after "--". Split them off first: a trailing
+    # REMAINDER positional would also swallow --label and --update. Windows
+    # PowerShell may drop the "--" itself, so other unknown arguments go to the
+    # game too.
+    argv = sys.argv[1:]
+    game_args = []
+    if '--' in argv:
+        split = argv.index('--')
+        game_args = argv[split + 1:]
+        argv = argv[:split]
+    args, unknown = parser.parse_known_args(argv)
+    game_args = unknown + game_args
 
+    if not args.executable.is_file():
+        print(f'no executable {args.executable}: give its path (relative to {pathlib.Path.cwd()})')
+        return 2
     traces = sorted(args.traces.glob('*.xtr'))
     if not traces:
         print(f'no .xtr files in {args.traces}')

@@ -24,3 +24,19 @@ test_mtvscr_sat_sticky:
   mfvscr v7
   blr
   #_ REGISTER_OUT v7 [00000000, 00000000, 00000000, 00010001]
+
+# NJ clear: mfvscr reads it back, and vector arithmetic keeps a denormal; set
+# again, it flushes the denormal to zero.
+test_mtvscr_nj_off:
+  #_ REGISTER_IN v3 [00000000, 00000000, 00000000, 00000000]
+  #_ REGISTER_IN v4 [00000001, 80000001, 00000001, 00000001]
+  #_ REGISTER_IN v5 [00000000, 00000000, 00000000, 00010000]
+  mtvscr v3
+  mfvscr v6
+  vaddfp v7, v4, v3
+  mtvscr v5
+  vaddfp v8, v4, v3
+  blr
+  #_ REGISTER_OUT v6 [00000000, 00000000, 00000000, 00000000]
+  #_ REGISTER_OUT v7 [00000001, 80000001, 00000001, 00000001]
+  #_ REGISTER_OUT v8 [00000000, 00000000, 00000000, 00000000]

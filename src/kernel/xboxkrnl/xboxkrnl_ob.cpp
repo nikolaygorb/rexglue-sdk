@@ -291,12 +291,27 @@ u32 ObOpenObjectByName_entry(mapped_void obj_attributes_ptr, mapped_void object_
   assert_true(obj_attributes->name_ptr != 0);
   auto name = util::TranslateAnsiStringAddress(REX_KERNEL_MEMORY(), obj_attributes->name_ptr);
 
-  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
-  X_STATUS result = REX_KERNEL_OBJECTS()->GetObjectByName(name, &handle);
-  if (XSUCCEEDED(result)) {
-    *handle_ptr = handle;
+  *handle_ptr = 0;
+  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  auto* table = REX_KERNEL_OBJECTS();
+  X_HANDLE found = 0;
+  X_STATUS result = table->GetObjectByName(name, &found);
+  if (XFAILED(result))
+    return result;
+  auto object = table->LookupObject<XObject>(found);
+  const uint32_t requested_type = object_type_ptr.guest_address();
+  const uint32_t actual_type = object ? (object->guest_object_type() ? object->guest_object_type()
+                                                                     : object->KernelObjectType())
+                                      : 0;
+  X_HANDLE opened = 0;
+  if (!object || (requested_type && requested_type != actual_type)) {
+    result = X_STATUS_OBJECT_TYPE_MISMATCH;
+  } else {
+    result = table->DuplicateHandle(found, &opened);
   }
-
+  table->ReleaseHandle(found);
+  if (XSUCCEEDED(result))
+    *handle_ptr = opened;
   return result;
 }
 
@@ -349,31 +364,20 @@ u32 ObOpenObjectByPointer_entry(mapped_void object_ptr, mapped_u32 out_handle_pt
 
   auto* object_table = REX_KERNEL_OBJECTS();
   const bool title_type = HasTitleObjectType(*object);
-  // A host object's own handle is not in the title's numbering and must never
-  // reach the guest: it gets a guest one, which holds this open (xenia-edge
-  // 672bc8b81).
-  if (object->is_host_object()) {
-    X_HANDLE guest_handle = X_INVALID_HANDLE_VALUE;
-    X_STATUS result = object_table->AddHandle(object.get(), &guest_handle, true);
+  // Every open gets its own guest slot, including a normal kernel object.
+  X_HANDLE guest_handle = 0;
+  X_STATUS result = object_table->AddHandle(object.get(), &guest_handle, true);
+  if (XFAILED(result))
+    return result;
+  if (title_type) {
+    result = object_table->OpenGuestHandle(guest_handle, object.get(), true);
     if (XFAILED(result)) {
+      object_table->ReleaseHandle(guest_handle);
       return result;
     }
-    // Counted for the close procedure of a title-defined type (the extra slot
-    // reference OpenGuestHandle takes is dropped).
-    if (title_type &&
-        XSUCCEEDED(object_table->OpenGuestHandle(guest_handle, object.get(), true))) {
-      object_table->ReleaseHandle(guest_handle);
-    }
-    *out_handle_ptr = guest_handle;
-    return X_STATUS_SUCCESS;
+    object_table->ReleaseHandle(guest_handle);
   }
-
-  // Opened until NtClose; counted apart for a title-defined type.
-  const X_STATUS result = object_table->OpenGuestHandle(object->handle(), object.get(), title_type);
-  if (XFAILED(result)) {
-    return result;
-  }
-  *out_handle_ptr = object->handle();
+  *out_handle_ptr = guest_handle;
   return X_STATUS_SUCCESS;
 }
 

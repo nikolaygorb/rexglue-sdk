@@ -16,9 +16,21 @@
 
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <thread>
 
 namespace rex::graphics {
+
+// A budget that waits until the creation ends (created or failed): for draws
+// that may never be redone, whose result a skip would leave wrong (memexport,
+// small surfaces kept past the frame; xenia-canary f9431eb95).
+inline constexpr int32_t kPipelineWaitUntilCreated = std::numeric_limits<int32_t>::max();
+
+// The budget for a draw: until created when a skip would lose data, otherwise
+// async_pipeline_wait_ms.
+inline int32_t PipelineWaitBudgetMs(bool must_not_skip, int32_t async_pipeline_wait_ms) {
+  return must_not_skip ? kPipelineWaitUntilCreated : async_pipeline_wait_ms;
+}
 
 // Polls is_ready (a pipeline appeared, or its creation ended) every 100
 // microseconds until it returns true or budget_ms have passed. Returns its last

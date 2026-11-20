@@ -5,8 +5,15 @@
 #   rexglue_apply_target_settings(<target>)        - common compile/platform flags
 #   rexglue_configure_target(<target>)             - host application
 #   rexglue_configure_module_target(<target> ...)  - guest DLL module
+# and rexglue_add_launcher(<target>) - the title's launcher (docs/launcher.md).
 #==========================================================
 include_guard(GLOBAL)
+
+# This file's folder, for functions (inside one, CMAKE_CURRENT_LIST_DIR is the
+# caller's). A global property: the SDK includes this file first, in its own
+# directory scope, and include_guard skips the title's later include, so a
+# variable set here would not reach the title's CMakeLists.
+set_property(GLOBAL PROPERTY REXGLUE_HELPERS_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
 function(_rexglue_stage_macos_vulkan_runtime target_name)
     if(TARGET Vulkan::Loader AND TARGET MoltenVK::MoltenVK)
@@ -219,6 +226,54 @@ function(rexglue_configure_module_target target_name)
 endfunction()
 
 #==========================================================
+# rexglue_add_gpu_plugin(<name> SOURCES <files...>) - A title's GPU plugin
+#
+# Builds rexgpu-<name>, a shared library loaded at run time like rexgpu-xenos
+# (the gpu_plugin setting = <name>). The sources must define the two exports
+# of rex/system/gpu_plugin.h (rex_gpu_abi_version, rex_gpu_create). The
+# plugin links the whole of rexgpu-core, the SDK's GPU code: the graphics
+# systems, the base CommandProcessor (PM4, register file, synchronisation),
+# the shader front end and translators, the caches and the backends, so a
+# title renderer derives from those classes (docs/gpu-plugins.md).
+#
+# Stage it with rexglue_setup_target(<host> GPU_PLUGINS <name> [xenos]).
+# Source-tree SDK only (REXSDK_DIR): rexgpu-core is not installed. Never link
+# rexgpu-core into the executable: its cvars would be defined twice once a
+# plugin is loaded.
+#==========================================================
+function(rexglue_add_gpu_plugin plugin_name)
+    cmake_parse_arguments(ARG "" "" "SOURCES" ${ARGN})
+
+    if(NOT TARGET rexgpu-core)
+        message(FATAL_ERROR
+            "rexglue_add_gpu_plugin(${plugin_name}): rexgpu-core is only built in a source-tree "
+            "SDK; set REXSDK_DIR to the rexglue-sdk tree")
+    endif()
+    if(NOT ARG_SOURCES)
+        message(FATAL_ERROR "rexglue_add_gpu_plugin(${plugin_name}): no SOURCES")
+    endif()
+
+    set(_target rexgpu-${plugin_name})
+    add_library(${_target} SHARED ${ARG_SOURCES})
+    # The loader opens rexgpu-<name><postfix> with the SDK's postfixes
+    # (gpu_plugin_loader.cpp), whatever the title's own CMAKE_<CONFIG>_POSTFIX.
+    set_target_properties(${_target} PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        DEBUG_POSTFIX d
+        RELWITHDEBINFO_POSTFIX rd
+    )
+    # Whole archive, as rexgpu-xenos links it: objects reached only through
+    # static initialisers (cvars) stay in.
+    target_link_libraries(${_target} PRIVATE
+        rex::runtime
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,rexgpu-core>"
+    )
+    rexglue_apply_target_settings(${_target})
+    unset(_target)
+endfunction()
+
+#==========================================================
 # rexglue_embed_metadata(<target> DIRECTORY <dir> [PREFIX <relative-prefix>])
 #
 # Embeds files into the host executable as metadata assets. Runtime lookups use
@@ -392,4 +447,99 @@ function(_rexglue_stage_shader_replacements target_name dir)
             "$<TARGET_FILE_DIR:${target_name}>/shader_replacements"
         VERBATIM
     )
+endfunction()
+
+#==========================================================
+# rexglue_add_launcher(<game_target> [MANIFEST_DIR <dir>] [ICON_RC <file.rc>])
+#   - The title's launcher, next to the game's executable
+#
+# Builds <game_target>_launcher from the SDK's src/launcher, linked with
+# rexruntime (window, presenter and Dear ImGui come from there), and stages
+# next to the executables, in launcher/: the SDK's common.toml, the default
+# font, and everything in MANIFEST_DIR (default: <title>/launcher, with the
+# title's launcher.toml and fonts/). Building the game builds the launcher.
+# ICON_RC: the game's .rc, so the launcher gets the same icon (Windows).
+# Ninja (single-configuration) builds. Source-tree SDK only (REXSDK_DIR).
+# The launcher finds settings/ and assets/ as the game does: next to itself in
+# a release, up the folders in a build tree. docs/launcher.md has the format.
+#==========================================================
+function(rexglue_add_launcher game_target)
+    cmake_parse_arguments(ARG "" "MANIFEST_DIR;ICON_RC" "" ${ARGN})
+    get_property(_helpers_dir GLOBAL PROPERTY REXGLUE_HELPERS_DIR)
+    get_filename_component(_sdk "${_helpers_dir}/.." ABSOLUTE)
+    set(_src "${_sdk}/src/launcher")
+    if(NOT EXISTS "${_src}/launcher_app.cpp")
+        message(FATAL_ERROR "rexglue_add_launcher: needs the SDK source tree (REXSDK_DIR)")
+    endif()
+    if(NOT ARG_MANIFEST_DIR)
+        set(ARG_MANIFEST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/launcher")
+    endif()
+    if(NOT EXISTS "${ARG_MANIFEST_DIR}/launcher.toml")
+        message(FATAL_ERROR "rexglue_add_launcher: ${ARG_MANIFEST_DIR}/launcher.toml is missing")
+    endif()
+
+    set(_target ${game_target}_launcher)
+    set(_sources
+        ${_src}/launcher_app.cpp
+        ${_src}/launcher_bindings.cpp
+        ${_src}/launcher_manifest.cpp
+        ${_src}/launcher_process.cpp
+        ${_src}/launcher_settings.cpp
+        ${_src}/launcher_widgets.cpp
+        ${_sdk}/src/ui/windowed_app_main_sdl.cpp)
+    if(WIN32 AND ARG_ICON_RC)
+        list(APPEND _sources ${ARG_ICON_RC})
+    endif()
+    if(WIN32)
+        add_executable(${_target} WIN32 ${_sources})
+    else()
+        add_executable(${_target} ${_sources})
+    endif()
+
+    # Next to the game: its own folder, as the game target has it.
+    get_target_property(_out ${game_target} RUNTIME_OUTPUT_DIRECTORY)
+    if(NOT _out)
+        if(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+            set(_out "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+        else()
+            set(_out "${CMAKE_CURRENT_BINARY_DIR}")
+        endif()
+    endif()
+    set_target_properties(${_target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${_out}")
+
+    target_link_libraries(${_target} PRIVATE rex::runtime)
+    # rexui's headers the launcher includes (the Vulkan provider) reach
+    # renderdoc_app.h, which rexruntime keeps private: the header-only target.
+    if(TARGET renderdoc)
+        target_link_libraries(${_target} PRIVATE renderdoc)
+    endif()
+    target_compile_definitions(${_target} PRIVATE
+        REXLAUNCHER_GAME_EXE="$<TARGET_FILE_NAME:${game_target}>")
+    if(UNIX AND NOT APPLE)
+        set_target_properties(${_target} PROPERTIES
+            INSTALL_RPATH "$ORIGIN"
+            BUILD_WITH_INSTALL_RPATH ON)
+    elseif(APPLE)
+        set_target_properties(${_target} PROPERTIES
+            INSTALL_RPATH "@executable_path"
+            BUILD_WITH_INSTALL_RPATH ON)
+    endif()
+    if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        target_compile_options(${_target} PRIVATE -msse4.1)
+    endif()
+
+    # The launcher's files, copied on every build (a custom target always runs),
+    # so an edit of launcher.toml shows at the next build.
+    set(_dest "${_out}/launcher")
+    add_custom_target(${_target}_files
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_dest}/fonts"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_src}/common.toml" "${_dest}/common.toml"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_sdk}/thirdparty/imgui/misc/fonts/Roboto-Medium.ttf" "${_dest}/fonts/default.ttf"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${ARG_MANIFEST_DIR}" "${_dest}"
+        COMMENT "Staging ${_target} files"
+        VERBATIM)
+    add_dependencies(${_target} ${_target}_files)
+    add_dependencies(${game_target} ${_target})
 endfunction()

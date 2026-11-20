@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -27,6 +28,11 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
+REXCVAR_DEFINE_BOOL(vulkan_validation_sync, false, "UI/Vulkan",
+                    "With vulkan_validation_enabled: also the layer's synchronization validation "
+                    "(a read or write of an image or buffer without the barrier it needs after "
+                    "another one; on any GPU, very slow)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 namespace ui {
@@ -138,9 +144,18 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   // #395.
   requested_extensions.emplace("VK_KHR_portability_enumeration",
                                &vulkan_instance->extensions_.ext_KHR_portability_enumeration);
+  // #248, provided by the validation layer.
+  const bool validation_sync = try_enable_validation && REXCVAR_GET(vulkan_validation_sync);
+  if (validation_sync) {
+    requested_extensions.emplace("VK_EXT_validation_features",
+                                 &vulkan_instance->extensions_.ext_EXT_validation_features);
+  }
   if (with_surface) {
     // #1.
     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
+    // #120. Required by the device extension VK_EXT_full_screen_exclusive.
+    requested_extensions.emplace("VK_KHR_get_surface_capabilities2",
+                                 &vulkan_instance->extensions_.ext_KHR_get_surface_capabilities2);
 #ifdef VK_USE_PLATFORM_XCB_KHR
     // #6.
     requested_extensions.emplace("VK_KHR_xcb_surface",
@@ -273,10 +288,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
         // retrieve different results if a pLayerName is available in one call
         // but not in another."
         while (true) {
+          // The layer's own count (the implementation's was asked before:
+          // then a layer with more extensions never got all of them).
           uint32_t supported_layer_extension_count = 0;
           const VkResult get_supported_layer_extension_count_result =
-              ifn.vkEnumerateInstanceExtensionProperties(nullptr, &supported_layer_extension_count,
-                                                         nullptr);
+              ifn.vkEnumerateInstanceExtensionProperties(
+                  available_layer.layerName, &supported_layer_extension_count, nullptr);
           if (get_supported_layer_extension_count_result != VK_SUCCESS &&
               get_supported_layer_extension_count_result != VK_INCOMPLETE) {
             got_layer_extensions = false;
@@ -361,6 +378,17 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   instance_create_info.ppEnabledLayerNames = enabled_layers.data();
   instance_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
   instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+  // vulkan_validation_sync: the layer's synchronization validation.
+  const VkValidationFeatureEnableEXT validation_feature_enables[] = {
+      VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT};
+  VkValidationFeaturesEXT validation_features = {};
+  validation_features.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+  validation_features.enabledValidationFeatureCount =
+      uint32_t(std::size(validation_feature_enables));
+  validation_features.pEnabledValidationFeatures = validation_feature_enables;
+  if (vulkan_instance->extensions_.ext_EXT_validation_features) {
+    instance_create_info.pNext = &validation_features;
+  }
   VkResult instance_create_result =
       ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
 
@@ -373,6 +401,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     for (const std::pair<std::string, bool*>& requested_layer : requested_layers) {
       *requested_layer.second = false;
     }
+    instance_create_info.pNext = nullptr;
     instance_create_info.enabledLayerCount = 0;
     instance_create_info.enabledExtensionCount = uint32_t(enabled_implementation_extension_count);
     instance_create_result =
@@ -476,6 +505,15 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
        enabled_extension_index < instance_create_info.enabledExtensionCount;
        ++enabled_extension_index) {
     REXLOG_INFO("* {}", instance_create_info.ppEnabledExtensionNames[enabled_extension_index]);
+  }
+  if (validation_sync) {
+    if (vulkan_instance->extensions_.ext_EXT_validation_features) {
+      REXLOG_INFO("Vulkan synchronization validation is on (vulkan_validation_sync)");
+    } else {
+      REXLOG_WARN(
+          "vulkan_validation_sync: the validation layer with VK_EXT_validation_features is not "
+          "available (the Vulkan SDK must be installed)");
+    }
   }
 
   // Create the debug messenger if requested and available.

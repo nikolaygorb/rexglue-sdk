@@ -98,6 +98,10 @@ target_compile_options(ppc_tests PRIVATE
     -UREXGLUE_ENABLE_PERF_COUNTERS -UREXGLUE_PROFILE_GUEST_FUNCTIONS
     -msse4.1 -mssse3
 )
+# ISO volatile semantics, as REXGLUE_RECOMP_OPTIONS gives the titles' code.
+if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
+    target_compile_options(ppc_tests PRIVATE -fno-ms-volatile)
+endif()
 
 include(Catch)
 catch_discover_tests(ppc_tests

@@ -478,9 +478,11 @@ void ObjectTable::RemoveNameMapping(const std::string_view name) {
 }
 
 X_STATUS ObjectTable::GetObjectByName(const std::string_view name, X_HANDLE* out_handle) {
+  // Match RemoveHandle's global -> name ordering and pin the slot throughout
+  // name lookup and retention, including when another thread closes it.
+  auto global_lock = global_critical_region_.Acquire();
   // Names are case-insensitive.
-  // Look up handle under name lock only -- do NOT hold name_mutex_ while
-  // acquiring global lock (RemoveHandle takes global -> name ordering).
+  // Look up under the name lock after taking the global lock.
   X_HANDLE handle;
   {
     std::lock_guard<std::mutex> name_lock(name_mutex_);
@@ -493,17 +495,41 @@ X_STATUS ObjectTable::GetObjectByName(const std::string_view name, X_HANDLE* out
   }
   *out_handle = handle;
 
-  // Retain under global lock via normal LookupObject path.
-  // The handle may have been removed between releasing name_mutex_ and
-  // acquiring global lock -- LookupObject returns nullptr in that case.
+  // Retain before another thread can remove or recycle the slot.
   auto obj = LookupObject(handle, false);
   if (obj) {
     // The name's handle, which may not be the object's first.
     RetainHandle(handle);
     obj->Release();
+  } else {
+    *out_handle = X_INVALID_HANDLE_VALUE;
+    return X_STATUS_OBJECT_NAME_NOT_FOUND;
   }
 
   return X_STATUS_SUCCESS;
+}
+
+X_STATUS ObjectTable::OpenNamedHandle(std::string_view name, XObject::Type type, bool open_if,
+                                      X_HANDLE* out_handle) {
+  *out_handle = 0;
+  auto global_lock = global_critical_region_.Acquire();
+  X_HANDLE found = 0;
+  X_STATUS result = GetObjectByName(name, &found);
+  if (XFAILED(result)) {
+    return result;
+  }
+  auto object = LookupObject<XObject>(found);
+  if (!open_if) {
+    result = X_STATUS_OBJECT_NAME_COLLISION;
+  } else if (!object || object->type() != type) {
+    result = X_STATUS_OBJECT_TYPE_MISMATCH;
+  } else {
+    result = DuplicateHandle(found, out_handle);
+    if (XSUCCEEDED(result))
+      result = X_STATUS_OBJECT_NAME_EXISTS;
+  }
+  ReleaseHandle(found);
+  return result;
 }
 
 bool ObjectTable::Save(stream::ByteStream* stream) {

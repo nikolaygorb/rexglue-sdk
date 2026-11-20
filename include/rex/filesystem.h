@@ -46,6 +46,8 @@ bool CreateParentFolder(const std::filesystem::path& path);
 
 // Creates an empty file at the given path, overwriting if it exists.
 bool CreateEmptyFile(const std::filesystem::path& path);
+// Atomically creates an empty file, failing without modifying an existing one.
+bool CreateNewFile(const std::filesystem::path& path);
 
 // Opens the file at the given path with the specified mode.
 // This behaves like fopen and the returned handle can be used with stdio.
@@ -102,7 +104,7 @@ class FileHandle {
   virtual bool SetLength(size_t length) = 0;
 
   // Flushes any pending write buffers to the underlying filesystem.
-  virtual void Flush() = 0;
+  virtual bool Flush() = 0;
 
  protected:
   explicit FileHandle(const std::filesystem::path& path) : path_(path) {}

@@ -46,6 +46,7 @@ ThreadState::~ThreadState() {
 }
 
 void ThreadState::Bind(ThreadState* thread_state) {
+  if (thread_state) thread_state->context()->reservation.valid = false;
   thread_state_ = thread_state;
 }
 

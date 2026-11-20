@@ -35,6 +35,10 @@ REXCVAR_DEFINE_BOOL(vulkan_force_convert_quad_lists_to_triangle_lists, false, "G
                     "even when geometry shaders are available")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// command_processor.cpp: converted indices in video memory through the
+// resizable BAR.
+REXCVAR_DECLARE(bool, vulkan_upload_rebar);
+
 namespace rex::graphics::vulkan {
 
 VulkanPrimitiveProcessor::~VulkanPrimitiveProcessor() {
@@ -72,7 +76,8 @@ bool VulkanPrimitiveProcessor::Initialize() {
   frame_index_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
       std::max(size_t(kMinRequiredConvertedIndexBufferSize),
-               ui::GraphicsUploadBufferPool::kDefaultPageSize));
+               ui::GraphicsUploadBufferPool::kDefaultPageSize),
+      REXCVAR_GET(vulkan_upload_rebar));
   return true;
 }
 

@@ -9,6 +9,31 @@ if(NOT EXISTS "${REXGLUE_PPC_CORPUS_DIR}/skip.txt")
                         "xenia-edge's src/xenia/cpu/ppc/testing")
 endif()
 
+# With an overlay, the corpus is copied into the build tree and the overlay's
+# files replace those of the same name (README.md, "Other vectors").
+set(CORPUS_ASM_DIR ${REXGLUE_PPC_CORPUS_DIR})
+if(REXGLUE_PPC_CORPUS_OVERLAY_DIR)
+    set(CORPUS_ASM_DIR ${CMAKE_BINARY_DIR}/tests/ppc_corpus/asm)
+    file(GLOB CORPUS_BASE_FILES ${REXGLUE_PPC_CORPUS_DIR}/*.s)
+    file(COPY ${CORPUS_BASE_FILES} DESTINATION ${CORPUS_ASM_DIR})
+    file(GLOB CORPUS_OVERLAY_FILES ${REXGLUE_PPC_CORPUS_OVERLAY_DIR}/*.s)
+    file(COPY ${CORPUS_OVERLAY_FILES} DESTINATION ${CORPUS_ASM_DIR})
+    list(LENGTH CORPUS_OVERLAY_FILES CORPUS_OVERLAY_COUNT)
+    message(STATUS "PPC corpus: ${CORPUS_OVERLAY_COUNT} files from ${REXGLUE_PPC_CORPUS_OVERLAY_DIR}")
+endif()
+# The skip list: the corpus' own, another, or none.
+set(CORPUS_SKIP_ARGS --skip-list=${REXGLUE_PPC_CORPUS_DIR}/skip.txt)
+set(CORPUS_SKIP_DEPENDS ${REXGLUE_PPC_CORPUS_DIR}/skip.txt)
+if(REXGLUE_PPC_CORPUS_SKIP_LIST STREQUAL "none")
+    set(CORPUS_SKIP_ARGS "")
+    set(CORPUS_SKIP_DEPENDS "")
+    message(STATUS "PPC corpus: no skip list")
+elseif(REXGLUE_PPC_CORPUS_SKIP_LIST)
+    set(CORPUS_SKIP_ARGS --skip-list=${REXGLUE_PPC_CORPUS_SKIP_LIST})
+    set(CORPUS_SKIP_DEPENDS ${REXGLUE_PPC_CORPUS_SKIP_LIST})
+    message(STATUS "PPC corpus: skip list ${REXGLUE_PPC_CORPUS_SKIP_LIST}")
+endif()
+
 set(CORPUS_OBJ_DIR ${CMAKE_BINARY_DIR}/tests/ppc_corpus/obj)
 set(CORPUS_BIN_DIR ${CMAKE_BINARY_DIR}/tests/ppc_corpus/bin)
 set(CORPUS_GEN_DIR ${CMAKE_BINARY_DIR}/tests/ppc_corpus/generated)
@@ -19,13 +44,13 @@ file(MAKE_DIRECTORY ${CORPUS_OBJ_DIR} ${CORPUS_BIN_DIR} ${CORPUS_GEN_DIR})
 set(CORPUS_CHUNKS 16)
 set_property(GLOBAL APPEND PROPERTY JOB_POOLS ppc_corpus=4)
 
-file(GLOB CORPUS_ASM_FILES ${REXGLUE_PPC_CORPUS_DIR}/instr*.s ${REXGLUE_PPC_CORPUS_DIR}/seq_*.s)
+file(GLOB CORPUS_ASM_FILES ${CORPUS_ASM_DIR}/instr*.s ${CORPUS_ASM_DIR}/seq_*.s)
 # Files the bundled assembler cannot assemble (assembler_unsupported.txt).
-file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/assembler_unsupported.txt UNSUPPORTED_LINES
+file(STRINGS ${REXGLUE_PPC_CORPUS_EXCLUDE_LIST} UNSUPPORTED_LINES
      REGEX "^[^#]")
 foreach(LINE ${UNSUPPORTED_LINES})
     string(REGEX MATCH "^[^ 	]+" STEM "${LINE}")
-    list(REMOVE_ITEM CORPUS_ASM_FILES ${REXGLUE_PPC_CORPUS_DIR}/${STEM}.s)
+    list(REMOVE_ITEM CORPUS_ASM_FILES ${CORPUS_ASM_DIR}/${STEM}.s)
 endforeach()
 list(LENGTH CORPUS_ASM_FILES CORPUS_FILE_COUNT)
 foreach(ASM_FILE ${CORPUS_ASM_FILES})
@@ -48,14 +73,14 @@ add_custom_command(
     COMMAND $<TARGET_FILE:rexglue> recompile-tests
             --output=${CORPUS_GEN_DIR}
             --bin-dir=${CORPUS_BIN_DIR}
-            --asm-dir=${REXGLUE_PPC_CORPUS_DIR}
+            --asm-dir=${CORPUS_ASM_DIR}
             --chunks=${CORPUS_CHUNKS}
             --table
-            --skip-list=${REXGLUE_PPC_CORPUS_DIR}/skip.txt
-            --known-failures=${CMAKE_CURRENT_SOURCE_DIR}/known_failures.txt
+            ${CORPUS_SKIP_ARGS}
+            --known-failures=${REXGLUE_PPC_CORPUS_KNOWN_FAILURES}
     DEPENDS ${CORPUS_BINS} ${CORPUS_MAPS} ${CORPUS_ASM_FILES}
-            ${REXGLUE_PPC_CORPUS_DIR}/skip.txt
-            ${CMAKE_CURRENT_SOURCE_DIR}/known_failures.txt rexglue
+            ${CORPUS_SKIP_DEPENDS}
+            ${REXGLUE_PPC_CORPUS_KNOWN_FAILURES} rexglue
     COMMENT "Generating the PPC corpus tests with rexglue"
     VERBATIM
 )
@@ -88,6 +113,10 @@ target_compile_options(ppc_corpus_tests PRIVATE
     -UREXGLUE_ENABLE_PERF_COUNTERS -UREXGLUE_PROFILE_GUEST_FUNCTIONS
     -msse4.1 -mssse3 -w
 )
+# ISO volatile semantics, as REXGLUE_RECOMP_OPTIONS gives the titles' code.
+if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
+    target_compile_options(ppc_corpus_tests PRIVATE -fno-ms-volatile)
+endif()
 
 # One CTest test per file, as the generated sources have one TEST_CASE per file.
 foreach(ASM_FILE ${CORPUS_ASM_FILES})

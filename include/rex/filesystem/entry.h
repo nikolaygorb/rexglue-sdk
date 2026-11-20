@@ -102,6 +102,16 @@ class Entry {
   virtual bool SetCreateTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
   virtual bool SetAccessTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
   virtual bool SetWriteTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
+  // The attributes a title sets (FileBasicInformation); the directory bit
+  // stays as it is. Kept on the entry, not on the host's file.
+  virtual bool SetAttributes([[maybe_unused]] uint32_t attributes) { return false; }
+
+  // A file time as FAT keeps it: rounded down to an even second (100 ns
+  // units). xenia-canary e70915a98.
+  static constexpr uint64_t RoundToFatTime(uint64_t timestamp) {
+    constexpr uint64_t kTwoSeconds = 2 * 10'000'000ull;
+    return timestamp - timestamp % kTwoSeconds;
+  }
   void SetForDeletion(bool delete_on_close) { delete_on_close_ = delete_on_close; }
 
   bool is_read_only() const;
@@ -139,6 +149,7 @@ class Entry {
     return nullptr;
   }
   virtual void update() { return; }
+  virtual bool is_empty_folder() const { return children_.empty(); }
 
  protected:
   Entry(Device* device, Entry* parent, const std::string_view path);

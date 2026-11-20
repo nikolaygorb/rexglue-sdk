@@ -248,8 +248,8 @@ bool build_mcrf(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_mfxer(BuilderContext& ctx) {
-  ctx.println("\t{}.u64 = ({}.so << 31) | ({}.ov << 30) | ({}.ca << 29);",
-              ctx.r(ctx.insn.operands[0]), ctx.xer(), ctx.xer(), ctx.xer());
+  ctx.println("\t{}.u64 = ({}.so << 31) | ({}.ov << 30) | ({}.ca << 29) | {}.byte_count;",
+              ctx.r(ctx.insn.operands[0]), ctx.xer(), ctx.xer(), ctx.xer(), ctx.xer());
   return true;
 }
 
@@ -297,8 +297,8 @@ bool build_mflr(BuilderContext& ctx) {
 
 bool build_mfmsr(BuilderContext& ctx) {
   if (!ctx.config().skipMsr) {
-    // Check global lock and return appropriate value
-    // Returns 0x8000 if unlocked (interrupts enabled), 0 if locked
+    // The MSR the console reads: 0x9030 (EE, ME, IR, DR) with interrupts on,
+    // 0x1030 inside a section that holds the global lock (interrupts off).
     ctx.println("\t{}.u64 = REX_CHECK_GLOBAL_LOCK();", ctx.r(ctx.insn.operands[0]));
   }
   return true;
@@ -311,9 +311,12 @@ bool build_mfpvr(BuilderContext& ctx) {
   return true;
 }
 
+// The console reads the upper word as 0xFFF80000.
 bool build_mffs(BuilderContext& ctx) {
-  ctx.println("\t{}.u64 = ctx.fpscr.loadFromHost() | ctx.fpscr.loadExceptionsFromHost();",
-              ctx.f(ctx.insn.operands[0]));
+  ctx.println(
+      "\t{}.u64 = 0xFFF8000000000000ull | ctx.fpscr.loadFromHost() | "
+      "ctx.fpscr.loadExceptionsFromHost();",
+      ctx.f(ctx.insn.operands[0]));
   return true;
 }
 
@@ -365,21 +368,30 @@ bool build_mtctr(BuilderContext& ctx) {
 
 bool build_mtlr(BuilderContext& ctx) {
   if (!ctx.config().skipLr)
-    ctx.println("\tctx.lr = {}.u64;", ctx.r(ctx.insn.operands[0]));
+    // PPCContext::lr holds 32 bits (code addresses).
+    ctx.println("\tctx.lr = {}.u32;", ctx.r(ctx.insn.operands[0]));
   return true;
 }
 
 bool build_mtmsrd(BuilderContext& ctx) {
   if (!ctx.config().skipMsr) {
     // Update MSR bits
-    ctx.println("\tctx.msr = ({}.u32 & 0x8020) | (ctx.msr & ~0x8020);",
+    ctx.println("\tctx.msr = ({}.u32 & 0x8002) | (ctx.msr & ~0x8002);",
                 ctx.r(ctx.insn.operands[0]));
     // Global lock mechanism:
     // R13 = enter lock (disable interrupts)
     // Other = leave lock (enable interrupts)
+    // A section that is one atomic read-modify-write (reservation_sections.h)
+    // takes no lock: its store-conditional is a host compare-exchange.
     uint32_t src_reg = ctx.insn.operands[0];
+    const ReservationSections* sections = ctx.reservations;
     if (src_reg == 13) {
-      ctx.println("\tREX_ENTER_GLOBAL_LOCK();");
+      if (sections && sections->isLockFreeEnter(ctx.base))
+        ctx.println("\tREX_ENTER_RESERVATION_SECTION();");
+      else
+        ctx.println("\tREX_ENTER_GLOBAL_LOCK();");
+    } else if (sections && sections->isLockFreeLeave(ctx.base)) {
+      ctx.println("\tREX_LEAVE_RESERVATION_SECTION();");
     } else {
       ctx.println("\tREX_LEAVE_GLOBAL_LOCK();");
     }
@@ -387,20 +399,37 @@ bool build_mtmsrd(BuilderContext& ctx) {
   return true;
 }
 
-// FPSCR is modelled as its rounding mode and NI (field 7), its exception bits
-// (FX, VX, OX, UX, ZX, XX and the VX causes), which live in the host's sticky
-// exception status flags, and FR, FI and FPRF, kept as written and set by the
-// arithmetic with the fpscr_result_bits option (rex::ppc::FPSCRRegister). The
-// enables are not modelled and read as zero. CR1 of a record form is set by
-// DispatchInstruction (emitFpRecordCR1) for every floating-point instruction.
+// FPSCR is modelled as its rounding mode (field 7; Xenon drops NI, which reads
+// 0: rex::ppc::FPSCRRegister::kNI), its exception bits
+// (OX, UX, ZX, XX and VX live in the host's sticky exception status flags, FX
+// and the VX causes by name beside them), the enables, kept as written, and
+// FR, FI and FPRF, kept as written and set by the arithmetic with the
+// fpscr_result_bits option (rex::ppc::FPSCRRegister). CR1 of a record form is
+// set by DispatchInstruction (emitFpRecordCR1) for every floating-point
+// instruction.
 
 // Bits of fields 3 and 4 the guest can write: FR, FI and FPRF.
 static constexpr uint32_t kFpscrResultBits = 0x0007F000;
+// FX, OX, UX, ZX, XX and the VX causes.
+static constexpr uint32_t kFpscrExceptionBits = 0x9FF80700;
+// VE, OE, UE, ZE, XE.
+static constexpr uint32_t kFpscrEnableBits = 0x000000F8;
 
-// After a write of NI the flush mode follows it at the next mode switch, so
-// the code must not assume the mode it had.
-static void forget_flush_mode(BuilderContext& ctx) {
-  ctx.csrState = CSRState::Unknown;
+// The writes of the FPSCR bits `mask` selects from `value`, an expression.
+// Field 7's RN is written by the caller.
+static void emit_fpscr_store(BuilderContext& ctx, const std::string& value, uint32_t mask) {
+  if (mask & kFpscrResultBits) {
+    ctx.println("\tctx.fpscr.storeResultBitsFromGuest({}, 0x{:08X});", value,
+                mask & kFpscrResultBits);
+  }
+  if (mask & kFpscrEnableBits) {
+    ctx.println("\tctx.fpscr.storeEnablesFromGuest({}, 0x{:08X});", value,
+                mask & kFpscrEnableBits);
+  }
+  if (mask & kFpscrExceptionBits) {
+    ctx.println("\tctx.fpscr.storeExceptionsFromGuest({}, 0x{:08X});", value,
+                mask & kFpscrExceptionBits);
+  }
 }
 
 bool build_mtfsf(BuilderContext& ctx) {
@@ -415,53 +444,41 @@ bool build_mtfsf(BuilderContext& ctx) {
   const auto f = ctx.f(ctx.insn.operands[1]);
   if (mask & 0xF) {
     ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", f);
-    forget_flush_mode(ctx);
   }
-  if (mask & kFpscrResultBits) {
-    ctx.println("\tctx.fpscr.storeResultBitsFromGuest({}.u32, 0x{:08X});", f, mask);
-  }
-  if (mask & ~0xFu) {
-    ctx.println("\tctx.fpscr.storeExceptionsFromGuest({}.u32, 0x{:08X});", f, mask);
-  }
+  emit_fpscr_store(ctx, fmt::format("{}.u32", f), mask);
   return true;
 }
 
 bool build_mtfsfi(BuilderContext& ctx) {
-  // FPSCR[BF] <- U: field 7 holds RN, fields 0-3 and 5 exception bits.
+  // FPSCR[BF] <- U: field 7 holds XE, NI (dropped) and RN, field 6 the other
+  // enables, fields 0-3 and 5 exception bits, 3 and 4 result bits.
   const uint32_t field = ctx.insn.operands[0];
   const uint32_t imm = ctx.insn.operands[1] & 0xF;
   if (field == 7) {
     ctx.println("\tctx.fpscr.storeFromGuest({});", imm);
-    forget_flush_mode(ctx);
-  } else {
-    const uint32_t shift = 4 * (7 - field);
-    if ((0xFu << shift) & kFpscrResultBits) {
-      ctx.println("\tctx.fpscr.storeResultBitsFromGuest(0x{:08X}, 0x{:08X});", imm << shift,
-                  0xFu << shift);
-    }
-    ctx.println("\tctx.fpscr.storeExceptionsFromGuest(0x{:08X}, 0x{:08X});", imm << shift,
-                0xFu << shift);
   }
+  const uint32_t shift = 4 * (7 - field);
+  emit_fpscr_store(ctx, fmt::format("0x{:08X}u", imm << shift), 0xFu << shift);
   return true;
 }
 
 static void emit_mtfsb(BuilderContext& ctx, bool set) {
-  // FPSCR bit BT (0 = leftmost). Bit 29 is NI, bits 30 and 31 are RN.
+  // FPSCR bit BT (0 = leftmost). Bit 29 is NI, which Xenon drops; bits 30 and
+  // 31 are RN. FEX and VX (bits 1 and 2) can't be written: they follow their
+  // causes and enables.
   const uint32_t bt = ctx.insn.operands[0];
   const uint32_t bit = 1u << (31 - bt);
-  if (bt >= 29) {
+  if (bt == 29) {
+    return;
+  }
+  if (bt >= 30) {
     if (set) {
       ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() | {});", bit);
     } else {
       ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() & ~{}u);", bit);
     }
-    forget_flush_mode(ctx);
-  } else if (bit & kFpscrResultBits) {
-    ctx.println("\tctx.fpscr.storeResultBitsFromGuest(0x{:08X}, 0x{:08X});", set ? bit : 0u,
-                bit);
   } else {
-    ctx.println("\tctx.fpscr.storeExceptionsFromGuest(0x{:08X}, 0x{:08X});", set ? bit : 0u,
-                bit);
+    emit_fpscr_store(ctx, fmt::format("0x{:08X}u", set ? bit : 0u), bit);
   }
 }
 
@@ -478,7 +495,7 @@ bool build_mtfsb1(BuilderContext& ctx) {
 bool build_mcrfs(BuilderContext& ctx) {
   // CR[BF] <- FPSCR[BFA], then the exception bits of that field are cleared
   // (FX and OX in field 0; UX, ZX, XX, VXSNAN in 1; VXISI, VXIDI, VXZDZ, VXIMZ
-  // in 2; VXVC in 3; VXSOFT, VXSQRT, VXCVI in 5). Field 7 is (0, NI, RN).
+  // in 2; VXVC in 3; VXSOFT, VXSQRT, VXCVI in 5). Field 7 is (XE, NI, RN).
   const auto cr = ctx.cr(ctx.insn.operands[0]);
   const uint32_t field = ctx.insn.operands[1];
   const uint32_t shift = 4 * (7 - field);
@@ -489,9 +506,11 @@ bool build_mcrfs(BuilderContext& ctx) {
       "\t\t{0}.lt = (fpscr >> {1}) & 1; {0}.gt = (fpscr >> {2}) & 1; {0}.eq = (fpscr >> {3}) & 1; "
       "{0}.so = (fpscr >> {4}) & 1;",
       cr, shift + 3, shift + 2, shift + 1, shift);
-  if (field != 7) {
-    // FX is derived from the others: clearing field 0 clears OX only.
-    ctx.println("\t\tctx.fpscr.storeExceptionsFromGuest(0, 0x{:08X});", 0xFu << shift);
+  // The exception bits of the field other than FEX and VX are cleared (FX and
+  // OX in field 0); FEX and VX then follow what is left.
+  if ((0xFu << shift) & kFpscrExceptionBits) {
+    ctx.println("\t\tctx.fpscr.storeExceptionsFromGuest(0, 0x{:08X});",
+                (0xFu << shift) & kFpscrExceptionBits);
   }
   ctx.println("\t}}");
   return true;
@@ -509,6 +528,7 @@ bool build_mtxer(BuilderContext& ctx) {
   ctx.println("\t{}.so = ({}.u64 & 0x80000000) != 0;", ctx.xer(), ctx.r(ctx.insn.operands[0]));
   ctx.println("\t{}.ov = ({}.u64 & 0x40000000) != 0;", ctx.xer(), ctx.r(ctx.insn.operands[0]));
   ctx.println("\t{}.ca = ({}.u64 & 0x20000000) != 0;", ctx.xer(), ctx.r(ctx.insn.operands[0]));
+  ctx.println("\t{}.byte_count = {}.u64 & 0x7F;", ctx.xer(), ctx.r(ctx.insn.operands[0]));
   return true;
 }
 

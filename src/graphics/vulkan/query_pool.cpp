@@ -475,6 +475,18 @@ void VulkanQueryPool::EndQuery(DeferredCommandBuffer& deferred_command_buffer,
   deferred_command_buffer.CmdVkEndQuery(query_pool_, query_index);
 }
 
+void VulkanQueryPool::BeginQuery(VkCommandBuffer command_buffer, uint32_t query_index,
+                                 bool precise) const {
+  assert_true(query_pool_ != VK_NULL_HANDLE && query_index < capacity_);
+  vulkan_device_->functions().vkCmdBeginQuery(command_buffer, query_pool_, query_index,
+                                              precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+}
+
+void VulkanQueryPool::EndQuery(VkCommandBuffer command_buffer, uint32_t query_index) const {
+  assert_true(query_pool_ != VK_NULL_HANDLE && query_index < capacity_);
+  vulkan_device_->functions().vkCmdEndQuery(command_buffer, query_pool_, query_index);
+}
+
 void VulkanQueryPool::QueueQueryResolve(uint32_t query_index, bool counter) {
   assert_true(query_index < capacity_);
   if (counter) {

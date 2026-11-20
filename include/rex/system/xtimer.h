@@ -50,9 +50,9 @@ class XTimer : public XObject {
   std::unique_ptr<rex::thread::Timer> timer_;
   bool manual_reset_ = false;
 
-  XThread* callback_thread_ = nullptr;
-  uint32_t callback_routine_ = 0;
-  uint32_t callback_routine_arg_ = 0;
+  std::mutex callback_mutex_;
+  std::shared_ptr<std::atomic<bool>> callback_active_;
+  std::weak_ptr<rex::thread::TimerQueueWaitItem> callback_expiry_;
 };
 
 }  // namespace rex::system

@@ -221,7 +221,13 @@ std::vector<TestSpec> ParseTestSpecs(const std::string& asmPath,
     return false;
   };
 
-  while (getline()) {
+  // The REGISTER_OUT loop below stops on the first line after the block. When
+  // that line is the next test's label (no blank line between two tests), it is
+  // parsed again here; reading a new line instead dropped that test silently
+  // (17 tests in instr_vpkd3d128.s and instr_vupkd3d128.s never ran).
+  bool line_pending = false;
+  while (line_pending || getline()) {
+    line_pending = false;
     if (line.empty() || line[0] == '#')
       continue;
     auto colonIndex = line.find(':');
@@ -243,9 +249,11 @@ std::vector<TestSpec> ParseTestSpecs(const std::string& asmPath,
       if (!getline())
         break;
     }
+    bool line_read = false;
     do {
       ApplyDirective(line, "REGISTER_OUT", "MEMORY_OUT", spec.outputs, spec.mem_outputs);
-    } while (getline() && !line.empty() && line[0] == '#');
+    } while ((line_read = getline()) && !line.empty() && line[0] == '#');
+    line_pending = line_read;
 
     if (!spec.inputs.empty() || !spec.outputs.empty() || !spec.mem_inputs.empty() ||
         !spec.mem_outputs.empty()) {

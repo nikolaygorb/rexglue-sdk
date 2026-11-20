@@ -31,6 +31,7 @@
 
 #include "codegen_logging.h"
 #include "file_io.h"
+#include "reservation_sections.h"
 #include "template_registry_internal.h"
 
 namespace {
@@ -89,6 +90,10 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"cr_as_local", cfg.crRegistersAsLocalVariables},
       {"non_argument_as_local", cfg.nonArgumentRegistersAsLocalVariables},
       {"non_volatile_as_local", cfg.nonVolatileRegistersAsLocalVariables},
+      {"non_volatile_gpr_as_local",
+       cfg.nonVolatileRegistersAsLocalVariables || cfg.nonVolatileGprsAsLocalVariables},
+      {"non_argument_gpr_as_local",
+       cfg.nonArgumentRegistersAsLocalVariables || cfg.nonArgumentGprsAsLocalVariables},
   };
 
   // The XEX this code comes from, checked by ReXApp at startup
@@ -272,6 +277,7 @@ bool CodegenWriter::write(bool force) {
   const size_t maxFileBytes = REXCVAR_GET(max_file_size_bytes);
   std::unordered_set<std::string> referenced;
   emitCtx.referenced = &referenced;
+  const ReservationSectionTotals reservationsBefore = ReservationSectionCounts();
   for (const auto* fn : functions) {
     referenced.clear();
     std::string code = fn->emitCpp(emitCtx);
@@ -284,6 +290,15 @@ bool CodegenWriter::write(bool force) {
     references.push_back(referenced);
   }
   emitCtx.referenced = nullptr;
+  {
+    const auto& totals = ReservationSectionCounts();
+    const uint64_t sections = totals.sections - reservationsBefore.sections;
+    if (sections) {
+      REXCODEGEN_INFO(
+          "Interrupts-off sections: {}, {} of them lock-free (one atomic read-modify-write)",
+          sections, totals.lockFree - reservationsBefore.lockFree);
+    }
+  }
 
   auto partition = OutputPartition::Load(outputPath / kPartitionFileName);
   auto buckets = partition.Assign(sizes, maxFileBytes);

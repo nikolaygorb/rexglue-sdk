@@ -841,6 +841,10 @@ class Shader {
     // If there was some failure during preparation on the implementation side.
     void MakeInvalid() { is_valid_ = false; }
 
+    // For a backend whose host object keeps its own copy of the binary (a
+    // Vulkan shader module) and that never needs it again (ReIGlue 0430).
+    void ReleaseTranslatedBinary() { std::vector<uint8_t>().swap(translated_binary_); }
+
    private:
     friend class Shader;
     friend class ShaderTranslator;
@@ -1064,6 +1068,8 @@ class Shader {
   bool is_ucode_analyzed_ = false;
 
   std::string ucode_disassembly_;
+  // Whether an exec past the end of the microcode was logged (once a shader).
+  bool ucode_past_end_logged_ = false;
   std::vector<VertexBinding> vertex_bindings_;
   std::vector<TextureBinding> texture_bindings_;
   ConstantRegisterMap constant_register_map_ = {};

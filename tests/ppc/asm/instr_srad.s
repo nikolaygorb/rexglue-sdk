@@ -151,3 +151,59 @@ test_srad_7_constant:
   #_ REGISTER_OUT r4 0xFFFFFFFFFFFFFFFF
   #_ REGISTER_OUT r5 100
   #_ REGISTER_OUT r6 1
+
+# Shifts of 64 (sraw: 32) or more: CA is the sign bit. From upstream rexglue 02a002f8
+# (expected values from qemu-ppc64 -cpu power7).
+test_srad_ca_1:
+  #_ REGISTER_IN r4 0x8000000000000000
+  #_ REGISTER_IN r5 0x40
+  srad r3, r4, r5
+  adde r6, r0, r0
+  blr
+  #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFF
+  #_ REGISTER_OUT r6 0x0000000000000001
+
+test_srad_ca_2:
+  #_ REGISTER_IN r4 0x8000000000000000
+  #_ REGISTER_IN r5 0x64
+  srad r3, r4, r5
+  adde r6, r0, r0
+  blr
+  #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFF
+  #_ REGISTER_OUT r6 0x0000000000000001
+
+test_srad_ca_3:
+  #_ REGISTER_IN r4 0x8000000000000000
+  #_ REGISTER_IN r5 0x7F
+  srad r3, r4, r5
+  adde r6, r0, r0
+  blr
+  #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFF
+  #_ REGISTER_OUT r6 0x0000000000000001
+
+test_srad_ca_4:
+  #_ REGISTER_IN r4 0x8000000000000001
+  #_ REGISTER_IN r5 0x40
+  srad r3, r4, r5
+  adde r6, r0, r0
+  blr
+  #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFF
+  #_ REGISTER_OUT r6 0x0000000000000001
+
+test_srad_ca_5:
+  #_ REGISTER_IN r4 0x5
+  #_ REGISTER_IN r5 0x40
+  srad r3, r4, r5
+  adde r6, r0, r0
+  blr
+  #_ REGISTER_OUT r3 0x0000000000000000
+  #_ REGISTER_OUT r6 0x0000000000000000
+
+test_srad_ca_6:
+  #_ REGISTER_IN r4 0x8000000000000000
+  #_ REGISTER_IN r5 0x3F
+  srad r3, r4, r5
+  adde r6, r0, r0
+  blr
+  #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFF
+  #_ REGISTER_OUT r6 0x0000000000000000

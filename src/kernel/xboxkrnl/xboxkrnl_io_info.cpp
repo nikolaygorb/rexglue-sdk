@@ -145,8 +145,7 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
     case XFileSectorInformation: {
       REXKRNL_DEBUG("Stub XFileSectorInformation!");
       auto info = info_ptr.as<uint32_t*>();
-      size_t fname_hash = rex::memory::hash_combine(82589933LL, file->path());
-      *info = static_cast<uint32_t>(fname_hash ^ (fname_hash >> 32));
+      *info = 0;
       out_length = sizeof(uint32_t);
       break;
     }
@@ -265,25 +264,39 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
   switch (info_class) {
     case XFileBasicInformation: {
       auto info = info_ptr.as<X_FILE_BASIC_INFORMATION*>();
-      // Of the attributes only the directory bit is kept, which a file can't
-      // take.
-      if ((info->attributes & rex::filesystem::kFileAttributeDirectory) &&
-          !(file->entry()->attributes() & rex::filesystem::kFileAttributeDirectory)) {
+      auto* entry = file->entry();
+      using rex::filesystem::Entry;
+      // A file can't take the directory bit.
+      const uint32_t attributes = info->attributes;
+      if ((attributes & rex::filesystem::kFileAttributeDirectory) &&
+          !(entry->attributes() & rex::filesystem::kFileAttributeDirectory)) {
         result = X_STATUS_INVALID_PARAMETER;
         break;
       }
 
+      // Times are kept to the even second below, as FAT keeps them, and the
+      // access time reads back as the write time: an access time on its own
+      // is ignored (xenia-canary e70915a98).
       bool basic_result = true;
       if (info->creation_time) {
-        basic_result &= file->entry()->SetCreateTimestamp(info->creation_time);
-      }
-
-      if (info->last_access_time) {
-        basic_result &= file->entry()->SetAccessTimestamp(info->last_access_time);
+        basic_result &= entry->SetCreateTimestamp(Entry::RoundToFatTime(info->creation_time));
       }
 
       if (info->last_write_time) {
-        basic_result &= file->entry()->SetWriteTimestamp(info->last_write_time);
+        const uint64_t time = Entry::RoundToFatTime(info->last_write_time);
+        basic_result &= entry->SetWriteTimestamp(time);
+        basic_result &= entry->SetAccessTimestamp(time);
+      }
+
+      // 0 leaves the attributes alone, and FILE_ATTRIBUTE_NORMAL is dropped,
+      // so on its own it clears them. A device that keeps no attributes
+      // (containers, discs) fails only a request that changes them.
+      if (attributes) {
+        constexpr uint32_t kKept = ~uint32_t(rex::filesystem::kFileAttributeNormal |
+                                             rex::filesystem::kFileAttributeDirectory);
+        if ((attributes & kKept) != (entry->attributes() & kKept)) {
+          basic_result &= entry->SetAttributes(attributes & kKept);
+        }
       }
 
       if (!basic_result) {
@@ -294,6 +307,11 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
     case XFileDispositionInformation: {
       auto info = info_ptr.as<X_FILE_DISPOSITION_INFORMATION*>();
       bool delete_on_close = info->delete_file ? true : false;
+      if (delete_on_close &&
+          (file->entry()->attributes() & rex::filesystem::kFileAttributeDirectory) &&
+          !file->entry()->is_empty_folder()) {
+        return X_STATUS_DIRECTORY_NOT_EMPTY;
+      }
       file->entry()->SetForDeletion(delete_on_close);
       REXKRNL_WARN("NtSetInformationFile set deleting flag for {} on close to: {}", file->name(),
                    delete_on_close);

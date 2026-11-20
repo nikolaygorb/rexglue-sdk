@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -40,6 +41,9 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/V
                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
                     "allow fallback to solid fill for line/point polygon modes)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DECLARE(bool, gpu_device_lost_breadcrumbs);
+REXCVAR_DECLARE(bool, gpu_device_lost_setup_breadcrumbs);
 
 namespace rex {
 namespace ui {
@@ -224,8 +228,20 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #if REX_PLATFORM_WIN32
     // #256. Windows-only extension to control fullscreen exclusive behavior.
     // Used to prevent HDR state corruption during fullscreen transitions.
-    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_full_screen_exclusive)
+    // Requires the instance extensions VK_KHR_get_surface_capabilities2 and
+    // VK_KHR_get_physical_device_properties2.
+    if (get_physical_device_properties2_supported &&
+        vulkan_instance->extensions().ext_KHR_get_surface_capabilities2) {
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_full_screen_exclusive)
+    }
 #endif
+  }
+
+  if (with_gpu_emulation) {
+    if (REXCVAR_GET(gpu_device_lost_breadcrumbs)) {
+      XE_UI_VULKAN_STRUCT_EXTENSION(AMD_buffer_marker)
+      XE_UI_VULKAN_STRUCT_EXTENSION(NV_device_diagnostic_checkpoints)
+    }
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
@@ -259,6 +275,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_conditional_rendering)
       // #284.
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_depth_bias_control)
+      // #81. Descriptor sets written into the command buffer (the native
+      // renderer's pixel shader textures).
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_push_descriptor)
       // #252.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
       // #55.
@@ -380,6 +399,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       features_EXT_custom_border_color;
   VkPhysicalDeviceCustomBorderColorPropertiesEXT properties_EXT_custom_border_color = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT};
+  VkPhysicalDevicePushDescriptorPropertiesKHR properties_KHR_push_descriptor = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
@@ -441,6 +462,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_push_descriptor) {
+      properties_KHR_push_descriptor.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_KHR_push_descriptor;
     }
     if (device->extensions_.ext_EXT_conditional_rendering) {
       features_EXT_conditional_rendering.Link(supported_features_2, device_create_info);
@@ -817,6 +842,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_PROPERTY_2(properties_EXT_custom_border_color, maxCustomBorderColorSamplers)
   }
 
+  if (device->extensions_.ext_KHR_push_descriptor) {
+    XE_UI_VULKAN_PROPERTY_2(properties_KHR_push_descriptor, maxPushDescriptors)
+  }
+
   if (device->extensions_.ext_EXT_robustness2) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
@@ -927,6 +956,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_EXT_depth_bias_control) {
 #include <rex/ui/vulkan/functions/device_ext_depth_bias_control.inc>
   }
+  if (device->extensions_.ext_KHR_push_descriptor) {
+#include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
+  }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION
@@ -938,6 +970,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   // Get the queues.
+  if (device->extensions_.ext_AMD_buffer_marker) {
+    dfn.vkCmdWriteBufferMarkerAMD = reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkCmdWriteBufferMarkerAMD"));
+  }
+  if (device->extensions_.ext_NV_device_diagnostic_checkpoints) {
+    dfn.vkCmdSetCheckpointNV = reinterpret_cast<PFN_vkCmdSetCheckpointNV>(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkCmdSetCheckpointNV"));
+    dfn.vkGetQueueCheckpointDataNV = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkGetQueueCheckpointDataNV"));
+  }
 
   for (size_t queue_family_index = 0; queue_family_index < device->queue_families_.size();
        ++queue_family_index) {
@@ -971,15 +1013,152 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (memory_type_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) {
       device->memory_types_.host_cached |= memory_type_bit;
     }
+    constexpr VkMemoryPropertyFlags kDeviceLocalHostVisible =
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const uint32_t heap_index = memory_properties.memoryTypes[memory_type_index].heapIndex;
+    if ((memory_type_flags & kDeviceLocalHostVisible) == kDeviceLocalHostVisible &&
+        heap_index < memory_properties.memoryHeapCount &&
+        memory_properties.memoryHeaps[heap_index].size > (VkDeviceSize(256) << 20)) {
+      device->memory_types_.device_local_host_visible_large |= memory_type_bit;
+    }
   }
 
+  device->InitializeBreadcrumbs();
   return device;
 }
 
 VulkanDevice::~VulkanDevice() {
   if (device_) {
+    DestroyBreadcrumbs();
     vulkan_instance_->functions().vkDestroyDevice(device_, nullptr);
   }
+}
+
+void VulkanDevice::DestroyBreadcrumbs() {
+  if (breadcrumb_mapping_) functions_.vkUnmapMemory(device_, breadcrumb_memory_);
+  if (breadcrumb_buffer_) functions_.vkDestroyBuffer(device_, breadcrumb_buffer_, nullptr);
+  if (breadcrumb_memory_) functions_.vkFreeMemory(device_, breadcrumb_memory_, nullptr);
+  breadcrumb_mapping_ = nullptr;
+  breadcrumb_buffer_ = VK_NULL_HANDLE;
+  breadcrumb_memory_ = VK_NULL_HANDLE;
+}
+
+void VulkanDevice::InitializeBreadcrumbs() {
+  breadcrumb_nv_ = functions_.vkCmdSetCheckpointNV && functions_.vkGetQueueCheckpointDataNV;
+  const char* force = std::getenv("REX_TEST_GPU_BREADCRUMBS");
+  if (functions_.vkCmdWriteBufferMarkerAMD && !(force && std::strcmp(force, "nv") == 0)) {
+    VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    // [0]: the last breadcrumb finished; [1]: the last draw whose work before
+    // it finished (EmitSetupBreadcrumb).
+    buffer.size = 2 * sizeof(uint32_t);
+    buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (functions_.vkCreateBuffer(device_, &buffer, nullptr, &breadcrumb_buffer_) == VK_SUCCESS) {
+      VkMemoryRequirements requirements;
+      functions_.vkGetBufferMemoryRequirements(device_, breadcrumb_buffer_, &requirements);
+      const uint32_t types = requirements.memoryTypeBits & memory_types_.host_visible & memory_types_.host_coherent;
+      for (uint32_t type = 0; type < 32; ++type) {
+        if (!(types & (uint32_t(1) << type))) continue;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = type;
+        if (functions_.vkAllocateMemory(device_, &allocation, nullptr, &breadcrumb_memory_) == VK_SUCCESS &&
+            functions_.vkBindBufferMemory(device_, breadcrumb_buffer_, breadcrumb_memory_, 0) == VK_SUCCESS &&
+            functions_.vkMapMemory(device_, breadcrumb_memory_, 0, VK_WHOLE_SIZE, 0, &breadcrumb_mapping_) == VK_SUCCESS) {
+          static_cast<uint32_t*>(breadcrumb_mapping_)[0] = 0;
+          static_cast<uint32_t*>(breadcrumb_mapping_)[1] = 0;
+          breadcrumb_nv_ = false;
+          break;
+        }
+        DestroyBreadcrumbs();
+        break;
+      }
+    }
+    if (!breadcrumb_mapping_) DestroyBreadcrumbs();
+  }
+  REXLOG_INFO("Vulkan GPU breadcrumbs: {}", breadcrumb_mapping_ ? "AMD buffer marker" :
+              breadcrumb_nv_ ? "NV diagnostic checkpoints" : "unavailable or disabled");
+}
+
+uint32_t VulkanDevice::RecordBreadcrumb(const ::rex::ui::GpuBreadcrumb& entry) const {
+  return (breadcrumb_mapping_ || breadcrumb_nv_) && !IsLost() ? breadcrumb_trail_.Record(entry) : 0;
+}
+
+void VulkanDevice::EmitBreadcrumb(VkCommandBuffer command_buffer, uint32_t sequence) const {
+  if (!sequence) return;
+  if (breadcrumb_mapping_) {
+    functions_.vkCmdWriteBufferMarkerAMD(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                        breadcrumb_buffer_, 0, sequence);
+  } else if (breadcrumb_nv_) {
+    functions_.vkCmdSetCheckpointNV(command_buffer, reinterpret_cast<void*>(uintptr_t(sequence)));
+  }
+}
+
+bool VulkanDevice::CanMarkBreadcrumbSetup() const {
+  return breadcrumb_mapping_ && REXCVAR_GET(gpu_device_lost_setup_breadcrumbs);
+}
+
+void VulkanDevice::EmitSetupBreadcrumb(VkCommandBuffer command_buffer, uint32_t sequence) const {
+  if (sequence && breadcrumb_mapping_) {
+    functions_.vkCmdWriteBufferMarkerAMD(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                        breadcrumb_buffer_, sizeof(uint32_t), sequence);
+  }
+}
+
+void VulkanDevice::LogBreadcrumbs(bool query_lost_device) const {
+  auto describe = [&](const char* label, uint32_t sequence) {
+    auto entry = breadcrumb_trail_.Find(sequence);
+    if (!entry) {
+      REXLOG_ERROR("GPU breadcrumbs {} #{}: {}", label, sequence,
+                   sequence ? "not recorded or no longer retained" : "none reached");
+      return;
+    }
+    REXLOG_ERROR("GPU breadcrumbs {} #{}: {} submission {}, frame {}, VS {:016X}, PS {:016X}, {} vertices",
+                 label, sequence, entry->resolve ? "resolve" : "draw", entry->submission,
+                 entry->frame, entry->vertex_shader, entry->pixel_shader, entry->vertices);
+  };
+  if (breadcrumb_mapping_) {
+    const uint32_t finished = static_cast<volatile uint32_t*>(breadcrumb_mapping_)[0];
+    const uint32_t setup_finished = static_cast<volatile uint32_t*>(breadcrumb_mapping_)[1];
+    describe("last finished", finished);
+    describe("first unconfirmed", finished == UINT32_MAX ? 1 : finished + 1);
+    const std::string details =
+        ::rex::ui::DescribeGpuBreadcrumbDetails(breadcrumb_trail_, finished, setup_finished);
+    if (!details.empty()) {
+      REXLOG_ERROR("{}", details);
+    }
+  } else if (breadcrumb_nv_ && query_lost_device) {
+    // This read-only query has no queue host-synchronization requirement.
+    // Do not take queue mutexes from the loss path (another thread may be in submit).
+    const auto queue = queue_families_[queue_family_graphics_compute_].queues[0]->queue;
+    uint32_t count = 0;
+    functions_.vkGetQueueCheckpointDataNV(queue, &count, nullptr);
+    std::vector<VkCheckpointDataNV> data(count);
+    for (auto& item : data) item.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+    functions_.vkGetQueueCheckpointDataNV(queue, &count, data.data());
+    for (uint32_t i = 0; i < count; ++i) {
+      const auto sequence = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+      REXLOG_ERROR("GPU NV checkpoint stage 0x{:X}", uint32_t(data[i].stage));
+      describe("reached", sequence);
+      if (data[i].stage == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT) {
+        describe("first unconfirmed", sequence == UINT32_MAX ? 1 : sequence + 1);
+        const std::string details =
+            ::rex::ui::DescribeGpuBreadcrumbDetails(breadcrumb_trail_, sequence, 0);
+        if (!details.empty()) {
+          REXLOG_ERROR("{}", details);
+        }
+      }
+    }
+  }
+}
+
+bool VulkanDevice::SetLost() noexcept {
+  if (lost_.exchange(true, std::memory_order_acq_rel)) return false;
+  try {
+    LogBreadcrumbs();
+    rex::FlushLogging();
+  } catch (...) {}
+  return true;
 }
 
 VulkanDevice::VulkanDevice(const VulkanInstance* const vulkan_instance,

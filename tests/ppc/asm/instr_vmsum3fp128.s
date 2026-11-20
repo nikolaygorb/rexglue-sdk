@@ -7,7 +7,9 @@ test_vmsum3fp128_1:
   blr
   #_ REGISTER_OUT v3 [3f800000, 3fc00000, 3f8ccccd, 01020304]
   #_ REGISTER_OUT v4 [40000000, 40700000, 4013d70a, 01020304]
-  #_ REGISTER_OUT v5 [4122A7F0, 4122A7F0, 4122A7F0, 4122A7F0]
+  # The console truncates the sum (fixed point, 29 bits below the largest
+  # product): 4122A7EF, not 4122A7F0 rounded to nearest
+  #_ REGISTER_OUT v5 [4122A7EF, 4122A7EF, 4122A7EF, 4122A7EF]
 
 test_vmsum3fp128_2:
   # Denormal output flushed to +0.0: FLT_MIN * 0.5 + 0 + 0 = denormal -> +0.0
@@ -87,20 +89,22 @@ test_vmsum3fp128_10:
   #_ REGISTER_OUT v5 [7fc00000, 7fc00000, 7fc00000, 7fc00000]
 
 test_vmsum3fp128_11:
-  # NaN in vA and vB: vA's, as Xenia's sequence (no recorded case has two NaNs)
+  # Any NaN operand gives the default QNaN on the console, whatever its payload
+  # or sign (upstream rexglue samples: SNaN 7F800001 * 0 -> 7FC00000)
   #_ REGISTER_IN v3 [7fc00001, 3f800000, 3f800000, 00000000]
   #_ REGISTER_IN v4 [7fc00002, 3f800000, 3f800000, 00000000]
   vmsum3fp128 v5, v3, v4
   blr
-  #_ REGISTER_OUT v5 [7fc00001, 7fc00001, 7fc00001, 7fc00001]
+  #_ REGISTER_OUT v5 [7fc00000, 7fc00000, 7fc00000, 7fc00000]
 
 test_vmsum3fp128_12:
-  # x before z: vB's x (a signaling NaN, quieted) before vA's z
+  # Any NaN operand gives the default QNaN on the console, whatever its payload
+  # or sign (upstream rexglue samples: SNaN 7F800001 * 0 -> 7FC00000)
   #_ REGISTER_IN v3 [3f800000, 3f800000, ffc00003, 00000000]
   #_ REGISTER_IN v4 [7f800004, 3f800000, 3f800000, 00000000]
   vmsum3fp128 v5, v3, v4
   blr
-  #_ REGISTER_OUT v5 [7fc00004, 7fc00004, 7fc00004, 7fc00004]
+  #_ REGISTER_OUT v5 [7fc00000, 7fc00000, 7fc00000, 7fc00000]
 
 test_vmsum3fp128_13:
   # an invalid x before a NaN in z: 7fc00000
@@ -111,12 +115,13 @@ test_vmsum3fp128_13:
   #_ REGISTER_OUT v5 [7fc00000, 7fc00000, 7fc00000, 7fc00000]
 
 test_vmsum3fp128_14:
-  # (x + z) before y
+  # Any NaN operand gives the default QNaN on the console, whatever its payload
+  # or sign (upstream rexglue samples: SNaN 7F800001 * 0 -> 7FC00000)
   #_ REGISTER_IN v3 [3f800000, 7fc00006, 3f800000, 00000000]
   #_ REGISTER_IN v4 [3f800000, 3f800000, ffc00007, 00000000]
   vmsum3fp128 v5, v3, v4
   blr
-  #_ REGISTER_OUT v5 [ffc00007, ffc00007, ffc00007, ffc00007]
+  #_ REGISTER_OUT v5 [7fc00000, 7fc00000, 7fc00000, 7fc00000]
 
 test_vmsum3fp128_15:
   # w is ignored, a NaN there too

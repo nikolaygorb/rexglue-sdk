@@ -74,6 +74,7 @@ class MMIOHandler {
 
   static bool ExceptionCallbackThunk(arch::Exception* ex, void* data);
   bool ExceptionCallback(arch::Exception* ex);
+  bool HandleAccessViolation(arch::Exception* ex);
 
   uint8_t* virtual_membase_;
   uint8_t* physical_membase_;

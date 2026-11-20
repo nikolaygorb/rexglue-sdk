@@ -126,9 +126,11 @@ struct TimeFields {
   int milliseconds;
 };
 
-// Decompose a FILETIME exactly as RtlTimeToTimeFields_entry does
+// Decompose a FILETIME exactly as RtlTimeToTimeFields_entry does (from 1601,
+// without system_clock: xenia-canary 5d1784c57)
 static TimeFields decompose(uint64_t filetime) {
-  auto tp = WinSystemClock::to_sys(WinSystemClock::from_file_time(filetime));
+  auto tp = rex::chrono::filetime_epoch +
+            rex::chrono::hundrednanoseconds{static_cast<int64_t>(filetime)};
   auto dp = std::chrono::floor<std::chrono::days>(tp);
   auto ymd = std::chrono::year_month_day{dp};
   auto wd = std::chrono::weekday{dp};
@@ -314,4 +316,25 @@ TEST_CASE("weekday c_encoding returns 0=Sunday through 6=Saturday", "[chrono]") 
   CHECK(weekday{sys_days{year{2021} / month{1} / day{1}}}.c_encoding() == 5);
   // 2000-01-01 is Saturday (6)
   CHECK(weekday{sys_days{year{2000} / month{1} / day{1}}}.c_encoding() == 6);
+}
+
+// Compose a FILETIME exactly as RtlTimeFieldsToTime_entry does.
+static uint64_t compose(const TimeFields& tf) {
+  using namespace std::chrono;
+  auto dp = static_cast<sys_days>(year_month_day{year{tf.year}, month{tf.month}, day{tf.day}});
+  auto time = duration_cast<rex::chrono::hundrednanoseconds>(
+      (dp - rex::chrono::filetime_epoch) + hours{tf.hours} + minutes{tf.minutes} +
+      seconds{tf.seconds} + milliseconds{tf.milliseconds});
+  return static_cast<uint64_t>(time.count());
+}
+
+TEST_CASE("time fields compose back to the same FILETIME from 1601", "[chrono]") {
+  CHECK(compose(decompose(kFtNtEpoch)) == kFtNtEpoch);
+  CHECK(compose(decompose(kFtUnixEpoch)) == kFtUnixEpoch);
+  CHECK(compose(decompose(kFtY2k)) == kFtY2k);
+  CHECK(compose(decompose(kFtLeapDay)) == kFtLeapDay);
+  CHECK(compose(decompose(kFtSubDay)) == kFtSubDay);
+  // Time 0 is 1601-01-01, not a date past 2262 (a nanosecond system_clock).
+  CHECK(decompose(0).year == 1601);
+  CHECK(compose({1601, 1, 1, 1, 0, 0, 0, 1}) == 10000u);
 }

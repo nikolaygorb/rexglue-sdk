@@ -12,7 +12,11 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+
 #include <rex/audio/audio_system.h>
+#include <rex/cvar.h>
+#include <rex/kernel/xboxkrnl/audio.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -24,8 +28,39 @@
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+REXCVAR_DEFINE_STRING(audio_speaker_config, "dolby_digital", "Audio",
+                      "Speaker setup reported to the game (XAudioGetSpeakerConfig): dolby_digital "
+                      "(the console default: digital 5.1, Pro Logic on the analog output), "
+                      "pro_logic (analog surround matrixed into stereo), stereo, mono. The game "
+                      "mixes 5.1 either way; some choose their surround panning or a stereo mix "
+                      "from it. A value the game sets itself (XAudioSetSpeakerConfig) wins")
+    .allowed({"dolby_digital", "pro_logic", "stereo", "mono"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+namespace {
+// What the title set with XAudioSetSpeakerConfig, read back by
+// XAudioGetSpeakerConfig (xenia-edge keeps it the same way). The host output
+// keeps its own layout: only the value reported to the title changes.
+std::atomic<uint32_t> g_speaker_config{0};
+std::atomic<bool> g_speaker_config_set{false};
+}  // namespace
+
 u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
-  *config_ptr = 0x00010001;
+  if (!config_ptr) {
+    return X_E_INVALIDARG;
+  }
+  if (g_speaker_config_set.load(std::memory_order_acquire)) {
+    *config_ptr = g_speaker_config.load(std::memory_order_relaxed);
+    return X_ERROR_SUCCESS;
+  }
+  *config_ptr = SpeakerConfigFromSetting(REXCVAR_GET(audio_speaker_config))
+                    .value_or(kAudioFlagDolbyDigital | kAudioFlagDolbyProLogic);
+  return X_ERROR_SUCCESS;
+}
+
+u32 XAudioSetSpeakerConfig_entry(u32 config) {
+  g_speaker_config.store(config, std::memory_order_relaxed);
+  g_speaker_config_set.store(true, std::memory_order_release);
   return X_ERROR_SUCCESS;
 }
 
@@ -108,6 +143,7 @@ u32 XAudioSubmitRenderDriverFrame_entry(mapped_void driver_ptr, mapped_void samp
 }  // namespace rex::kernel::xboxkrnl
 
 REX_EXPORT(__imp__XAudioGetSpeakerConfig, rex::kernel::xboxkrnl::XAudioGetSpeakerConfig_entry)
+REX_EXPORT(__imp__XAudioSetSpeakerConfig, rex::kernel::xboxkrnl::XAudioSetSpeakerConfig_entry)
 REX_EXPORT(__imp__XAudioGetVoiceCategoryVolumeChangeMask,
            rex::kernel::xboxkrnl::XAudioGetVoiceCategoryVolumeChangeMask_entry)
 REX_EXPORT(__imp__XAudioGetVoiceCategoryVolume,
@@ -128,7 +164,6 @@ REX_EXPORT_STUB(__imp__XAudioEndDigitalBypassMode);
 REX_EXPORT_STUB(__imp__XAudioSubmitDigitalPacket);
 REX_EXPORT_STUB(__imp__XAudioQueryDriverPerformance);
 REX_EXPORT_STUB(__imp__XAudioGetRenderDriverThread);
-REX_EXPORT_STUB(__imp__XAudioSetSpeakerConfig);
 REX_EXPORT_STUB(__imp__XAudioOverrideSpeakerConfig);
 REX_EXPORT_STUB(__imp__XAudioSuspendRenderDriverClients);
 REX_EXPORT_STUB(__imp__XAudioRegisterRenderDriverMECClient);

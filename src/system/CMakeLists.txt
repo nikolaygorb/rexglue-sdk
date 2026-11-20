@@ -1,5 +1,6 @@
 set(REXSYSTEM_SOURCES
     runtime.cpp
+    reservation.cpp
     embedded_metadata.cpp
     achievement_manager.cpp
     achievements.cpp
@@ -32,6 +33,7 @@ set(REXSYSTEM_SOURCES
     xam/app_manager.cpp
     xam/content_manager.cpp
     xam/user_profile.cpp
+    xam/workspace_heap.cpp
 
     ppc_types.cpp
     elf_module.cpp

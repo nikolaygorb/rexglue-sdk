@@ -24,7 +24,9 @@ add_library(rexcore OBJECT
 )
 add_library(rex::core ALIAS rexcore)
 
-if(APPLE)
+if(WIN32)
+    target_link_libraries(rexcore PRIVATE Synchronization)
+elseif(APPLE)
     # Apple's libc++ still gates std::jthread/std::stop_token behind the
     # experimental-library feature flag. Only timer_queue.cpp uses them, and
     # neither type crosses a header boundary.

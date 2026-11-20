@@ -62,21 +62,29 @@ namespace rex::codegen {
 // Vector Floating Point Arithmetic
 //=============================================================================
 
-bool build_vaddfp(BuilderContext& ctx) {
+// vD = vA op vB, with the NaN lanes of rex::ppc::vec_arith_result.
+static void emit_vec_fp_arith(BuilderContext& ctx, const char* simd_op) {
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("add");
+  const auto a = fmt::format("simde_mm_load_ps({}.f32)", ctx.v(ctx.insn.operands[1]));
+  const auto b = fmt::format("simde_mm_load_ps({}.f32)", ctx.v(ctx.insn.operands[2]));
+  ctx.println(
+      "\tsimde_mm_store_ps({0}.f32, rex::ppc::vec_arith_result(simde_mm_{1}_ps({2}, {3}), {2}, "
+      "{3}));",
+      ctx.v(ctx.insn.operands[0]), simd_op, a, b);
+}
+
+bool build_vaddfp(BuilderContext& ctx) {
+  emit_vec_fp_arith(ctx, "add");
   return true;
 }
 
 bool build_vsubfp(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("sub");
+  emit_vec_fp_arith(ctx, "sub");
   return true;
 }
 
 bool build_vmulfp128(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("mul");
+  emit_vec_fp_arith(ctx, "mul");
   return true;
 }
 
@@ -122,68 +130,34 @@ bool build_vminfp(BuilderContext& ctx) {
   return true;
 }
 
+// vrefp, vrsqrtefp, vexptefp, vlogefp and their VMX128 forms: the console's
+// estimates, lane by lane (rex/ppc/estimates.h). Integer arithmetic on the
+// bits, so the result does not depend on the flush mode (a denormal input is
+// a zero, as with VSCR[NJ] set).
+static void emit_vec_estimate(BuilderContext& ctx, const char* estimate) {
+  ctx.println(
+      "\tsimde_mm_store_ps({}.f32, "
+      "rex::ppc::vec_estimate<rex::ppc::{}>(simde_mm_load_ps({}.f32)));",
+      ctx.v(ctx.insn.operands[0]), estimate, ctx.v(ctx.insn.operands[1]));
+}
+
 bool build_vrefp(BuilderContext& ctx) {
-  // TODO: see if we can use rcp safely
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_unary_expr("simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_load_ps({vA}.f32))");
+  emit_vec_estimate(ctx, "estimate_reciprocal");
   return true;
 }
 
 bool build_vrsqrtefp(BuilderContext& ctx) {
-  // TODO: see if we can use rsqrt safely
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_unary_expr(
-      "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32)))");
+  emit_vec_estimate(ctx, "estimate_reciprocal_sqrt");
   return true;
 }
 
 bool build_vexptefp(BuilderContext& ctx) {
-  // SIMD exp2 estimate (~12-bit precision, matching PPC vexptefp spec)
-  // Algorithm: exp2(x) = 2^n * poly(f), where n = floor(x), f = x - n
-  auto vD = ctx.v(ctx.insn.operands[0]);
-  auto vA = ctx.v(ctx.insn.operands[1]);
-  ctx.emit_set_flush_mode(true);
-  ctx.println("\t{{");
-  ctx.println("\t\tsimde__m128 x = simde_mm_load_ps({}.f32);", vA);
-  // The exponent field only holds n in [-126, 127]: clamp x into that range
-  // (NaN passes through, max/min return the second operand) and fix up the
-  // out-of-range lanes after.
-  ctx.println(
-      "\t\tsimde__m128 xc = simde_mm_min_ps(simde_mm_set1_ps(127.99999f), "
-      "simde_mm_max_ps(simde_mm_set1_ps(-126.0f), x));");
-  ctx.println(
-      "\t\tsimde__m128 n = simde_mm_round_ps(xc, "
-      "SIMDE_MM_FROUND_TO_NEG_INF | SIMDE_MM_FROUND_NO_EXC);");
-  ctx.println("\t\tsimde__m128 f = simde_mm_sub_ps(xc, n);");
-  // 4th-order minimax polynomial for 2^f, f in [0,1), ~12-bit accuracy
-  ctx.println("\t\tsimde__m128 p = simde_mm_set1_ps(1.8775767e-3f);");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(8.9893397e-3f));");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(5.5826318e-2f));");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(2.4015361e-1f));");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(6.9315308e-1f));");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(1.0f));");
-  // Construct 2^n by adding n to the IEEE 754 exponent bias and shifting into place
-  ctx.println("\t\tsimde__m128i exp_bits = simde_mm_slli_epi32(");
-  ctx.println("\t\t\tsimde_mm_add_epi32(simde_mm_cvttps_epi32(n), simde_mm_set1_epi32(127)), 23);");
-  ctx.println("\t\tsimde__m128 r = simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits));");
-  // Below 2^-126 flush to 0 (non-Java mode), from 2^128 up +inf.
-  ctx.println(
-      "\t\tr = simde_mm_blendv_ps(r, simde_mm_setzero_ps(), "
-      "simde_mm_cmplt_ps(x, simde_mm_set1_ps(-126.0f)));");
-  ctx.println(
-      "\t\tr = simde_mm_blendv_ps(r, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7F800000)), "
-      "simde_mm_cmpge_ps(x, simde_mm_set1_ps(128.0f)));");
-  ctx.println("\t\tsimde_mm_store_ps({}.f32, r);", vD);
-  ctx.println("\t}}");
+  emit_vec_estimate(ctx, "estimate_pow2");
   return true;
 }
 
 bool build_vlogefp(BuilderContext& ctx) {
-  // TODO: vectorize
-  ctx.emit_set_flush_mode(true);
-  for (size_t i = 0; i < 4; i++)
-    ctx.println("\t{}.f32[{}] = log2f({}.f32[{}]);", ctx.v(ctx.insn.operands[0]), i,
-                ctx.v(ctx.insn.operands[1]), i);
+  emit_vec_estimate(ctx, "estimate_log2");
   return true;
 }
 
@@ -191,13 +165,15 @@ bool build_vlogefp(BuilderContext& ctx) {
 // Vector Dot Products
 //=============================================================================
 
+// The console's fixed point sum by default; the float64 sum with
+// fast_dot_products (rex/ppc/intrinsics.h).
 bool build_vmsum3fp128(BuilderContext& ctx) {
-  emit_vec_fp_helper(ctx, "vec_msum3");
+  emit_vec_fp_helper(ctx, ctx.config().fastDotProducts ? "vec_msum3_fast" : "vec_msum3");
   return true;
 }
 
 bool build_vmsum4fp128(BuilderContext& ctx) {
-  emit_vec_fp_helper(ctx, "vec_msum4");
+  emit_vec_fp_helper(ctx, ctx.config().fastDotProducts ? "vec_msum4_fast" : "vec_msum4");
   return true;
 }
 
@@ -1391,6 +1367,9 @@ bool build_vupkd3d128(BuilderContext& ctx) {
       for (size_t i = 0; i < 2; i++) {
         ctx.println("\t{}.f32 = 3.0f;", ctx.temp());
         ctx.println("\t{}.s32 += {}.s16[{}];", ctx.temp(), ctx.v(ctx.insn.operands[1]), 1 - i);
+        // -32768 (3.0 - 2^-7, 0x403F8000) is the negative overflow, a quiet NaN on
+        // the console (xenia-canary's XMMUnpackSHORT_Overflow; test short2_3).
+        ctx.println("\tif ({}.u32 == 0x403F8000) {}.u32 = 0x7FC00000;", ctx.temp(), ctx.temp());
         ctx.println("\t{}.f32[{}] = {}.f32;", ctx.v_temp(), 3 - i, ctx.temp());
       }
       ctx.println("\t{}.f32[1] = 0.0f;", ctx.v_temp());
@@ -1459,6 +1438,8 @@ bool build_vupkd3d128(BuilderContext& ctx) {
         size_t dstIdx = 3 - i;  // Write to f32 indices 3, 2, 1, 0 (Guest elements 0, 1, 2, 3)
         ctx.println("\t{}.f32 = 3.0f;", ctx.temp());
         ctx.println("\t{}.s32 += {}.s16[{}];", ctx.temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
+        // -32768: a quiet NaN, as for NORMSHORT2.
+        ctx.println("\tif ({}.u32 == 0x403F8000) {}.u32 = 0x7FC00000;", ctx.temp(), ctx.temp());
         ctx.println("\t{}.f32[{}] = {}.f32;", ctx.v(ctx.insn.operands[0]), dstIdx, ctx.temp());
       }
       break;

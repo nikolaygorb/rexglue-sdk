@@ -13,7 +13,28 @@
 
 #include <rex/codegen/function_node.h>
 
+#include <functional>
+#include <optional>
+#include <string_view>
+
 namespace rex::codegen {
+
+// __savegprlr_N, __restgprlr_N, __savefpr_N, __restfpr_N, __savevmx_N, __restvmx_N.
+bool IsSaveRestoreHelperName(std::string_view name);
+
+// The jump table the emitter finds for a bctr no table claims yet (mtctr right
+// before it); data points at the bctr's word.
+std::optional<JumpTable> DetectLateJumpTable(const BinaryView& binary, uint32_t bctrAddress,
+                                             const uint32_t* data);
+
+// With r0 / r2 / r11 / r12 or r14-r31 as locals, flag share_registers on every
+// function reading one of them before any path sets it, there or in a callee:
+// it takes its caller's value outside the ABI (SEH funclets the owner's frame
+// in r12, __chkstk the frame size in r12, tail fragments, entries in the
+// middle of a body). Run after calls and jump tables are resolved. Returns the
+// number flagged.
+size_t MarkCallerRegisterReaders(FunctionGraph& graph, const BinaryView& binary,
+                                 const RecompilerConfig& config);
 
 //=============================================================================
 // Function Graph
@@ -178,6 +199,16 @@ class FunctionGraph {
   // Flag every SEH funclet as register-sharing. Run after discovery, once
   // funclet extents are known. Returns the number flagged.
   size_t markFuncletRegisterSharing();
+
+  // Flag the functions that keep their non-volatiles in ctx when the others
+  // localize them: the save / restore helpers, the bodies of setjmp and
+  // longjmp, every function with a call or tail call to setjmp (the
+  // predicates tell their addresses; RecompilerConfig::isSetJmp, isLongJmp),
+  // and with sehWrappers (generate_exception_handlers) every function with
+  // SEH scopes, whose catch block works on ctx. Run after calls are resolved.
+  // Returns the number flagged.
+  size_t markContextNonVolatiles(const std::function<bool(uint32_t)>& isSetJmp,
+                                 const std::function<bool(uint32_t)>& isLongJmp, bool sehWrappers);
 
   //=========================================================================
   // Target Classification (for code generation)

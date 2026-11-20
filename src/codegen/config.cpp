@@ -22,6 +22,7 @@
 #include <rex/logging.h>
 
 #include "codegen_logging.h"
+#include "config_keys.h"
 
 #include <toml++/toml.hpp>
 
@@ -82,6 +83,7 @@ void MergeBool(bool& dst, bool src, bool present, const char* name) {
 // ---------------------------------------------------------------------------
 
 void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string& filePath) {
+  CheckConfigKeys(toml, filePath, cfg.keyWarnings);
   // --- Scalars: last wins ---
 
   // String scalars (only override if present in this file)
@@ -102,6 +104,10 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
   auto hasBool = [&](const char* key) -> bool { return toml[key].is_boolean(); };
   MergeBool(cfg.skipLr, toml["skip_lr"].value_or(false), hasBool("skip_lr"), "skip_lr");
   MergeBool(cfg.skipMsr, toml["skip_msr"].value_or(false), hasBool("skip_msr"), "skip_msr");
+  MergeBool(cfg.lockFreeReservations, toml["lock_free_reservations"].value_or(true),
+            hasBool("lock_free_reservations"), "lock_free_reservations");
+  MergeBool(cfg.fastDotProducts, toml["fast_dot_products"].value_or(false),
+            hasBool("fast_dot_products"), "fast_dot_products");
   MergeBool(cfg.ctrAsLocalVariable, toml["ctr_as_local"].value_or(false), hasBool("ctr_as_local"),
             "ctr_as_local");
   MergeBool(cfg.xerAsLocalVariable, toml["xer_as_local"].value_or(false), hasBool("xer_as_local"),
@@ -114,10 +120,18 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("non_argument_as_local"), "non_argument_as_local");
   MergeBool(cfg.nonVolatileRegistersAsLocalVariables, toml["non_volatile_as_local"].value_or(false),
             hasBool("non_volatile_as_local"), "non_volatile_as_local");
+  MergeBool(cfg.nonVolatileGprsAsLocalVariables, toml["non_volatile_gpr_as_local"].value_or(false),
+            hasBool("non_volatile_gpr_as_local"), "non_volatile_gpr_as_local");
+  MergeBool(cfg.nonArgumentGprsAsLocalVariables, toml["non_argument_gpr_as_local"].value_or(false),
+            hasBool("non_argument_gpr_as_local"), "non_argument_gpr_as_local");
+  MergeBool(cfg.autoShareRegisters, toml["auto_share_registers"].value_or(true),
+            hasBool("auto_share_registers"), "auto_share_registers");
   MergeBool(cfg.fpuFlushDenormals, toml["fpu_flush_denormals"].value_or(false),
             hasBool("fpu_flush_denormals"), "fpu_flush_denormals");
   MergeBool(cfg.fpscrResultBits, toml["fpscr_result_bits"].value_or(false),
             hasBool("fpscr_result_bits"), "fpscr_result_bits");
+  MergeBool(cfg.singleDenormalOperandQuirk, toml["single_denormal_operand_quirk"].value_or(true),
+            hasBool("single_denormal_operand_quirk"), "single_denormal_operand_quirk");
   MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
             hasBool("generate_exception_handlers"), "generate_exception_handlers");
   if (hasBool("is_dll")) {
@@ -125,14 +139,28 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
   }
 
   // Integer scalars (only override if present)
-  if (auto v = toml["longjmp_address"].value<int64_t>()) {
-    uint32_t addr = static_cast<uint32_t>(*v);
-    MergeScalar(cfg.longJmpAddress, addr, "longjmp_address");
-  }
-  if (auto v = toml["setjmp_address"].value<int64_t>()) {
-    uint32_t addr = static_cast<uint32_t>(*v);
-    MergeScalar(cfg.setJmpAddress, addr, "setjmp_address");
-  }
+  // longjmp_address / setjmp_address: an address or an array of them. A later
+  // file's value replaces an earlier one's, as a scalar does; the first
+  // address is the scalar, the others go to the set.
+  auto jmpAddresses = [&](const char* key, uint32_t& first, std::unordered_set<uint32_t>& rest) {
+    std::vector<uint32_t> addrs;
+    if (auto v = toml[key].value<int64_t>()) {
+      addrs.push_back(static_cast<uint32_t>(*v));
+    } else if (auto* arr = toml[key].as_array()) {
+      for (const auto& e : *arr) {
+        if (auto a = e.value<int64_t>())
+          addrs.push_back(static_cast<uint32_t>(*a));
+      }
+    }
+    if (addrs.empty())
+      return;
+    MergeScalar(first, addrs[0], key);
+    rest.clear();
+    rest.insert(addrs.begin() + 1, addrs.end());
+    rest.erase(first);
+  };
+  jmpAddresses("longjmp_address", cfg.longJmpAddress, cfg.longJmpAddresses);
+  jmpAddresses("setjmp_address", cfg.setJmpAddress, cfg.setJmpAddresses);
 
   // --- [analysis] section scalars ---
   if (auto* analysisTable = toml["analysis"].as_table()) {
@@ -514,6 +542,7 @@ bool RecompilerConfig::LoadFromTable(const toml::table& tbl,
 
 RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
   ValidationResult result;
+  result.warnings = keyWarnings;
 
   // Helper to check 4-byte alignment (PPC instructions are 4-byte aligned)
   auto checkAlignment = [&](uint32_t addr, const char* name) {
@@ -526,6 +555,10 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
   // Check special address alignment
   checkAlignment(longJmpAddress, "longjmp");
   checkAlignment(setJmpAddress, "setjmp");
+  for (uint32_t addr : longJmpAddresses)
+    checkAlignment(addr, "longjmp");
+  for (uint32_t addr : setJmpAddresses)
+    checkAlignment(addr, "setjmp");
 
   for (const auto& [name, addr] : rexcrtFunctions) {
     if (addr & 0x3) {

@@ -161,6 +161,11 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
     return X_E_FALSE;
   }
 
+  // Reset the decoder's state for the context first: the clear also sets the
+  // read offset to the first packet's data, and the title's comes from the init
+  // struct below (edge 56e9596f8).
+  StoreXmaContextIndexedRegister(REX_KERNEL_STATE(), 0x1A80, context_ptr.guest_address());
+
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
 
   XMA_CONTEXT_DATA context(context_ptr);
@@ -175,7 +180,8 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
 
   // context.work_buffer = context_init->work_buffer;  // ?
   context.subframe_decode_count = context_init->subframe_decode_count;
-  context.is_stereo = context_init->channel_count >= 1;
+  // The channel count is 0-based: only bit 0 is used.
+  context.is_stereo = context_init->channel_count & 1;
   context.sample_rate = context_init->sample_rate;
 
   context.loop_start = context_init->loop_data.loop_start;
@@ -185,8 +191,6 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
   context.loop_subframe_skip = context_init->loop_data.loop_subframe_skip;
 
   context.Store(context_ptr);
-
-  StoreXmaContextIndexedRegister(REX_KERNEL_STATE(), 0x1A80, context_ptr.guest_address());
 
   return 0;
 }
@@ -338,17 +342,13 @@ u32 XMADisableContext_entry(mapped_void context_ptr, u32 wait) {
   return result;
 }
 
+// Waits only while the decoder works on the context (its lock), as
+// XMADisableContext with wait does. Waiting for both input buffers to be
+// consumed hung on a disabled context whose buffers were still valid.
 u32 XMABlockWhileInUse_entry(mapped_void context_ptr) {
-  do {
-    XMA_CONTEXT_DATA context(context_ptr);
-    if (!context.input_buffer_0_valid && !context.input_buffer_1_valid) {
-      break;
-    }
-    if (!context.work_buffer_ptr) {
-      break;
-    }
-    rex::thread::Sleep(std::chrono::milliseconds(1));
-  } while (true);
+  static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system())
+      ->xma_decoder()
+      ->BlockOnContext(context_ptr.guest_address(), false);
   return 0;
 }
 

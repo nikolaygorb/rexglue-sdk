@@ -9,6 +9,11 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <algorithm>
+#include <string>
+
+#include <fmt/format.h>
+
 #include "builder_context.h"
 #include "helpers.h"
 
@@ -241,6 +246,109 @@ bool build_lmw(BuilderContext& ctx) {
   for (uint32_t i = rD; i <= 31; ++i) {
     ctx.println("\t{}.u64 = REX_LOAD_U32({} + {});", ctx.r(i), ctx.ea(), (i - rD) * 4);
   }
+  return true;
+}
+
+
+//=============================================================================
+// String Loads and Stores
+//=============================================================================
+// n bytes from EA into rD, rD+1, ... (after r31, r0), four to a register from
+// the high byte of its low word; the last register's bytes past the string
+// are zero (Power ISA lswi / lswx). EA is computed first, so a base in the
+// loaded range (an invalid form) still reads from the original address.
+
+namespace {
+
+// One register of a string load: `bytes` (1-4) from ea + offset.
+std::string StringLoadValue(BuilderContext& ctx, uint32_t offset, uint32_t bytes) {
+  if (bytes == 4) {
+    return fmt::format("REX_LOAD_U32({} + {})", ctx.ea(), offset);
+  }
+  std::string value;
+  for (uint32_t j = 0; j < bytes; ++j) {
+    value += fmt::format("{}(uint32_t(REX_LOAD_U8({} + {})) << {})", j ? " | " : "", ctx.ea(),
+                         offset + j, 24 - 8 * j);
+  }
+  return value;
+}
+
+void EmitStringEa(BuilderContext& ctx, uint32_t rA, int rB) {
+  std::string base = rA ? fmt::format("{}.u32", ctx.r(rA)) : std::string("0");
+  if (rB >= 0) {
+    ctx.println("\t{} = {} + {}.u32;", ctx.ea(), base, ctx.r(uint32_t(rB)));
+  } else {
+    ctx.println("\t{} = {};", ctx.ea(), base);
+  }
+}
+
+}  // namespace
+
+bool build_lswi(BuilderContext& ctx) {
+  // n = NB, 0 meaning 32.
+  const uint32_t rD = ctx.insn.operands[0];
+  const uint32_t nb = ctx.insn.operands[2];
+  const uint32_t n = nb ? nb : 32;
+  EmitStringEa(ctx, ctx.insn.operands[1], -1);
+  for (uint32_t k = 0; 4 * k < n; ++k) {
+    ctx.println("\t{}.u64 = {};", ctx.r((rD + k) % 32),
+                StringLoadValue(ctx, 4 * k, std::min(4u, n - 4 * k)));
+  }
+  return true;
+}
+
+bool build_lswx(BuilderContext& ctx) {
+  // n = XER[57:63], known only at run time (0: rD is left as it is); up to
+  // 127 bytes, so up to 32 registers.
+  const uint32_t rD = ctx.insn.operands[0];
+  EmitStringEa(ctx, ctx.insn.operands[1], int(ctx.insn.operands[2]));
+  ctx.println("\t{{");
+  ctx.println("\tconst uint32_t string_bytes = {}.byte_count;", ctx.xer());
+  for (uint32_t k = 0; k < 32; ++k) {
+    std::string value;
+    for (uint32_t j = 0; j < 4; ++j) {
+      value += fmt::format("{}(string_bytes > {} ? uint32_t(REX_LOAD_U8({} + {})) << {} : 0u)",
+                           j ? " | " : "", 4 * k + j, ctx.ea(), 4 * k + j, 24 - 8 * j);
+    }
+    ctx.println("\tif (string_bytes > {}) {}.u64 = {};", 4 * k, ctx.r((rD + k) % 32), value);
+  }
+  ctx.println("\t}}");
+  return true;
+}
+
+bool build_stswi(BuilderContext& ctx) {
+  // n = NB, 0 meaning 32: the bytes of rS, rS+1, ... from the high byte of
+  // each register's low word.
+  const uint32_t rS = ctx.insn.operands[0];
+  const uint32_t nb = ctx.insn.operands[2];
+  const uint32_t n = nb ? nb : 32;
+  EmitStringEa(ctx, ctx.insn.operands[1], -1);
+  for (uint32_t k = 0; 4 * k < n; ++k) {
+    const uint32_t reg = (rS + k) % 32;
+    const uint32_t bytes = std::min(4u, n - 4 * k);
+    if (bytes == 4) {
+      ctx.println("\tREX_STORE_U32({} + {}, {}.u32);", ctx.ea(), 4 * k, ctx.r(reg));
+      continue;
+    }
+    for (uint32_t j = 0; j < bytes; ++j) {
+      ctx.println("\tREX_STORE_U8({} + {}, uint8_t({}.u32 >> {}));", ctx.ea(), 4 * k + j,
+                  ctx.r(reg), 24 - 8 * j);
+    }
+  }
+  return true;
+}
+
+bool build_stswx(BuilderContext& ctx) {
+  // n = XER[57:63], known only at run time.
+  const uint32_t rS = ctx.insn.operands[0];
+  EmitStringEa(ctx, ctx.insn.operands[1], int(ctx.insn.operands[2]));
+  ctx.println("\t{{");
+  ctx.println("\tconst uint32_t string_bytes = {}.byte_count;", ctx.xer());
+  for (uint32_t i = 0; i < 128; ++i) {
+    ctx.println("\tif (string_bytes > {}) REX_STORE_U8({} + {}, uint8_t({}.u32 >> {}));", i,
+                ctx.ea(), i, ctx.r((rS + i / 4) % 32), 24 - 8 * (i % 4));
+  }
+  ctx.println("\t}}");
   return true;
 }
 
@@ -686,23 +794,19 @@ bool build_stvewx(BuilderContext& ctx) {
   return true;
 }
 
+// stvlx / stvrx: at most two overlapping stores (rex::ppc::StoreVectorLeft /
+// StoreVectorRight) instead of a loop of volatile byte stores.
 bool build_stvlx(BuilderContext& ctx) {
-  // TODO(tomc): vectorize
-  // NOTE: accounting for the full vector reversal here
   emitVectorEA(ctx);
-
-  ctx.println("\tfor (size_t i = 0; i < (16 - ({} & 0xF)); i++)", ctx.ea());
-  ctx.println("\t\tREX_STORE_U8({} + i, {}.u8[15 - i]);", ctx.ea(), ctx.v(ctx.insn.operands[0]));
+  ctx.println("\trex::ppc::StoreVectorLeft(REX_RAW_ADDR({0}), {0}, {1}.u8);", ctx.ea(),
+              ctx.v(ctx.insn.operands[0]));
   return true;
 }
 
 bool build_stvrx(BuilderContext& ctx) {
-  // TODO(tomc): vectorize
-  // NOTE: accounting for the full vector reversal here
   emitVectorEA(ctx);
-
-  ctx.println("\tfor (size_t i = 0; i < ({} & 0xF); i++)", ctx.ea());
-  ctx.println("\t\tREX_STORE_U8({} - i - 1, {}.u8[i]);", ctx.ea(), ctx.v(ctx.insn.operands[0]));
+  ctx.println("\trex::ppc::StoreVectorRight(REX_RAW_ADDR({0} & ~0xFu), {0}, {1}.u8);", ctx.ea(),
+              ctx.v(ctx.insn.operands[0]));
   return true;
 }
 

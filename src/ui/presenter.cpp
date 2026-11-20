@@ -87,14 +87,14 @@ REXCVAR_DEFINE_DOUBLE(present_nis_sharpness,
                       "UI/Presenter", "NVIDIA Image Scaling sharpness in [0, 1]")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kNisSharpnessMin,
            rex::ui::Presenter::GuestOutputPaintConfig::kNisSharpnessMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
                       "UI/Presenter", "Additional CAS sharpness in [0, 1]")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMin,
            rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(present_fsr_max_upsampling_passes,
                      rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax,
@@ -107,7 +107,7 @@ REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
                       "UI/Presenter", "FSR RCAS sharpness reduction in stops")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
            rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 REXCVAR_DEFINE_STRING(
@@ -119,7 +119,7 @@ REXCVAR_DEFINE_STRING(
 
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
                     "Enable output dithering in the final present pass")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
@@ -322,6 +322,26 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 }
 
 }  // namespace
+
+REXCVAR_DEFINE_INT32(host_frame_limit, 0, "UI/Presenter",
+                     "Host presentation limit in FPS (0 = unlimited). Skips presents without "
+                     "waiting or changing guest speed.")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_device_lost_breadcrumbs, true, "GPU",
+                    "Record GPU work markers for device-loss diagnostics")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// ReIGlue 1100: a second marker before a draw that had work of its own
+// recorded first, so a device loss says whether the GPU hung in that work or in
+// the draw. Off: it costs GPU time on draws with such work, and only a player
+// whose GPU resets needs it.
+REXCVAR_DEFINE_BOOL(gpu_device_lost_setup_breadcrumbs, false, "GPU",
+                    "With gpu_device_lost_breadcrumbs on VK_AMD_buffer_marker, also mark the end "
+                    "of the work recorded before a draw (render passes, EDRAM transfers, texture "
+                    "loads, barriers), so that a device loss says whether the GPU hung in that "
+                    "work or in the draw (costs GPU time)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
 namespace ui {
@@ -536,6 +556,9 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // in a way so that the UI won't be stealing all the remaining GPU
       // resources if it's repainted continuously, and the window system itself
       // doesn't limit the frame rate.
+      // A host cap can skip the implicit-vsync present. Keep UI ticks active
+      // in that case, including when the limit is changed while a menu is open.
+      UpdateUITicksNeededFromUIThread();
       WaitForUITickFromUIThread();
 
       paint_result = PaintAndPresent(draw_ui);
@@ -882,6 +905,12 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
     // UI thread.
     std::unique_lock<std::mutex> config_lock(guest_output_paint_config_mutex_);
     *paint_config_out = guest_output_paint_config_;
+    // These only change shader constants; keep effect/resource selection in
+    // the existing configuration while applying the live controls each paint.
+    paint_config_out->SetCasAdditionalSharpness(float(REXCVAR_GET(present_cas_additional_sharpness)));
+    paint_config_out->SetFsrSharpnessReduction(float(REXCVAR_GET(present_fsr_sharpness_reduction)));
+    paint_config_out->SetNisSharpness(float(REXCVAR_GET(present_nis_sharpness)));
+    paint_config_out->SetDither(REXCVAR_GET(present_dither));
   }
 
   // Lock the mutex to make sure the image that will be acquired now is owned
@@ -1582,7 +1611,17 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+  const int32_t limit = REXCVAR_GET(host_frame_limit);
+  if (!host_frame_limiter_.Allows(limit, PresentRateLimiter::Clock::now())) {
+    if (is_in_ui_thread_paint_ && !ui_drawers_.empty()) {
+      request_ui_paint_after_current_ui_thread_paint_ = true;
+    }
+    return PaintResult::kNotPresented;
+  }
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    host_frame_limiter_.NotePresent(limit, PresentRateLimiter::Clock::now());
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;

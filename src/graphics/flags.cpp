@@ -31,6 +31,12 @@ REXCVAR_DEFINE_BOOL(precise_interpolation, true, "GPU",
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                     "Convert float24 depth in pixel shader");
+REXCVAR_DEFINE_BOOL(vulkan_reverse_depth_range, true, "GPU/Vulkan",
+                    "Vulkan and the native renderer: a guest viewport with reversed depth gives "
+                    "the host viewport a reversed depth range; off: the vertex shader reverses "
+                    "Z instead and the range stays ascending, as on Direct3D 12 (diagnostic: "
+                    "depth precision of reversed-Z games)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(depth_transfer_not_equal_test, true, "GPU",
                     "Use not-equal test for depth transfer");
 REXCVAR_DEFINE_BOOL(gamma_render_target_as_unorm16, true, "GPU",
@@ -92,6 +98,31 @@ REXCVAR_DEFINE_BOOL(texture_point_snap, false, "GPU",
                     "Snap normalized point sampled 2D texture coordinates to texel centers. Fixes "
                     "texture seams in titles that use virtual textures, e.g. idTech 5, but may "
                     "cause rendering issues in other titles.");
+
+// Used by the SPIR-V translator's backends (xenos on Vulkan, native).
+REXCVAR_DEFINE_INT32(stacked_texture_layer_wrap, 0, "GPU",
+                     "Stacked textures (2D arrays) of at least this many layers whose fetch "
+                     "constant repeats on the layer axis wrap their layer coordinate (looping "
+                     "animations stored as layers) instead of clamping it to the first and last "
+                     "layer; 0: never (the SDK's clamp). Vulkan only")
+    .range(0, 64)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(clamp_relative_float_constants, true, "GPU",
+                    "Clamp the index of relatively addressed float constants (c[a0+N], "
+                    "c[aL+N]) to the 256 constants in translated shaders, so an index out of "
+                    "range can't read outside the constant buffer (on AMD a negative one hung "
+                    "the GPU on Direct3D 12). Off: the index as the shader computes it")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// Read by the xenos command processors (Vulkan, Direct3D 12) at each frame's
+// start. The native renderer always compares.
+REXCVAR_DEFINE_BOOL(gpu_elide_unchanged_registers, true, "GPU",
+                    "Shader constant writes (float, bool / loop, fetch) that leave a value as "
+                    "it was change nothing: games rewrite most constants with the values they "
+                    "already have, and each such write made the next draw upload the constant "
+                    "buffer again. Off: every write invalidates, as before")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 bool IsGpuDebugMarkersEnabled() {
   static bool cached = false;

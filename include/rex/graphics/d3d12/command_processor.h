@@ -207,7 +207,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   }
 
   // Returns the text to display in the GPU backend name in the window title.
-  std::string GetWindowTitleText() const;
+  std::string GetWindowTitleText() const override;
 
  protected:
   bool SetupContext() override;
@@ -533,6 +533,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool queue_operations_done_since_submission_signal_ = false;
 
   bool frame_open_ = false;
+  // gpu_elide_unchanged_registers, read when a frame opens.
+  bool elide_unchanged_registers_ = true;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;

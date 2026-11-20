@@ -136,6 +136,12 @@ class CommandProcessor {
   virtual bool Initialize();
   virtual void Shutdown();
 
+  // The backend's name in the window title (for example "Direct3D 12 - RTV/DSV"
+  // and the draw resolution scale). Empty: the graphics system's own name is
+  // shown. Virtual so a graphics system can ask any command processor, its own
+  // or a title plugin's (docs/gpu-plugins.md).
+  virtual std::string GetWindowTitleText() const { return std::string(); }
+
   void CallInThread(std::function<void()> fn);
 
   virtual void ClearCaches();
@@ -187,7 +193,21 @@ class CommandProcessor {
   void ExecutePacket(const void* data, uint32_t count);
   // Makes waits on registers or memory pass at once: what the guest would
   // have written during the wait isn't in a trace.
-  void set_trace_playback(bool trace_playback) { trace_playback_ = trace_playback; }
+  // trace_replay_draw_limit: the last draw a limited replay draws, its
+  // shaders, targets and textures, logged.
+  void LogTraceLimitDraw(uint32_t draw_index, reg::VGT_DRAW_INITIATOR vgt_draw_initiator);
+  void set_trace_playback(bool trace_playback) {
+    trace_playback_ = trace_playback;
+    if (trace_playback) {
+      trace_playback_draws_ = 0;
+    }
+  }
+  // Draws (not copies) the playback met, run or skipped by
+  // trace_replay_draw_limit.
+  uint32_t trace_playback_draws() const { return trace_playback_draws_; }
+  // occlusion_query_log: the replayed frame's occlusion query reports
+  // retired (and logged) before the replay ends, waiting for the GPU.
+  void RetireZPDReportsForTrace();
   virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
   void RestoreRegisters(uint32_t first_register, const uint32_t* values, uint32_t count);
   void RestoreGammaRamp(const reg::DC_LUT_30_COLOR* table_256_entry,
@@ -280,6 +300,14 @@ class CommandProcessor {
   virtual void OnGuestMemorySyncPoint() {}
   // For the upload statistics of frame_stats_interval.
   virtual SharedMemory* GetSharedMemoryForStats() const { return nullptr; }
+  // frame_stats_interval: adds what the renderer counted since the last call
+  // to `counters` and starts counting again (sets `reported`). Called at the
+  // end of each window, and once when the statistics are switched on to drop
+  // what came before. Command processor thread.
+  virtual void CollectRendererFrameCounters(RendererFrameCounters& counters) {}
+  // frame_stats_interval is on (as of the last swap): renderers time their
+  // command buffers on the graphics card only then.
+  bool frame_stats_enabled() const { return frame_stats_enabled_; }
 
   // TODO(boma): Add tracking for EVENT_WRITE_EXT reports.
   using ReportHandle = uint64_t;
@@ -313,6 +341,13 @@ class CommandProcessor {
     // For strict and async, when a report holds the D3D sentinel.
     // Only these are worth blocking a wait for.
     bool awaited = false;
+    // Retired without all of its host results (a deadline): the count has a
+    // floor of one sample.
+    bool forced = false;
+    // occlusion_query_log: when the event came (uptime in ms), and in a trace
+    // replay the draws before it.
+    uint64_t queued_ms = 0;
+    uint32_t trace_draws = 0;
   };
 
   static constexpr uint64_t kInvalidVIZGeneration = 0;
@@ -487,6 +522,8 @@ class CommandProcessor {
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool DispatchPacket(memory::RingBuffer* reader, uint32_t packet);
+  // DispatchPacket timing the packet for gpu_pm4_survey.
+  bool DispatchPacketSurveyed(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketTraced(memory::RingBuffer* reader, uint32_t packet);
   void OnTraceSwap();
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
@@ -664,6 +701,27 @@ class CommandProcessor {
   // frame_stats_interval: time between guest swaps.
   FrameStats frame_stats_;
   uint64_t frame_stats_last_swap_tick_ = 0;
+  bool frame_stats_enabled_ = false;
+  // The current frame's host ticks in IssueDraw and its draws, while on; its
+  // resolves (draws in the EDRAM copy mode) apart.
+  uint64_t frame_stats_draw_ticks_ = 0;
+  uint32_t frame_stats_draws_ = 0;
+  uint64_t frame_stats_copy_ticks_ = 0;
+  uint32_t frame_stats_copies_ = 0;
+  // The command processor thread waiting, not working: on an empty ring (for
+  // the guest to write commands) and in WAIT_REG_MEM (for a value the guest or
+  // its interrupt handler writes, usually the frame flip). Near zero while the
+  // frame is slower than the refresh: this thread is the critical path.
+  uint64_t frame_stats_idle_ticks_ = 0;
+  uint64_t frame_stats_wait_reg_ticks_ = 0;
+  // The ticks above (draws, resolves, waits) summed since the start, never
+  // reset: an indirect buffer spanning a swap still gets its share.
+  uint64_t frame_stats_busy_ticks_total_ = 0;
+  // gpu_indirect_buffer_survey (doc 21 Q11).
+  IndirectBufferSurvey indirect_buffer_survey_;
+  // gpu_pm4_survey (doc 21 NV1): set at swaps while frame_stats_interval is on.
+  bool pm4_survey_active_ = false;
+  Pm4PacketSurvey pm4_survey_;
 
   // The retired counter advances as intervals retire. The speculative counter
   // tracks the latest queued report so fast modes can monotonically write
@@ -678,6 +736,19 @@ class CommandProcessor {
 
   // Uptime in ms when the current retire backstop was armed.
   uint64_t zpd_pending_retire_start_ms_ = 0;
+
+  // occlusion_query_log: a retired report logged (2), or counted into the
+  // summary logged every few seconds (1).
+  void LogRetiredZPDReport(const ZPDReport& report);
+  struct ZPDLogStats {
+    uint64_t window_start_ms = 0;
+    uint32_t reports = 0;
+    uint32_t zero = 0;
+    uint32_t forced = 0;
+    uint64_t lag_sum_ms = 0;
+    uint64_t lag_max_ms = 0;
+  };
+  ZPDLogStats zpd_log_stats_;
 
   // Set by the backend when resolution scale changes.
   uint32_t zpd_draw_resolution_scale_x_ = 1;
@@ -712,6 +783,13 @@ class CommandProcessor {
   uint32_t read_ptr_index_ = 0;
   uint32_t read_ptr_update_freq_ = 0;
   uint32_t read_ptr_writeback_ptr_ = 0;
+  // Set by EnableReadPointerWriteBack (a guest thread): the worker writes the
+  // read pointer back at once, so the title sees the consumer's position
+  // before the next burst (upstream rexglue PR #588).
+  std::atomic<bool> read_ptr_writeback_publish_{false};
+  // Writes read_ptr_index_ to the write-back address, if one is set. Worker
+  // thread only.
+  void PublishReadPointer();
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
   // Set after each guest vblank interrupt: WAIT_REG_MEM sleeps on it, so a value
@@ -739,6 +817,7 @@ class CommandProcessor {
   std::filesystem::path trace_frame_path_;
   bool trace_swap_executed_ = false;
   bool trace_playback_ = false;
+  uint32_t trace_playback_draws_ = 0;
   std::vector<uint32_t> trace_packet_;
 
   bool paused_ = false;

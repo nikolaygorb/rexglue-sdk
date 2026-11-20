@@ -14,6 +14,7 @@
 #include <mutex>
 
 #include <rex/chrono/clock.h>
+#include <rex/chrono/guest_tick_accumulator.h>
 #include <rex/cvar.h>
 #include <rex/math.h>
 
@@ -35,11 +36,9 @@ uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
 // Computed by RecomputeGuestTickScalar.
 std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
 
-// Native guest ticks.
-uint64_t last_guest_tick_count_ = 0;
-// Last sampled host tick count.
-uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
-// Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
+// Native guest ticks, from the last sampled host tick count.
+GuestTickAccumulator guest_ticks_{Clock::QueryHostTickCount()};
+// Mutex to keep guest_ticks_ consistent.
 std::mutex tick_mutex_;
 
 void RecomputeGuestTickScalar() {
@@ -59,6 +58,8 @@ void RecomputeGuestTickScalar() {
 
   std::lock_guard<std::mutex> lock(tick_mutex_);
   guest_tick_ratio_ = frac;
+  // The remainder is in units of the old denominator.
+  guest_ticks_.remainder = 0;
 }
 
 // Update the guest timer for all threads.
@@ -73,18 +74,14 @@ uint64_t UpdateGuestClock() {
 
   std::unique_lock<std::mutex> lock(tick_mutex_, std::defer_lock);
   if (lock.try_lock()) {
-    // Translate host tick count to guest tick count.
-    uint64_t host_tick_delta =
-        host_tick_count > last_host_tick_count_ ? host_tick_count - last_host_tick_count_ : 0;
-    last_host_tick_count_ = host_tick_count;
-    uint64_t guest_tick_delta =
-        host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
-    last_guest_tick_count_ += guest_tick_delta;
-    return last_guest_tick_count_;
+    // Translate host tick count to guest tick count, only forwards (see
+    // GuestTickAccumulator).
+    return guest_ticks_.Advance(host_tick_count, guest_tick_ratio_.first,
+                                guest_tick_ratio_.second);
   } else {
     // Wait until another thread has finished updating the clock.
     lock.lock();
-    return last_guest_tick_count_;
+    return guest_ticks_.guest_ticks;
   }
 }
 
@@ -200,6 +197,16 @@ uint32_t Clock::ScaleGuestDurationMillis(uint32_t guest_ms) {
   uint64_t scaled_ms =
       static_cast<uint64_t>((static_cast<uint64_t>(guest_ms) * guest_time_scalar_));
   return static_cast<uint32_t>(std::min(scaled_ms, max));
+}
+
+uint64_t Clock::ScaleGuestDurationMicros(uint64_t guest_us) {
+  if (REXCVAR_GET(clock_no_scaling) || !guest_us) {
+    return guest_us;
+  }
+  // Half the range, so the double -> integer conversion can't overflow.
+  constexpr uint64_t max = std::numeric_limits<uint64_t>::max() / 2;
+  const double scaled_us = static_cast<double>(guest_us) * guest_time_scalar_;
+  return scaled_us >= static_cast<double>(max) ? max : static_cast<uint64_t>(scaled_us);
 }
 
 int64_t Clock::ScaleGuestDurationFileTime(int64_t guest_file_time) {

@@ -21,6 +21,7 @@
 #include <utf8.h>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -565,7 +566,9 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
 
 void WindowSDL::HandleDropEvent(SDL_Event& event) {
   WindowDestructionReceiver destruction_receiver(this);
-  FileDropEvent e(this, std::filesystem::path(event.drop.data));
+  // SDL gives UTF-8; a narrow path converts through the ANSI code page on
+  // Windows and mangles (or throws on) other names.
+  FileDropEvent e(this, rex::to_path(event.drop.data ? event.drop.data : ""));
   OnFileDrop(e, destruction_receiver);
 }
 

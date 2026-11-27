@@ -29,6 +29,8 @@ are only seen as they were at the start of that frame.
 | `trace_replay_reference` | `""` (no comparison) | Reference PNG to compare the frame with. |
 | `trace_replay_tolerance` | 2 | How much red, green or blue may differ (0 to 255) before a pixel counts as different. |
 | `trace_replay_max_different_percent` | 0 | Share of different pixels, in percent, still accepted as a match. |
+| `trace_replay_edram` | `true` | Restores the EDRAM the frame started with (what the previous frame left). `false` starts with it empty: for comparing with a renderer that can't restore it (the native renderer). |
+| `trace_replay_draw_limit` | -1 (all) | Draws only the first N draws of the frame; copies, clears and the swap still run. The N-th draw is logged with its shaders, render targets and textures. For finding where two renderers start to differ (below). |
 
 All of them except `bind_gpu_trace` are read at start.
 
@@ -93,6 +95,49 @@ the log names both versions); record them again.
 ## Finding a wrong value in a shader
 
 On Vulkan, the `shader_bisect_*` settings ([graphics-options.md](graphics-options.md), "Debugging") make one pixel shader write a register to its color instead of its result. Replaying the same trace with `shader_bisect_instruction` moved step by step shows in the saved frame where the value goes wrong; `shader_bisect_probe` marks NaN, infinite or large values, which an 8-bit image would hide. The replay's log names the shader and the instruction count.
+
+## Finding the first draw that differs
+
+When a renderer draws a trace differently from another (a plugin against `xenos`, or one
+backend against another), `tools/gpu_traces/bisect_draws.py` finds the first draw after
+which the two frames differ:
+
+```
+python tools/gpu_traces/bisect_draws.py game.exe D:/traces/frame.xtr -- --gpu_plugin=native
+```
+
+It replays the trace with `trace_replay_draw_limit` on both, doubling the limit until the
+frames differ or the frame's draws end (the count comes from the game's newest log in
+`logs` next to the executable), then halving the range; about twice the base-2 logarithm of the frame's
+draws in replays of each renderer. Arguments after `--` go to the tested renderer;
+`--reference` sets the reference's (default `--gpu_plugin=xenos`). `--tolerance` and
+`--max-percent` (default 2 and 0.05) set how different a frame may be and still match.
+Both replays start with an empty EDRAM (`trace_replay_edram = false`): with no draw a
+renderer that restores it shows the previous frame, one that can't a black one. Pass
+`--keep-edram` when both restore it. Both run at `resolution_scale = 1` whatever the
+game's configuration has (`--scale` sets another). A small difference (an edge, a thin line) stops the
+search before a large one; raise `--max-percent` to skip past it. `--at N` replays both
+with N draws and compares, with no search.
+
+It prints the first differing draw. The game log of the last replay (the tested
+renderer at that limit) names it: "GPU trace: draw limit", with its vertex and pixel
+shaders (the hashes `dump_shaders` and `shader_bisect_ps_hash` use), render targets and
+the fetch constants of its textures. The two frames are kept as
+`<trace>.bisect.reference.png` and `<trace>.bisect.tested.png`.
+
+A draw into a render target the frame shows only later (a shadow map, a lighting buffer)
+changes the picture only when a later draw reads it: the draw found is then that reader,
+and its textures point to the target that differs.
+
+## Comparing occlusion query results
+
+A frame's visibility queries (lens flares, glares, culling) are in the trace with the
+draws they count, but their results show only in later frames, so the saved picture
+doesn't show them. With `occlusion_query_log = 2` a replay logs every result of the frame
+in order, with the draws before it ("Occlusion query log: report N at ADDRESS: S samples
+passed ..., D draws of the trace before it"), and waits for all of them before it exits.
+Replaying the trace on two renderers and comparing those lines shows the first query
+counted differently; `bisect_draws.py --at D` then names the draw just before it.
 
 ## Checking many traces
 

@@ -168,6 +168,13 @@ class FunctionNode {
   bool sharesRegisters() const { return sharesRegisters_; }
   void setSharesRegisters(bool val) { sharesRegisters_ = val; }
 
+  // Keeps its own non-volatiles in ctx under non_volatile_as_local /
+  // non_volatile_gpr_as_local, without its callers syncing anything: it calls
+  // setjmp (a longjmp back restores ctx, not C++ locals), or it is a save or
+  // restore helper (its body must work for the callers that keep theirs in ctx).
+  bool keepsNonVolatilesInContext() const { return sharesRegisters_ || keepsNonVolatiles_; }
+  void setKeepsNonVolatiles(bool val) { keepsNonVolatiles_ = val; }
+
  private:
   //=========================================================================
   // Mutation methods - only FunctionGraph can call these
@@ -210,6 +217,7 @@ class FunctionNode {
   FunctionState state_ = FunctionState::kRegistered;
   bool hasExceptionHandler_ = false;
   bool sharesRegisters_ = false;
+  bool keepsNonVolatiles_ = false;
 
   // Populated at discover()
   std::vector<Block> blocks_;

@@ -12,6 +12,12 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
+#include <iterator>
+#include <string>
+
+#include <fmt/format.h>
+
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -137,6 +143,21 @@ void RtlRaiseException_entry(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
       return;
     }
   }
+
+  // No guest exception dispatch: name the exception before the break, as its
+  // code and parameters are often all that says why (a guest heap out of
+  // memory raises STATUS_NO_MEMORY, for one). Upstream rexglue PR #607.
+  const uint32_t count = std::min<uint32_t>(
+      record->number_parameters, static_cast<uint32_t>(std::size(record->exception_information)));
+  std::string parameters;
+  for (uint32_t i = 0; i < count; ++i) {
+    parameters += fmt::format("{}{:08X}", i ? " " : "",
+                              static_cast<uint32_t>(record->exception_information[i]));
+  }
+  REXKRNL_ERROR("RtlRaiseException: code {:08X}, flags {:08X}, address {:08X}, parameters [{}]",
+                static_cast<uint32_t>(record->code),
+                static_cast<uint32_t>(record->exception_flags),
+                static_cast<uint32_t>(record->exception_address), parameters);
 
   // TODO(benvanik): unwinding.
   // This is going to suck.

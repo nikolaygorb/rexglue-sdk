@@ -55,41 +55,29 @@ bool build_fcfid(BuilderContext& ctx) {
 
 bool build_fctid(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.println(
-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
-      "({1}.f64 >= double(LLONG_MAX)) ? LLONG_MAX : "
-      "simde_mm_cvtsd_si64(simde_mm_load_sd(&{1}.f64));",
-      ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
+  ctx.println("\t{}.s64 = rex::ppc::fp_to_int64({}.f64);", ctx.f(ctx.insn.operands[0]),
+              ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
 bool build_fctidz(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.println(
-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
-      "({1}.f64 >= double(LLONG_MAX)) ? LLONG_MAX : "
-      "simde_mm_cvttsd_si64(simde_mm_load_sd(&{1}.f64));",
-      ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
+  ctx.println("\t{}.s64 = rex::ppc::fp_to_int64_truncate({}.f64);", ctx.f(ctx.insn.operands[0]),
+              ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
 bool build_fctiw(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.println(
-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
-      "({1}.f64 >= double(INT_MAX)) ? INT_MAX : "
-      "simde_mm_cvtsd_si32(simde_mm_load_sd(&{1}.f64));",
-      ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
+  ctx.println("\t{}.s64 = rex::ppc::fp_to_int32({}.f64);", ctx.f(ctx.insn.operands[0]),
+              ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
 bool build_fctiwz(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.println(
-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
-      "({1}.f64 >= double(INT_MAX)) ? INT_MAX : "
-      "simde_mm_cvttsd_si32(simde_mm_load_sd(&{1}.f64));",
-      ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
+  ctx.println("\t{}.s64 = rex::ppc::fp_to_int32_truncate({}.f64);", ctx.f(ctx.insn.operands[0]),
+              ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
@@ -122,22 +110,40 @@ bool build_fcmpo(BuilderContext& ctx) {
 // Addition
 //=============================================================================
 
-bool build_fadd(BuilderContext& ctx) {
+// fadd, fsub, fmul and fdiv, with the NaN results of rex::ppc::fp_nan_result.
+static void emit_fp_double_arithmetic(BuilderContext& ctx, char op) {
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = {}.f64 + {}.f64;", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+  const auto a = ctx.f(ctx.insn.operands[1]);
+  const auto b = ctx.f(ctx.insn.operands[2]);
+  ctx.println("\t{0}.f64 = rex::ppc::fp_nan_result({1}.f64 {3} {2}.f64, {1}.f64, {2}.f64);",
+              ctx.f(ctx.insn.operands[0]), a, b, op);
+}
+
+bool build_fadd(BuilderContext& ctx) {
+  emit_fp_double_arithmetic(ctx, '+');
   return true;
 }
 
 // The single-precision arithmetic of fadds, fsubs and fmuls: a denormal
-// operand answers with the default QNaN (rex::ppc::fp_single_denormal_operand).
+// operand answers with the default QNaN (rex::ppc::fp_single_denormal_operand)
+// and raises nothing, so the arithmetic of the other path is kept behind the
+// branch (rex::ppc::fp_opaque). The NaN result is worked out before rounding:
+// a NaN operand loses the low bits of its fraction, as on the hardware.
 static void emit_fp_single_arithmetic(BuilderContext& ctx, char op) {
   ctx.emit_set_flush_mode(false);
   const auto a = ctx.f(ctx.insn.operands[1]);
   const auto b = ctx.f(ctx.insn.operands[2]);
+  if (!ctx.config().singleDenormalOperandQuirk) {
+    ctx.println(
+        "\t{0}.f64 = double(float(rex::ppc::fp_nan_result({1}.f64 {3} {2}.f64, {1}.f64, "
+        "{2}.f64)));",
+        ctx.f(ctx.insn.operands[0]), a, b, op);
+    return;
+  }
   ctx.println(
       "\t{0}.f64 = rex::ppc::fp_single_denormal_operand({1}.f64, {2}.f64) ? "
-      "rex::ppc::kFpDefaultQNaN : double(float({1}.f64 {3} {2}.f64));",
+      "rex::ppc::kFpDefaultQNaN : double(float(rex::ppc::fp_nan_result("
+      "rex::ppc::fp_opaque({1}.f64) {3} {2}.f64, {1}.f64, {2}.f64)));",
       ctx.f(ctx.insn.operands[0]), a, b, op);
 }
 
@@ -151,9 +157,7 @@ bool build_fadds(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_fsub(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = {}.f64 - {}.f64;", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+  emit_fp_double_arithmetic(ctx, '-');
   return true;
 }
 
@@ -167,9 +171,7 @@ bool build_fsubs(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_fmul(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = {}.f64 * {}.f64;", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+  emit_fp_double_arithmetic(ctx, '*');
   return true;
 }
 
@@ -183,9 +185,7 @@ bool build_fmuls(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_fdiv(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = {}.f64 / {}.f64;", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+  emit_fp_double_arithmetic(ctx, '/');
   return true;
 }
 
@@ -194,9 +194,16 @@ bool build_fdivs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
   const auto a = ctx.f(ctx.insn.operands[1]);
   const auto b = ctx.f(ctx.insn.operands[2]);
+  if (!ctx.config().singleDenormalOperandQuirk) {
+    ctx.println(
+        "\t{0}.f64 = double(float(rex::ppc::fp_nan_result({1}.f64 / {2}.f64, {1}.f64, {2}.f64)));",
+        ctx.f(ctx.insn.operands[0]), a, b);
+    return true;
+  }
   ctx.println(
       "\t{0}.f64 = rex::ppc::fp_single_denormal_operand({1}.f64, {2}.f64) ? {1}.f64 / {2}.f64 "
-      ": double(float({1}.f64 / {2}.f64));",
+      ": double(float(rex::ppc::fp_nan_result(rex::ppc::fp_opaque({1}.f64) / {2}.f64, {1}.f64, "
+      "{2}.f64)));",
       ctx.f(ctx.insn.operands[0]), a, b);
   return true;
 }
@@ -214,11 +221,17 @@ static void emit_fp_madd(BuilderContext& ctx, bool subtract, bool negate, bool s
   const auto a = ctx.f(ctx.insn.operands[1]);
   const auto c = ctx.f(ctx.insn.operands[2]);
   const auto b = ctx.f(ctx.insn.operands[3]);
+  // The single forms keep the multiply-add behind the branch of the denormal
+  // operand (see emit_fp_single_arithmetic).
+  const bool quirk = single && ctx.config().singleDenormalOperandQuirk;
   const auto result = fmt::format(
-      "rex::ppc::fp_madd_result(rex::ppc::fp_fma({0}.f64, {1}.f64, {2}{3}.f64), {0}.f64, "
+      "rex::ppc::fp_madd_result(rex::ppc::fp_fma({5}, {1}.f64, {2}{3}.f64), {0}.f64, "
       "{3}.f64, {1}.f64, {4})",
-      a, c, subtract ? "-" : "", b, negate ? "true" : "false");
-  if (single) {
+      a, c, subtract ? "-" : "", b, negate ? "true" : "false",
+      quirk ? fmt::format("rex::ppc::fp_opaque({}.f64)", a) : fmt::format("{}.f64", a));
+  if (single && !quirk) {
+    ctx.println("\t{}.f64 = double(float({}));", d, result);
+  } else if (single) {
     // A denormal operand answers with the default QNaN.
     ctx.println(
         "\t{}.f64 = rex::ppc::fp_single_denormal_operand({}.f64, {}.f64, {}.f64) ? "
@@ -273,23 +286,27 @@ bool build_fnmsubs(BuilderContext& ctx) {
 // Reciprocal and Square Root
 //=============================================================================
 
+// The console's estimates, with the flags its FPU raises (rex::ppc::fp_fres,
+// rex::ppc::fp_frsqrte; tables in rex/ppc/estimates.h).
 bool build_fres(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float(1.0 / {}.f64));", ctx.f(ctx.insn.operands[0]),
+  ctx.println("\t{}.f64 = rex::ppc::fp_fres({}.f64);", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
 bool build_frsqrte(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = double(float(1.0 / sqrt({}.f64)));", ctx.f(ctx.insn.operands[0]),
+  ctx.println("\t{}.f64 = rex::ppc::fp_frsqrte({}.f64);", ctx.f(ctx.insn.operands[0]),
               ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
+// rex::ppc::fp_sqrt: the host instruction, not the C library's sqrt.
 bool build_fsqrt(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = sqrt({}.f64);", ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
+  ctx.println("\t{0}.f64 = rex::ppc::fp_nan_result(rex::ppc::fp_sqrt({1}.f64), {1}.f64);",
+              ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
   return true;
 }
 
@@ -297,9 +314,16 @@ bool build_fsqrts(BuilderContext& ctx) {
   // A denormal operand keeps the double root, not rounded to single.
   ctx.emit_set_flush_mode(false);
   const auto b = ctx.f(ctx.insn.operands[1]);
+  if (!ctx.config().singleDenormalOperandQuirk) {
+    ctx.println(
+        "\t{0}.f64 = double(float(rex::ppc::fp_nan_result(rex::ppc::fp_sqrt({1}.f64), {1}.f64)));",
+        ctx.f(ctx.insn.operands[0]), b);
+    return true;
+  }
   ctx.println(
-      "\t{0}.f64 = rex::ppc::fp_single_denormal_operand({1}.f64) ? sqrt({1}.f64) : "
-      "double(float(sqrt({1}.f64)));",
+      "\t{0}.f64 = rex::ppc::fp_single_denormal_operand({1}.f64) ? rex::ppc::fp_sqrt({1}.f64) : "
+      "double(float(rex::ppc::fp_nan_result(rex::ppc::fp_sqrt(rex::ppc::fp_opaque({1}.f64)), "
+      "{1}.f64)));",
       ctx.f(ctx.insn.operands[0]), b);
   return true;
 }
@@ -308,11 +332,13 @@ bool build_fsqrts(BuilderContext& ctx) {
 // Selection
 //=============================================================================
 
+// A selection by the bits of A (rex::ppc::fp_select_nonnegative): fsel raises
+// no exception, not even for an SNaN, and copies C or B as they are. No
+// arithmetic, so no flush mode switch.
 bool build_fsel(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f64 = {}.f64 >= 0.0 ? {}.f64 : {}.f64;", ctx.f(ctx.insn.operands[0]),
-              ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
-              ctx.f(ctx.insn.operands[3]));
+  ctx.println("\t{}.u64 = rex::ppc::fp_select_nonnegative({}.f64) ? {}.u64 : {}.u64;",
+              ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]),
+              ctx.f(ctx.insn.operands[2]), ctx.f(ctx.insn.operands[3]));
   return true;
 }
 

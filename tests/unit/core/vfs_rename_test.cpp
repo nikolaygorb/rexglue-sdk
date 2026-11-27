@@ -12,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/filesystem/devices/host_path_device.h>
+#include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/entry.h>
 
 using rex::X_STATUS;
@@ -38,11 +39,26 @@ TEST_CASE("Host path entry moves into the directory it is renamed into", "[files
   const std::filesystem::path& dir = temporary.path;
   REQUIRE(std::filesystem::create_directories(dir / "pack"));
   std::ofstream(dir / "temp.bin") << "data";
+  std::filesystem::create_directories(dir / "tree" / "nested");
+  std::ofstream(dir / "tree" / "nested" / "leaf.bin") << "leaf";
 
   HostPathDevice device("\\Device\\Test", dir, false);
   REQUIRE(device.Initialize());
   Entry* entry = device.ResolvePath("temp.bin");
   REQUIRE(entry != nullptr);
+
+  SECTION("cached descendants follow a renamed directory") {
+    Entry* tree = device.ResolvePath("tree");
+    Entry* leaf = device.ResolvePath("tree\\nested\\leaf.bin");
+    REQUIRE(tree);
+    REQUIRE(leaf);
+    REQUIRE(tree->Rename("cache:\\pack\\moved") == X_STATUS_SUCCESS);
+    CHECK(leaf->path() == "pack\\moved\\nested\\leaf.bin");
+    auto* host_leaf = dynamic_cast<rex::filesystem::HostPathEntry*>(leaf);
+    REQUIRE(host_leaf);
+    CHECK(host_leaf->host_path() == dir / "pack" / "moved" / "nested" / "leaf.bin");
+    CHECK(std::filesystem::exists(host_leaf->host_path()));
+  }
 
   SECTION("into an existing directory") {
     REQUIRE(entry->Rename("cache:\\pack\\item.arc") == X_STATUS_SUCCESS);

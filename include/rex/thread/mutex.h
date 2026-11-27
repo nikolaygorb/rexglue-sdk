@@ -12,6 +12,7 @@
 #pragma once
 
 #include <mutex>
+#include <cstdint>
 
 namespace rex::thread {
 
@@ -56,6 +57,10 @@ namespace rex::thread {
 class global_critical_region {
  public:
   static std::recursive_mutex& mutex();
+
+  // Recursive acquisitions made by generated guest interrupts-off sections.
+  // Kernel RAII locks are deliberately not included.
+  static uint32_t& guest_depth();
 
   // Acquires a lock on the global critical section.
   // Use this when keeping an instance is not possible. Otherwise, prefer

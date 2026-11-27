@@ -5378,6 +5378,28 @@ int decode_insn_ppc(bfd_vma memaddr, disassemble_info* info, ppc_insn* oinsn)
     return decode_insn_powerpc(memaddr, info, 1, dialect, oinsn);
 }
 
+int ppc_operand_gpr_kind(const powerpc_opcode* opcode, int index)
+{
+    const struct powerpc_operand* operand;
+    int i;
+
+    if (opcode == NULL || index < 0 || index >= 8)
+        return 0;
+    for (i = 0; i <= index; i++)
+    {
+        if (opcode->operands[i] == 0)
+            return 0;
+    }
+    operand = &powerpc_operands[opcode->operands[index]];
+    if ((operand->flags & PPC_OPERAND_FAKE) != 0)
+        return 0;
+    if ((operand->flags & PPC_OPERAND_GPR) != 0)
+        return 1;
+    if ((operand->flags & PPC_OPERAND_GPR_0) != 0)
+        return 2;
+    return 0;
+}
+
 /* Qemu default */
 int
 print_insn_ppc(bfd_vma memaddr, struct disassemble_info* info)

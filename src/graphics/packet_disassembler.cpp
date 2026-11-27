@@ -10,6 +10,7 @@
  */
 
 #include <rex/graphics/packet_disassembler.h>
+#include <rex/graphics/title_scene.h>
 #include <rex/graphics/xenos.h>
 
 namespace rex::graphics {
@@ -202,12 +203,26 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr, uint32_t pac
       uint32_t value = memory::load_and_swap<uint32_t>(ptr + 8);
       break;
     }
+    case PM4_EVENT_WRITE_CFL: {
+      // generate a cache flush done event (same layout as SHD)
+      static const PacketTypeInfo op_info = {PacketCategory::kGeneric, "PM4_EVENT_WRITE_CFL"};
+      out_info->type_info = &op_info;
+      uint32_t initiator = memory::load_and_swap<uint32_t>(ptr + 0);
+      uint32_t address = memory::load_and_swap<uint32_t>(ptr + 4);
+      uint32_t value = memory::load_and_swap<uint32_t>(ptr + 8);
+      break;
+    }
     case PM4_EVENT_WRITE_EXT: {
       // generate a screen extent event
       static const PacketTypeInfo op_info = {PacketCategory::kGeneric, "PM4_EVENT_WRITE_EXT"};
       out_info->type_info = &op_info;
       uint32_t unk0 = memory::load_and_swap<uint32_t>(ptr + 0);
       uint32_t unk1 = memory::load_and_swap<uint32_t>(ptr + 4);
+      break;
+    }
+    case title::kSceneOpcode: {
+      static const PacketTypeInfo info = {PacketCategory::kGeneric, "TITLE_SCENE"};
+      out_info->type_info = &info;
       break;
     }
     case PM4_DRAW_INDX: {

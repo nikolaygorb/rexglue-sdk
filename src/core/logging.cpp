@@ -31,6 +31,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/logging/async_sink.h>
 #include <rex/platform.h>
 #include <rex/platform/env.h>
 
@@ -53,6 +54,9 @@ REXCVAR_DEFINE_BOOL(log_verbose, false, "Log", "Enable verbose logging (sets lev
 
 REXCVAR_DEFINE_BOOL(log_noisy, false, "Log", "Enable noisy/high-frequency log macros");
 
+REXCVAR_DEFINE_BOOL(log_async, true, "Log", "Write the log file on a background thread")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in seconds (0 = off)")
     .range(0, 60)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -71,6 +75,8 @@ namespace {
 std::vector<LogCategoryEntry> g_registry;
 spdlog::sink_ptr g_console_sink;
 spdlog::sink_ptr g_file_sink;
+// The file sink's path, absolute (CurrentLogFilePath).
+std::filesystem::path g_log_file_path;
 spdlog::sink_ptr g_early_sink;
 
 // spdlog's file sinks take narrow names, which Windows opens in the ANSI code
@@ -388,9 +394,17 @@ void InitLogging(const LogConfig& config) {
   }
   if (!resolved_path.empty()) {
     auto sink = CreateFileSink(resolved_path, config.file_max_bytes);
+    if (REXCVAR_GET(log_async)) {
+      sink = std::make_shared<AsyncFileSink>(std::move(sink));
+    }
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;
+    std::error_code absolute_error;
+    g_log_file_path = std::filesystem::absolute(resolved_path, absolute_error);
+    if (absolute_error) {
+      g_log_file_path = resolved_path;
+    }
   }
 
   g_extra_sinks = config.extra_sinks;
@@ -427,6 +441,7 @@ void InitLogging(std::filesystem::path log_file, spdlog::level::level_enum level
 }
 
 void ShutdownLogging() {
+  DrainLogging(1000);
   std::lock_guard lock(g_mutex);
   if (!g_initialized && !g_early_initialized)
     return;
@@ -439,10 +454,16 @@ void ShutdownLogging() {
   g_registry.clear();
   g_console_sink.reset();
   g_file_sink.reset();
+  g_log_file_path.clear();
   g_early_sink.reset();
   g_extra_sinks.clear();
   g_initialized = false;
   g_early_initialized = false;
+}
+
+std::filesystem::path CurrentLogFilePath() {
+  std::lock_guard lock(g_mutex);
+  return g_log_file_path;
 }
 
 void FlushLogging() {
@@ -450,6 +471,18 @@ void FlushLogging() {
   for (auto& entry : g_registry)
     if (entry.logger)
       entry.logger->flush();
+  if (auto async = std::dynamic_pointer_cast<AsyncFileSink>(g_file_sink)) {
+    async->Drain(std::chrono::seconds(1));
+  }
+}
+
+bool DrainLogging(uint32_t timeout_ms) {
+  std::shared_ptr<AsyncFileSink> async;
+  {
+    std::lock_guard lock(g_mutex);
+    async = std::dynamic_pointer_cast<AsyncFileSink>(g_file_sink);
+  }
+  return !async || async->Drain(std::chrono::milliseconds(timeout_ms));
 }
 
 LogCategoryId RegisterLogCategory(const char* name) {

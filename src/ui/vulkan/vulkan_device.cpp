@@ -10,10 +10,15 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -21,6 +26,9 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/frame_generation.h>
+#include <rex/ui/vulkan/ngx.h>
+#include <rex/ui/vulkan/xess.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -41,6 +49,9 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/V
                     "allow fallback to solid fill for line/point polygon modes)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DECLARE(bool, gpu_device_lost_breadcrumbs);
+REXCVAR_DECLARE(bool, gpu_device_lost_setup_breadcrumbs);
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -58,6 +69,216 @@ struct VulkanFeatures {
     device_create_info.pNext = &enabled;
   }
 };
+
+namespace {
+// Feature structures: sType, pNext, then VkBool32 only. Sizes of those another
+// library's chain may hold, and of the device's own (for ORing into them).
+size_t FeatureStructSize(VkStructureType type) {
+  switch (type) {
+#define XE_UI_VULKAN_FEATURE_SIZE(type_name, structure) \
+  case type_name:                                       \
+    return sizeof(structure);
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, VkPhysicalDeviceVulkan11Features)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, VkPhysicalDeviceVulkan12Features)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, VkPhysicalDeviceVulkan13Features)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT,
+                              VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+                              VkPhysicalDeviceShaderFloat16Int8Features)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES,
+                              VkPhysicalDeviceShaderIntegerDotProductFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, VkPhysicalDevice8BitStorageFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES, VkPhysicalDevice16BitStorageFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES,
+                              VkPhysicalDeviceSubgroupSizeControlFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES,
+                              VkPhysicalDeviceScalarBlockLayoutFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_EXTENDED_TYPES_FEATURES,
+                              VkPhysicalDeviceShaderSubgroupExtendedTypesFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+                              VkPhysicalDeviceDescriptorIndexingFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+                              VkPhysicalDeviceTimelineSemaphoreFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
+                              VkPhysicalDeviceBufferDeviceAddressFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
+                              VkPhysicalDeviceSynchronization2Features)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES,
+                              VkPhysicalDeviceHostQueryResetFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+                              VkPhysicalDeviceDynamicRenderingFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES,
+                              VkPhysicalDeviceShaderDemoteToHelperInvocationFeatures)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR,
+                              VkPhysicalDevicePortabilitySubsetFeaturesKHR)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT,
+                              VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT,
+                              VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR,
+                              VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT,
+                              VkPhysicalDeviceCustomBorderColorFeaturesEXT)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+                              VkPhysicalDeviceRobustness2FeaturesEXT)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+                              VkPhysicalDeviceConditionalRenderingFeaturesEXT)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT,
+                              VkPhysicalDeviceDepthBiasControlFeaturesEXT)
+    XE_UI_VULKAN_FEATURE_SIZE(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+                              VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR)
+#undef XE_UI_VULKAN_FEATURE_SIZE
+    default:
+      return 0;
+  }
+}
+
+// Adds another library's required feature chain (Intel XeSS's) to a device's
+// create info: its VkBool32s ORed into the structures already chained, or into
+// their Vulkan 1.2/1.3 promotions there (a promoted structure next to its
+// VkPhysicalDeviceVulkan1xFeatures is invalid), other structures copied and
+// chained. Undo restores the create info (a device that fails with them).
+class FeatureChainAddition {
+ public:
+  bool Add(const void* chain, VkPhysicalDeviceFeatures& features, VkDeviceCreateInfo& info,
+           std::string& reason) {
+    next_ = info.pNext;
+    added_ = true;
+    for (auto* s = static_cast<const VkBaseInStructure*>(chain); s; s = s->pNext) {
+      if (s->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 && !FeatureStructSize(s->sType)) {
+        reason = fmt::format("unknown feature structure (sType {})", uint32_t(s->sType));
+        return false;
+      }
+    }
+    for (auto* s = static_cast<const VkBaseInStructure*>(chain); s; s = s->pNext) {
+      if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+        const auto& from = reinterpret_cast<const VkPhysicalDeviceFeatures2*>(s)->features;
+        OrBools(&features.robustBufferAccess, &from.robustBufferAccess,
+                sizeof(VkPhysicalDeviceFeatures) / sizeof(VkBool32));
+        continue;
+      }
+      if (Promote(s, info)) continue;
+      if (VkBaseOutStructure* own = Find(info, s->sType)) {
+        OrBools(Bools(own), Bools(s), Count(s->sType));
+        continue;
+      }
+      const size_t size = FeatureStructSize(s->sType);
+      auto& copy = copies_.emplace_back((size + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+      std::memcpy(copy.data(), s, size);
+      auto* chained = reinterpret_cast<VkBaseOutStructure*>(copy.data());
+      chained->pNext = static_cast<VkBaseOutStructure*>(const_cast<void*>(info.pNext));
+      info.pNext = chained;
+    }
+    return true;
+  }
+  // Without an Add (its library's requirements unavailable): nothing to undo.
+  void Undo(VkDeviceCreateInfo& info) {
+    if (!added_) return;
+    added_ = false;
+    for (auto it = changed_.rbegin(); it != changed_.rend(); ++it) *it->first = it->second;
+    changed_.clear();
+    info.pNext = next_;
+    copies_.clear();
+  }
+
+ private:
+  static VkBaseOutStructure* Find(VkDeviceCreateInfo& info, VkStructureType type) {
+    for (auto* s = static_cast<VkBaseOutStructure*>(const_cast<void*>(info.pNext)); s; s = s->pNext)
+      if (s->sType == type) return s;
+    return nullptr;
+  }
+  static VkBool32* Bools(VkBaseOutStructure* s) {
+    return reinterpret_cast<VkBool32*>(reinterpret_cast<uint8_t*>(s) + sizeof(VkBaseOutStructure));
+  }
+  static const VkBool32* Bools(const VkBaseInStructure* s) {
+    return reinterpret_cast<const VkBool32*>(reinterpret_cast<const uint8_t*>(s) +
+                                             sizeof(VkBaseInStructure));
+  }
+  static size_t Count(VkStructureType type) {
+    return (FeatureStructSize(type) - sizeof(VkBaseOutStructure)) / sizeof(VkBool32);
+  }
+  void Or(VkBool32& to, VkBool32 from) {
+    if (from && !to) {
+      changed_.emplace_back(&to, to);
+      to = VK_TRUE;
+    }
+  }
+  void OrBools(VkBool32* to, const VkBool32* from, size_t count) {
+    for (size_t i = 0; i < count; ++i) Or(to[i], from[i]);
+  }
+  // Into VkPhysicalDeviceVulkan12/13Features when the device chains them.
+  bool Promote(const VkBaseInStructure* s, VkDeviceCreateInfo& info) {
+    auto* v12 = reinterpret_cast<VkPhysicalDeviceVulkan12Features*>(
+        Find(info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES));
+    auto* v13 = reinterpret_cast<VkPhysicalDeviceVulkan13Features*>(
+        Find(info, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES));
+    switch (s->sType) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: {
+        if (!v12) return false;
+        const auto* f = reinterpret_cast<const VkPhysicalDeviceShaderFloat16Int8Features*>(s);
+        Or(v12->shaderFloat16, f->shaderFloat16);
+        Or(v12->shaderInt8, f->shaderInt8);
+        return true;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: {
+        if (!v12) return false;
+        const auto* f = reinterpret_cast<const VkPhysicalDevice8BitStorageFeatures*>(s);
+        Or(v12->storageBuffer8BitAccess, f->storageBuffer8BitAccess);
+        Or(v12->uniformAndStorageBuffer8BitAccess, f->uniformAndStorageBuffer8BitAccess);
+        Or(v12->storagePushConstant8, f->storagePushConstant8);
+        return true;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES: {
+        if (!v12) return false;
+        Or(v12->scalarBlockLayout,
+           reinterpret_cast<const VkPhysicalDeviceScalarBlockLayoutFeatures*>(s)->scalarBlockLayout);
+        return true;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: {
+        if (!v13) return false;
+        Or(v13->shaderIntegerDotProduct,
+           reinterpret_cast<const VkPhysicalDeviceShaderIntegerDotProductFeatures*>(s)
+               ->shaderIntegerDotProduct);
+        return true;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: {
+        if (!v13) return false;
+        const auto* f = reinterpret_cast<const VkPhysicalDeviceSubgroupSizeControlFeatures*>(s);
+        Or(v13->subgroupSizeControl, f->subgroupSizeControl);
+        Or(v13->computeFullSubgroups, f->computeFullSubgroups);
+        return true;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES: {
+        if (!v12) return false;
+        Or(v12->timelineSemaphore,
+           reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures*>(s)->timelineSemaphore);
+        return true;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: {
+        if (!v12) return false;
+        const auto* f = reinterpret_cast<const VkPhysicalDeviceBufferDeviceAddressFeatures*>(s);
+        Or(v12->bufferDeviceAddress, f->bufferDeviceAddress);
+        Or(v12->bufferDeviceAddressCaptureReplay, f->bufferDeviceAddressCaptureReplay);
+        Or(v12->bufferDeviceAddressMultiDevice, f->bufferDeviceAddressMultiDevice);
+        return true;
+      }
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES: {
+        if (!v13) return false;
+        Or(v13->synchronization2,
+           reinterpret_cast<const VkPhysicalDeviceSynchronization2Features*>(s)->synchronization2);
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  const void* next_ = nullptr;
+  bool added_ = false;
+  std::vector<std::pair<VkBool32*, VkBool32>> changed_;
+  std::vector<std::vector<uint64_t>> copies_;
+};
+}  // namespace
 
 std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     const VulkanInstance* const vulkan_instance, const VkPhysicalDevice physical_device,
@@ -224,8 +445,20 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #if REX_PLATFORM_WIN32
     // #256. Windows-only extension to control fullscreen exclusive behavior.
     // Used to prevent HDR state corruption during fullscreen transitions.
-    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_full_screen_exclusive)
+    // Requires the instance extensions VK_KHR_get_surface_capabilities2 and
+    // VK_KHR_get_physical_device_properties2.
+    if (get_physical_device_properties2_supported &&
+        vulkan_instance->extensions().ext_KHR_get_surface_capabilities2) {
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_full_screen_exclusive)
+    }
 #endif
+  }
+
+  if (with_gpu_emulation) {
+    if (REXCVAR_GET(gpu_device_lost_breadcrumbs)) {
+      XE_UI_VULKAN_STRUCT_EXTENSION(AMD_buffer_marker)
+      XE_UI_VULKAN_STRUCT_EXTENSION(NV_device_diagnostic_checkpoints)
+    }
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
@@ -259,6 +492,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_conditional_rendering)
       // #284.
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_depth_bias_control)
+      // #81. Descriptor sets written into the command buffer (the native
+      // renderer's pixel shader textures).
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_push_descriptor)
       // #252.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
       // #55.
@@ -380,6 +616,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       features_EXT_custom_border_color;
   VkPhysicalDeviceCustomBorderColorPropertiesEXT properties_EXT_custom_border_color = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT};
+  VkPhysicalDevicePushDescriptorPropertiesKHR properties_KHR_push_descriptor = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
@@ -442,6 +680,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
     }
+    if (device->extensions_.ext_KHR_push_descriptor) {
+      properties_KHR_push_descriptor.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_KHR_push_descriptor;
+    }
     if (device->extensions_.ext_EXT_conditional_rendering) {
       features_EXT_conditional_rendering.Link(supported_features_2, device_create_info);
     }
@@ -472,6 +714,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
        ++queue_family_index) {
     QueueFamily& queue_family = device->queue_families_[queue_family_index];
     const VkQueueFamilyProperties& queue_family_properties = queue_families[queue_family_index];
+    queue_family.queue_flags = queue_family_properties.queueFlags;
 
     const VkQueueFlags queue_unsupported_flags = ~queue_family_properties.queueFlags;
 
@@ -558,6 +801,21 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(std::max(
         size_t(1), device->queue_families_[device->queue_family_sparse_binding_].queues.size()));
+  }
+  // AMD FSR frame generation's swapchain presents, acquires images and
+  // generates (async compute) on queues of its own (frame_generation.h): more
+  // queues where the family has them. Nothing else submits to them.
+  if (with_swapchain && VulkanFrameGeneration::Requested()) {
+    for (uint32_t queue_family_index = 0; queue_family_index < queue_family_count;
+         ++queue_family_index) {
+      QueueFamily& queue_family = device->queue_families_[queue_family_index];
+      const size_t wanted = queue_family_index == device->queue_family_graphics_compute_ ? 4
+                            : queue_family.may_support_presentation                    ? 2
+                                                                                       : 1;
+      queue_family.queues.resize(std::max(
+          queue_family.queues.size(),
+          std::min(wanted, size_t(queue_families[queue_family_index].queueCount))));
+    }
   }
 
   size_t max_enabled_queues_per_family = 0;
@@ -817,6 +1075,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_PROPERTY_2(properties_EXT_custom_border_color, maxCustomBorderColorSamplers)
   }
 
+  if (device->extensions_.ext_KHR_push_descriptor) {
+    XE_UI_VULKAN_PROPERTY_2(properties_KHR_push_descriptor, maxPushDescriptors)
+  }
+
   if (device->extensions_.ext_EXT_robustness2) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_robustness2, nullDescriptor)
@@ -849,10 +1111,117 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 #undef XE_UI_VULKAN_ENUM_PROPERTY_2
 #undef XE_UI_VULKAN_FEATURE_2
 
+  // Intel XeSS (ui/vulkan/xess.h), when libxess.dll is there and the instance
+  // has XeSS's requirements: its device extensions and features, so the native
+  // temporal upscaler can switch to XeSS while the game runs. A device that
+  // fails to be created with them is created again without (no XeSS).
+  FeatureChainAddition xess_features;
+  const size_t enabled_extension_count_without_xess = enabled_extensions.size();
+  bool xess_added = false;
+  if (with_gpu_emulation && vulkan_instance->xess_ready()) {
+    std::vector<const char*> xess_extensions;
+    const void* xess_chain = nullptr;
+    std::string reason;
+    if (XessDeviceRequirements(vulkan_instance->instance(), physical_device, xess_extensions,
+                               xess_chain, reason) &&
+        xess_features.Add(xess_chain, enabled_features, device_create_info, reason)) {
+      for (const char* name : xess_extensions) {
+        if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                         [name](const char* enabled) { return !std::strcmp(enabled, name); })) {
+          enabled_extensions.push_back(name);
+        }
+      }
+      device_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
+      device_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+      xess_added = true;
+      REXLOG_INFO("Intel XeSS: device requirements enabled (extensions: {})",
+                  xess_extensions.empty() ? std::string("none")
+                                          : fmt::format("{}", fmt::join(xess_extensions, ", ")));
+    } else {
+      xess_features.Undo(device_create_info);
+      device->xess_note_ = reason;
+      REXLOG_INFO("Intel XeSS unavailable on '{}': {}", properties.deviceName, reason);
+    }
+  } else if (with_gpu_emulation) {
+    device->xess_note_ = vulkan_instance->xess_note();
+  }
+
+  // NVIDIA NGX (ui/vulkan/ngx.h): DLSS on GPU emulation devices, DLSS Frame
+  // Generation on presentation devices, when their DLLs are there and NGX
+  // supports this GPU and driver: their device extensions and features. A
+  // device that fails to be created with them is created again without.
+  FeatureChainAddition ngx_sr_features, ngx_fg_features;
+  const size_t enabled_extension_count_without_ngx = enabled_extensions.size();
+  bool ngx_added = false;
+  for (const ngx::Feature feature : {ngx::Feature::kSuperResolution, ngx::Feature::kFrameGeneration}) {
+    const bool sr = feature == ngx::Feature::kSuperResolution;
+    std::string& note = sr ? device->ngx_sr_note_ : device->ngx_fg_note_;
+    if (!(sr ? with_gpu_emulation : with_swapchain)) {
+      note = sr ? "not a GPU emulation device" : "not a presentation device";
+      continue;
+    }
+    if (!vulkan_instance->ngx_ready()) {
+      note = vulkan_instance->ngx_note().empty() ? std::string("NGX unavailable") : vulkan_instance->ngx_note();
+      continue;
+    }
+    std::vector<const char*> ngx_extensions;
+    ngx::DeviceFeatures ngx_device_features;
+    FeatureChainAddition& addition = sr ? ngx_sr_features : ngx_fg_features;
+    if (ngx::DeviceRequirements(*vulkan_instance, physical_device, feature, ngx_extensions, ngx_device_features,
+                                note) &&
+        addition.Add(ngx_device_features.chain(), enabled_features, device_create_info, note)) {
+      for (const char* name : ngx_extensions) {
+        if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                         [name](const char* enabled) { return !std::strcmp(enabled, name); })) {
+          enabled_extensions.push_back(name);
+        }
+      }
+      (sr ? device->ngx_sr_ready_ : device->ngx_fg_ready_) = true;
+      ngx_added = true;
+      REXLOG_INFO("NVIDIA {}: device requirements enabled (extensions: {})", ngx::FeatureName(feature),
+                  ngx_extensions.empty() ? std::string("none") : fmt::format("{}", fmt::join(ngx_extensions, ", ")));
+    } else {
+      addition.Undo(device_create_info);
+      REXLOG_INFO("NVIDIA {} unavailable on '{}': {}", ngx::FeatureName(feature), properties.deviceName, note);
+    }
+  }
+  device_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
+  device_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+
   // Create the device.
 
-  const VkResult device_create_result =
+  VkResult device_create_result =
       ifn.vkCreateDevice(physical_device, &device_create_info, nullptr, &device->device_);
+  if (device_create_result != VK_SUCCESS && ngx_added) {
+    REXLOG_WARN("Vulkan device '{}' failed with NVIDIA NGX's requirements ({}); creating it without DLSS",
+                properties.deviceName, vk::to_string(vk::Result(device_create_result)));
+    ngx_fg_features.Undo(device_create_info);
+    ngx_sr_features.Undo(device_create_info);
+    enabled_extensions.resize(enabled_extension_count_without_ngx);
+    device_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
+    device_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+    for (const bool sr : {true, false}) {
+      if (!(sr ? device->ngx_sr_ready_ : device->ngx_fg_ready_)) continue;
+      (sr ? device->ngx_sr_ready_ : device->ngx_fg_ready_) = false;
+      (sr ? device->ngx_sr_note_ : device->ngx_fg_note_) = "the device failed to be created with NGX's requirements";
+    }
+    ngx_added = false;
+    device_create_result =
+        ifn.vkCreateDevice(physical_device, &device_create_info, nullptr, &device->device_);
+  }
+  if (device_create_result != VK_SUCCESS && xess_added) {
+    REXLOG_WARN("Vulkan device '{}' failed with Intel XeSS's requirements ({}); creating it without XeSS",
+                properties.deviceName, vk::to_string(vk::Result(device_create_result)));
+    xess_features.Undo(device_create_info);
+    enabled_extensions.resize(enabled_extension_count_without_xess);
+    device_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
+    device_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+    xess_added = false;
+    device->xess_note_ = "the device failed to be created with XeSS's requirements";
+    device_create_result =
+        ifn.vkCreateDevice(physical_device, &device_create_info, nullptr, &device->device_);
+  }
+  device->xess_ready_ = xess_added;
   if (device_create_result != VK_SUCCESS) {
     REXLOG_ERROR(
         "Failed to create a Vulkan logical device from the physical device "
@@ -927,6 +1296,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_EXT_depth_bias_control) {
 #include <rex/ui/vulkan/functions/device_ext_depth_bias_control.inc>
   }
+  if (device->extensions_.ext_KHR_push_descriptor) {
+#include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
+  }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION
@@ -938,6 +1310,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   // Get the queues.
+  if (device->extensions_.ext_AMD_buffer_marker) {
+    dfn.vkCmdWriteBufferMarkerAMD = reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkCmdWriteBufferMarkerAMD"));
+  }
+  if (device->extensions_.ext_NV_device_diagnostic_checkpoints) {
+    dfn.vkCmdSetCheckpointNV = reinterpret_cast<PFN_vkCmdSetCheckpointNV>(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkCmdSetCheckpointNV"));
+    dfn.vkGetQueueCheckpointDataNV = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkGetQueueCheckpointDataNV"));
+  }
 
   for (size_t queue_family_index = 0; queue_family_index < device->queue_families_.size();
        ++queue_family_index) {
@@ -971,15 +1353,154 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (memory_type_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) {
       device->memory_types_.host_cached |= memory_type_bit;
     }
+    constexpr VkMemoryPropertyFlags kDeviceLocalHostVisible =
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+    const uint32_t heap_index = memory_properties.memoryTypes[memory_type_index].heapIndex;
+    if ((memory_type_flags & kDeviceLocalHostVisible) == kDeviceLocalHostVisible &&
+        heap_index < memory_properties.memoryHeapCount &&
+        memory_properties.memoryHeaps[heap_index].size > (VkDeviceSize(256) << 20)) {
+      device->memory_types_.device_local_host_visible_large |= memory_type_bit;
+    }
   }
 
+  device->InitializeBreadcrumbs();
   return device;
 }
 
 VulkanDevice::~VulkanDevice() {
   if (device_) {
+    // NGX's features and state of this device (ui/vulkan/ngx.h), if any.
+    ngx::Shutdown(device_);
+    DestroyBreadcrumbs();
     vulkan_instance_->functions().vkDestroyDevice(device_, nullptr);
   }
+}
+
+void VulkanDevice::DestroyBreadcrumbs() {
+  if (breadcrumb_mapping_) functions_.vkUnmapMemory(device_, breadcrumb_memory_);
+  if (breadcrumb_buffer_) functions_.vkDestroyBuffer(device_, breadcrumb_buffer_, nullptr);
+  if (breadcrumb_memory_) functions_.vkFreeMemory(device_, breadcrumb_memory_, nullptr);
+  breadcrumb_mapping_ = nullptr;
+  breadcrumb_buffer_ = VK_NULL_HANDLE;
+  breadcrumb_memory_ = VK_NULL_HANDLE;
+}
+
+void VulkanDevice::InitializeBreadcrumbs() {
+  breadcrumb_nv_ = functions_.vkCmdSetCheckpointNV && functions_.vkGetQueueCheckpointDataNV;
+  const char* force = std::getenv("REX_TEST_GPU_BREADCRUMBS");
+  if (functions_.vkCmdWriteBufferMarkerAMD && !(force && std::strcmp(force, "nv") == 0)) {
+    VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    // [0]: the last breadcrumb finished; [1]: the last draw whose work before
+    // it finished (EmitSetupBreadcrumb).
+    buffer.size = 2 * sizeof(uint32_t);
+    buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (functions_.vkCreateBuffer(device_, &buffer, nullptr, &breadcrumb_buffer_) == VK_SUCCESS) {
+      VkMemoryRequirements requirements;
+      functions_.vkGetBufferMemoryRequirements(device_, breadcrumb_buffer_, &requirements);
+      const uint32_t types = requirements.memoryTypeBits & memory_types_.host_visible & memory_types_.host_coherent;
+      for (uint32_t type = 0; type < 32; ++type) {
+        if (!(types & (uint32_t(1) << type))) continue;
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = type;
+        if (functions_.vkAllocateMemory(device_, &allocation, nullptr, &breadcrumb_memory_) == VK_SUCCESS &&
+            functions_.vkBindBufferMemory(device_, breadcrumb_buffer_, breadcrumb_memory_, 0) == VK_SUCCESS &&
+            functions_.vkMapMemory(device_, breadcrumb_memory_, 0, VK_WHOLE_SIZE, 0, &breadcrumb_mapping_) == VK_SUCCESS) {
+          static_cast<uint32_t*>(breadcrumb_mapping_)[0] = 0;
+          static_cast<uint32_t*>(breadcrumb_mapping_)[1] = 0;
+          breadcrumb_nv_ = false;
+          break;
+        }
+        DestroyBreadcrumbs();
+        break;
+      }
+    }
+    if (!breadcrumb_mapping_) DestroyBreadcrumbs();
+  }
+  REXLOG_INFO("Vulkan GPU breadcrumbs: {}", breadcrumb_mapping_ ? "AMD buffer marker" :
+              breadcrumb_nv_ ? "NV diagnostic checkpoints" : "unavailable or disabled");
+}
+
+uint32_t VulkanDevice::RecordBreadcrumb(const ::rex::ui::GpuBreadcrumb& entry) const {
+  return (breadcrumb_mapping_ || breadcrumb_nv_) && !IsLost() ? breadcrumb_trail_.Record(entry) : 0;
+}
+
+void VulkanDevice::EmitBreadcrumb(VkCommandBuffer command_buffer, uint32_t sequence) const {
+  if (!sequence) return;
+  if (breadcrumb_mapping_) {
+    functions_.vkCmdWriteBufferMarkerAMD(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                        breadcrumb_buffer_, 0, sequence);
+  } else if (breadcrumb_nv_) {
+    functions_.vkCmdSetCheckpointNV(command_buffer, reinterpret_cast<void*>(uintptr_t(sequence)));
+  }
+}
+
+bool VulkanDevice::CanMarkBreadcrumbSetup() const {
+  return breadcrumb_mapping_ && REXCVAR_GET(gpu_device_lost_setup_breadcrumbs);
+}
+
+void VulkanDevice::EmitSetupBreadcrumb(VkCommandBuffer command_buffer, uint32_t sequence) const {
+  if (sequence && breadcrumb_mapping_) {
+    functions_.vkCmdWriteBufferMarkerAMD(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                        breadcrumb_buffer_, sizeof(uint32_t), sequence);
+  }
+}
+
+void VulkanDevice::LogBreadcrumbs(bool query_lost_device) const {
+  auto describe = [&](const char* label, uint32_t sequence) {
+    auto entry = breadcrumb_trail_.Find(sequence);
+    if (!entry) {
+      REXLOG_ERROR("GPU breadcrumbs {} #{}: {}", label, sequence,
+                   sequence ? "not recorded or no longer retained" : "none reached");
+      return;
+    }
+    REXLOG_ERROR("GPU breadcrumbs {} #{}: {} submission {}, frame {}, VS {:016X}, PS {:016X}, {} vertices",
+                 label, sequence, entry->resolve ? "resolve" : "draw", entry->submission,
+                 entry->frame, entry->vertex_shader, entry->pixel_shader, entry->vertices);
+  };
+  if (breadcrumb_mapping_) {
+    const uint32_t finished = static_cast<volatile uint32_t*>(breadcrumb_mapping_)[0];
+    const uint32_t setup_finished = static_cast<volatile uint32_t*>(breadcrumb_mapping_)[1];
+    describe("last finished", finished);
+    describe("first unconfirmed", finished == UINT32_MAX ? 1 : finished + 1);
+    const std::string details =
+        ::rex::ui::DescribeGpuBreadcrumbDetails(breadcrumb_trail_, finished, setup_finished);
+    if (!details.empty()) {
+      REXLOG_ERROR("{}", details);
+    }
+  } else if (breadcrumb_nv_ && query_lost_device) {
+    // This read-only query has no queue host-synchronization requirement.
+    // Do not take queue mutexes from the loss path (another thread may be in submit).
+    const auto queue = queue_families_[queue_family_graphics_compute_].queues[0]->queue;
+    uint32_t count = 0;
+    functions_.vkGetQueueCheckpointDataNV(queue, &count, nullptr);
+    std::vector<VkCheckpointDataNV> data(count);
+    for (auto& item : data) item.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+    functions_.vkGetQueueCheckpointDataNV(queue, &count, data.data());
+    for (uint32_t i = 0; i < count; ++i) {
+      const auto sequence = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(data[i].pCheckpointMarker));
+      REXLOG_ERROR("GPU NV checkpoint stage 0x{:X}", uint32_t(data[i].stage));
+      describe("reached", sequence);
+      if (data[i].stage == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT) {
+        describe("first unconfirmed", sequence == UINT32_MAX ? 1 : sequence + 1);
+        const std::string details =
+            ::rex::ui::DescribeGpuBreadcrumbDetails(breadcrumb_trail_, sequence, 0);
+        if (!details.empty()) {
+          REXLOG_ERROR("{}", details);
+        }
+      }
+    }
+  }
+}
+
+bool VulkanDevice::SetLost() noexcept {
+  if (lost_.exchange(true, std::memory_order_acq_rel)) return false;
+  try {
+    LogBreadcrumbs();
+    rex::FlushLogging();
+  } catch (...) {}
+  return true;
 }
 
 VulkanDevice::VulkanDevice(const VulkanInstance* const vulkan_instance,

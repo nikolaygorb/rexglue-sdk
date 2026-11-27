@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
@@ -30,12 +31,6 @@
 #include <rex/thread/mutex.h>
 
 namespace rex::graphics {
-
-namespace texture_replacement {
-class Index;
-struct Image;
-struct Policy;
-}  // namespace texture_replacement
 
 // Manages host copies of guest textures, performing untiling, format and endian
 // conversion of textures stored in the shared memory, and also handling
@@ -289,6 +284,15 @@ class TextureCache {
     static constexpr uint32_t kOutdatedBitMips = UINT32_C(1) << 1;
     uint32_t outdated_mask() const { return outdated_mask_.load(std::memory_order_acquire); }
 
+    // Optional diagnostics. Enable before publishing watches; all subsequent
+    // access is under the same global lock as watch callbacks. Counts are
+    // notifications, not individual writes or proof of changed bytes.
+    struct WatchStats {
+      uint64_t base_cpu = 0, base_gpu = 0, mips_cpu = 0, mips_gpu = 0;
+    };
+    void EnableWatchStats() { watch_stats_ = std::make_unique<WatchStats>(); }
+    WatchStats GetWatchStats() const;
+
     bool base_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return base_outdated_;
     }
@@ -297,7 +301,8 @@ class TextureCache {
     }
     bool MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
 
-    void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+    void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
+                       bool invalidated_by_gpu);
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
@@ -385,6 +390,7 @@ class TextureCache {
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
     std::atomic<uint32_t> outdated_mask_{0};
+    std::unique_ptr<WatchStats> watch_stats_;
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
@@ -724,6 +730,10 @@ class TextureCache {
   static uint32_t GetIntegerScaleBits(const xenos::xe_gpu_texture_fetch_t& fetch,
                                       uint8_t swizzled_signs);
   bool LoadTextureData(Texture& texture);
+  // Native's opt-in full-resolve path may prepare bindings without uploading
+  // their ordinary images. Outdated data stays outdated; a later eager request
+  // invalidates the data-dependent in-sync bits and performs the normal load.
+  void RequestTexturesWithDeferredLoads(uint32_t used_texture_mask, uint32_t deferred_load_mask);
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data
@@ -876,6 +886,8 @@ class TextureCache {
   // and logged once), and retired replacement textures with the submission
   // after which they can be destroyed.
   const texture_replacement::Index* replacement_index_ = nullptr;
+  texture_replacement::PreloadCache replacement_preloaded_;
+  uint64_t replacement_last_eviction_time_ = 0;
   std::vector<uint8_t> replacement_key_scratch_;
   std::unordered_set<std::string> replacement_failed_files_;
   // Host memory of the replacement textures alive (kept by

@@ -20,6 +20,8 @@ namespace rex::thread {
 
 thread_local Fiber* Fiber::tls_current_ = nullptr;
 
+Fiber* Fiber::Current() { return tls_current_; }
+
 Fiber* Fiber::ConvertCurrentThread() {
   auto* f = new Fiber();
   f->handle_ = ::ConvertThreadToFiber(nullptr);
@@ -48,10 +50,15 @@ void Fiber::SwitchTo(Fiber* target) {
 }
 
 void Fiber::Destroy() {
-  // Thread fibers are destroyed from the owning thread itself.
   if (is_thread_fiber_) {
-    ::ConvertFiberToThread();
-    tls_current_ = nullptr;
+    // ConvertFiberToThread acts on the calling thread. Another thread's fiber
+    // (an XThread released elsewhere after its thread ended) has nothing left
+    // to convert, and converting would take the caller's own fiber away
+    // (upstream rexglue 6937495b).
+    if (tls_current_ == this) {
+      ::ConvertFiberToThread();
+      tls_current_ = nullptr;
+    }
   } else {
     assert(this != tls_current_ && "Destroy called on the currently running fiber");
     ::DeleteFiber(handle_);

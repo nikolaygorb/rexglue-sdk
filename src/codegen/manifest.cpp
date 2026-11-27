@@ -24,6 +24,8 @@
 #include <rex/logging.h>
 #include <rex/system/guest_path.h>
 
+#include "config_keys.h"
+
 namespace rex::codegen {
 
 std::string CanonicalizeModuleGuestPath(std::string_view path, std::string_view project_name) {
@@ -113,10 +115,24 @@ std::optional<ManifestConfig> ManifestConfig::Load(const std::filesystem::path& 
   manifest.manifestDir = path.parent_path();
   manifest.manifestPath = path;
 
+  std::vector<std::string> key_warnings;
+  for (const auto& [key, value] : tbl) {
+    if (key != "project" && key != "entrypoint" && key != "modules") {
+      REXLOG_WARN("{}: unknown manifest key '{}'", path.string(), key.str());
+    }
+  }
+
   auto* project = tbl["project"].as_table();
   if (!project) {
     REXLOG_ERROR("Manifest missing [project] section: {}", path.string());
     return std::nullopt;
+  }
+  CheckProjectKeys(*project, path.string() + " [project]", key_warnings);
+  for (const auto& warning : key_warnings) {
+    REXLOG_WARN("{}", warning);
+  }
+  if (auto* modules = tbl.get("modules"); modules && !modules->is_array()) {
+    REXLOG_WARN("{}: key 'modules' should be an array of tables", path.string());
   }
   manifest.projectName = (*project)["name"].value_or<std::string>("");
   if (manifest.projectName.empty()) {

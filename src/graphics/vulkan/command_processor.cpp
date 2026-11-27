@@ -23,15 +23,15 @@
 #include <utility>
 #include <vector>
 
-#include <SPIRV/GlslangToSpv.h>
-#include <glslang/Public/ShaderLang.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/draw_phase_timer.h>
 #include <rex/graphics/util/float_constants.h>
+#include <rex/graphics/util/register_writes.h>
 #include <rex/graphics/util/pipeline_wait.h>
 #include <rex/perf/counter.h>
 
@@ -42,8 +42,11 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include <rex/graphics/vulkan/glsl_compile.h>
+#include <rex/graphics/vulkan/swap_fxaa_shader.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/vulkan/shader.h>
@@ -128,6 +131,13 @@ REXCVAR_DEFINE_INT32(vulkan_submission_draw_limit, -1, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload)
     .debug_only();
 
+REXCVAR_DEFINE_BOOL(vulkan_upload_rebar, true, "GPU/Vulkan",
+                    "Constants and converted indices the GPU reads in place go into video "
+                    "memory the CPU writes directly when the whole of it is mapped (resizable "
+                    "BAR / Smart Access Memory), as the native renderer does too; off: system "
+                    "memory. Read at start")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(vulkan_max_frames_in_flight, 0, "GPU/Vulkan",
                      "How many frames the CPU may queue ahead of the GPU, 1 to 3; 0: 3 (canary). "
                      "2 shortens waits for resolve readbacks and input latency, 1 more so, at "
@@ -162,258 +172,6 @@ bool IsDepthBiasForceUnorm(const ui::vulkan::VulkanDevice::Properties& device_pr
   return REXCVAR_GET(vulkan_depth_bias_force_unorm) && device_properties.depthBiasControl &&
          device_properties.leastRepresentableValueForceUnormRepresentation &&
          device_properties.depthBiasExact;
-}
-
-// glslang default built-in resource limits.
-constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
-    /* .maxLights = */ 32,
-    /* .maxClipPlanes = */ 6,
-    /* .maxTextureUnits = */ 32,
-    /* .maxTextureCoords = */ 32,
-    /* .maxVertexAttribs = */ 64,
-    /* .maxVertexUniformComponents = */ 4096,
-    /* .maxVaryingFloats = */ 64,
-    /* .maxVertexTextureImageUnits = */ 32,
-    /* .maxCombinedTextureImageUnits = */ 80,
-    /* .maxTextureImageUnits = */ 32,
-    /* .maxFragmentUniformComponents = */ 4096,
-    /* .maxDrawBuffers = */ 32,
-    /* .maxVertexUniformVectors = */ 128,
-    /* .maxVaryingVectors = */ 8,
-    /* .maxFragmentUniformVectors = */ 16,
-    /* .maxVertexOutputVectors = */ 16,
-    /* .maxFragmentInputVectors = */ 15,
-    /* .minProgramTexelOffset = */ -8,
-    /* .maxProgramTexelOffset = */ 7,
-    /* .maxClipDistances = */ 8,
-    /* .maxComputeWorkGroupCountX = */ 65535,
-    /* .maxComputeWorkGroupCountY = */ 65535,
-    /* .maxComputeWorkGroupCountZ = */ 65535,
-    /* .maxComputeWorkGroupSizeX = */ 1024,
-    /* .maxComputeWorkGroupSizeY = */ 1024,
-    /* .maxComputeWorkGroupSizeZ = */ 64,
-    /* .maxComputeUniformComponents = */ 1024,
-    /* .maxComputeTextureImageUnits = */ 16,
-    /* .maxComputeImageUniforms = */ 8,
-    /* .maxComputeAtomicCounters = */ 8,
-    /* .maxComputeAtomicCounterBuffers = */ 1,
-    /* .maxVaryingComponents = */ 60,
-    /* .maxVertexOutputComponents = */ 64,
-    /* .maxGeometryInputComponents = */ 64,
-    /* .maxGeometryOutputComponents = */ 128,
-    /* .maxFragmentInputComponents = */ 128,
-    /* .maxImageUnits = */ 8,
-    /* .maxCombinedImageUnitsAndFragmentOutputs = */ 8,
-    /* .maxCombinedShaderOutputResources = */ 8,
-    /* .maxImageSamples = */ 0,
-    /* .maxVertexImageUniforms = */ 0,
-    /* .maxTessControlImageUniforms = */ 0,
-    /* .maxTessEvaluationImageUniforms = */ 0,
-    /* .maxGeometryImageUniforms = */ 0,
-    /* .maxFragmentImageUniforms = */ 8,
-    /* .maxCombinedImageUniforms = */ 8,
-    /* .maxGeometryTextureImageUnits = */ 16,
-    /* .maxGeometryOutputVertices = */ 256,
-    /* .maxGeometryTotalOutputComponents = */ 1024,
-    /* .maxGeometryUniformComponents = */ 1024,
-    /* .maxGeometryVaryingComponents = */ 64,
-    /* .maxTessControlInputComponents = */ 128,
-    /* .maxTessControlOutputComponents = */ 128,
-    /* .maxTessControlTextureImageUnits = */ 16,
-    /* .maxTessControlUniformComponents = */ 1024,
-    /* .maxTessControlTotalOutputComponents = */ 4096,
-    /* .maxTessEvaluationInputComponents = */ 128,
-    /* .maxTessEvaluationOutputComponents = */ 128,
-    /* .maxTessEvaluationTextureImageUnits = */ 16,
-    /* .maxTessEvaluationUniformComponents = */ 1024,
-    /* .maxTessPatchComponents = */ 120,
-    /* .maxPatchVertices = */ 32,
-    /* .maxTessGenLevel = */ 64,
-    /* .maxViewports = */ 16,
-    /* .maxVertexAtomicCounters = */ 0,
-    /* .maxTessControlAtomicCounters = */ 0,
-    /* .maxTessEvaluationAtomicCounters = */ 0,
-    /* .maxGeometryAtomicCounters = */ 0,
-    /* .maxFragmentAtomicCounters = */ 8,
-    /* .maxCombinedAtomicCounters = */ 8,
-    /* .maxAtomicCounterBindings = */ 1,
-    /* .maxVertexAtomicCounterBuffers = */ 0,
-    /* .maxTessControlAtomicCounterBuffers = */ 0,
-    /* .maxTessEvaluationAtomicCounterBuffers = */ 0,
-    /* .maxGeometryAtomicCounterBuffers = */ 0,
-    /* .maxFragmentAtomicCounterBuffers = */ 1,
-    /* .maxCombinedAtomicCounterBuffers = */ 1,
-    /* .maxAtomicCounterBufferSize = */ 16384,
-    /* .maxTransformFeedbackBuffers = */ 4,
-    /* .maxTransformFeedbackInterleavedComponents = */ 64,
-    /* .maxCullDistances = */ 8,
-    /* .maxCombinedClipAndCullDistances = */ 8,
-    /* .maxSamples = */ 4,
-    /* .maxMeshOutputVerticesNV = */ 256,
-    /* .maxMeshOutputPrimitivesNV = */ 512,
-    /* .maxMeshWorkGroupSizeX_NV = */ 32,
-    /* .maxMeshWorkGroupSizeY_NV = */ 1,
-    /* .maxMeshWorkGroupSizeZ_NV = */ 1,
-    /* .maxTaskWorkGroupSizeX_NV = */ 32,
-    /* .maxTaskWorkGroupSizeY_NV = */ 1,
-    /* .maxTaskWorkGroupSizeZ_NV = */ 1,
-    /* .maxMeshViewCountNV = */ 4,
-    /* .maxDualSourceDrawBuffersEXT = */ 1,
-    /* .limits = */
-    {
-        /* .nonInductiveForLoops = */ 1,
-        /* .whileLoops = */ 1,
-        /* .doWhileLoops = */ 1,
-        /* .generalUniformIndexing = */ 1,
-        /* .generalAttributeMatrixVectorIndexing = */ 1,
-        /* .generalVaryingIndexing = */ 1,
-        /* .generalSamplerIndexing = */ 1,
-        /* .generalVariableIndexing = */ 1,
-        /* .generalConstantMatrixVectorIndexing = */ 1,
-    },
-};
-
-const char* GetSwapFxaaComputeSource(bool extreme_quality) {
-  return extreme_quality ? R"(#version 450
-layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
-
-layout(push_constant) uniform XeApplyGammaRampConstants {
-  uvec2 xe_fxaa_size;
-  vec2 xe_fxaa_size_inv;
-};
-
-layout(set = 0, binding = 0) uniform sampler2D xe_fxaa_source;
-layout(set = 1, binding = 0, rgb10_a2) writeonly uniform image2D xe_fxaa_dest;
-
-const vec3 kLumaWeights = vec3(0.299, 0.587, 0.114);
-const float kEdgeThreshold = 0.063;
-const float kEdgeThresholdMin = 0.0312;
-const float kSpanMax = 12.0;
-const float kDirReduceMul = 0.125;
-const float kDirReduceMin = 1.0 / 128.0;
-
-float SampleLuma(vec2 uv) {
-  return textureLod(xe_fxaa_source, uv, 0.0).a;
-}
-
-void main() {
-  uvec2 pixel = gl_GlobalInvocationID.xy;
-  if (any(greaterThanEqual(pixel, xe_fxaa_size))) {
-    return;
-  }
-
-  vec2 uv = (vec2(pixel) + vec2(0.5)) * xe_fxaa_size_inv;
-  vec2 texel = xe_fxaa_size_inv;
-  vec4 rgbm = textureLod(xe_fxaa_source, uv, 0.0);
-
-  float lumaM = rgbm.a;
-  float lumaNW = SampleLuma(uv + vec2(-texel.x, -texel.y));
-  float lumaNE = SampleLuma(uv + vec2( texel.x, -texel.y));
-  float lumaSW = SampleLuma(uv + vec2(-texel.x,  texel.y));
-  float lumaSE = SampleLuma(uv + vec2( texel.x,  texel.y));
-
-  float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
-  float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
-  float lumaRange = lumaMax - lumaMin;
-
-  vec3 result = rgbm.rgb;
-  if (lumaRange >= max(kEdgeThresholdMin, lumaMax * kEdgeThreshold)) {
-    vec2 dir;
-    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
-    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
-
-    float dirReduce = max(
-        (lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * kDirReduceMul),
-        kDirReduceMin);
-    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
-    dir = clamp(dir * rcpDirMin, vec2(-kSpanMax), vec2(kSpanMax)) * texel;
-
-    vec3 rgbA =
-        0.5 *
-        (textureLod(xe_fxaa_source, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
-         textureLod(xe_fxaa_source, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
-    vec3 rgbB =
-        rgbA * 0.5 +
-        0.25 *
-            (textureLod(xe_fxaa_source, uv + dir * -0.5, 0.0).rgb +
-             textureLod(xe_fxaa_source, uv + dir * 0.5, 0.0).rgb);
-    float lumaB = dot(rgbB, kLumaWeights);
-    result = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
-  }
-
-  imageStore(xe_fxaa_dest, ivec2(pixel), vec4(result, 1.0));
-}
-)"
-                         : R"(#version 450
-layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
-
-layout(push_constant) uniform XeApplyGammaRampConstants {
-  uvec2 xe_fxaa_size;
-  vec2 xe_fxaa_size_inv;
-};
-
-layout(set = 0, binding = 0) uniform sampler2D xe_fxaa_source;
-layout(set = 1, binding = 0, rgb10_a2) writeonly uniform image2D xe_fxaa_dest;
-
-const vec3 kLumaWeights = vec3(0.299, 0.587, 0.114);
-const float kEdgeThreshold = 0.166;
-const float kEdgeThresholdMin = 0.0833;
-const float kSpanMax = 8.0;
-const float kDirReduceMul = 0.125;
-const float kDirReduceMin = 1.0 / 128.0;
-
-float SampleLuma(vec2 uv) {
-  return textureLod(xe_fxaa_source, uv, 0.0).a;
-}
-
-void main() {
-  uvec2 pixel = gl_GlobalInvocationID.xy;
-  if (any(greaterThanEqual(pixel, xe_fxaa_size))) {
-    return;
-  }
-
-  vec2 uv = (vec2(pixel) + vec2(0.5)) * xe_fxaa_size_inv;
-  vec2 texel = xe_fxaa_size_inv;
-  vec4 rgbm = textureLod(xe_fxaa_source, uv, 0.0);
-
-  float lumaM = rgbm.a;
-  float lumaNW = SampleLuma(uv + vec2(-texel.x, -texel.y));
-  float lumaNE = SampleLuma(uv + vec2( texel.x, -texel.y));
-  float lumaSW = SampleLuma(uv + vec2(-texel.x,  texel.y));
-  float lumaSE = SampleLuma(uv + vec2( texel.x,  texel.y));
-
-  float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
-  float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
-  float lumaRange = lumaMax - lumaMin;
-
-  vec3 result = rgbm.rgb;
-  if (lumaRange >= max(kEdgeThresholdMin, lumaMax * kEdgeThreshold)) {
-    vec2 dir;
-    dir.x = -((lumaNW + lumaNE) - (lumaSW + lumaSE));
-    dir.y =  ((lumaNW + lumaSW) - (lumaNE + lumaSE));
-
-    float dirReduce = max(
-        (lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * kDirReduceMul),
-        kDirReduceMin);
-    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
-    dir = clamp(dir * rcpDirMin, vec2(-kSpanMax), vec2(kSpanMax)) * texel;
-
-    vec3 rgbA =
-        0.5 *
-        (textureLod(xe_fxaa_source, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
-         textureLod(xe_fxaa_source, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
-    vec3 rgbB =
-        rgbA * 0.5 +
-        0.25 *
-            (textureLod(xe_fxaa_source, uv + dir * -0.5, 0.0).rgb +
-             textureLod(xe_fxaa_source, uv + dir * 0.5, 0.0).rgb);
-    float lumaB = dot(rgbB, kLumaWeights);
-    result = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
-  }
-
-  imageStore(xe_fxaa_dest, ivec2(pixel), vec4(result, 1.0));
-}
-)";
 }
 
 const char* GetSwapApplyGammaTablePixelRbSwapSource() {
@@ -586,58 +344,6 @@ void main() {
 )";
 }
 
-bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
-                                std::vector<uint32_t>& spirv_out, std::string& error_out) {
-  static std::once_flag glslang_initialize_once;
-  std::call_once(glslang_initialize_once, []() { glslang::InitializeProcess(); });
-
-  const char* source_c_str = source.data();
-  glslang::TShader shader(stage);
-  shader.setStrings(&source_c_str, 1);
-  shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 450);
-  shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
-  shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
-
-  EShMessages messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
-  if (!shader.parse(&kGlslangDefaultTBuiltInResource, 450, false, messages)) {
-    error_out = "glslang shader parse failed";
-    if (const char* shader_log = shader.getInfoLog();
-        shader_log != nullptr && shader_log[0] != '\0') {
-      error_out += ": ";
-      error_out += shader_log;
-    }
-    return false;
-  }
-
-  glslang::TProgram program;
-  program.addShader(&shader);
-  if (!program.link(messages)) {
-    error_out = "glslang program link failed";
-    if (const char* program_log = program.getInfoLog();
-        program_log != nullptr && program_log[0] != '\0') {
-      error_out += ": ";
-      error_out += program_log;
-    }
-    return false;
-  }
-
-  const glslang::TIntermediate* intermediate = program.getIntermediate(stage);
-  if (intermediate == nullptr) {
-    error_out = "glslang produced no stage intermediate";
-    return false;
-  }
-
-  glslang::SpvOptions spv_options = {};
-  spv_options.disableOptimizer = true;
-  spv_options.optimizeSize = false;
-  glslang::GlslangToSpv(*intermediate, spirv_out, &spv_options);
-  if (spirv_out.empty()) {
-    error_out = "glslang produced empty SPIR-V";
-    return false;
-  }
-  return true;
-}
-
 // The submissions' draws and the slow waits for them (submission_watch.h). One
 // command processor per process; its thread alone touches these.
 submission_watch::Watch submission_watch_state;
@@ -715,10 +421,12 @@ void VulkanCommandProcessor::InitializeGpuTime() {
   gpu_time_ring_next_ = 0;
   gpu_time_ring_used_ = 0;
   gpu_section_ = GpuSection::kOther;
+  gpu_time_for_counters_ = false;
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
-  if (!REXCVAR_GET(vulkan_gpu_time)) {
-    return;
-  }
+  gpu_time_for_counters_ = REXCVAR_GET(vulkan_gpu_time);
+#endif  // REXGLUE_ENABLE_PERF_COUNTERS
+  // Also without the counters: frame_stats_interval may be switched on while
+  // the game runs. Nothing is written while neither wants it.
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
   const VkPhysicalDevice physical_device = vulkan_device->physical_device();
@@ -747,7 +455,6 @@ void VulkanCommandProcessor::InitializeGpuTime() {
     gpu_time_query_pool_ = VK_NULL_HANDLE;
     REXGPU_WARN("Vulkan: failed to create a timestamp query pool; no graphics card time");
   }
-#endif  // REXGLUE_ENABLE_PERF_COUNTERS
 }
 
 void VulkanCommandProcessor::ShutdownGpuTime() {
@@ -784,6 +491,9 @@ void VulkanCommandProcessor::BeginGpuTimeSubmission() {
     gpu_time_ring_used_ -= gpu_time_current_.query_count;
     gpu_time_recording_ = false;
   }
+  if (!gpu_time_for_counters_ && !frame_stats_enabled()) {
+    return;
+  }
   gpu_time_current_ = GpuTimeSubmission();
   gpu_time_current_.first_query = gpu_time_ring_next_;
   if (AllocateGpuTimeQuery(gpu_time_current_.start_query)) {
@@ -807,7 +517,8 @@ GpuSection VulkanCommandProcessor::SetGpuSection(GpuSection section) {
   // them with one (if the ring has room; otherwise they count for the next).
   // Not while writing hoisted commands, which run earlier than the main
   // stream's order.
-  if (gpu_time_recording_ && submission_open_ && !deferred_command_buffer_.is_writing_hoisted() &&
+  if (gpu_time_recording_ && gpu_time_for_counters_ && submission_open_ &&
+      !deferred_command_buffer_.is_writing_hoisted() &&
       deferred_command_buffer_.stream_size() != gpu_section_stream_mark_) {
     uint32_t query;
     if (AllocateGpuTimeQuery(query)) {
@@ -861,7 +572,13 @@ void VulkanCommandProcessor::ReadGpuTimes() {
     gpu_time_ring_used_ -= done.query_count;
     gpu_time_submitted_.pop_front();
   }
+  for (size_t i = 0; i < size_t(GpuSection::kCount); ++i) {
+    stats_gpu_ticks_ += ticks[i];
+  }
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  if (!gpu_time_for_counters_) {
+    return;
+  }
   static constexpr rex::perf::CounterId kCounters[size_t(GpuSection::kCount)] = {
       rex::perf::CounterId::kGpuDrawUs,    rex::perf::CounterId::kGpuTransferUs,
       rex::perf::CounterId::kGpuResolveUs, rex::perf::CounterId::kGpuTextureLoadUs,
@@ -880,6 +597,83 @@ void VulkanCommandProcessor::ReadGpuTimes() {
                                 int64_t(double(total_ticks) * gpu_time_ns_per_tick_ / 1000.0));
   }
 #endif  // REXGLUE_ENABLE_PERF_COUNTERS
+}
+
+GpuTimeRange VulkanCommandProcessor::GetGpuTimeRange() const {
+  GpuTimeRange range;
+  if (gpu_time_recording_) {
+    range.recorded = true;
+    range.first_query = gpu_time_current_.first_query;
+    range.query_count = gpu_time_current_.query_count;
+    range.start_query = gpu_time_current_.start_query;
+    range.end_query = gpu_time_current_.end_query;
+  }
+  return range;
+}
+
+void VulkanCommandProcessor::RecordGpuTimeStart(VkCommandBuffer command_buffer,
+                                                const GpuTimeRange& range) const {
+  if (!range.recorded) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn = GetVulkanDevice()->functions();
+  // The submission's queries are reset before any of them is written.
+  const uint32_t first_part = std::min(range.query_count, kGpuTimeQueries - range.first_query);
+  dfn.vkCmdResetQueryPool(command_buffer, gpu_time_query_pool_, range.first_query, first_part);
+  if (first_part < range.query_count) {
+    dfn.vkCmdResetQueryPool(command_buffer, gpu_time_query_pool_, 0,
+                            range.query_count - first_part);
+  }
+  // Bottom of the pipe: once everything submitted earlier is done, so the
+  // time of one submission isn't counted again in the next.
+  dfn.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                          gpu_time_query_pool_, range.start_query);
+}
+
+void VulkanCommandProcessor::RecordGpuTimeEnd(VkCommandBuffer command_buffer,
+                                              const GpuTimeRange& range) const {
+  if (!range.recorded) {
+    return;
+  }
+  GetVulkanDevice()->functions().vkCmdWriteTimestamp(
+      command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_time_query_pool_,
+      range.end_query);
+}
+
+void VulkanCommandProcessor::CollectRendererFrameCounters(RendererFrameCounters& counters) {
+  counters.reported = true;
+  counters.gpu_timed = gpu_time_query_pool_ != VK_NULL_HANDLE;
+  counters.gpu_ns += uint64_t(double(stats_gpu_ticks_) * gpu_time_ns_per_tick_);
+  counters.submissions += stats_submissions_;
+  counters.draw_render_passes += stats_render_passes_;
+  counters.draw_pipeline_binds += stats_pipeline_binds_;
+  stats_gpu_ticks_ = 0;
+  stats_submissions_ = 0;
+  stats_render_passes_ = 0;
+  stats_pipeline_binds_ = 0;
+  // IssueDraw by phase, a frame, named as the native renderer's.
+  if (counters.frames) {
+    static const char* const kPhaseNames[] = {
+        "shaders",  "indices", "vertex data", "textures", "targets",
+        "pipeline", "state",   "descriptors", "pass",     "record",
+    };
+    static_assert(sizeof(kPhaseNames) / sizeof(kPhaseNames[0]) == size_t(DrawPhase::kCount));
+    const double scale = double(kDrawPhaseSampleRate) * 1000.0 /
+                         double(rex::chrono::Clock::QueryHostTickFrequency()) /
+                         double(counters.frames);
+    std::string detail =
+        fmt::format("IssueDraw ms a frame (1 draw in {} timed):", kDrawPhaseSampleRate);
+    for (size_t i = 0; i < size_t(DrawPhase::kCount); ++i) {
+      detail += fmt::format(" {} {:.2f}{}", kPhaseNames[i],
+                            double(stats_draw_phase_ticks_[i]) * scale,
+                            i + 1 < size_t(DrawPhase::kCount) ? "," : "");
+    }
+    if (!counters.detail.empty()) {
+      counters.detail += "; ";
+    }
+    counters.detail += detail;
+  }
+  std::memset(stats_draw_phase_ticks_, 0, sizeof(stats_draw_phase_ticks_));
 }
 
 void VulkanCommandProcessor::TrimRenderTargetsIfNeeded() {
@@ -1031,31 +825,7 @@ bool VulkanCommandProcessor::CompileGlslToSpirv(VkShaderStageFlagBits stage,
                                                 std::string_view source,
                                                 std::vector<uint32_t>& spirv_out,
                                                 std::string& error_out) const {
-  EShLanguage glslang_stage;
-  switch (stage) {
-    case VK_SHADER_STAGE_VERTEX_BIT:
-      glslang_stage = EShLangVertex;
-      break;
-    case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
-      glslang_stage = EShLangTessControl;
-      break;
-    case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT:
-      glslang_stage = EShLangTessEvaluation;
-      break;
-    case VK_SHADER_STAGE_GEOMETRY_BIT:
-      glslang_stage = EShLangGeometry;
-      break;
-    case VK_SHADER_STAGE_FRAGMENT_BIT:
-      glslang_stage = EShLangFragment;
-      break;
-    case VK_SHADER_STAGE_COMPUTE_BIT:
-      glslang_stage = EShLangCompute;
-      break;
-    default:
-      error_out = fmt::format("Unsupported Vulkan shader stage mask {}", uint32_t(stage));
-      return false;
-  }
-  return CompileGlslToSpirvInternal(glslang_stage, source, spirv_out, error_out);
+  return ::rex::graphics::vulkan::CompileGlslToSpirv(stage, source, spirv_out, error_out);
 }
 
 bool VulkanCommandProcessor::SetupContext() {
@@ -1068,6 +838,10 @@ bool VulkanCommandProcessor::SetupContext() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
+
+  // Device-loss breadcrumbs keep the work recorded before each draw (ReIGlue
+  // 1100).
+  deferred_command_buffer_.SetCountBreadcrumbWork(vulkan_device->HasBreadcrumbs());
 
   // The unconditional inclusion of the vertex shader stage also covers the case
   // of manual index / factor buffer fetch (the system constants and the shared
@@ -1093,7 +867,8 @@ bool VulkanCommandProcessor::SetupContext() {
   uniform_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
       rex::align(std::max(ui::GraphicsUploadBufferPool::kDefaultPageSize, size_t(16384)),
-                 size_t(device_properties.minUniformBufferOffsetAlignment)));
+                 size_t(device_properties.minUniformBufferOffsetAlignment)),
+      REXCVAR_GET(vulkan_upload_rebar));
 
   // Descriptor set layouts that don't depend on the setup of other subsystems.
   VkShaderStageFlags guest_shader_stages =
@@ -2453,7 +2228,9 @@ void VulkanCommandProcessor::SubmissionThread() {
       } else if (dfn.vkBeginCommandBuffer(job.command_buffer.buffer, &begin_info) != VK_SUCCESS) {
         failure = "Failed to begin a Vulkan command buffer";
       } else {
+        RecordGpuTimeStart(job.command_buffer.buffer, job.gpu_time);
         deferred_command_buffer_.ExecuteStreams(job.command_buffer.buffer, job.streams);
+        RecordGpuTimeEnd(job.command_buffer.buffer, job.gpu_time);
         if (host_query_pool_) {
           host_query_pool_->RecordResolveBatch(job.command_buffer.buffer, job.resolve_batch);
         }
@@ -2523,6 +2300,7 @@ bool VulkanCommandProcessor::HandOverSubmission(const CommandBuffer& command_buf
   job.fence = fence_acquisition->GetFenceForSubmitting();
   job.wait_semaphores = current_submission_wait_semaphores_;
   job.wait_stage_masks = current_submission_wait_stage_masks_;
+  job.gpu_time = GetGpuTimeRange();
   deferred_command_buffer_.TakeStreams(job.streams);
   if (host_query_pool_) {
     host_query_pool_->TakeResolveBatch(job.resolve_batch);
@@ -2840,6 +2618,12 @@ void VulkanCommandProcessor::ShutdownContext() {
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   // Only the shader constant blocks are handled here (WriteRegistersFromMem and
   // CommandProcessor::IsPlainRegister rely on that for the other registers).
+  // A constant written with the value it has changes nothing that depends on it
+  // (the constant buffers, the texture bindings, the vertex buffer residency).
+  if (elide_unchanged_registers_ && IsShaderConstantRegister(index) &&
+      register_file_->values[index] == value) {
+    return;
+  }
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2908,12 +2692,25 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
     return (usage_map[last_word] & last_mask) != 0;
   };
 
+  // With gpu_elide_unchanged_registers only the values that change are stored,
+  // and only the range between the first and the last changed one counts.
+  uint32_t first_changed = 0, last_changed = num_registers - 1;
+
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    if (elide_unchanged_registers_) {
+      if (!StoreChangedRegisters(register_file_->values + start_index, base, num_registers,
+                                 first_changed, last_changed)) {
+        return;
+      }
+    } else {
+      memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    }
     if (frame_open_) {
-      uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
-      uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      uint32_t first_float_constant =
+          (start_index + first_changed - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      uint32_t last_float_constant =
+          (start_index + last_changed - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       if (first_float_constant < 256) {
         uint32_t last_vertex_constant = std::min(last_float_constant, 255u);
         if (range_has_any_constant_usage(current_float_constant_map_vertex_, first_float_constant,
@@ -2938,7 +2735,14 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    if (elide_unchanged_registers_) {
+      if (!StoreChangedRegisters(register_file_->values + start_index, base, num_registers,
+                                 first_changed, last_changed)) {
+        return;
+      }
+    } else {
+      memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    }
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
     return;
@@ -4109,6 +3913,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = color_attachment_count ? color_attachments : nullptr;
     rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
+    ++stats_render_passes_;
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
@@ -4125,6 +3930,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.pClearValues = nullptr;
     // The sample locations for automatic depth layout transitions and for the
     // subpass rasterization state when variableSampleLocations is false.
+    ++stats_render_passes_;
     deferred_command_buffer_.CmdVkBeginRenderPass(
         &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE,
         framebuffer->render_pass_key.depth_and_color_used
@@ -4216,6 +4022,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
     rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
+    ++stats_render_passes_;
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
@@ -4230,6 +4037,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.pClearValues = nullptr;
     // The sample locations for automatic depth layout transitions and for the
     // subpass rasterization state when variableSampleLocations is false.
+    ++stats_render_passes_;
     deferred_command_buffer_.CmdVkBeginRenderPass(
         &render_pass_begin_info, VK_SUBPASS_CONTENTS_INLINE,
         framebuffer->render_pass_key.depth_and_color_used
@@ -4704,6 +4512,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return IssueCopy();
   }
 
+  // frame_stats_interval: one draw in kDrawPhaseSampleRate by phase.
+  DrawPhaseTimer<DrawPhase> phase_timer(
+      stats_draw_phase_ticks_,
+      frame_stats_enabled() && stats_draw_phase_sample_++ % kDrawPhaseSampleRate == 0,
+      DrawPhase::kShaders);
+
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   const ui::vulkan::VulkanDevice::Properties& device_properties = GetVulkanDevice()->properties();
@@ -4758,6 +4572,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+  // No sample passes and nothing is exported: no effect (not a VIZ survey,
+  // whose result is measured). Upstream rexglue 11539bc1.
+  if (is_rasterization_done && !memexport_used_vertex && !memexport_used_pixel && !viz_survey &&
+      draw_util::IsDepthTestNeverPassing(regs)) {
+    return true;
+  }
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
       REXGPU_ERROR(
@@ -4817,9 +4637,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
 
     // Process primitives.
+    phase_timer.Next(DrawPhase::kIndices);
     if (!primitive_processor_->Process(primitive_processing_result)) {
       return draw_fail("primitive_processing");
     }
+    phase_timer.Next(DrawPhase::kShaders);
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
       return true;
@@ -4957,7 +4779,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  phase_timer.Next(DrawPhase::kTextures);
   texture_cache_->RequestTextures(used_texture_mask);
+  phase_timer.Next(DrawPhase::kTargets);
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Put the window offset into the EDRAM bases when possible.
@@ -4976,6 +4800,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanRenderTargetCache::RenderPassKey render_pass_key =
       render_target_cache_->last_update_render_pass_key();
   VulkanPipelineCache::Pipeline* pipeline_state;
+  phase_timer.Next(DrawPhase::kPipeline);
   if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
                                           primitive_processing_result, normalized_depth_control,
                                           normalized_color_mask, render_pass_key, zpd_hybrid,
@@ -4988,7 +4813,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // May have been created between the two loads.
     pipeline = pipeline_state->pipeline.load(std::memory_order_acquire);
     if (pipeline == VK_NULL_HANDLE && creation_pending) {
-      // Still being created asynchronously: wait for it if allowed.
+      // Still being created asynchronously: wait for it if allowed. A draw that
+      // may never be redone (memexport, a surface at most 2 tiles wide) waits
+      // until the creation ends (xenia-canary f9431eb95).
       WaitForPipelineCreation(
           [&]() {
             creation_pending = pipeline_state->creation_pending.load(std::memory_order_acquire);
@@ -4996,7 +4823,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
             pipeline = pipeline_state->pipeline.load(std::memory_order_acquire);
             return pipeline != VK_NULL_HANDLE || !creation_pending;
           },
-          REXCVAR_GET(async_pipeline_wait_ms));
+          PipelineWaitBudgetMs(memexport_used_vertex || memexport_used_pixel ||
+                                   draw_util::IsAsyncPipelineWaitNeededForDraw(regs),
+                               REXCVAR_GET(async_pipeline_wait_ms)));
     }
     if (pipeline == VK_NULL_HANDLE) {
       if (creation_pending) {
@@ -5022,6 +4851,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    ++stats_pipeline_binds_;
     current_guest_graphics_pipeline_ = pipeline;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
   }
@@ -5068,6 +4898,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Segments can't mix scales, hybrid query Total counting, or VIZ IDs.
   // The resolved sample count is divided by one scale area per segment.
   // Needs to be split before the counter index goes into system constants.
+  phase_timer.Next(DrawPhase::kState);
   UpdateQuerySegment(draw_resolution_scale_x * draw_resolution_scale_y, zpd_hybrid, viz_survey);
 
   // Get dynamic rasterizer state.
@@ -5090,8 +4921,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // directly to pixel address and to things like ps_param_gen.
   draw_util::GetHostViewportInfo(
       regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
-      device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
-      normalized_depth_control,
+      device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1],
+      REXCVAR_GET(vulkan_reverse_depth_range), normalized_depth_control,
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info,
       window_offset_tiles != 0,
@@ -5142,11 +4973,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
+  phase_timer.Next(DrawPhase::kDescriptors);
   if (!UpdateBindings(vertex_shader, pixel_shader)) {
     return draw_fail("update_bindings");
   }
 
   // Ensure vertex buffers are resident.
+  phase_timer.Next(DrawPhase::kVertexData);
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   // Also what the draw reads, for upload hoisting once in the render pass.
   uint32_t vfetch_addresses[96];
@@ -5290,6 +5123,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // copies the bytes the shaders actually changed. Copying the whole range
   // back would overwrite anything the CPU wrote there while the draw was in
   // flight, since the ranges are usually much larger than what gets exported.
+  phase_timer.Next(DrawPhase::kPass);
   const bool memexport_snapshot_taken = IssueDraw_MemexportSnapshot();
 
   // Insert the shared memory barrier if needed.
@@ -5333,6 +5167,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Draw. What follows is the draw's (the textures and render targets set
   // their own sections while they work).
+  phase_timer.Next(DrawPhase::kRecord);
   SetGpuSection(GpuSection::kDraws);
   PROFILE_DRAW_CALL();
   OnVIZSurveyDraw(true);
@@ -5369,6 +5204,30 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       MarkSharedMemoryReadInRenderPass(0, SharedMemory::kBufferSize);
     }
   }
+
+  // Device-loss breadcrumbs (ReIGlue 1100): the work recorded for this draw
+  // before its draw command (a render pass, EDRAM transfers, texture loads,
+  // barriers), kept in the trail; with gpu_device_lost_setup_breadcrumbs, a
+  // marker the GPU writes once that work has finished, so that a loss tells
+  // the work from the draw.
+  ui::GpuBreadcrumbDetails breadcrumb_details;
+  {
+    const ui::vulkan::VulkanDevice* const breadcrumb_device = GetVulkanDevice();
+    if (breadcrumb_device->HasBreadcrumbs()) {
+      breadcrumb_details.work = deferred_command_buffer_.TakeBreadcrumbWork();
+      if (breadcrumb_details.work.Any() && breadcrumb_device->CanMarkBreadcrumbSetup()) {
+        deferred_command_buffer_.CmdSetupBreadcrumb(breadcrumb_device->NextBreadcrumb());
+        breadcrumb_details.setup_marked = true;
+      }
+      breadcrumb_details.vertex_shader_modification = vertex_shader_modification.value;
+      breadcrumb_details.pixel_shader_modification =
+          pixel_shader ? pixel_shader_modification.value : 0;
+      breadcrumb_details.render_pass = render_target_cache_->last_update_render_pass_key().key;
+      breadcrumb_details.render_pass_kind = ui::GpuRenderPassKind::kXenosVulkan;
+      breadcrumb_details.filled = true;
+    }
+  }
+
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
@@ -5420,6 +5279,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       deferred_command_buffer_.CmdVkEndConditionalRenderingEXT();
     }
   }
+
+  // The draw command itself is not work recorded before the next draw.
+  deferred_command_buffer_.TakeBreadcrumbWork();
+  deferred_command_buffer_.CmdBreadcrumb(GetVulkanDevice()->RecordBreadcrumb(
+      {0, GetCurrentSubmission(), frame_current_, vertex_shader->ucode_data_hash(),
+       pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+       primitive_processing_result.host_draw_vertex_count, false, breadcrumb_details}));
 
   // Invalidate textures in memexported memory and watch for changes.
   if (!memexport_ranges_.empty()) {
@@ -5711,6 +5577,16 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   return true;
 }
 
+ui::GpuBreadcrumbDetails VulkanCommandProcessor::ResolveBreadcrumbDetails() {
+  ui::GpuBreadcrumbDetails details;
+  if (GetVulkanDevice()->HasBreadcrumbs()) {
+    // The resolve's own commands and whatever was recorded since the last draw.
+    details.work = deferred_command_buffer_.TakeBreadcrumbWork();
+    details.filled = true;
+  }
+  return details;
+}
+
 bool VulkanCommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -5724,8 +5600,11 @@ bool VulkanCommandProcessor::IssueCopy() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    const bool result = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                      written_address, written_length);
+    deferred_command_buffer_.CmdBreadcrumb(GetVulkanDevice()->RecordBreadcrumb(
+        {0, GetCurrentSubmission(), frame_current_, 0, 0, 0, true, ResolveBreadcrumbDetails()}));
+    return result;
   }
 
   return IssueCopy_ReadbackResolvePath();
@@ -6035,6 +5914,8 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return false;
   }
 
+  deferred_command_buffer_.CmdBreadcrumb(vulkan_device->RecordBreadcrumb(
+      {0, GetCurrentSubmission(), frame_current_, 0, 0, 0, true, ResolveBreadcrumbDetails()}));
   if (!written_length) {
     return true;
   }
@@ -6826,6 +6707,7 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(uint64_t awa
   const bool test_gpu_loss = test_gpu_loss_frame && frame_current_ >= test_gpu_loss_frame;
 
   if (vulkan_device->IsLost() || test_gpu_loss) {
+    if (test_gpu_loss && !vulkan_device->IsLost()) vulkan_device->LogBreadcrumbs(false);
     // The driver lost the device (a GPU reset, or it gave up on it); without
     // this line the abort that follows leaves nothing in the log.
     REXGPU_ERROR(
@@ -7044,6 +6926,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
+    elide_unchanged_registers_ = REXCVAR_GET(gpu_elide_unchanged_registers);
     frame_used_pending_pipeline_ = false;
     frame_pending_pipeline_must_hold_ = false;
 
@@ -7242,9 +7125,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     assert_false(command_buffers_writable_.empty());
     CommandBuffer command_buffer = command_buffers_writable_.back();
     const uint64_t submission_index = GetCurrentSubmission();
-    // GPU time queries are recorded around the replay from this thread's state,
-    // so such a submission (a developer's capture) is made here, in queue order.
-    if (submission_thread_ && !gpu_time_recording_) {
+    // GPU time queries go with the job, written around its replay.
+    if (submission_thread_) {
       if (!HandOverSubmission(command_buffer, submission_index)) {
         return false;
       }
@@ -7264,27 +7146,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
         REXGPU_ERROR("Failed to begin a Vulkan command buffer");
         return false;
       }
-      if (gpu_time_recording_) {
-        // The submission's queries are reset before any of them is written.
-        const GpuTimeSubmission& current = gpu_time_current_;
-        const uint32_t first_part =
-            std::min(current.query_count, kGpuTimeQueries - current.first_query);
-        dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_time_query_pool_, current.first_query,
-                                first_part);
-        if (first_part < current.query_count) {
-          dfn.vkCmdResetQueryPool(command_buffer.buffer, gpu_time_query_pool_, 0,
-                                  current.query_count - first_part);
-        }
-        // Bottom of the pipe: once everything submitted earlier is done, so the
-        // time of one submission isn't counted again in the next.
-        dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                gpu_time_query_pool_, current.start_query);
-      }
+      const GpuTimeRange gpu_time_range = GetGpuTimeRange();
+      RecordGpuTimeStart(command_buffer.buffer, gpu_time_range);
       deferred_command_buffer_.Execute(command_buffer.buffer);
-      if (gpu_time_recording_) {
-        dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                gpu_time_query_pool_, gpu_time_current_.end_query);
-      }
+      RecordGpuTimeEnd(command_buffer.buffer, gpu_time_range);
 
       // Record query resolves before submitting.
       if (host_query_pool_) {
@@ -7330,6 +7195,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     current_submission_wait_semaphores_.clear();
     command_buffers_submitted_.emplace_back(submission_index, command_buffer);
     command_buffers_writable_.pop_back();
+    ++stats_submissions_;
     if (gpu_time_recording_) {
       gpu_time_current_.submission = submission_index;
       gpu_time_current_.last = gpu_section_;
@@ -8484,8 +8350,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         point_screen_diameter_to_ndc_radius_y;
   }
 
-  // Texture signedness / gamma.
+  // Texture signedness / gamma, and the stacked ones wrapping their layers.
   uint32_t textures_resolution_scaled = 0;
+  uint32_t textures_stacked_layer_wrap = 0;
+  const uint32_t stacked_layer_wrap_min_layers =
+      uint32_t(std::max(REXCVAR_GET(stacked_texture_layer_wrap), int32_t(0)));
   {
     uint32_t textures_remaining = used_texture_mask;
     uint32_t texture_index;
@@ -8505,10 +8374,18 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       system_constants_.texture_integer_scale_bits[texture_index] = texture_integer_scale_bits;
       textures_resolution_scaled |=
           uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
+      if (stacked_layer_wrap_min_layers) {
+        textures_stacked_layer_wrap |=
+            uint32_t(texture_util::IsStackedLayerWrapped(regs.GetTextureFetch(texture_index),
+                                                         stacked_layer_wrap_min_layers))
+            << texture_index;
+      }
     }
   }
   dirty |= system_constants_.textures_resolution_scaled != textures_resolution_scaled;
   system_constants_.textures_resolution_scaled = textures_resolution_scaled;
+  dirty |= system_constants_.textures_stacked_layer_wrap != textures_stacked_layer_wrap;
+  system_constants_.textures_stacked_layer_wrap = textures_stacked_layer_wrap;
 
   // Texture host swizzle in the shader.
   if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {

@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <string>
+#include <vector>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -900,6 +903,137 @@ TEST_CASE("cvar SaveConfig keeps lines of flags nobody registered", "[cvar]") {
   std::filesystem::remove(config_path);
 }
 
+TEST_CASE("EditConfigText changes only the edited values", "[cvar]") {
+  using rex::cvar::ConfigEdit;
+  using rex::cvar::EditConfigText;
+
+  SECTION("A value is replaced in place, comment, spacing and other lines kept") {
+    const std::string text =
+        "# header comment\n"
+        "\n"
+        "  vsync   =  true   # keep me\n"
+        "resolution_scale = 2\n";
+    CHECK(EditConfigText(text, {ConfigEdit{"vsync", "false"}}) ==
+          "# header comment\n"
+          "\n"
+          "  vsync   =  false   # keep me\n"
+          "resolution_scale = 2\n");
+  }
+
+  SECTION("A string with a # inside and a comment after it") {
+    const std::string text = "name = \"a # b\" # comment\n";
+    CHECK(EditConfigText(text, {ConfigEdit{"name", "\"c\""}}) == "name = \"c\" # comment\n");
+  }
+
+  SECTION("A missing setting is added at the end, a final newline added") {
+    CHECK(EditConfigText("a = 1", {ConfigEdit{"b", "2"}}) == "a = 1\nb = 2\n");
+    CHECK(EditConfigText("", {ConfigEdit{"b", "2"}}) == "b = 2\n");
+  }
+
+  SECTION("A setting written twice: the last line, the one the loader uses, changes") {
+    CHECK(EditConfigText("a = 1\na = 2\n", {ConfigEdit{"a", "3"}}) == "a = 1\na = 3\n");
+  }
+
+  SECTION("Tables stay as they are; a new setting goes after the root's last setting") {
+    const std::string text =
+        "a = 1\n"
+        "# about the table\n"
+        "[table]\n"
+        "a = 5\n";
+    CHECK(EditConfigText(text, {ConfigEdit{"a", "2"}, ConfigEdit{"b", "3"}}) ==
+          "a = 2\n"
+          "b = 3\n"
+          "# about the table\n"
+          "[table]\n"
+          "a = 5\n");
+  }
+
+  SECTION("CRLF files keep CRLF, new lines included") {
+    CHECK(EditConfigText("a = 1\r\nb = 2\r\n", {ConfigEdit{"b", "4"}, ConfigEdit{"c", "5"}}) ==
+          "a = 1\r\nb = 4\r\nc = 5\r\n");
+  }
+
+  SECTION("Nothing to edit: the text comes back unchanged") {
+    const std::string text = "# only a comment\nkey = [1, 2] # array\n";
+    CHECK(EditConfigText(text, {}) == text);
+    CHECK(EditConfigText(text, {ConfigEdit{"key", "[3]"}}) ==
+          "# only a comment\nkey = [3] # array\n");
+  }
+}
+
+TEST_CASE("cvar SaveConfig edits a loaded settings file in place", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  auto config_path = std::filesystem::temp_directory_path() / "test_in_place_config.toml";
+  {
+    std::ofstream file(config_path, std::ios::binary);
+    file << "# Hand-written settings\n"
+            "\n"
+            "test_int32_flag = 5   # five\n"
+            "test_double_flag = 2.5\n"
+            "test_bool_flag = true\n"
+            "plugin_only_setting = \"kept\"\n";
+  }
+  rex::cvar::LoadConfig(config_path);
+  REQUIRE(REXCVAR_GET(test_int32_flag) == 5);
+
+  REXCVAR_SET(test_int32_flag, 6);
+  REXCVAR_SET(test_bool_flag, false);  // the default: the line stays, with false
+  REXCVAR_SET(test_string_flag, "new");
+  rex::cvar::SaveConfig(config_path);
+
+  CHECK(ReadTextFile(config_path) ==
+        "# Hand-written settings\n"
+        "\n"
+        "test_int32_flag = 6   # five\n"
+        "test_double_flag = 2.5\n"
+        "test_bool_flag = false\n"
+        "plugin_only_setting = \"kept\"\n"
+        "test_string_flag = \"new\"\n");
+
+  // Saving again without a change leaves the file alone.
+  rex::cvar::SaveConfig(config_path);
+  CHECK(ReadTextFile(config_path).find("test_int32_flag = 6   # five") != std::string::npos);
+
+  rex::cvar::testing::ResetAllForTesting();
+  rex::cvar::LoadConfig(config_path);
+  CHECK(REXCVAR_GET(test_int32_flag) == 6);
+  CHECK(REXCVAR_GET(test_bool_flag) == false);
+  CHECK(REXCVAR_GET(test_string_flag) == "new");
+  CHECK(REXCVAR_GET(test_double_flag) == Catch::Approx(2.5));
+
+  std::filesystem::remove(config_path);
+}
+
+TEST_CASE("cvar SaveConfig puts each setting back into the file it came from", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  const auto dir = std::filesystem::temp_directory_path();
+  const auto hardware = dir / "test_two_files_hardware.toml";
+  const auto mapping = dir / "test_two_files_mapping.toml";
+  {
+    std::ofstream file(hardware, std::ios::binary);
+    file << "test_int32_flag = 1\n";
+  }
+  {
+    std::ofstream file(mapping, std::ios::binary);
+    file << "# input\ntest_string_flag = \"keys\"\n";
+  }
+  rex::cvar::LoadConfig(hardware);
+  rex::cvar::LoadConfig(mapping);
+
+  REXCVAR_SET(test_int32_flag, 2);
+  REXCVAR_SET(test_string_flag, "other keys");
+  REXCVAR_SET(test_double_flag, 1.5);  // in neither file: goes to the file saved to
+  rex::cvar::SaveConfig(hardware);
+
+  CHECK(ReadTextFile(hardware) == "test_int32_flag = 2\ntest_double_flag = 1.5\n");
+  CHECK(ReadTextFile(mapping) == "# input\ntest_string_flag = \"other keys\"\n");
+
+  std::filesystem::remove(hardware);
+  std::filesystem::remove(mapping);
+}
+
 TEST_CASE("cvar SetDefaultValue makes an app default", "[cvar]") {
   rex::cvar::testing::ResetAllForTesting();
 
@@ -1013,4 +1147,96 @@ TEST_CASE("DescribeFlags splits changed settings from the rest", "[cvar]") {
       CHECK_FALSE(line.starts_with("test_noarg_cmd"));
     }
   }
+}
+
+// Declaration order is registration order: the repeated flag comes before the
+// last one, which a throw in the repeated flag's callback used to skip.
+REXCVAR_DEFINE_STRING(test_repeated_flag, "default", "Test", "Given twice on the command line");
+REXCVAR_DEFINE_STRING(test_after_repeated_flag, "default", "Test", "Registered after it");
+
+TEST_CASE("cvar repeated command line switch: the last wins, later ones still apply", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+  char argv0[] = "cvar_test";
+  char arg1[] = "--test_repeated_flag=first";
+  char arg2[] = "--test_repeated_flag=second";
+  char arg3[] = "--test_after_repeated_flag=applied";
+  char* argv[] = {argv0, arg1, arg2, arg3};
+  rex::cvar::Init(4, argv);
+  CHECK(REXCVAR_GET(test_repeated_flag) == "second");
+  CHECK(REXCVAR_GET(test_after_repeated_flag) == "applied");
+  rex::cvar::testing::ResetAllForTesting();
+}
+
+TEST_CASE("config duplicates: earlier lines of a repeated key are dropped per table", "[cvar]") {
+  std::vector<std::string> dropped;
+  const std::string text =
+      "a = 1\n"
+      "b = 2\n"
+      "a = 3\n"
+      "[GPU]\n"
+      "a = 4\n"
+      "x = 5\n"
+      "x = 6\n";
+  CHECK(rex::cvar::DropEarlierConfigDuplicates(text, dropped) ==
+        "b = 2\n"
+        "a = 3\n"
+        "[GPU]\n"
+        "a = 4\n"
+        "x = 6\n");
+  CHECK(dropped == std::vector<std::string>{"a", "x"});
+
+  dropped.clear();
+  const std::string clean = "# comment\nkey = \"v\"\n[T]\nkey = 1";
+  CHECK(rex::cvar::DropEarlierConfigDuplicates(clean, dropped) == clean);
+  CHECK(dropped.empty());
+}
+
+TEST_CASE("config load: a repeated key is read with its last value and reported", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+  auto config_path = std::filesystem::temp_directory_path() / "test_config_duplicates.toml";
+  {
+    std::ofstream file(config_path, std::ios::trunc);
+    file << "test_int32_flag = 11\n";
+    file << "test_bool_flag = true\n";
+    file << "test_int32_flag = 7\n";
+  }
+  rex::cvar::LoadConfig(config_path);
+  CHECK(REXCVAR_GET(test_int32_flag) == 7);
+  CHECK(REXCVAR_GET(test_bool_flag) == true);
+  const auto reports = rex::cvar::GetConfigLoadReports();
+  REQUIRE(reports.size() == 1);
+  CHECK(reports[0].kind == rex::cvar::ConfigLoadReport::Kind::kDuplicates);
+  CHECK(reports[0].duplicate_keys == std::vector<std::string>{"test_int32_flag"});
+  std::filesystem::remove(config_path);
+  rex::cvar::testing::ResetAllForTesting();
+}
+
+TEST_CASE("config load: an unreadable file is kept as .bad and defaults apply", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+  auto config_path = std::filesystem::temp_directory_path() / "test_config_unreadable.toml";
+  auto bad_path = config_path;
+  bad_path += ".bad";
+  std::filesystem::remove(bad_path);
+  const std::string text = "test_int32_flag = 12\ntest_bool_flag = = true\n";
+  {
+    std::ofstream file(config_path, std::ios::binary | std::ios::trunc);
+    file << text;
+  }
+  REXCVAR_SET(test_int32_flag, 42);
+  rex::cvar::LoadConfig(config_path);
+  CHECK(REXCVAR_GET(test_int32_flag) == 42);
+  const auto reports = rex::cvar::GetConfigLoadReports();
+  REQUIRE(reports.size() == 1);
+  CHECK(reports[0].kind == rex::cvar::ConfigLoadReport::Kind::kUnreadable);
+  CHECK(reports[0].line == 2);
+  CHECK_FALSE(reports[0].error.empty());
+  CHECK(reports[0].bad_copy == bad_path);
+  {
+    std::ifstream bad(bad_path, std::ios::binary);
+    const std::string copied{std::istreambuf_iterator<char>(bad), std::istreambuf_iterator<char>()};
+    CHECK(copied == text);
+  }
+  std::filesystem::remove(config_path);
+  std::filesystem::remove(bad_path);
+  rex::cvar::testing::ResetAllForTesting();
 }

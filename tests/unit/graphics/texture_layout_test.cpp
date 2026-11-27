@@ -252,3 +252,25 @@ TEST_CASE("2x1 packed mips use the square layout", "[graphics][texture]") {
   CHECK(x == 0);
   CHECK(y == 16);
 }
+
+// stacked_texture_layer_wrap: only stacks of enough layers repeating on the layer axis.
+TEST_CASE("Stacked textures wrap their layers only when asked and repeating",
+          "[graphics][texture]") {
+  xenos::xe_gpu_texture_fetch_t fetch = {};
+  fetch.dimension = xenos::DataDimension::k2DOrStacked;
+  fetch.size_2d.stack_depth = 16 - 1;
+  fetch.clamp_z = xenos::ClampMode::kRepeat;
+  CHECK_FALSE(texture_util::IsStackedLayerWrapped(fetch, 0));
+  CHECK(texture_util::IsStackedLayerWrapped(fetch, 8));
+  CHECK(texture_util::IsStackedLayerWrapped(fetch, 16));
+  CHECK_FALSE(texture_util::IsStackedLayerWrapped(fetch, 17));
+  // A clamped layer axis, a single layer, a 3D texture: never.
+  fetch.clamp_z = xenos::ClampMode::kClampToEdge;
+  CHECK_FALSE(texture_util::IsStackedLayerWrapped(fetch, 8));
+  fetch.clamp_z = xenos::ClampMode::kRepeat;
+  fetch.size_2d.stack_depth = 0;
+  CHECK_FALSE(texture_util::IsStackedLayerWrapped(fetch, 1));
+  fetch.dimension = xenos::DataDimension::k3D;
+  fetch.size_3d.depth = 16 - 1;
+  CHECK_FALSE(texture_util::IsStackedLayerWrapped(fetch, 8));
+}

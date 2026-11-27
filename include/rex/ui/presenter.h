@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/ui/present_rate_limiter.h>
 #include <rex/math.h>
 #include <rex/platform.h>
 #include <rex/types.h>
@@ -188,6 +189,31 @@ class Presenter {
   using HostGpuLossCallback =
       std::function<void(bool is_responsible, bool statically_from_ui_thread)>;
   static void FatalErrorHostGpuLossCallback(bool is_responsible, bool statically_from_ui_thread);
+
+  // Scene data a guest output refresher publishes with its frame for frame
+  // generation (a backend with it gives the refresher the images to write;
+  // ui/vulkan/frame_generation.h). Filled from a title's scene contract.
+  struct FrameGenerationInputs {
+    bool valid = false;     // Depth, motion and the frame without the HUD were written.
+    bool generate = true;   // The title allows a generated frame before this one.
+    bool reset = false;     // History discontinuity.
+    uint64_t frame = 0;     // Producer frame serial, consecutive (a gap resets).
+    float delta_ms = 0;     // Simulated time since the previous frame; 0 unknown.
+    float jitter_x = 0, jitter_y = 0;  // Scene jitter, input pixels.
+    float camera_near = 0, camera_far = 0, fov_y = 0, meters_per_unit = 0;
+    bool depth_inverted = false, depth_infinite = false;
+    // World space; normalized axes.
+    std::array<float, 3> position{}, up{}, right{}, forward{};
+    // Camera matrices, row-major for column vectors (clip = M * v), without
+    // jitter, in the clip space of the depth and motion images (the frame: a
+    // letterboxed scene's mapped into it): view -> clip, clip -> view, this
+    // frame's clip -> the previous frame's and back (identity without one).
+    std::array<float, 16> view_to_clip{}, clip_to_view{}, clip_to_previous_clip{}, previous_clip_to_clip{};
+    float aspect = 0;  // View width / height.
+    // The producer frame the motion refers to (the scene before, frames
+    // without one between); 0: none (reset).
+    uint64_t previous_frame = 0;
+  };
 
   class GuestOutputRefreshContext {
    public:
@@ -369,11 +395,17 @@ class Presenter {
   // (making the image the next to present, and painting it if the paint mode
   // asks for that) is handed to it instead of running in RefreshGuestOutput. It
   // must run the steps in order, each once the refresher's work is on the
-  // queue, and all before the next RefreshGuestOutput. Set it only while no
-  // refresh is in progress.
+  // queue, and publication must finish before the next RefreshGuestOutput.
+  // Optionally defer painting separately: the caller can await publication
+  // without waiting for host presentation. Queue both steps in order; drain
+  // both before changing the deferrers or destroying the presenter. Without
+  // paint_deferrer, publication and painting remain one step. Set these only
+  // while no refresh or deferred step is in progress.
   using GuestOutputPublishDeferrer = std::function<void(std::function<void()> step)>;
-  void SetGuestOutputPublishDeferrer(GuestOutputPublishDeferrer deferrer) {
+  void SetGuestOutputPublishDeferrer(GuestOutputPublishDeferrer deferrer,
+                                   GuestOutputPublishDeferrer paint_deferrer = {}) {
     guest_output_publish_deferrer_ = std::move(deferrer);
+    guest_output_paint_deferrer_ = std::move(paint_deferrer);
   }
   bool IsGuestOutputPublishDeferred() const { return bool(guest_output_publish_deferrer_); }
   // The implementation must be callable from any thread, including from
@@ -391,6 +423,12 @@ class Presenter {
 
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
+
+  // Frame generation runs (the backend's swapchain generates frames): a GPU
+  // plugin with a title scene producer then prepares its inputs. Any thread.
+  bool IsFrameGenerationActive() const {
+    return frame_generation_active_.load(std::memory_order_relaxed);
+  }
 
  protected:
   enum class PaintResult {
@@ -425,6 +463,7 @@ class Presenter {
     uint32_t display_aspect_ratio_x;
     uint32_t display_aspect_ratio_y;
     bool is_8bpc;
+    FrameGenerationInputs frame_generation;
 
     GuestOutputProperties() { SetToInactive(); }
 
@@ -439,6 +478,7 @@ class Presenter {
       display_aspect_ratio_x = 0;
       display_aspect_ratio_y = 0;
       is_8bpc = false;
+      frame_generation = {};
     }
   };
 
@@ -725,10 +765,26 @@ class Presenter {
   // Call via PaintAndPresent.
   virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
 
+  // The frame generation inputs of a mailbox slot, for RefreshGuestOutputImpl
+  // (the slot being refreshed is the refresher's alone).
+  FrameGenerationInputs& GuestOutputFrameGenerationInputs(uint32_t mailbox_index) {
+    return guest_output_properties_[mailbox_index].frame_generation;
+  }
+  // Set by the backend (IsFrameGenerationActive).
+  void SetFrameGenerationActive(bool active) {
+    frame_generation_active_.store(active, std::memory_order_relaxed);
+  }
+  // The refresh rate of the display showing the surface, Hz (0 unknown); updated
+  // by the UI thread at each surface connection. Any thread.
+  double display_refresh_rate() const { return display_refresh_rate_.load(std::memory_order_relaxed); }
+
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
 
  private:
+  // present_screenshot_request (RefreshGuestOutput, the refreshing thread).
+  void SaveRequestedScreenshot();
+
   enum class PaintMode {
     // Don't paint at all.
     // Painting lifecycle is accessible only by the UI thread.
@@ -853,6 +909,7 @@ class Presenter {
   // kPresentedSuboptimal rather than kNotPresentedConnectionOutdated, the image
   // has been successfully sent to the OS presentation at least.
   PaintResult PaintAndPresent(bool execute_ui_drawers);
+  PresentRateLimiter host_frame_limiter_;
 
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
 
@@ -864,7 +921,7 @@ class Presenter {
     // sync in the presentation already as that might result in inconsistent
     // frame pacing and potentially skipped vertical sync intervals.
     return !ui_drawers_.empty() && paint_mode_ != PaintMode::kNone &&
-           !surface_paint_connection_has_implicit_vsync_;
+           (!surface_paint_connection_has_implicit_vsync_ || REXCVAR_GET(host_frame_limit) > 0);
   }
   void UpdateUITicksNeededFromUIThread();
   void WaitForUITickFromUIThread();
@@ -885,6 +942,9 @@ class Presenter {
   // (even if the UI thread argument is false - such as when the guest output is
   // refreshed on the UI thread).
   HostGpuLossCallback host_gpu_loss_callback_;
+
+  std::atomic<bool> frame_generation_active_{false};
+  std::atomic<double> display_refresh_rate_{0.0};
 
   // May be accessed by the guest output thread if the paint mode is not kNone,
   // to request painting (for kUIThreadOnRequest) or reconnection (for
@@ -995,8 +1055,10 @@ class Presenter {
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
   GuestOutputPublishDeferrer guest_output_publish_deferrer_;
-  // The part of a refresh after the refresher.
+  GuestOutputPublishDeferrer guest_output_paint_deferrer_;
+  // Mailbox ownership is advanced separately from potentially blocking paint.
   void PublishGuestOutput();
+  void PaintGuestOutput();
 
   // Ordered by the Z order, and then by the time of addition.
   // Note: All the iteration logic involving this Z ordering must be the same as

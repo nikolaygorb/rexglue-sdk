@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -22,6 +24,8 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/dlss_frame_generation.h>
+#include <rex/ui/vulkan/frame_generation.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/gpu_completion_timeline.h>
 #include <rex/ui/vulkan/ui_samplers.h>
@@ -84,16 +88,41 @@ class VulkanPresenter final : public Presenter {
   static constexpr VkImageLayout kGuestOutputInternalLayout =
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
+  // Frame generation inputs of a guest output image (ui/vulkan/frame_generation.h):
+  // all of the frontbuffer's size, acquired and released like the guest output
+  // image (kGuestOutputInternalLayout; from UNDEFINED at the first write).
+  static constexpr VkFormat kFrameGenerationDepthFormat = VK_FORMAT_R32_SFLOAT;
+  static constexpr VkFormat kFrameGenerationMotionFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+  struct FrameGenerationTargets {
+    // The frame without the HUD, as the guest output image (kGuestOutputFormat).
+    VkImage hudless = VK_NULL_HANDLE;
+    VkImageView hudless_view = VK_NULL_HANDLE;
+    uint64_t hudless_version = 0;
+    // Guest clip z/w (storage).
+    VkImage depth = VK_NULL_HANDLE;
+    VkImageView depth_view = VK_NULL_HANDLE;
+    // xy: current -> previous pixels without jitter, zw unused (storage).
+    VkImage motion = VK_NULL_HANDLE;
+    VkImageView motion_view = VK_NULL_HANDLE;
+    bool ever_written_previously = false;
+    // native_frame_generation_debug: 4 asks for the inputs drawn into `hudless`.
+    int32_t debug = 0;
+    // Set valid once all three are written.
+    FrameGenerationInputs* inputs = nullptr;
+  };
+
   // The callback must use the graphics and compute queue 0 of the device.
   class VulkanGuestOutputRefreshContext final : public GuestOutputRefreshContext {
    public:
     VulkanGuestOutputRefreshContext(bool& is_8bpc_out_ref, VkImage image, VkImageView image_view,
-                                    uint64_t image_version, bool image_ever_written_previously)
+                                    uint64_t image_version, bool image_ever_written_previously,
+                                    const FrameGenerationTargets* frame_generation = nullptr)
         : GuestOutputRefreshContext(is_8bpc_out_ref),
           image_(image),
           image_view_(image_view),
           image_version_(image_version),
-          image_ever_written_previously_(image_ever_written_previously) {}
+          image_ever_written_previously_(image_ever_written_previously),
+          frame_generation_(frame_generation) {}
 
     // The format is kGuestOutputFormat.
     // Supports usage as a color attachment and as a sampled image, as well as
@@ -103,12 +132,15 @@ class VulkanPresenter final : public Presenter {
     uint64_t image_version() const { return image_version_; }
     // Whether a proper barrier must be done to acquire the image.
     bool image_ever_written_previously() const { return image_ever_written_previously_; }
+    // Non-null while the presenter generates frames and wants this frame's inputs.
+    const FrameGenerationTargets* frame_generation() const { return frame_generation_; }
 
    private:
     VkImage image_;
     VkImageView image_view_;
     uint64_t image_version_;
     bool image_ever_written_previously_;
+    const FrameGenerationTargets* frame_generation_;
   };
 
   static std::unique_ptr<VulkanPresenter> Create(HostGpuLossCallback host_gpu_loss_callback,
@@ -156,11 +188,13 @@ class VulkanPresenter final : public Presenter {
   class GuestOutputImage {
    public:
     static std::unique_ptr<GuestOutputImage> Create(const VulkanDevice* const vulkan_device,
-                                                    const uint32_t width, const uint32_t height) {
+                                                    const uint32_t width, const uint32_t height,
+                                                    VkFormat format = kGuestOutputFormat) {
       assert_not_zero(width);
       assert_not_zero(height);
       auto image =
           std::unique_ptr<GuestOutputImage>(new GuestOutputImage(vulkan_device, width, height));
+      image->format_ = format;
       if (!image->Initialize()) {
         return nullptr;
       }
@@ -176,6 +210,13 @@ class VulkanPresenter final : public Presenter {
     VkImage image() const { return image_; }
     VkDeviceMemory memory() const { return memory_; }
     VkImageView view() const { return view_; }
+    VkFormat format() const { return format_; }
+
+    // Frame generation inputs (a guest output image's), living as long as it.
+    bool CreateFrameGenerationImages();
+    const GuestOutputImage* frame_generation_hudless() const { return fg_hudless_.get(); }
+    const GuestOutputImage* frame_generation_depth() const { return fg_depth_.get(); }
+    const GuestOutputImage* frame_generation_motion() const { return fg_motion_.get(); }
 
    private:
     GuestOutputImage(const VulkanDevice* const vulkan_device, const uint32_t width,
@@ -190,9 +231,11 @@ class VulkanPresenter final : public Presenter {
     const VulkanDevice* vulkan_device_;
 
     VkExtent2D extent_;
+    VkFormat format_ = kGuestOutputFormat;
     VkImage image_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkImageView view_ = VK_NULL_HANDLE;
+    std::unique_ptr<GuestOutputImage> fg_hudless_, fg_depth_, fg_motion_;
   };
 
   struct GuestOutputImageInstance {
@@ -200,6 +243,7 @@ class VulkanPresenter final : public Presenter {
     // of destruction only after painting is done on the GPU).
     std::shared_ptr<GuestOutputImage> image;
     uint64_t version = UINT64_MAX;
+    uint64_t hudless_version = UINT64_MAX;  // Of its frame generation hudless image.
     uint64_t last_refresher_submission = 0;
     // For choosing the barrier stage and access mask and layout depending on
     // whether the image has previously been written. If an image is active
@@ -209,6 +253,7 @@ class VulkanPresenter final : public Presenter {
     void SetToNewImage(const std::shared_ptr<GuestOutputImage>& new_image, uint64_t new_version) {
       image = new_image;
       version = new_version;
+      hudless_version = UINT64_MAX;
       last_refresher_submission = 0;
       ever_successfully_refreshed = false;
     }
@@ -313,8 +358,12 @@ class VulkanPresenter final : public Presenter {
       kGuestOutputDescriptorSetIntermediate0Sampled =
           kGuestOutputDescriptorSetGuestOutput0Sampled + kGuestOutputMailboxSize,
 
-      kGuestOutputDescriptorSetCount =
+      // The frame generation hudless image of each guest output paint reference.
+      kGuestOutputDescriptorSetHudless0Sampled =
           kGuestOutputDescriptorSetIntermediate0Sampled + kMaxGuestOutputPaintEffects - 1,
+
+      kGuestOutputDescriptorSetCount =
+          kGuestOutputDescriptorSetHudless0Sampled + kGuestOutputMailboxSize,
     };
 
     struct UISetupCommandBuffer {
@@ -346,11 +395,22 @@ class VulkanPresenter final : public Presenter {
     // call (though it may fail before the vkCreateSwapchainKHR that will
     // technically retire it, so it will be in an undefined state), and needs to
     // be destroyed externally no matter what the result is.
+    // frame_generation: its proxy swapchain first (old_swapchain must be null
+    // then); frame_generation_out tells which kind was created.
+    // dlss_frame_generation: a regular swapchain with the copies and extra
+    // images DLSS frame generation needs where the surface allows them (its
+    // minImageCount and the images' usage out).
     static VkSwapchainKHR CreateSwapchainForVulkanSurface(
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& ui_surface_unusable_out);
+        bool& ui_surface_unusable_out, VulkanFrameGeneration* frame_generation = nullptr,
+        bool* frame_generation_out = nullptr, bool dlss_frame_generation = false,
+        uint32_t* surface_min_image_count_out = nullptr, VkImageUsageFlags* image_usage_out = nullptr);
+    // Destroys a swapchain PrepareForSwapchainRetirement returned, of the kind
+    // swapchain_frame_generation said before it.
+    void DestroyRetiredSwapchain(VkSwapchainKHR old_swapchain, bool was_frame_generation);
+    void DestroyFrameGenerationHudless();
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -414,6 +474,43 @@ class VulkanPresenter final : public Presenter {
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
     std::vector<VkSemaphore> swapchain_image_present_semaphores;
+
+    // Frame generation (the presenter's, may be null): `swapchain` is its proxy
+    // while swapchain_frame_generation.
+    VulkanFrameGeneration* frame_generation = nullptr;
+    bool swapchain_frame_generation = false;
+    // DLSS frame generation (the presenter's, may be null): generating on the
+    // regular `swapchain` while swapchain_dlss_frame_generation.
+    VulkanDlssFrameGeneration* dlss_frame_generation = nullptr;
+    bool swapchain_dlss_frame_generation = false;
+    uint32_t swapchain_surface_min_image_count = 0;
+    VkImageUsageFlags swapchain_image_usage = 0;
+    // The frame without the HUD painted like the guest output (swapchain size
+    // and format, left in SHADER_READ_ONLY_OPTIMAL), and its pass.
+    VkRenderPass fg_hudless_render_pass = VK_NULL_HANDLE;
+    VkFormat fg_hudless_render_pass_format = VK_FORMAT_UNDEFINED;
+    // Two, alternating per generated frame: with async generation the proxy
+    // still reads the last one while the next paint writes (AMD's rule).
+    std::array<VkImage, 2> fg_hudless_image{};
+    std::array<VkDeviceMemory, 2> fg_hudless_memory{};
+    std::array<VkImageView, 2> fg_hudless_view{};
+    std::array<VkFramebuffer, 2> fg_hudless_framebuffer{};
+    uint32_t fg_hudless_index = 0;
+    // Neutral inputs for frames without the title's (8x8: far depth for a
+    // forward and an inverted depth, still motion), cleared at the first paint.
+    std::unique_ptr<GuestOutputImage> fg_neutral_depth[2], fg_neutral_motion;
+    bool fg_neutral_ready = false;
+    // The last frame presented with inputs (its camera and rectangle), and the
+    // frames since presented with neutral inputs.
+    VulkanFrameGeneration::Frame fg_last_generated{};
+    bool fg_has_last_generated = false;
+    uint32_t fg_gap_frames = 0;
+    // The producer frame of the last real frame presented with generation inputs.
+    uint64_t fg_last_frame = 0;
+    std::chrono::steady_clock::time_point fg_last_real_present{};
+    std::chrono::steady_clock::time_point fg_stats_since{};
+    uint64_t fg_stats_real = 0, fg_stats_generating = 0, fg_stats_presents_base = 0;
+    uint64_t fg_stats_held_base = 0, fg_stats_resets_base = 0;
   };
 
   // Out of line: the members include a std::unique_ptr of a type complete
@@ -436,6 +533,10 @@ class VulkanPresenter final : public Presenter {
   void DestroyTemporalUpscalerContext();
 #endif
 
+  // The frame generation hudless image for the swapchain's size and format
+  // (and its render pass), at a frame generation swapchain's connection.
+  bool CreateFrameGenerationHudless();
+
   // NVIDIA Image Scaling in the first EASU slot (present_effect = "nis"),
   // recorded into command_buffer of the paint `submission`. False if it is
   // unavailable, then the slot is drawn with EASU.
@@ -447,6 +548,17 @@ class VulkanPresenter final : public Presenter {
 
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
+
+  // AMD FSR frame generation (native_frame_generation): created with the
+  // presenter; used by surface connection and painting (one thread at a time).
+  std::unique_ptr<VulkanFrameGeneration> frame_generation_;
+  // The refresher's last frame while frame generation runs (its frame rate cap).
+  std::chrono::steady_clock::time_point frame_generation_last_refresh_{};
+  // Painting's: generation is on (the refresher caps the frame rate only then).
+  std::atomic<bool> frame_generation_generating_{false};
+  // NVIDIA DLSS frame generation (native_frame_generation = dlss): created with
+  // the presenter, generating on the regular swapchain (dlss_frame_generation.h).
+  std::unique_ptr<VulkanDlssFrameGeneration> dlss_frame_generation_;
 
   // Created on the first NIS paint (paint thread), destroyed after the paint
   // submissions complete.

@@ -85,6 +85,9 @@ class ObjectTable {
   X_STATUS AddNameMapping(const std::string_view name, X_HANDLE handle);
   void RemoveNameMapping(const std::string_view name);
   X_STATUS GetObjectByName(const std::string_view name, X_HANDLE* out_handle);
+  // A named NtCreate* open: an independent handle, or collision/type mismatch.
+  X_STATUS OpenNamedHandle(std::string_view name, XObject::Type type, bool open_if,
+                           X_HANDLE* out_handle);
   template <typename T>
   std::vector<object_ref<T>> GetObjectsByType(XObject::Type type) {
     std::vector<object_ref<T>> results;

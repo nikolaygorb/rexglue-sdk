@@ -21,6 +21,10 @@ project(ReXGlue
 option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
 option(REXGLUE_PPC_CORPUS        "Build the hardware-captured PPC test corpus (170,000 cases, label ppc_corpus)" OFF)
 set(REXGLUE_PPC_CORPUS_DIR "" CACHE PATH "xenia-edge's src/xenia/cpu/ppc/testing, for REXGLUE_PPC_CORPUS")
+set(REXGLUE_PPC_CORPUS_OVERLAY_DIR "" CACHE PATH "Optional: .s files that replace the corpus files of the same name (e.g. xenia-canary's versions)")
+set(REXGLUE_PPC_CORPUS_SKIP_LIST "" CACHE STRING "Optional: the corpus skip list to use instead of the corpus' skip.txt; none: no skips")
+set(REXGLUE_PPC_CORPUS_KNOWN_FAILURES "${CMAKE_CURRENT_SOURCE_DIR}/tests/ppc/corpus/known_failures.txt" CACHE FILEPATH "Expected failures for the selected PPC corpus")
+set(REXGLUE_PPC_CORPUS_EXCLUDE_LIST "${CMAKE_CURRENT_SOURCE_DIR}/tests/ppc/corpus/assembler_unsupported.txt" CACHE FILEPATH "Files unavailable in the selected PPC corpus, one stem per line")
 option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer (same as REXGLUE_SANITIZERS=undefined)" OFF)
 set(REXGLUE_SANITIZERS "" CACHE STRING "Comma-separated clang sanitizers: address, undefined")
 option(REXGLUE_BUILD_FUZZERS     "Build libFuzzer targets (tests/fuzz); best with REXGLUE_SANITIZERS=address" OFF)
@@ -310,7 +314,10 @@ endif()
 
 # Output directories (multi-config appends /<Config>/ automatically). Sanitizer
 # builds get their own directory so they never replace the normal binaries.
-set(REXGLUE_OUTPUT_DIR "${REXGLUE_ROOT}/out/${REX_PLATFORM}${REXGLUE_OUTPUT_SUFFIX}")
+set(REXGLUE_OUTPUT_DIR "" CACHE PATH "Override the SDK binary directory (config appended by multi-config generators)")
+if(NOT REXGLUE_OUTPUT_DIR)
+    set(REXGLUE_OUTPUT_DIR "${REXGLUE_ROOT}/out/${REX_PLATFORM}${REXGLUE_OUTPUT_SUFFIX}")
+endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")

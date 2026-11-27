@@ -117,6 +117,9 @@ bool Entry::Delete(Entry* entry) {
   if (entry->has_open_files()) {
     return false;
   }
+  if ((entry->attributes() & kFileAttributeDirectory) && !entry->is_empty_folder()) {
+    return false;
+  }
   if (entry->parent() != this) {
     return false;
   }
@@ -134,8 +137,7 @@ bool Entry::Delete(Entry* entry) {
 }
 
 bool Entry::Delete() {
-  assert_not_null(parent_);
-  return parent_->Delete(this);
+  return parent_ && parent_->Delete(this);
 }
 
 X_STATUS Entry::Rename(const std::filesystem::path& file_path, bool replace_existing) {
@@ -163,9 +165,7 @@ X_STATUS Entry::Rename(const std::filesystem::path& file_path, bool replace_exis
     if (!replace_existing || (existing->attributes() & kFileAttributeDirectory)) {
       return X_STATUS_OBJECT_NAME_COLLISION;
     }
-    // TODO: edge also refuses an open target; open handles are not tracked
-    // here, so the host rename reports it where the host refuses.
-    if (existing == this) {
+    if (existing == this || existing->has_open_files()) {
       return X_STATUS_ACCESS_DENIED;
     }
   }
@@ -188,6 +188,15 @@ X_STATUS Entry::Rename(const std::filesystem::path& file_path, bool replace_exis
   path_ = rex::string::utf8_join_guest_paths(new_parent->path(), name);
   absolute_path_ = rex::string::utf8_join_guest_paths(device_->mount_path(), path_);
   name_ = name;
+  const auto update_children = [&](auto&& self, Entry* parent) -> void {
+    for (auto& child : parent->children_) {
+      child->path_ = rex::string::utf8_join_guest_paths(parent->path_, child->name_);
+      child->absolute_path_ =
+          rex::string::utf8_join_guest_paths(device_->mount_path(), child->path_);
+      self(self, child.get());
+    }
+  };
+  update_children(update_children, this);
   return X_STATUS_SUCCESS;
 }
 

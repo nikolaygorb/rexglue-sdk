@@ -15,6 +15,7 @@
 #include <mutex>
 
 #include <rex/dbg.h>
+#include <rex/input/deadzone.h>
 #include <rex/input/device_assignment.h>
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
@@ -254,23 +255,8 @@ void InputSystem::UpdateConnectedUser(uint32_t user_index, bool connected) {
   }
 
   if (!connected) {
-    user_max_joystick_value_[user_index] = {};
     consumed_buttons_[user_index] = 0;
-    return;
   }
-
-  // Deadzone percentages scale against the device's own range.
-  DeviceId chosen = ChooseDeviceForUser(user_index);
-  auto* driver = DriverForDevice(chosen);
-  if (!driver) {
-    return;
-  }
-  X_INPUT_CAPABILITIES caps = {};
-  if (driver->GetDeviceCapabilities(chosen, 0, &caps) != X_ERROR_SUCCESS) {
-    return;
-  }
-  user_max_joystick_value_[user_index] = {{caps.gamepad.thumb_lx, caps.gamepad.thumb_ly},
-                                          {caps.gamepad.thumb_rx, caps.gamepad.thumb_ry}};
 }
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
@@ -387,35 +373,17 @@ void InputSystem::AdjustDeadzoneLevels(uint32_t user_index, X_INPUT_GAMEPAD* gam
     return;
   }
 
-  // Radial: the cutoff follows the stick's angle, so a diagonal is not held to
-  // a larger displacement than a cardinal push.
-  auto apply = [](double percentage, const JoystickValue& max, int16_t& axis_x, int16_t& axis_y) {
-    if (percentage <= 0.0 || percentage >= 1.0) {
-      return;
-    }
-    const double deadzone_x = max.first * percentage;
-    const double deadzone_y = max.second * percentage;
-    const double theta = std::atan2(static_cast<double>(axis_y), static_cast<double>(axis_x));
-    const double cutoff_x = std::cos(theta) * deadzone_x;
-    const double cutoff_y = std::sin(theta) * deadzone_y;
-    if (axis_x > -cutoff_x && axis_x < cutoff_x) {
-      axis_x = 0;
-    }
-    if (axis_y > -cutoff_y && axis_y < cutoff_y) {
-      axis_y = 0;
-    }
-  };
-
-  const auto& maxima = user_max_joystick_value_[user_index];
+  // Radial, of the thumbstick range (see ApplyRadialDeadzone).
+  auto apply = ApplyRadialDeadzone;
   int16_t lx = gamepad->thumb_lx;
   int16_t ly = gamepad->thumb_ly;
-  apply(REXCVAR_GET(left_stick_deadzone_percentage), maxima.first, lx, ly);
+  apply(REXCVAR_GET(left_stick_deadzone_percentage), lx, ly);
   gamepad->thumb_lx = lx;
   gamepad->thumb_ly = ly;
 
   int16_t rx = gamepad->thumb_rx;
   int16_t ry = gamepad->thumb_ry;
-  apply(REXCVAR_GET(right_stick_deadzone_percentage), maxima.second, rx, ry);
+  apply(REXCVAR_GET(right_stick_deadzone_percentage), rx, ry);
   gamepad->thumb_rx = rx;
   gamepad->thumb_ry = ry;
 }

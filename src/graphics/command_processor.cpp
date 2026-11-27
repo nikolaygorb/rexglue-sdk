@@ -34,6 +34,7 @@
 #include <rex/graphics/util/display_transfer.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
+#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -45,11 +46,41 @@
 #include <rex/thread.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_INT32(trace_replay_draw_limit, -1, "GPU/Trace",
+                     "In a GPU trace replay, only the first N draws are drawn (copies, clears and "
+                     "the swap still run), and the N-th is logged with its shaders and textures; "
+                     "for finding the first draw two renderers disagree on "
+                     "(tools/gpu_traces/bisect_draws.py). -1: all")
+    .range(-1, INT32_MAX);
 
 REXCVAR_DEFINE_INT32(frame_stats_interval, 0, "GPU",
-                     "Log guest frame pacing (fps and frame time percentiles between swaps) "
-                     "every this many seconds; 0 = off")
+                     "Log guest frame pacing (fps and frame time percentiles between swaps), the "
+                     "renderer's draw and graphics card times and the uploads every this many "
+                     "seconds; 0 = off")
     .range(0, 3600);
+
+REXCVAR_DEFINE_BOOL(gpu_indirect_buffer_survey, false, "GPU",
+                    "With frame_stats_interval: log how many indirect buffers (the command "
+                    "buffers titles replay) run each frame with the same contents as at their "
+                    "last run, and the command processor's time in them outside draws, "
+                    "resolves and waits (what remembering their decoding could save at most); "
+                    "hashes each buffer, so it costs CPU time")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_pm4_survey, false, "GPU",
+                    "With frame_stats_interval: log the command processor's time a frame by "
+                    "packet kind (register writes, constants, events, draws, ...) outside draws, "
+                    "resolves and waits: what decoding on a thread of its own or a cheaper kind "
+                    "could save at most; times every packet, so it costs CPU time")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_register_group_survey, false, "GPU",
+                    "With frame_stats_interval: log how many draws leave each group of render "
+                    "state (render targets, pipeline state, constants, textures, samplers, vertex "
+                    "fetch, ...) as the draw before set it: what skipping per-draw work for "
+                    "unchanged state could save at most; compares about 3,400 registers a draw, "
+                    "so it costs CPU time")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(gpu_plain_register_ranges, true, "GPU",
                     "Store a range of registers that only keep their value (render state, no side "
@@ -102,6 +133,14 @@ REXCVAR_DEFINE_BOOL(occlusion_query_viz, false, "GPU",
                     "With that said, VIZ and standard occlusion queries can both cause a "
                     "noticeable penalty with ROV and FSI, especially when combined.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(occlusion_query_log, 0, "GPU",
+                     "Log the occlusion query reports as they reach the game: 0 off, 1 a summary "
+                     "every 5 seconds (reports, how many hidden, forced by a deadline, delay), "
+                     "2 every report (its address, samples, delay; in a trace replay the draws "
+                     "before it, and all of the frame's reports are waited for)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       "Controls CPU readback of render-to-texture resolve results.\n"
@@ -213,6 +252,16 @@ REXCVAR_DEFINE_INT32(gpu_idle_spin_count, -1, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
+
+namespace {
+void StoreCompletionRelease(void* host, uint32_t value) {
+  std::atomic_ref<uint32_t>(*static_cast<uint32_t*>(host)).store(value, std::memory_order_release);
+}
+uint32_t LoadCompletionAcquire(const void* host) {
+  return std::atomic_ref<const uint32_t>(*static_cast<const uint32_t*>(host))
+      .load(std::memory_order_acquire);
+}
+}  // namespace
 
 using namespace rex::graphics::xenos;
 
@@ -510,6 +559,8 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+      const uint64_t idle_start_tick =
+          frame_stats_enabled_ ? rex::chrono::Clock::QueryHostTickCount() : 0;
       const uint32_t spin_limit = GetIdleSpinLimit();
       uint32_t loop_count = 0;
       do {
@@ -518,6 +569,9 @@ void CommandProcessor::WorkerThreadMain() {
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
+          // Kept current while idle, as the console's CP does: a title can
+          // reset the word and poll it for the consumer's position.
+          PublishReadPointer();
           // Strict ZPD may still owe the guest a report it's spinning on with
           // nothing left in the ring. Async keeps retiring what resolves.
           if ((zpd_mode_ == ZPDMode::kStrict && zpd_awaited_report_count_) ||
@@ -526,12 +580,19 @@ void CommandProcessor::WorkerThreadMain() {
           }
         }
 
+        if (read_ptr_writeback_publish_.load(std::memory_order_relaxed) &&
+            read_ptr_writeback_publish_.exchange(false, std::memory_order_acquire)) {
+          PublishReadPointer();
+        }
         rex::thread::MaybeYield();
         ProcessResolveFetches();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      if (idle_start_tick) {
+        frame_stats_idle_ticks_ += rex::chrono::Clock::QueryHostTickCount() - idle_start_tick;
+      }
       ReturnFromWait();
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
@@ -544,10 +605,7 @@ void CommandProcessor::WorkerThreadMain() {
 
     // ExecutePrimaryBuffer republishes this every read_ptr_update_freq_ dwords
     // as it drains, this is the final position for the burst.
-    if (read_ptr_writeback_ptr_) {
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-                                       read_ptr_index_);
-    }
+    PublishReadPointer();
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
     // but no games seem to actually use it.
@@ -632,6 +690,18 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
   // updates of the read pointer. Kept in dwords, the unit read_ptr_index_ and
   // the write-back use. Usually 6, so 128 dwords.
   read_ptr_update_freq_ = (uint32_t(1) << std::min(block_size_log2, 19u)) * 2;
+  // The worker writes the current position at once (it may be idle and have
+  // nothing to drain for a while).
+  read_ptr_writeback_publish_.store(true, std::memory_order_release);
+  write_ptr_index_event_->Set();
+}
+
+void CommandProcessor::PublishReadPointer() {
+  const uint32_t writeback_ptr = read_ptr_writeback_ptr_;
+  if (writeback_ptr) {
+    memory_->TranslatePhysical<rex::be<uint32_t>*>(writeback_ptr)
+        ->store(read_ptr_index_, std::memory_order_release);
+  }
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
@@ -729,7 +799,8 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      memory_->TranslatePhysical<rex::be<uint32_t>*>(mem_addr)->store(value,
+                                                                      std::memory_order_release);
     }
   } else {
     switch (index) {
@@ -1676,8 +1747,8 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
         // Publishing the read pointer hands that ring space back, so it has to
         // land after our reads of it.
         std::atomic_thread_fence(std::memory_order_release);
-        memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(writeback_ptr),
-                                         uint32_t(reader.read_offset() / sizeof(uint32_t)));
+        memory_->TranslatePhysical<rex::be<uint32_t>*>(writeback_ptr)
+            ->store(uint32_t(reader.read_offset() / sizeof(uint32_t)), std::memory_order_release);
       }
       remaining_at_writeback = remaining;
     }
@@ -1691,8 +1762,25 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
+  uint8_t* const data = memory_->TranslatePhysical(ptr);
+
+  // gpu_indirect_buffer_survey: its contents against its last run here, and
+  // the time in it (doc 21 Q11).
+  const bool survey = frame_stats_enabled_ && REXCVAR_GET(gpu_indirect_buffer_survey);
+  IndirectBufferSurvey::Kind survey_kind = IndirectBufferSurvey::kNew;
+  uint64_t survey_start_tick = 0;
+  uint64_t survey_busy_start = 0;
+  if (survey) {
+    const uint64_t hash_start_tick = rex::chrono::Clock::QueryHostTickCount();
+    survey_kind = indirect_buffer_survey_.Classify(
+        ptr, count, XXH3_64bits(data, size_t(count) * sizeof(uint32_t)));
+    survey_start_tick = rex::chrono::Clock::QueryHostTickCount();
+    indirect_buffer_survey_.AddHashTicks(survey_start_tick - hash_start_tick);
+    survey_busy_start = frame_stats_busy_ticks_total_;
+  }
+
   // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+  memory::RingBuffer reader(data, count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
     ProcessResolveFetches();
@@ -1703,6 +1791,12 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
+
+  if (survey) {
+    const uint64_t ticks = rex::chrono::Clock::QueryHostTickCount() - survey_start_tick;
+    const uint64_t busy = frame_stats_busy_ticks_total_ - survey_busy_start;
+    indirect_buffer_survey_.Add(survey_kind, count, ticks, ticks - std::min(busy, ticks));
+  }
 }
 
 void CommandProcessor::ExecutePacket(const void* data, uint32_t count) {
@@ -1818,7 +1912,40 @@ __attribute__((noinline, cold)) void WarnUninitializedPacket() {
 }
 }  // namespace
 
+bool CommandProcessor::DispatchPacketSurveyed(memory::RingBuffer* reader, uint32_t packet) {
+  const uint32_t type = packet >> 30;
+  const uint32_t opcode = (packet >> 8) & 0x7F;
+  auto dispatch = [&]() {
+    switch (type) {
+      case 0x03:
+        return ExecutePacketType3(reader, packet);
+      case 0x00:
+        return ExecutePacketType0(reader, packet);
+      default:
+        return ExecutePacketType1(reader, packet);
+    }
+  };
+  // An indirect buffer isn't counted itself: the packets it runs are.
+  if (type == 0x03 && (opcode == PM4_INDIRECT_BUFFER || opcode == PM4_INDIRECT_BUFFER_PFD)) {
+    return dispatch();
+  }
+  const uint32_t dwords = type == 0x01 ? 2 : ((packet >> 16) & 0x3FFF) + 1;
+  const uint64_t busy_start = frame_stats_busy_ticks_total_;
+  const uint64_t start = rex::chrono::Clock::QueryHostTickCount();
+  const bool result = dispatch();
+  const uint64_t ticks = rex::chrono::Clock::QueryHostTickCount() - start;
+  const uint64_t busy = frame_stats_busy_ticks_total_ - busy_start;
+  pm4_survey_.Add(type == 0x03   ? opcode
+                  : type == 0x00 ? Pm4PacketSurvey::kType0
+                                 : Pm4PacketSurvey::kType1,
+                  dwords, ticks - std::min(busy, ticks));
+  return result;
+}
+
 inline bool CommandProcessor::DispatchPacket(memory::RingBuffer* reader, uint32_t packet) {
+  if (pm4_survey_active_) [[unlikely]] {
+    return DispatchPacketSurveyed(reader, packet);
+  }
   switch (packet >> 30) {
     case 0x03:
       return ExecutePacketType3(reader, packet);
@@ -1965,6 +2092,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
 
   bool result = false;
   switch (opcode) {
+    case title::kSceneOpcode:
+      result = ExecuteTitleScene(reader, count);
+      break;
     case PM4_ME_INIT:
       result = ExecutePacketType3_ME_INIT(reader, packet, count);
       break;
@@ -2000,6 +2130,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       result = ExecutePacketType3_EVENT_WRITE(reader, packet, count);
       break;
     case PM4_EVENT_WRITE_SHD:
+    // Cache flush done event: the same initiator / address / value layout as
+    // SHD, and it can carry a fence write.
+    case PM4_EVENT_WRITE_CFL:
       result = ExecutePacketType3_EVENT_WRITE_SHD(reader, packet, count);
       break;
     case PM4_EVENT_WRITE_EXT:
@@ -2110,6 +2243,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     case PM4_MEM_WRITE:
     case PM4_COND_WRITE:
     case PM4_EVENT_WRITE_SHD:
+    case PM4_EVENT_WRITE_CFL:
     case PM4_EVENT_WRITE_EXT:
     case PM4_INTERRUPT:
       OnGuestMemorySyncPoint();
@@ -2233,28 +2367,104 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 
   SharedMemory* stats_shared_memory = GetSharedMemoryForStats();
   if (int32_t interval = REXCVAR_GET(frame_stats_interval); interval > 0) {
+    frame_stats_enabled_ = true;
+    pm4_survey_active_ = REXCVAR_GET(gpu_pm4_survey);
+    register_group_survey_active_ = REXCVAR_GET(gpu_register_group_survey);
     if (stats_shared_memory) {
       stats_shared_memory->SetUploadStatsEnabled(true);
     }
     uint64_t now = rex::chrono::Clock::QueryHostTickCount();
     if (frame_stats_last_swap_tick_) {
       uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
-      frame_stats_.Add(double(now - frame_stats_last_swap_tick_) * 1000.0 / double(freq));
+      frame_stats_.Add(double(now - frame_stats_last_swap_tick_) * 1000.0 / double(freq),
+                       double(frame_stats_draw_ticks_) * 1000.0 / double(freq),
+                       frame_stats_draws_,
+                       double(frame_stats_copy_ticks_) * 1000.0 / double(freq),
+                       frame_stats_copies_,
+                       double(frame_stats_idle_ticks_) * 1000.0 / double(freq),
+                       double(frame_stats_wait_reg_ticks_) * 1000.0 / double(freq));
       if (frame_stats_.window_seconds() >= double(interval)) {
         FrameStats::Summary summary = frame_stats_.Take();
         REXGPU_INFO("Frame pacing: {}", FrameStats::Format(summary));
+        RendererFrameCounters renderer_counters;
+        renderer_counters.frames = summary.frames;
+        CollectRendererFrameCounters(renderer_counters);
+        REXGPU_INFO("Renderer: {}", FrameStats::FormatRenderer(summary, renderer_counters));
+        if (!frame_stats_wait_targets_.empty()) {
+          // The three longest waits by target, per frame.
+          std::vector<std::pair<uint64_t, WaitTarget>> targets(frame_stats_wait_targets_.begin(),
+                                                               frame_stats_wait_targets_.end());
+          std::sort(targets.begin(), targets.end(),
+                    [](const auto& a, const auto& b) { return a.second.ticks > b.second.ticks; });
+          static constexpr const char* kFunctions[] = {"never", "<", "<=", "==", "!=", ">=", ">", "always"};
+          const double freq = double(rex::chrono::Clock::QueryHostTickFrequency());
+          const double frames = double(std::max<uint64_t>(summary.frames, 1));
+          std::string line;
+          for (size_t i = 0; i < targets.size() && i < 3; ++i) {
+            const auto& [key, target] = targets[i];
+            line += fmt::format("{}{} {:08X} {} {:X} (mask {:X}): {:.2f} ms, {:.1f} waits a frame",
+                                line.empty() ? "" : "; ", (key >> 32) ? "memory" : "register",
+                                uint32_t(key), kFunctions[target.function], target.ref, target.mask,
+                                double(target.ticks) * 1000.0 / freq / frames, double(target.waits) / frames);
+          }
+          REXGPU_INFO("WAIT_REG_MEM by target: {}", line);
+          frame_stats_wait_targets_.clear();
+        }
+        if (REXCVAR_GET(gpu_indirect_buffer_survey)) {
+          const std::string survey_line = indirect_buffer_survey_.Format(
+              summary.frames, rex::chrono::Clock::QueryHostTickFrequency());
+          REXGPU_INFO("Indirect buffers: {}",
+                      survey_line.empty() ? std::string("none") : survey_line);
+        }
+        indirect_buffer_survey_.ResetCounts();
+        if (REXCVAR_GET(gpu_pm4_survey)) {
+          const std::string pm4_line =
+              pm4_survey_.Format(summary.frames, rex::chrono::Clock::QueryHostTickFrequency());
+          REXGPU_INFO("PM4 packets: {}", pm4_line.empty() ? std::string("none") : pm4_line);
+        }
+        pm4_survey_.ResetCounts();
+        if (REXCVAR_GET(gpu_register_group_survey)) {
+          const std::string groups_line = register_group_survey_.Format(summary.frames);
+          REXGPU_INFO("Register groups: {}",
+                      groups_line.empty() ? std::string("no draws") : groups_line);
+        }
+        register_group_survey_.ResetCounts();
         if (stats_shared_memory) {
           REXGPU_INFO("Shared memory uploads: {}",
                       stats_shared_memory->FormatUploadStats(stats_shared_memory->TakeUploadStats(),
                                                              summary.frames));
         }
       }
+    } else {
+      // The first window: the renderer's counts from before are dropped.
+      RendererFrameCounters renderer_counters;
+      CollectRendererFrameCounters(renderer_counters);
+      indirect_buffer_survey_.ResetCounts();
+      pm4_survey_.ResetCounts();
+      register_group_survey_.ResetCounts();
+      frame_stats_wait_targets_.clear();
     }
     frame_stats_last_swap_tick_ = now;
+    frame_stats_draw_ticks_ = 0;
+    frame_stats_draws_ = 0;
+    frame_stats_copy_ticks_ = 0;
+    frame_stats_copies_ = 0;
+    frame_stats_idle_ticks_ = 0;
+    frame_stats_wait_reg_ticks_ = 0;
   } else if (frame_stats_last_swap_tick_) {
     // Switched off while running: start over when it is switched on again, so
     // no frame time spans the off period and no partial window carries over.
+    frame_stats_enabled_ = false;
+    pm4_survey_active_ = false;
+    register_group_survey_active_ = false;
     frame_stats_last_swap_tick_ = 0;
+    frame_stats_draw_ticks_ = 0;
+    frame_stats_draws_ = 0;
+    frame_stats_copy_ticks_ = 0;
+    frame_stats_copies_ = 0;
+    frame_stats_idle_ticks_ = 0;
+    frame_stats_wait_reg_ticks_ = 0;
+    frame_stats_wait_targets_.clear();
     frame_stats_.Take();
     if (stats_shared_memory) {
       stats_shared_memory->SetUploadStatsEnabled(false);
@@ -2312,12 +2522,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // frame_stats_interval: the time until the value matched (0 when it did at once).
+  const uint64_t wait_start_tick =
+      frame_stats_enabled_ ? rex::chrono::Clock::QueryHostTickCount() : 0;
   bool matched = false;
   do {
     uint32_t value = 0;
     if (is_memory) {
-      value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      value = LoadCompletionAcquire(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
       value = ReadRegisterValue(poll_reg_addr);
@@ -2384,6 +2596,16 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (wait_start_tick) {
+    const uint64_t wait_ticks = rex::chrono::Clock::QueryHostTickCount() - wait_start_tick;
+    frame_stats_wait_reg_ticks_ += wait_ticks;
+    frame_stats_busy_ticks_total_ += wait_ticks;
+    if (wait_ticks && frame_stats_wait_targets_.size() < 64) {
+      auto& target = frame_stats_wait_targets_[uint64_t(is_memory) << 32 | poll_reg_addr];
+      target.ticks += wait_ticks; ++target.waits;
+      target.ref = ref; target.mask = mask; target.function = wait_info & 7;
+    }
+  }
 
   // Once, with the value that ended the wait, not on every poll.
   if (is_memory) {
@@ -2431,7 +2653,7 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
-  memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  StoreCompletionRelease(memory_->TranslatePhysical(mem_addr), reg_val);
 
   return true;
 }
@@ -2445,7 +2667,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
+    StoreCompletionRelease(memory_->TranslatePhysical(addr), write_data);
     write_addr += 4;
   }
 
@@ -2467,7 +2689,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
     trace_writer_.WriteMemoryRead(poll_reg_addr, sizeof(uint32_t));
-    value = memory::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
+    value = LoadCompletionAcquire(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
   } else {
     // Register.
@@ -2507,7 +2729,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      StoreCompletionRelease(memory_->TranslatePhysical(write_reg_addr), write_data);
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -2552,7 +2774,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  StoreCompletionRelease(memory_->TranslatePhysical(address), data_value);
   return true;
 }
 
@@ -2623,6 +2845,73 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
   zpd_speculative_sample_counter_ += XenosZPDReport::FromNativeQuery(fake_zpd_sample_count_);
   zpd_sample_counter_ = zpd_speculative_sample_counter_;
   WriteZPDReport(report_address, zpd_sample_counter_);
+  return true;
+}
+
+void CommandProcessor::LogTraceLimitDraw(uint32_t draw_index,
+                                         reg::VGT_DRAW_INITIATOR vgt_draw_initiator) {
+  const RegisterFile& regs = *register_file_;
+  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  auto rb_depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
+  auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+  std::string targets;
+  uint32_t color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (!((color_mask >> (i * 4)) & 0xF)) {
+      continue;
+    }
+    auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+    targets += fmt::format(" RT{} base {} format {}", i, uint32_t(color_info.color_base),
+                           uint32_t(color_info.color_format));
+  }
+  if (rb_depthcontrol.z_enable || rb_depthcontrol.stencil_enable) {
+    targets += fmt::format(" depth base {} format {}", uint32_t(rb_depth_info.depth_base),
+                           uint32_t(rb_depth_info.depth_format));
+  }
+  REXGPU_INFO(
+      "GPU trace: draw limit {}: the last draw drawn is #{}: VS {:016X}, PS {:016X}, primitive "
+      "{}, {} indices; pitch {}, MSAA {};{}",
+      draw_index + 1, draw_index,
+      active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0,
+      active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0,
+      uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.num_indices),
+      uint32_t(rb_surface_info.surface_pitch), uint32_t(rb_surface_info.msaa_samples),
+      targets.empty() ? std::string(" no targets") : targets);
+  for (const Shader* shader : {active_vertex_shader_, active_pixel_shader_}) {
+    if (!shader || !shader->is_ucode_analyzed()) {
+      continue;
+    }
+    for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+      xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
+      REXGPU_INFO(
+          "GPU trace:   {} fetch {}: base {:08X} mips {:08X}, format {}, dimension {}, size "
+          "{}x{}, tiled {}, signs {}{}{}{}, swizzle {:03X}, clamp {}/{}/{}",
+          shader == active_vertex_shader_ ? "VS" : "PS", binding.fetch_constant,
+          uint32_t(fetch.base_address) << 12, uint32_t(fetch.mip_address) << 12,
+          uint32_t(fetch.format), uint32_t(fetch.dimension), uint32_t(fetch.size_2d.width) + 1,
+          uint32_t(fetch.size_2d.height) + 1, uint32_t(fetch.tiled), uint32_t(fetch.sign_x),
+          uint32_t(fetch.sign_y), uint32_t(fetch.sign_z), uint32_t(fetch.sign_w),
+          uint32_t(fetch.swizzle), uint32_t(fetch.clamp_x), uint32_t(fetch.clamp_y),
+          uint32_t(fetch.clamp_z));
+    }
+  }
+}
+
+bool CommandProcessor::ExecuteTitleScene(memory::RingBuffer* reader, uint32_t count) {
+  // Always consumed and never a packet failure (that would drop the rest of
+  // the buffer): an unsupported backend, version or malformed marker, or a
+  // consumer error, only counts as failed (a trace replayed elsewhere, too).
+  title::SceneMarker marker;
+  bool decoded = false;
+  if (count == title::kSceneWords && GetTitleSceneProtocolVersion() == title::kSceneProtocolVersion) {
+    std::array<uint32_t, title::kSceneWords> words{};
+    for (auto& word : words) word = reader->ReadAndSwap<uint32_t>();
+    decoded = title::DecodeScene(words, marker);
+  } else {
+    reader->AdvanceRead(count * sizeof(uint32_t));
+  }
+  ++title_scene_consumed_;
+  if (decoded && OnTitleSceneMarker(marker)) ++title_scene_completed_; else ++title_scene_failed_;
   return true;
 }
 
@@ -2710,15 +2999,58 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // we don't support yet.
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
-  if (draw_succeeded) {
+  // trace_replay_draw_limit: in a replay, the draws (not the copies) after the
+  // first N are skipped; the N-th is logged.
+  bool skipped_by_trace_limit = false;
+  if (draw_succeeded && trace_playback_) {
+    auto edram_mode = register_file_->Get<reg::RB_MODECONTROL>().edram_mode;
+    if (edram_mode == xenos::EdramMode::kColorDepth ||
+        edram_mode == xenos::EdramMode::kDepthOnly) {
+      uint32_t draw_index = trace_playback_draws_++;
+      int32_t draw_limit = REXCVAR_GET(trace_replay_draw_limit);
+      if (draw_limit >= 0) {
+        if (draw_index >= uint32_t(draw_limit)) {
+          skipped_by_trace_limit = true;
+        } else if (draw_index + 1 == uint32_t(draw_limit)) {
+          LogTraceLimitDraw(draw_index, vgt_draw_initiator);
+        }
+      }
+    }
+  }
+
+  if (draw_succeeded && !skipped_by_trace_limit) {
     // A consumer draw whose survey is still outstanding runs under the
     // backend's predicate instead of blocking. Surveys themselves are
     // ordinary draws here.
     if (PrepareVIZDraw(viz_query_condition)) {
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      // frame_stats_interval: the command processor thread's time in the
+      // renderer's draw, resolves apart.
+      uint64_t draw_start_tick =
+          frame_stats_enabled_ ? rex::chrono::Clock::QueryHostTickCount() : 0;
+      const bool draw_is_copy =
+          draw_start_tick &&
+          register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy;
+      // gpu_register_group_survey: draws, not resolves.
+      if (register_group_survey_active_ &&
+          register_file_->Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kCopy) {
+        register_group_survey_.Observe(register_file_->values);
+      }
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      if (draw_start_tick) {
+        uint64_t draw_ticks = rex::chrono::Clock::QueryHostTickCount() - draw_start_tick;
+        if (draw_is_copy) {
+          frame_stats_copy_ticks_ += draw_ticks;
+          ++frame_stats_copies_;
+          frame_stats_busy_ticks_total_ += draw_ticks;
+        } else {
+          frame_stats_draw_ticks_ += draw_ticks;
+          ++frame_stats_draws_;
+          frame_stats_busy_ticks_total_ += draw_ticks;
+        }
+      }
       viz_draw_predicate_ = {};
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
@@ -3113,6 +3445,10 @@ void CommandProcessor::QueueZPDReport(uint32_t report_address) {
 
   ZPDReport& report = zpd_current_report_;
   report.address = report_address;
+  if (REXCVAR_GET(occlusion_query_log)) {
+    report.queued_ms = chrono::Clock::QueryHostUptimeMillis();
+    report.trace_draws = trace_playback_draws_;
+  }
   if (zpd_mode_ == ZPDMode::kStrict || zpd_mode_ == ZPDMode::kAsync) {
     // Nothing is written until the report retires, so the guest keeps seeing
     // the sentinel and reads the query as not ready.
@@ -3120,7 +3456,8 @@ void CommandProcessor::QueueZPDReport(uint32_t report_address) {
     const uint32_t kPendingSentinel = rex::byte_swap(0xFFFFFEEDu);
     const auto* guest =
         memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(report_address);
-    report.awaited = guest->ZPass_A == kPendingSentinel || guest->ZFail_A == kPendingSentinel;
+    report.awaited = guest->ZPass_A.load(std::memory_order_acquire) == kPendingSentinel ||
+                     guest->ZFail_A.load(std::memory_order_acquire) == kPendingSentinel;
   } else {
     // Fast modes write a guess now and correct it when the real delta lands.
     // Unknown still means visible. Replaying the last real delta for the same
@@ -3356,6 +3693,7 @@ void CommandProcessor::PrepareZPDForWait() {
   // Keep what resolved, with a floor of one so culling doesn't flash occluded.
   front.delta.z_pass = std::max<uint64_t>(front.delta.z_pass, 1);
   front.pending_segments = 0;
+  front.forced = true;
   PumpPendingRetire();
 }
 
@@ -3386,9 +3724,13 @@ void CommandProcessor::PumpPendingRetire() {
       }
       front.delta.z_pass = std::max<uint64_t>(front.delta.z_pass, 1);
       front.pending_segments = 0;
+      front.forced = true;
     }
     zpd_pending_retire_start_ms_ = 0;
 
+    if (REXCVAR_GET(occlusion_query_log)) {
+      LogRetiredZPDReport(front);
+    }
     zpd_sample_counter_ += front.delta;
     if (front.speculative) {
       if (fast_zpd_report_cached_deltas_.size() >= kFastZPDCacheMaxEntries &&
@@ -3423,6 +3765,68 @@ void CommandProcessor::PumpPendingRetire() {
     zpd_speculative_sample_counter_ = running;
   } else if (zpd_reports_.empty()) {
     zpd_speculative_sample_counter_ = zpd_sample_counter_;
+  }
+}
+
+void CommandProcessor::LogRetiredZPDReport(const ZPDReport& report) {
+  const uint64_t now_ms = chrono::Clock::QueryHostUptimeMillis();
+  // Logging turned on after the event: no time for it.
+  const uint64_t lag_ms = report.queued_ms ? now_ms - report.queued_ms : 0;
+  if (REXCVAR_GET(occlusion_query_log) >= 2) {
+    REXGPU_INFO(
+        "Occlusion query log: report {} at {:08X}: {} samples passed, {} failed; retired after "
+        "{} ms{}{}",
+        report.handle, report.address, report.delta.z_pass, report.delta.z_fail, lag_ms,
+        report.forced ? ", forced by a deadline (at least 1 sample)" : "",
+        trace_playback_ ? fmt::format(", {} draws of the trace before it", report.trace_draws)
+                        : std::string());
+    return;
+  }
+  ZPDLogStats& stats = zpd_log_stats_;
+  if (!stats.window_start_ms) {
+    stats.window_start_ms = now_ms;
+  }
+  ++stats.reports;
+  stats.zero += report.delta.z_pass == 0;
+  stats.forced += report.forced;
+  stats.lag_sum_ms += lag_ms;
+  stats.lag_max_ms = std::max(stats.lag_max_ms, lag_ms);
+  if (now_ms - stats.window_start_ms < 5000) {
+    return;
+  }
+  REXGPU_INFO(
+      "Occlusion query log: {} reports in {:.1f} s, {} with no sample passed, {} forced by a "
+      "deadline; retired {:.1f} ms after the event on average, at most {} ms",
+      stats.reports, double(now_ms - stats.window_start_ms) / 1000.0, stats.zero, stats.forced,
+      double(stats.lag_sum_ms) / double(stats.reports), stats.lag_max_ms);
+  stats = {};
+  stats.window_start_ms = now_ms;
+}
+
+void CommandProcessor::RetireZPDReportsForTrace() {
+  if (!REXCVAR_GET(occlusion_query_log) || zpd_mode_ == ZPDMode::kFake ||
+      zpd_force_fake_fallback_) {
+    return;
+  }
+  // The queued reports in order, each waited for (the report still open,
+  // without its event, isn't one of them). A report whose results can't be
+  // waited for retires as the deadline does it.
+  while (!zpd_reports_.empty()) {
+    ZPDReport& front = zpd_reports_.front();
+    if (front.pending_segments &&
+        !AwaitQueryResolve(front.handle, front.last_segment_end_submission)) {
+      ZPDReport* report = FindZPDReport(front.handle);
+      if (report && report->pending_segments) {
+        report->delta.z_pass = std::max<uint64_t>(report->delta.z_pass, 1);
+        report->pending_segments = 0;
+        report->forced = true;
+      }
+    }
+    size_t count = zpd_reports_.size();
+    PumpPendingRetire();
+    if (zpd_reports_.size() >= count) {
+      break;
+    }
   }
 }
 

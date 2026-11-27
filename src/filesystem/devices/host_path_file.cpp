@@ -32,6 +32,10 @@ void HostPathFile::Destroy() {
   delete this;
 }
 
+X_STATUS HostPathFile::Flush() {
+  return file_handle_->Flush() ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+}
+
 X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
                                 size_t* out_bytes_read) {
   if (!(file_access_ & (FileAccess::kGenericRead | FileAccess::kFileReadData))) {

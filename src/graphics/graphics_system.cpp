@@ -94,6 +94,17 @@ GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
 
 GraphicsSystem::~GraphicsSystem() = default;
 
+uint32_t GraphicsSystem::GetTitleSceneProtocolVersion() const {
+  return command_processor_ ? command_processor_->GetTitleSceneProtocolVersion() : 0;
+}
+bool GraphicsSystem::QueryTitleSceneStats(uint64_t* values, uint32_t count) const {
+  if (!command_processor_ || !values || count < 3) return false;
+  const auto stats = command_processor_->GetTitleSceneStats();
+  values[0] = stats.consumed; values[1] = stats.completed; values[2] = stats.failed;
+  if (count >= 5) { values[3] = stats.views_accepted; values[4] = stats.last_view_source; }
+  return true;
+}
+
 X_STATUS GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) {
   if (presenter_) {
     return X_STATUS_SUCCESS;

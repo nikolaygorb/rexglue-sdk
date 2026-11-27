@@ -23,6 +23,7 @@ REXCVAR_DECLARE(std::string, log_level);
 REXCVAR_DECLARE(std::string, log_file);
 REXCVAR_DECLARE(bool, log_verbose);
 REXCVAR_DECLARE(bool, log_noisy);
+REXCVAR_DECLARE(bool, log_async);
 REXCVAR_DECLARE(int32_t, log_flush_interval);
 
 namespace rex {
@@ -77,6 +78,16 @@ void ShutdownLogging();
  * concurrent logger cannot hit freed state.
  */
 void FlushLogging();
+
+// Wait up to timeout_ms for file messages already queued to reach disk.
+bool DrainLogging(uint32_t timeout_ms);
+
+/**
+ * The absolute path of the log file the file sink writes (e.g. <exe>/logs/app_007.log; a long
+ * run's later parts go to files named from it), or an empty path when logging to a file isn't
+ * set up. A title can put its own output files next to it.
+ */
+std::filesystem::path CurrentLogFilePath();
 
 /**
  * Register a new log category at runtime.

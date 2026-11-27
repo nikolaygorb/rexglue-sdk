@@ -54,6 +54,7 @@ class MnkInputDriver final : public InputDriver,
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
+  void OnMouseWheel(rex::ui::MouseEvent& e) override;
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
@@ -98,6 +99,13 @@ class MnkInputDriver final : public InputDriver,
   bool key_tapped_[256] = {};
   uint32_t key_press_seq_[256] = {};
   uint32_t press_seq_ = 0;
+  // Under state_mutex_: the wheel's keys (WheelUp, WheelDown) are held for a
+  // notch until both its time is up and a poll has seen them, so a title
+  // reading the pad less often than it is polled still sees the press.
+  // 0: not held.
+  int64_t wheel_release_ns_[2] = {};
+  bool wheel_polled_[2] = {};
+  void ReleaseWheelLocked();
 
   // Mouse delta tracking. Fractional because relative motion arrives in
   // fractions of a pixel, and truncating each event drops slow movement.

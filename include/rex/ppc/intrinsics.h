@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <array>
 #include <bit>
 #include <climits>
 #include <cmath>
@@ -30,6 +31,7 @@
 #include <arm_neon.h>
 #endif
 
+#include <rex/ppc/estimates.h>
 #include <rex/types.h>
 
 namespace rex::ppc {
@@ -115,6 +117,56 @@ inline uint8_t VectorShiftTableR[] = {
     0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
     0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
 };
+
+//=============================================================================
+// stvlx / stvrx
+//=============================================================================
+// A vector register holds its bytes reversed (u8[15 - i] is guest byte i).
+// These write the part of it the instruction stores with at most two
+// overlapping stores instead of a byte loop (upstream rexglue 55dd9b0b, U11),
+// never touching a byte outside it. Like stvx, the stores are not volatile.
+
+// Writes the first count (0-16) bytes of the 16 at bytes to host.
+inline void StoreVectorBytes(uint8_t* host, const uint8_t* bytes, uint32_t count) {
+  if (count == 16) {
+    std::memcpy(host, bytes, 16);
+  } else if (count >= 8) {
+    std::memcpy(host, bytes, 8);
+    std::memcpy(host + count - 8, bytes + count - 8, 8);
+  } else if (count >= 4) {
+    std::memcpy(host, bytes, 4);
+    std::memcpy(host + count - 4, bytes + count - 4, 4);
+  } else if (count >= 2) {
+    std::memcpy(host, bytes, 2);
+    std::memcpy(host + count - 2, bytes + count - 2, 2);
+  } else if (count == 1) {
+    host[0] = bytes[0];
+  }
+}
+
+// The register's bytes in guest order.
+inline void VectorGuestBytes(const uint8_t* reg, uint8_t* bytes) {
+  simde_mm_storeu_si128(
+      reinterpret_cast<simde__m128i*>(bytes),
+      simde_mm_shuffle_epi8(simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(reg)),
+                            simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(VectorMaskL))));
+}
+
+// stvlx: guest bytes 0 .. 15 - (ea & 0xF) at ea (host: its host address).
+inline void StoreVectorLeft(uint8_t* host, uint32_t ea, const uint8_t* reg) {
+  alignas(16) uint8_t bytes[16];
+  VectorGuestBytes(reg, bytes);
+  StoreVectorBytes(host, bytes, 16 - (ea & 0xF));
+}
+
+// stvrx: the last ea & 0xF guest bytes at the start of ea's quadword
+// (host_quadword: the host address of ea & ~0xF). Nothing when ea is aligned.
+inline void StoreVectorRight(uint8_t* host_quadword, uint32_t ea, const uint8_t* reg) {
+  alignas(16) uint8_t bytes[16];
+  VectorGuestBytes(reg, bytes);
+  const uint32_t count = ea & 0xF;
+  StoreVectorBytes(host_quadword, bytes + 16 - count, count);
+}
 
 //=============================================================================
 // SIMD Helper Functions
@@ -530,6 +582,171 @@ inline double fp_fma(double a, double b, double c) {
 #endif
 
 //=============================================================================
+// Scalar arithmetic: NaN results, host flags
+//=============================================================================
+// fadd, fsub, fmul, fdiv, fsqrt and their single forms: a NaN operand is the
+// result, the first in A, B order, quieted, and an invalid operation with no
+// NaN operand (infinity minus infinity, zero over zero, the root of a negative
+// value) gives the default QNaN, which is positive on PPC, negative on x86.
+// The FPSCR exception bits live in the host's sticky status flags
+// (FPSCRRegister), so the host arithmetic must raise the flags the hardware's
+// does, no more, no fewer.
+
+inline constexpr uint64_t kFpQuietBit = 0x0008000000000000ull;
+inline constexpr double kFpDefaultQNaN = std::bit_cast<double>(0x7FF8000000000000ull);
+
+// Fixes up the result `r` of an arithmetic on `operands`, in A, B order.
+template <typename... Operands>
+inline double fp_nan_result(double r, Operands... operands) {
+  if (!std::isnan(r)) [[likely]] {
+    return r;
+  }
+  for (double x : {double(operands)...}) {
+    if (std::isnan(x)) {
+      return std::bit_cast<double>(std::bit_cast<uint64_t>(x) | kFpQuietBit);
+    }
+  }
+  return kFpDefaultQNaN;
+}
+
+// A value the compiler can't see through. Arithmetic on it stays in the branch
+// it is written in: computed ahead of the branch (a select), it would raise
+// the host flags of the path not taken.
+inline double fp_opaque(double x) {
+#if defined(__x86_64__) || defined(_M_X64)
+  __asm__("" : "+x"(x));
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  __asm__("" : "+w"(x));
+#endif
+  return x;
+}
+
+// Raises the host's invalid flag (an FPSCR VX cause the host arithmetic
+// doesn't raise itself).
+inline void fp_raise_invalid() {
+  volatile double zero = 0.0;
+  volatile double product = zero * HUGE_VAL;
+  (void)product;
+}
+
+// The host's square root instruction. The C library's sqrt may answer a NaN
+// operand in software, without the invalid flag of an SNaN (VXSNAN).
+inline double fp_sqrt(double x) {
+  const simde__m128d v = simde_mm_set_sd(x);
+  return simde_mm_cvtsd_f64(simde_mm_sqrt_sd(v, v));
+}
+
+// Raise the host's divide-by-zero flag (ZX), and overflow with inexact (OX,
+// XX).
+inline void fp_raise_divide_by_zero() {
+  volatile double one = 1.0;
+  volatile double zero = 0.0;
+  volatile double quotient = one / zero;
+  (void)quotient;
+}
+
+inline void fp_raise_overflow() {
+  volatile double largest = 0x1.FFFFFFFFFFFFFp1023;
+  volatile double product = largest * 2.0;
+  (void)product;
+}
+
+inline bool fp_is_snan(double x) {
+  const uint64_t bits = std::bit_cast<uint64_t>(x);
+  return (bits & 0x7FF8000000000000ull) == 0x7FF0000000000000ull &&
+         (bits & 0x0007FFFFFFFFFFFFull) != 0;
+}
+
+// fres and frsqrte: the console's estimates (rex/ppc/estimates.h) and the
+// flags its FPU raises with them, from the hardware captures: ZX for a zero,
+// VX for an SNaN, and for frsqrte a negative operand (VXSQRT), OX and XX for
+// fres of a denormal (the reciprocal overflows). An estimate in range raises
+// nothing, not even XX.
+inline double fp_fres(double b) {
+  const double r = estimate_reciprocal_single(b);
+  const uint64_t magnitude = std::bit_cast<uint64_t>(b) & 0x7FFFFFFFFFFFFFFFull;
+  if (magnitude - 1 >= 0x7FEFFFFFFFFFFFFFull) [[unlikely]] {
+    // Zero, infinity or a NaN.
+    if (magnitude == 0) {
+      fp_raise_divide_by_zero();
+    } else if (fp_is_snan(b)) {
+      fp_raise_invalid();
+    }
+  } else if (std::isinf(r)) [[unlikely]] {
+    fp_raise_overflow();
+  }
+  return r;
+}
+
+inline double fp_frsqrte(double b) {
+  const double r = estimate_reciprocal_sqrt_double(b);
+  const uint64_t bits = std::bit_cast<uint64_t>(b);
+  const uint64_t magnitude = bits & 0x7FFFFFFFFFFFFFFFull;
+  if (magnitude == 0) [[unlikely]] {
+    fp_raise_divide_by_zero();
+  } else if (fp_is_snan(b) || (magnitude <= 0x7FF0000000000000ull && (bits >> 63))) [[unlikely]] {
+    fp_raise_invalid();
+  }
+  return r;
+}
+
+// vrefp, vrsqrtefp, vlogefp, vexptefp: the console's estimate in each lane.
+template <uint32_t (*Estimate)(uint32_t)>
+inline simde__m128 vec_estimate(simde__m128 x) {
+  alignas(16) uint32_t lanes[4];
+  simde_mm_store_ps(reinterpret_cast<float*>(lanes), x);
+  for (uint32_t& lane : lanes) {
+    lane = Estimate(lane);
+  }
+  return simde_mm_load_ps(reinterpret_cast<const float*>(lanes));
+}
+
+// fsel's A >= 0 without a compare, which raises the invalid flag for an SNaN
+// (fsel raises nothing): not a NaN, and positive or a zero of either sign.
+inline bool fp_select_nonnegative(double a) {
+  const uint64_t bits = std::bit_cast<uint64_t>(a);
+  const uint64_t magnitude = bits & 0x7FFFFFFFFFFFFFFFull;
+  return magnitude <= 0x7FF0000000000000ull && (bits == magnitude || magnitude == 0);
+}
+
+// fctiw, fctiwz, fctid, fctidz. The host conversion always runs: it raises the
+// invalid flag (VXCVI) for a NaN or a value out of range, and answers those
+// with the smallest integer, the hardware's result for a NaN and a negative
+// value; a positive one saturates to the largest. fctiw and fctiwz put the
+// sign extension of the word in the high word, as the hardware does.
+inline int64_t fp_to_int32(double x) {
+  int32_t r = simde_mm_cvtsd_si32(simde_mm_set_sd(x));
+  if (r == INT32_MIN && x > 0.0) {
+    r = INT32_MAX;
+  }
+  return r;
+}
+
+inline int64_t fp_to_int32_truncate(double x) {
+  int32_t r = simde_mm_cvttsd_si32(simde_mm_set_sd(x));
+  if (r == INT32_MIN && x > 0.0) {
+    r = INT32_MAX;
+  }
+  return r;
+}
+
+inline int64_t fp_to_int64(double x) {
+  int64_t r = simde_mm_cvtsd_si64(simde_mm_set_sd(x));
+  if (r == INT64_MIN && x > 0.0) {
+    r = INT64_MAX;
+  }
+  return r;
+}
+
+inline int64_t fp_to_int64_truncate(double x) {
+  int64_t r = simde_mm_cvttsd_si64(simde_mm_set_sd(x));
+  if (r == INT64_MIN && x > 0.0) {
+    r = INT64_MAX;
+  }
+  return r;
+}
+
+//=============================================================================
 // Multiply-add NaN rules
 //=============================================================================
 // fmadd/fmsub/fnmadd/fnmsub (and their single forms), vmaddfp and vnmsubfp
@@ -537,20 +754,29 @@ inline double fp_fma(double a, double b, double c) {
 // the first NaN operand in A, B, C order, quieted, with its sign left alone;
 // that is not the host's order. An invalid operation with no NaN operand
 // (infinity times zero) gives the default QNaN, which is positive on PPC and
-// negative on x86. The negated forms never negate a NaN result.
+// negative on x86. The negated forms never negate a NaN result. Infinity times
+// zero is invalid (VXIMZ) even when the addend is a QNaN, where x86's FMA
+// raises nothing.
 
-// Fixes up the result `r` of a scalar multiply-add with operands a, b, c.
+// Fixes up the result `r` of a scalar multiply-add with operands a, b, c
+// (the product a * c, the addend b).
 inline double fp_madd_result(double r, double a, double b, double c, bool negate) {
   if (!std::isnan(r)) [[likely]] {
     return negate ? -r : r;
   }
-  constexpr uint64_t kQuietBit = 0x0008000000000000ull;
+  constexpr uint64_t kMagnitude = 0x7FFFFFFFFFFFFFFFull;
+  constexpr uint64_t kInfinity = 0x7FF0000000000000ull;
+  const uint64_t ma = std::bit_cast<uint64_t>(a) & kMagnitude;
+  const uint64_t mc = std::bit_cast<uint64_t>(c) & kMagnitude;
+  if ((ma == kInfinity && mc == 0) || (ma == 0 && mc == kInfinity)) {
+    fp_raise_invalid();
+  }
   for (double x : {a, b, c}) {
     if (std::isnan(x)) {
-      return std::bit_cast<double>(std::bit_cast<uint64_t>(x) | kQuietBit);
+      return std::bit_cast<double>(std::bit_cast<uint64_t>(x) | kFpQuietBit);
     }
   }
-  return std::bit_cast<double>(0x7FF8000000000000ull);
+  return kFpDefaultQNaN;
 }
 
 //=============================================================================
@@ -564,19 +790,26 @@ inline double fp_madd_result(double r, double a, double b, double c, bool negate
 
 // Whether every operand is finite and at least one is denormal (a zero isn't:
 // subtracting one wraps its magnitude to the top).
+// One test of each operand on the way in (the compiler packs them into one
+// SSE compare), and the finiteness of all only when one is denormal: the hot
+// path of a two-operand check is 9 instructions instead of 14 (x86-64-v2).
+// Moving the slow half out of line costs more (spills around the call).
 template <typename... Operands>
 inline bool fp_single_denormal_operand(Operands... operands) {
+  constexpr uint64_t kMagnitude = 0x7FFFFFFFFFFFFFFFull;
   bool any_denormal = false;
-  bool any_nonfinite = false;
   for (double x : {double(operands)...}) {
-    const uint64_t magnitude = std::bit_cast<uint64_t>(x) & 0x7FFFFFFFFFFFFFFFull;
-    any_denormal |= magnitude - 1 < 0x000FFFFFFFFFFFFFull;
-    any_nonfinite |= magnitude >= 0x7FF0000000000000ull;
+    any_denormal |= (std::bit_cast<uint64_t>(x) & kMagnitude) - 1 < 0x000FFFFFFFFFFFFFull;
   }
-  return any_denormal && !any_nonfinite;
+  if (!any_denormal) [[likely]] {
+    return false;
+  }
+  bool all_finite = true;
+  for (double x : {double(operands)...}) {
+    all_finite &= (std::bit_cast<uint64_t>(x) & kMagnitude) < 0x7FF0000000000000ull;
+  }
+  return all_finite;
 }
-
-inline constexpr double kFpDefaultQNaN = std::bit_cast<double>(0x7FF8000000000000ull);
 
 //=============================================================================
 // FPSCR[FR]: whether a result was rounded away from zero
@@ -665,6 +898,17 @@ inline bool vec_any_nan(simde__m128 r) {
   return simde_mm_movemask_ps(simde_mm_cmpunord_ps(r, r)) != 0;
 }
 
+// vaddfp, vsubfp, vmulfp128 and their VMX128 forms: the NaN lanes of r = a op b
+// as the multiply-adds' (vA first). x86 gives the first source's NaN, and the
+// compiler may swap the operands of an add or a multiply; its default NaN is
+// negative.
+inline simde__m128 vec_arith_result(simde__m128 r, simde__m128 a, simde__m128 b) {
+  if (vec_any_nan(r)) [[unlikely]] {
+    r = vec_nan3(r, a, b, b);
+  }
+  return r;
+}
+
 #if defined(__FMA__) || defined(__aarch64__) || defined(_M_ARM64)
 
 inline simde__m128 vec_fma(simde__m128 a, simde__m128 c, simde__m128 b) {
@@ -704,10 +948,68 @@ inline simde__m128 vec_fms(simde__m128 a, simde__m128 c, simde__m128 b) {
 
 #endif
 
+inline simde__m128 vec_flush_denormals(simde__m128 x);
+
+// The lanes of r that are a NaN or +-FLT_MIN: the multiply-adds' rare cases.
+inline bool vec_any_nan_or_min(simde__m128 r) {
+  const simde__m128i magnitude =
+      simde_mm_and_si128(simde_mm_castps_si128(r), simde_mm_set1_epi32(0x7FFFFFFF));
+  const simde__m128 min = simde_mm_castsi128_ps(
+      simde_mm_cmpeq_epi32(magnitude, simde_mm_set1_epi32(0x00800000)));
+  return simde_mm_movemask_ps(simde_mm_or_ps(simde_mm_cmpunord_ps(r, r), min)) != 0;
+}
+
+// The lanes (all bits) whose exact a * c + b is below FLT_MIN in magnitude. The
+// product of two floats is exact in a double (24 + 24 bits, far from its limits),
+// and TwoSum gives the sum's rounding error exactly: the exact value is below
+// FLT_MIN when the rounded sum is, or when it is FLT_MIN and the error points to
+// zero.
+[[gnu::always_inline]] inline simde__m128d vec_madd_tiny_half(simde__m128d a, simde__m128d c,
+                                                              simde__m128d b) {
+  const simde__m128d zero = simde_mm_setzero_pd();
+  const simde__m128d min = simde_mm_set1_pd(0x1p-126);
+  const simde__m128d p = simde_mm_mul_pd(a, c);
+  const simde__m128d s = simde_mm_add_pd(p, b);
+  const simde__m128d b_rounded = simde_mm_sub_pd(s, p);
+  const simde__m128d error = simde_mm_add_pd(simde_mm_sub_pd(p, simde_mm_sub_pd(s, b_rounded)),
+                                             simde_mm_sub_pd(b, b_rounded));
+  const simde__m128d magnitude = simde_mm_andnot_pd(simde_mm_set1_pd(-0.0), s);
+  const simde__m128d toward_zero =
+      simde_mm_and_pd(simde_mm_cmpneq_pd(error, zero),
+                      simde_mm_xor_pd(simde_mm_cmplt_pd(error, zero), simde_mm_cmplt_pd(s, zero)));
+  return simde_mm_or_pd(simde_mm_cmplt_pd(magnitude, min),
+                        simde_mm_and_pd(simde_mm_cmpeq_pd(magnitude, min), toward_zero));
+}
+
+// vmaddfp, vnmsubfp: the console flushes a result whose exact value is below
+// FLT_MIN (tiny before rounding), x86 only one below it after rounding, so an
+// exact value just under FLT_MIN comes out of the host as +-FLT_MIN (upstream
+// hardware samples, tests/unit/ppc/upstream_multiply_add_test.cpp). Those lanes
+// of r = a * c + b become the zero of their sign. Denormal operands are zeros,
+// as the host's DAZ made them for r.
+[[gnu::always_inline]] inline simde__m128 vec_madd_flush_tiny(simde__m128 r, simde__m128 a,
+                                                              simde__m128 c, simde__m128 b) {
+  a = vec_flush_denormals(a);
+  c = vec_flush_denormals(c);
+  b = vec_flush_denormals(b);
+  const simde__m128d low = vec_madd_tiny_half(simde_mm_cvtps_pd(a), simde_mm_cvtps_pd(c),
+                                              simde_mm_cvtps_pd(b));
+  const simde__m128d high = vec_madd_tiny_half(simde_mm_cvtps_pd(simde_mm_movehl_ps(a, a)),
+                                               simde_mm_cvtps_pd(simde_mm_movehl_ps(c, c)),
+                                               simde_mm_cvtps_pd(simde_mm_movehl_ps(b, b)));
+  const simde__m128 tiny = simde_mm_shuffle_ps(simde_mm_castpd_ps(low), simde_mm_castpd_ps(high),
+                                               SIMDE_MM_SHUFFLE(2, 0, 2, 0));
+  const simde__m128 sign = simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)));
+  const simde__m128 min = simde_mm_castsi128_ps(simde_mm_cmpeq_epi32(
+      simde_mm_castps_si128(simde_mm_andnot_ps(sign, r)), simde_mm_set1_epi32(0x00800000)));
+  return simde_mm_blendv_ps(r, simde_mm_and_ps(r, sign), simde_mm_and_ps(tiny, min));
+}
+
 // vD = vA * vC + vB.
 inline simde__m128 vec_madd(simde__m128 a, simde__m128 c, simde__m128 b) {
   simde__m128 r = vec_fma(a, c, b);
-  if (vec_any_nan(r)) [[unlikely]] {
+  if (vec_any_nan_or_min(r)) [[unlikely]] {
+    r = vec_madd_flush_tiny(r, a, c, b);
     r = vec_nan3(r, a, b, c);
   }
   return r;
@@ -715,9 +1017,11 @@ inline simde__m128 vec_madd(simde__m128 a, simde__m128 c, simde__m128 b) {
 
 // vD = -(vA * vC - vB). An exact zero comes out as -0; a NaN keeps its sign.
 inline simde__m128 vec_nmsub(simde__m128 a, simde__m128 c, simde__m128 b) {
-  simde__m128 r = simde_mm_xor_ps(vec_fms(a, c, b),
-                                  simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))));
-  if (vec_any_nan(r)) [[unlikely]] {
+  const simde__m128 sign = simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)));
+  simde__m128 r = simde_mm_xor_ps(vec_fms(a, c, b), sign);
+  if (vec_any_nan_or_min(r)) [[unlikely]] {
+    // r is -(a * c) + b.
+    r = vec_madd_flush_tiny(r, simde_mm_xor_ps(a, sign), c, b);
     r = vec_nan3(r, a, b, c);
   }
   return r;
@@ -762,7 +1066,12 @@ inline simde__m128 vec_min(simde__m128 a, simde__m128 b) {
   return r;
 }
 
-// vmsum3fp128 and vmsum4fp128: each product is exact in float64, summed in the
+// vmsum3fp128 and vmsum4fp128, fast form (codegen `fast_dot_products = true`;
+// the default is the console's, vec_msum3 / vec_msum4 below). It is 1 ulp off
+// the console (rounded to nearest where the console truncates) in about three
+// of four sampled cases, and its NaN and overflow results differ.
+//
+// Each product is exact in float64, summed in the
 // order Xenia's x64 backend matched to the console (DOT_PRODUCT_3/4),
 // (x + z) + y or (x + z) + (y + w), and rounded once to float32, in all four
 // lanes. Host lanes 3..0 hold the guest's x, y, z, w. Denormal inputs and results
@@ -839,16 +1148,278 @@ inline simde__m128 vec_msum_result(simde__m128d sum, simde__m128 a, simde__m128 
   return simde_mm_set1_ps(narrow);
 }
 
-inline simde__m128 vec_msum3(simde__m128 a, simde__m128 b) {
+inline simde__m128 vec_msum3_fast(simde__m128 a, simde__m128 b) {
   simde__m128d yx;
   const simde__m128d pairs = vec_msum_pairs(a, b, yx);
   return vec_msum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), yx), a, b, false);
 }
 
-inline simde__m128 vec_msum4(simde__m128 a, simde__m128 b) {
+inline simde__m128 vec_msum4_fast(simde__m128 a, simde__m128 b) {
   simde__m128d yx;
   const simde__m128d pairs = vec_msum_pairs(a, b, yx);
   return vec_msum_result(simde_mm_add_sd(simde_mm_unpackhi_pd(pairs, pairs), pairs), a, b, true);
+}
+
+// vmsum3fp128 and vmsum4fp128 as the console computes them. Ported from
+// upstream rexglue (include/rex/ppc/fpu.h, DotProductReference and
+// DotProductFinite, 9740cacf and later; Copyright (c) 2026 Tom Clay, BSD
+// 3-Clause), which matches all 747 of its console samples (tests/unit/ppc/
+// upstream_cases). The products are exact; they are added as truncated fixed
+// point with 29 fractional bits below the largest product, in the sign most of
+// the terms have, then normalized without rounding. A NaN operand or an
+// infinity times zero gives the default QNaN; infinities of one sign give that
+// infinity, of both signs the QNaN. The result goes to all four lanes. flush
+// takes denormal operands as zeros (VSCR[NJ] set, which generated code assumes).
+namespace vec_dot_detail {
+
+struct Term {
+  bool negative;
+  uint64_t mantissa;
+  int32_t exponent;
+};
+
+inline Term MakeTerm(uint32_t a, uint32_t b, bool flush) {
+  const auto split = [flush](uint32_t bits, uint32_t& mantissa, int32_t& exponent) {
+    const uint32_t biased = (bits >> 23) & 0xFFu;
+    mantissa = biased == 0 ? 0 : ((bits & 0x7FFFFFu) | 0x800000u);
+    exponent = static_cast<int32_t>(biased) - 127;
+    if (biased == 0 && !flush && (bits & 0x7FFFFFu) != 0) {
+      const int32_t shift = std::countl_zero(bits & 0x7FFFFFu) - 8;
+      mantissa = (bits & 0x7FFFFFu) << shift;
+      exponent = -126 - shift;
+    }
+  };
+  uint32_t mantissa_a, mantissa_b;
+  int32_t exponent_a, exponent_b;
+  split(a, mantissa_a, exponent_a);
+  split(b, mantissa_b, exponent_b);
+  return {((a ^ b) & 0x80000000u) != 0, uint64_t{mantissa_a} * mantissa_b,
+          exponent_a + exponent_b - 46};
+}
+
+// The fixed point sum (bits from `lowest` up) to the result bits.
+inline uint32_t Finish(int64_t sum, bool majority_negative, int32_t lowest) {
+  const int64_t flip = sum >> 63;
+  const uint32_t sign =
+      (majority_negative ? 0x80000000u : 0u) ^ (static_cast<uint32_t>(flip) & 0x80000000u);
+  const uint64_t magnitude = static_cast<uint64_t>(sum ^ flip);
+  if (magnitude == 0) {
+    return 0;
+  }
+  const uint32_t width = static_cast<uint32_t>(std::bit_width(magnitude));
+  const int32_t exponent = lowest + static_cast<int32_t>(width) - 1;
+  const uint32_t top = static_cast<uint32_t>((magnitude << (64 - width)) >> 40);
+  if (static_cast<uint32_t>(exponent + 126) < 254u) [[likely]] {
+    return sign | (static_cast<uint32_t>(exponent + 127) << 23) | (top & 0x7FFFFFu);
+  }
+  if (exponent < -127) {
+    return sign;
+  }
+  if (exponent == -127) {
+    return sign | (top & 0x7FFFFFu);
+  }
+  if (exponent > 128) {
+    return sign | 0x7FC00000u;
+  }
+  // Exponent 128: the console leaves the bits as they are (2 * FLT_MAX gives
+  // 0x7FFFFFFF).
+  return sign | (static_cast<uint32_t>(exponent + 127) << 23) | (top & 0x7FFFFFu);
+}
+
+// Any operands, in guest order (element i is host lane 3 - i).
+template <uint32_t Terms>
+inline uint32_t Reference(const std::array<uint32_t, 4>& a, const std::array<uint32_t, 4>& b,
+                          bool flush) {
+  bool any_nan = false;
+  bool any_invalid = false;
+  uint32_t infinities = 0;
+  uint32_t negative_infinities = 0;
+  std::array<Term, Terms> terms{};
+  for (uint32_t i = 0; i < Terms; ++i) {
+    const uint32_t x = flush && (a[i] & 0x7F800000u) == 0 ? (a[i] & 0x80000000u) : a[i];
+    const uint32_t y = flush && (b[i] & 0x7F800000u) == 0 ? (b[i] & 0x80000000u) : b[i];
+    const bool nan_x = (x & 0x7FFFFFFFu) > 0x7F800000u;
+    const bool nan_y = (y & 0x7FFFFFFFu) > 0x7F800000u;
+    const bool inf_x = (x & 0x7FFFFFFFu) == 0x7F800000u;
+    const bool inf_y = (y & 0x7FFFFFFFu) == 0x7F800000u;
+    const bool zero_x = (x & 0x7FFFFFFFu) == 0;
+    const bool zero_y = (y & 0x7FFFFFFFu) == 0;
+    any_nan |= nan_x || nan_y;
+    any_invalid |= (inf_x && zero_y) || (inf_y && zero_x);
+    if ((inf_x || inf_y) && !zero_x && !zero_y) {
+      ++infinities;
+      negative_infinities += ((x ^ y) & 0x80000000u) != 0 ? 1 : 0;
+    }
+    terms[i] = MakeTerm(x, y, flush);
+  }
+  if (any_nan || any_invalid) {
+    return 0x7FC00000u;
+  }
+  if (infinities != 0) {
+    if (negative_infinities == 0) {
+      return 0x7F800000u;
+    }
+    return negative_infinities == infinities ? 0xFF800000u : 0x7FC00000u;
+  }
+  uint32_t negatives = 0;
+  bool any_live = false;
+  int32_t highest = 0;
+  for (const Term& term : terms) {
+    negatives += term.negative ? 1 : 0;
+    if (term.mantissa != 0 && (!any_live || term.exponent > highest)) {
+      highest = term.exponent;
+      any_live = true;
+    }
+  }
+  if (!any_live) {
+    return negatives == Terms ? 0x80000000u : 0u;
+  }
+  const bool majority_negative = 2 * negatives > Terms;
+  const int32_t lowest = highest + 47 - 29;
+  int64_t sum = 0;
+  for (const Term& term : terms) {
+    uint64_t aligned = 0;
+    if (term.mantissa != 0) {
+      const int32_t shift = lowest - term.exponent;
+      aligned = shift >= 64 ? 0 : (term.mantissa >> shift);
+    }
+    const int64_t value = static_cast<int64_t>(aligned);
+    sum += term.negative == majority_negative ? value : ~value;
+  }
+  return Finish(sum, majority_negative, lowest);
+}
+
+// Finite, normal-or-zero operands (no infinity, NaN, or with flush clear, a
+// denormal) in the highest Terms host lanes, as Reference. The products scaled
+// to the fixed point are below 2^31, so they go through float64 and truncate
+// to int32 exactly.
+template <uint32_t Terms>
+inline uint32_t Finite(simde__m128i words_a, simde__m128i words_b, simde__m128i biased_a,
+                       simde__m128i biased_b) {
+  constexpr int32_t kNone = -0x40000000;
+  const auto set = [](uint32_t value) { return simde_mm_set1_epi32(static_cast<int32_t>(value)); };
+  const simde__m128i used = simde_mm_set_epi32(-1, -1, -1, Terms == 4 ? -1 : 0);
+  const simde__m128i zero = simde_mm_setzero_si128();
+  const simde__m128i live_a = simde_mm_and_si128(simde_mm_cmpgt_epi32(biased_a, zero), used);
+  const simde__m128i live_b = simde_mm_and_si128(simde_mm_cmpgt_epi32(biased_b, zero), used);
+  const simde__m128i mantissa_a = simde_mm_and_si128(
+      simde_mm_or_si128(simde_mm_and_si128(words_a, set(0x7FFFFFu)), set(0x800000u)), live_a);
+  const simde__m128i mantissa_b = simde_mm_and_si128(
+      simde_mm_or_si128(simde_mm_and_si128(words_b, set(0x7FFFFFu)), set(0x800000u)), live_b);
+  const simde__m128i exponent = simde_mm_sub_epi32(simde_mm_add_epi32(biased_a, biased_b), set(300));
+  const simde__m128i live = simde_mm_and_si128(live_a, live_b);
+  const simde__m128i candidate =
+      simde_mm_blendv_epi8(set(static_cast<uint32_t>(kNone)), exponent, live);
+  simde__m128i highest_lanes =
+      simde_mm_max_epi32(candidate, simde_mm_shuffle_epi32(candidate, 0x4E));
+  highest_lanes = simde_mm_max_epi32(highest_lanes, simde_mm_shuffle_epi32(highest_lanes, 0xB1));
+  const int32_t highest = simde_mm_cvtsi128_si32(highest_lanes);
+  const simde__m128i negative = simde_mm_srai_epi32(simde_mm_xor_si128(words_a, words_b), 31);
+  const uint32_t negatives = static_cast<uint32_t>(std::popcount(static_cast<uint32_t>(
+      simde_mm_movemask_ps(simde_mm_castsi128_ps(simde_mm_and_si128(negative, used))))));
+  if (highest == kNone) {
+    return negatives == Terms ? 0x80000000u : 0u;
+  }
+  const bool majority = 2 * negatives > Terms;
+  const simde__m128i minority = simde_mm_and_si128(
+      simde_mm_xor_si128(negative, simde_mm_set1_epi32(-static_cast<int32_t>(majority))), used);
+  const int32_t lowest = highest + 47 - 29;
+  // 2^(exponent - lowest) as float64 bits; the field stays within 1..2046 for
+  // every exponent two finite floats give.
+  const simde__m128i field = simde_mm_add_epi32(
+      simde_mm_sub_epi32(exponent, simde_mm_set1_epi32(lowest)), simde_mm_set1_epi32(1023));
+  const auto upper = [](simde__m128i v) { return simde_mm_shuffle_epi32(v, 0xEE); };
+  const simde__m128d scale_low =
+      simde_mm_castsi128_pd(simde_mm_slli_epi64(simde_mm_cvtepu32_epi64(field), 52));
+  const simde__m128d scale_high =
+      simde_mm_castsi128_pd(simde_mm_slli_epi64(simde_mm_cvtepu32_epi64(upper(field)), 52));
+  const simde__m128d product_low =
+      simde_mm_mul_pd(simde_mm_cvtepi32_pd(mantissa_a), simde_mm_cvtepi32_pd(mantissa_b));
+  const simde__m128d product_high = simde_mm_mul_pd(simde_mm_cvtepi32_pd(upper(mantissa_a)),
+                                                    simde_mm_cvtepi32_pd(upper(mantissa_b)));
+  const simde__m128i aligned =
+      simde_mm_unpacklo_epi64(simde_mm_cvttpd_epi32(simde_mm_mul_pd(product_low, scale_low)),
+                              simde_mm_cvttpd_epi32(simde_mm_mul_pd(product_high, scale_high)));
+  const simde__m128i terms = simde_mm_xor_si128(aligned, minority);
+  const simde__m128i pair =
+      simde_mm_add_epi64(simde_mm_cvtepi32_epi64(terms), simde_mm_cvtepi32_epi64(upper(terms)));
+  const int64_t total = simde_mm_cvtsi128_si64(pair) + simde_mm_extract_epi64(pair, 1);
+  return Finish(total, majority, lowest);
+}
+
+template <uint32_t Terms>
+inline simde__m128 Dot(simde__m128 a, simde__m128 b, bool flush) {
+  const simde__m128i words_a = simde_mm_castps_si128(a);
+  const simde__m128i words_b = simde_mm_castps_si128(b);
+  const simde__m128i used = simde_mm_set_epi32(-1, -1, -1, Terms == 4 ? -1 : 0);
+  const simde__m128i exponent_mask = simde_mm_set1_epi32(0x7F800000);
+  const simde__m128i biased_a = simde_mm_srli_epi32(simde_mm_and_si128(words_a, exponent_mask), 23);
+  const simde__m128i biased_b = simde_mm_srli_epi32(simde_mm_and_si128(words_b, exponent_mask), 23);
+  const simde__m128i infinite = simde_mm_set1_epi32(0xFF);
+  simde__m128i special = simde_mm_or_si128(simde_mm_cmpeq_epi32(biased_a, infinite),
+                                           simde_mm_cmpeq_epi32(biased_b, infinite));
+  if (!flush) [[unlikely]] {
+    const simde__m128i zero = simde_mm_setzero_si128();
+    const simde__m128i fraction_mask = simde_mm_set1_epi32(0x7FFFFF);
+    const simde__m128i denormal_a = simde_mm_andnot_si128(
+        simde_mm_cmpeq_epi32(simde_mm_and_si128(words_a, fraction_mask), zero),
+        simde_mm_cmpeq_epi32(biased_a, zero));
+    const simde__m128i denormal_b = simde_mm_andnot_si128(
+        simde_mm_cmpeq_epi32(simde_mm_and_si128(words_b, fraction_mask), zero),
+        simde_mm_cmpeq_epi32(biased_b, zero));
+    special = simde_mm_or_si128(special, simde_mm_or_si128(denormal_a, denormal_b));
+  }
+  special = simde_mm_and_si128(special, used);
+  uint32_t result;
+  if (simde_mm_movemask_epi8(special) == 0) [[likely]] {
+    result = Finite<Terms>(words_a, words_b, biased_a, biased_b);
+  } else {
+    alignas(16) std::array<uint32_t, 4> host_a;
+    alignas(16) std::array<uint32_t, 4> host_b;
+    simde_mm_store_si128(reinterpret_cast<simde__m128i*>(host_a.data()), words_a);
+    simde_mm_store_si128(reinterpret_cast<simde__m128i*>(host_b.data()), words_b);
+    std::array<uint32_t, 4> guest_a{}, guest_b{};
+    for (uint32_t i = 0; i < 4; ++i) {
+      guest_a[i] = host_a[3 - i];
+      guest_b[i] = host_b[3 - i];
+    }
+    result = Reference<Terms>(guest_a, guest_b, flush);
+  }
+  return simde_mm_castsi128_ps(simde_mm_set1_epi32(static_cast<int32_t>(result)));
+}
+
+}  // namespace vec_dot_detail
+
+inline simde__m128 vec_msum3(simde__m128 a, simde__m128 b, bool flush = true) {
+  return vec_dot_detail::Dot<3>(a, b, flush);
+}
+
+inline simde__m128 vec_msum4(simde__m128 a, simde__m128 b, bool flush = true) {
+  return vec_dot_detail::Dot<4>(a, b, flush);
+}
+
+// One field of vpkd3d128: a lane in the 3.0 + k * 2^-22 form (raw float bits)
+// clamped to its field's range [lo, hi], floats in [2, 4) whose low bits are
+// the field. A lane the clamp moves sets VSCR[SAT], even one the mask doesn't
+// write. A NaN packs as nan_bits, the field's minimum (0x8000 for a short),
+// which unpacks back to a NaN, or 0 in the unsigned W fields, and sets nothing
+// (xenia-canary c0ea2c443, 6fc314d26; VSCR[SAT] measured on a console,
+// xenia-edge 4bcbae774).
+[[gnu::always_inline]] inline uint32_t pack_d3d_field(uint32_t bits, uint32_t lo, uint32_t hi,
+                                                      uint32_t nan_bits, uint8_t& sat) {
+  const float value = std::bit_cast<float>(bits);
+  if (value != value) {
+    return nan_bits;
+  }
+  if (value < std::bit_cast<float>(lo)) {
+    sat = 1;
+    return lo;
+  }
+  if (value > std::bit_cast<float>(hi)) {
+    sat = 1;
+    return hi;
+  }
+  return bits;
 }
 
 }  // namespace rex::ppc

@@ -443,7 +443,8 @@ class Thread : public WaitHandle {
   // function unless it is in an alertable state. After the thread is in an
   // alertable state, the thread handles all pending APCs in first in, first out
   // (FIFO) order, and the wait operation returns WaitResult::kUserCallback.
-  virtual void QueueUserCallback(std::function<void()> callback) = 0;
+  // False reports a rejected callback or failure to signal the target.
+  virtual bool QueueUserCallback(std::function<void()> callback) = 0;
 
   // Decrements a thread's suspend count. When the suspend count is decremented
   // to zero, the execution of the thread is resumed.

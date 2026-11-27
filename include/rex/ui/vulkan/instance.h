@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <rex/platform.h>
@@ -107,8 +108,12 @@ class VulkanInstance {
     bool ext_EXT_metal_surface = false;  // #217
 #endif
     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
+    // Required by the device's VK_EXT_full_screen_exclusive.
+    bool ext_KHR_get_surface_capabilities2 = false;  // #120
     bool ext_EXT_debug_utils = false;                          // #129
-    bool ext_KHR_portability_enumeration = false;              // #395
+    // From the validation layer, with vulkan_validation_sync.
+    bool ext_EXT_validation_features = false;      // #248
+    bool ext_KHR_portability_enumeration = false;  // #395
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -116,6 +121,15 @@ class VulkanInstance {
   VkInstance instance() const { return instance_; }
 
   void EnumeratePhysicalDevices(std::vector<VkPhysicalDevice>& physical_devices_out) const;
+
+  // Intel XeSS's instance extensions and API version are enabled
+  // (ui/vulkan/xess.h; libxess.dll next to the executable); else why not.
+  bool xess_ready() const { return xess_ready_; }
+  const std::string& xess_note() const { return xess_note_; }
+  // NVIDIA NGX's instance extensions are enabled (ui/vulkan/ngx.h: DLSS or
+  // DLSS Frame Generation DLLs next to the executable); else why not.
+  bool ngx_ready() const { return ngx_ready_; }
+  const std::string& ngx_note() const { return ngx_note_; }
 
  private:
   explicit VulkanInstance() = default;
@@ -131,6 +145,11 @@ class VulkanInstance {
   Extensions extensions_;
 
   VkInstance instance_ = nullptr;
+
+  bool xess_ready_ = false;
+  std::string xess_note_;
+  bool ngx_ready_ = false;
+  std::string ngx_note_;
 
   static VkBool32 DebugUtilsMessengerCallback(
       VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,

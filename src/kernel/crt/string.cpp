@@ -48,8 +48,11 @@ static char* native_strrchr(const char* s, int c) {
 }
 
 static char* native_strtok(char* s, const char* delim) {
-  // Non-reentrant per guest libc contract; concurrent guest threads will trample.
-  static char* context = nullptr;
+  // Not reentrant, as the CRT's, but per thread like the CRT's (its position is
+  // in the thread's data): one shared position let two guest threads tokenizing
+  // at once continue each other's strings (upstream rexglue ca1432fa). Each
+  // guest thread runs on its own host thread.
+  thread_local char* context = nullptr;
 #if REX_PLATFORM_WIN32
   return strtok_s(s, delim, &context);
 #else
@@ -58,27 +61,33 @@ static char* native_strtok(char* s, const char* delim) {
 }
 
 static int native_stricmp(const char* s1, const char* s2) {
-#if REX_PLATFORM_WIN32
-  return _stricmp(s1, s2);
-#else
-  return strcasecmp(s1, s2);
-#endif
+  if (!s1 || !s2)
+    return 0x7FFFFFFF;
+  const auto fold = [](char c) {
+    const int value = static_cast<unsigned char>(c);
+    return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value;
+  };
+  int left, right;
+  do {
+    left = fold(*s1++);
+    right = fold(*s2++);
+  } while (left && left == right);
+  return left - right;
 }
 
-static int native_strcpy_s(char* dst, size_t dstsz, const char* src) {
-#if REX_PLATFORM_WIN32
-  return strcpy_s(dst, dstsz, src);
-#else
-  if (!dst || !src || dstsz == 0)
-    return 22;  // EINVAL
-  const size_t src_len = std::strlen(src);
-  if (src_len + 1 > dstsz) {
-    dst[0] = '\0';
-    return 34;  // ERANGE
+static int native_strcpy_s(char* dst, uint32_t dstsz, const char* src) {
+  if (!dst || !dstsz)
+    return 22;
+  if (!src) {
+    dst[0] = 0;
+    return 22;
   }
-  std::memcpy(dst, src, src_len + 1);
-  return 0;
-#endif
+  for (uint32_t i = 0; i < dstsz; ++i) {
+    if (!(dst[i] = src[i]))
+      return 0;
+  }
+  dst[0] = 0;
+  return 34;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,13 +149,16 @@ static uint32_t native_wcscmp(const int16_t* lhs, const int16_t* rhs) {
     lhs++;
     rhs++;
   }
-  return (int)(*lhs) - (int)(*rhs);
+  const int difference = int(rex::byte_swap(static_cast<uint16_t>(*lhs))) -
+                         int(rex::byte_swap(static_cast<uint16_t>(*rhs)));
+  return (difference > 0) - (difference < 0);
 }
 
-static uint32_t native_wcsncmp(const int16_t* lhs, const int16_t* rhs, int count) {
+static uint32_t native_wcsncmp(const int16_t* lhs, const int16_t* rhs, uint32_t count) {
   for (; count > 0; count--, lhs++, rhs++) {
     if (*lhs != *rhs)
-      return (int)(*lhs) - (int)(*rhs);
+      return int(rex::byte_swap(static_cast<uint16_t>(*lhs))) -
+             int(rex::byte_swap(static_cast<uint16_t>(*rhs)));
 
     if (*lhs == L'\0')
       return 0;
@@ -158,7 +170,7 @@ static uint32_t native_wcsncmp(const int16_t* lhs, const int16_t* rhs, int count
 static uint32_t native_wcscoll(const int16_t* lhs, const int16_t* rhs) {
   if (lhs && rhs)
     return native_wcscmp(lhs, rhs);
-  return 22;  // EINVAL
+  return 0x7FFFFFFF;
 }
 
 static int16_t* native_wcschr(const int16_t* str, int16_t ch) {
@@ -196,24 +208,36 @@ static int16_t* native_wcsncpy(int16_t* dest, const int16_t* src, int count) {
   return dest;
 }
 
-static uint32_t native_wcsncpy_s(int16_t* dst, size_t dstsz, const int16_t* src, size_t count) {
-  if (!dst || !src || dstsz == 0)
-    return 22;  // EINVAL
-
-  size_t i = 0;
-
-  for (; i < count && i + 1 < dstsz && src[i]; i++)
-    dst[i] = src[i];
-
-  if (i < dstsz)
+static uint32_t native_wcsncpy_s(int16_t* dst, uint32_t dstsz, const int16_t* src, uint32_t count) {
+  constexpr uint32_t kTruncate = 0xFFFFFFFF;
+  if (!count && !dst && !dstsz)
+    return 0;
+  if (!dst || !dstsz)
+    return 22;
+  if (!count) {
+    dst[0] = 0;
+    return 0;
+  }
+  if (!src) {
+    dst[0] = 0;
+    return 22;
+  }
+  uint32_t i = 0;
+  while (i < dstsz && (count == kTruncate || i < count)) {
+    if (!(dst[i] = src[i]))
+      return 0;
+    ++i;
+  }
+  if (i < dstsz) {
     dst[i] = 0;
-  else
+    return 0;
+  }
+  if (count == kTruncate) {
     dst[dstsz - 1] = 0;
-
-  if (i < count && src[i] != 0)
-    return 34;  // ERANGE
-
-  return 0;
+    return 80;
+  }
+  dst[0] = 0;
+  return 34;
 }
 
 static int16_t* native_wcsstr(const int16_t* dest, const int16_t* src) {

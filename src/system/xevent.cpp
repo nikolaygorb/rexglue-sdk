@@ -91,7 +91,7 @@ void XEvent::SetGuestSignalState(uint32_t signal_state) {
 }
 
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
-  std::lock_guard<std::mutex> lock(state_lock_);
+  auto global_lock = global_critical_region_.Acquire();
   // KeSetEvent returns the signal state from before.
   const int32_t old_signal_state =
       guest_object() ? int32_t(guest_object<X_KEVENT>()->header.signal_state) : 0;
@@ -101,7 +101,7 @@ int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
 }
 
 int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
-  std::lock_guard<std::mutex> lock(state_lock_);
+  auto global_lock = global_critical_region_.Acquire();
   // KePulseEvent returns the signal state before the pulse.
   const int32_t old_signal_state =
       guest_object() ? int32_t(guest_object<X_KEVENT>()->header.signal_state) : 0;
@@ -112,7 +112,7 @@ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
 }
 
 int32_t XEvent::Reset() {
-  std::lock_guard<std::mutex> lock(state_lock_);
+  auto global_lock = global_critical_region_.Acquire();
   // KeResetEvent returns the signal state from before.
   const int32_t old_signal_state =
       guest_object() ? int32_t(guest_object<X_KEVENT>()->header.signal_state) : 0;
@@ -128,7 +128,7 @@ void XEvent::Clear() {
 void XEvent::WaitCallback() {
   // An auto-reset event clears on a successful wait; a manual one stays set.
   if (!manual_reset_) {
-    std::lock_guard<std::mutex> lock(state_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     SetGuestSignalState(0);
   }
 }
@@ -137,7 +137,7 @@ void XEvent::SyncFromGuest() {
   if (!guest_object()) {
     return;
   }
-  std::lock_guard<std::mutex> lock(state_lock_);
+  auto global_lock = global_critical_region_.Acquire();
   const bool guest_signaled = guest_object<X_KEVENT>()->header.signal_state != 0;
   if (guest_signaled == host_signaled_) {
     return;

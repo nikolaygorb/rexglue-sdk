@@ -137,7 +137,10 @@ union PageEntry {
     uint32_t current_protect : 4;
     // Allocation state of the page as a MemoryAllocationFlag bit mask.
     uint32_t state : 2;
-    uint32_t reserved : 14;
+    // Set once a commit has initialized the page (NtAllocateVirtualMemory).
+    // Decommit and release keep it, as the page holds data from then on.
+    uint32_t initialized : 1;
+    uint32_t reserved : 13;
   };
 };
 
@@ -213,12 +216,24 @@ class BaseHeap {
   // Partial overlapping pages will also be released.
   virtual bool Release(uint32_t address, uint32_t* out_region_size = nullptr);
 
+  // Releases whole pages inside one region. The pages before and after them
+  // become regions of their own.
+  bool ReleaseRange(uint32_t address, uint32_t size);
+
+  // The runs of the range whose pages no commit has initialized since the heap
+  // was reset. Marks the whole range initialized.
+  std::vector<std::pair<uint32_t, uint32_t>> TakeUninitializedRuns(uint32_t address,
+                                                                   uint32_t size);
+
   // Modifies the protection mode of pages within the given range.
   virtual bool Protect(uint32_t address, uint32_t size, uint32_t protect,
                        uint32_t* old_protect = nullptr);
 
   // Queries information about the given region of pages.
-  bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info);
+  // The region size stops growing once it reaches max_region_size, for a
+  // caller only asking about a range within it.
+  bool QueryRegionInfo(uint32_t base_address, HeapAllocationInfo* out_info,
+                       uint32_t max_region_size = UINT32_MAX);
 
   // Queries the size of the region containing the given address.
   bool QuerySize(uint32_t address, uint32_t* out_size);
@@ -227,8 +242,10 @@ class BaseHeap {
   bool QueryBaseAndSize(uint32_t* in_out_address, uint32_t* out_size);
 
   // Queries the current protection mode of the region containing the given
-  // address.
-  bool QueryProtect(uint32_t address, uint32_t* out_protect);
+  // address, and with out_state its page's kMemoryAllocation* state (a
+  // reserved page keeps the reservation's protection; callers that report it
+  // to the guest check the state).
+  bool QueryProtect(uint32_t address, uint32_t* out_protect, uint32_t* out_state = nullptr);
 
   // Whether no page in the range has been reserved or committed by the heap
   // (false for a range outside the heap).
@@ -249,6 +266,10 @@ class BaseHeap {
   // Callers must hold the global critical region - see
   // AcquireHostPageReconcileLock.
   bool SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_number);
+
+  // Frees the page range in page_table_ (keeping each page's initialized bit).
+  // Callers hold the global critical region and heap_mutex_.
+  bool ReleasePages(uint32_t start_page_number, uint32_t page_count);
 
   // Acquires the global critical region for operations that will run the host
   // page reconcile pass, which reads watch state guarded by it.
@@ -350,6 +371,15 @@ class PhysicalHeap : public BaseHeap {
   // parent will need it, so the ordering holds even for a heap whose own guest
   // pages are large enough to skip reconciling but whose parent's are not.
   std::unique_lock<std::recursive_mutex> AcquireHostPageReconcileLock() const override;
+
+  // After a commit: the GPU's copies of the range dropped (pages the GPU read
+  // while the guest had them free carry no write watch). Without the heap's
+  // locks held.
+  void InvalidateGpuCopies(uint32_t address, uint32_t size);
+  // The physical ranges (address, size) in a range not committed in the
+  // parent heap, in its pages.
+  std::vector<std::pair<uint32_t, uint32_t>> UncommittedPhysicalRanges(uint32_t physical_address,
+                                                                       uint32_t size) const;
 
   VirtualHeap* parent_heap_;
 

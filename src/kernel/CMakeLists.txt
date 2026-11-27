@@ -68,3 +68,14 @@ target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
 
 target_link_libraries(rexruntime PRIVATE o1heap rexcore rexfilesystem rexui rexaudio rexinput imgui
     libavutil)
+
+# NVIDIA NGX (cmake/rexglue_dlss_sdk.cmake) for rexui's vulkan/vulkan_ngx.cpp:
+# its static library (/MD; the debug CRT build in Debug) in this module only,
+# so the process has one NGX. version: the DLLs' file versions.
+if(REXGLUE_USE_VULKAN AND REXGLUE_DLSS_SDK_DIR)
+    set(_ngx_lib "${REXGLUE_DLSS_SDK_DIR}/lib/Windows_x86_64/x64")
+    target_link_libraries(rexruntime PRIVATE
+        "$<IF:$<CONFIG:Debug>,${_ngx_lib}/nvsdk_ngx_d_dbg.lib,${_ngx_lib}/nvsdk_ngx_d.lib>"
+        version advapi32 user32)
+    unset(_ngx_lib)
+endif()

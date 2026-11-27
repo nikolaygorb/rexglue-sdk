@@ -56,6 +56,7 @@ class File {
     (void)length;
     return X_STATUS_NOT_IMPLEMENTED;
   }
+  virtual X_STATUS Flush() { return X_STATUS_SUCCESS; }
 
   // rex::filesystem::FileAccess
   uint32_t file_access() const { return file_access_; }

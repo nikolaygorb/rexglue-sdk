@@ -197,9 +197,17 @@ KernelState::~KernelState() {
 
   // Stop the dispatch thread before touching the object table
   if (dispatch_thread_running_) {
-    dispatch_thread_running_ = false;
+    std::list<std::function<void()>> dropped;
+    {
+      std::lock_guard lock(dispatch_mutex_);
+      dispatch_thread_running_ = false;
+      dropped.swap(dispatch_queue_);
+    }
     dispatch_cond_.notify_all();
     dispatch_thread_->Wait(0, 0, 0, nullptr);
+    // Captured object references may acquire the global region on destruction.
+    // Drop them without the queue mutex, like callbacks run without it.
+    dropped.clear();
   }
 
   // Unload through UnloadUserModule so the recompiled-DLL teardown runs.
@@ -587,8 +595,14 @@ object_ref<XThread> KernelState::PrepareModuleLaunch(object_ref<UserModule> modu
 
   // Create a thread to run in.
   // We start suspended so the caller can inspect/attach before resume.
-  auto thread = object_ref<XThread>(new XThread(
-      this, module->stack_size(), 0, module->entry_point(), 0, X_CREATE_SUSPENDED, true, true));
+  // The console's XexStartExecutable always starts it on CPU 0 (creation flag
+  // bits 24-29 are the processor mask). Without it the CPU came from the
+  // round-robin of threads created before, which titles that send their
+  // interrupts to CPU 0 can depend on (xenia-edge 0fd1953ef).
+  constexpr uint32_t kCreateOnCpu0 = 0x01000000;
+  auto thread =
+      object_ref<XThread>(new XThread(this, module->stack_size(), 0, module->entry_point(), 0,
+                                      X_CREATE_SUSPENDED | kCreateOnCpu0, true, true));
 
   // We know this is the 'main thread'.
   thread->set_name("Main XThread");
@@ -680,21 +694,17 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
   if (!dispatch_thread_running_) {
     dispatch_thread_running_ = true;
     dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
-      auto global_lock = global_critical_region_.AcquireDeferred();
-      while (dispatch_thread_running_) {
-        global_lock.lock();
-        if (dispatch_queue_.empty()) {
-          dispatch_cond_.wait(global_lock);
-          if (!dispatch_thread_running_) {
-            global_lock.unlock();
+      while (true) {
+        std::function<void()> fn;
+        {
+          std::unique_lock lock(dispatch_mutex_);
+          dispatch_cond_.wait(
+              lock, [this] { return !dispatch_thread_running_ || !dispatch_queue_.empty(); });
+          if (!dispatch_thread_running_)
             break;
-          }
+          fn = std::move(dispatch_queue_.front());
+          dispatch_queue_.pop_front();
         }
-        auto fn = std::move(dispatch_queue_.front());
-        dispatch_queue_.pop_front();
-        REXSYS_NOISY_DEBUG("Dispatch thread processing queued item ({} remaining)",
-                           dispatch_queue_.size());
-        global_lock.unlock();
 
         // Throws out of fn leave the originating overlapped uncompleted and
         // the waiting guest thread stuck; fail visibly rather than swallow.
@@ -1290,9 +1300,8 @@ void KernelState::CompleteOverlappedDeferredEx(
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   const X_HANDLE thread_handle = XThread::GetCurrentThreadHandle();
-  auto global_lock = global_critical_region_.Acquire();
-  dispatch_queue_.push_back(
-      [this, completion_callback, overlapped_ptr, thread_handle, pre_callback, post_callback]() {
+  if (!PostDeferred([this, completion_callback, overlapped_ptr, thread_handle, pre_callback,
+                     post_callback]() {
         REXSYS_DEBUG("Deferred overlapped {:08X}: running pre_callback", overlapped_ptr);
         if (pre_callback) {
           pre_callback();
@@ -1310,15 +1319,48 @@ void KernelState::CompleteOverlappedDeferredEx(
           REXSYS_DEBUG("Deferred overlapped {:08X}: running post_callback", overlapped_ptr);
           post_callback();
         }
-      });
-  dispatch_cond_.notify_all();
+      })) {
+    CompleteOverlappedEx(overlapped_ptr, X_ERROR_CANCELLED, X_ERROR_CANCELLED, 0, thread_handle);
+  }
 }
 
-void KernelState::PostIo(std::function<void()> fn) {
+bool KernelState::PostDeferred(std::function<void()> fn) {
+  {
+    std::lock_guard lock(dispatch_mutex_);
+    if (!dispatch_thread_running_ || terminating_title_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    dispatch_queue_.push_back(std::move(fn));
+  }
+  dispatch_cond_.notify_one();
+  return true;
+}
+
+uint32_t KernelState::AllocWorkspace(uint32_t size, bool zero) {
+  auto global_lock = global_critical_region_.Acquire();
+  if (!workspace_) {
+    rex::be<uint32_t>* header_size = nullptr;
+    if (executable_module_)
+      executable_module_->GetOptHeader(XEX_HEADER_TITLE_WORKSPACE_SIZE, &header_size);
+    workspace_ = xam::WorkspaceHeap::Create(*memory_, header_size ? uint32_t(*header_size) : 0);
+  }
+  return workspace_ ? workspace_->Allocate(size, zero) : 0;
+}
+
+bool KernelState::FreeWorkspace(uint32_t address) {
+  auto global_lock = global_critical_region_.Acquire();
+  if (!workspace_ || !workspace_->Contains(address))
+    return false;
+  if (!workspace_->Free(address))
+    REXSYS_WARN("Ignoring stale workspace free {:08X}", address);
+  return true;
+}
+
+bool KernelState::PostIo(std::function<void()> fn) {
   {
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (io_thread_stop_) {
-      return;
+      return false;
     }
     io_queue_.push_back(std::move(fn));
     if (!io_thread_.joinable()) {
@@ -1340,6 +1382,7 @@ void KernelState::PostIo(std::function<void()> fn) {
     }
   }
   io_cond_.notify_one();
+  return true;
 }
 
 DPCImpersonationScope KernelState::BeginDPCImpersonation() {

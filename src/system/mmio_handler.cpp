@@ -16,6 +16,7 @@
 
 #include <rex/assert.h>
 #include <rex/exception_handler.h>
+#include <rex/ppc/reservation.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/platform.h>
@@ -477,6 +478,18 @@ bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
 }
 
 bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+  uintptr_t resume_pc = 0;
+  if (ex->code() == arch::Exception::Code::kAccessViolation &&
+      ex->fault_address() >= uint64_t(virtual_membase_) &&
+      ex->fault_address() <= uint64_t(memory_end_)) {
+    resume_pc = rex::ppc::ReleaseFaultingReservation(ex);
+  }
+  const bool handled = HandleAccessViolation(ex);
+  if (handled && resume_pc) ex->set_resume_pc(resume_pc);
+  return handled;
+}
+
+bool MMIOHandler::HandleAccessViolation(arch::Exception* ex) {
   if (ex->code() != arch::Exception::Code::kAccessViolation) {
     return false;
   }

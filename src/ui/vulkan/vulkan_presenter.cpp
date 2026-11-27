@@ -17,6 +17,8 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,7 @@
 #include <rex/math.h>
 #include <rex/platform.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/vulkan/frame_generation.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -232,6 +235,9 @@ VulkanPresenter::~VulkanPresenter() {
   // and the vkQueuePresentKHR semaphore wait).
   // This will await completion of all paint submissions also.
   paint_context_.DestroySwapchainAndVulkanSurface();
+  util::DestroyAndNullHandle(vulkan_device_->functions().vkDestroyRenderPass,
+                             vulkan_device_->device(), paint_context_.fg_hudless_render_pass);
+  SetFrameGenerationActive(false);
 
   // Await completion of the usage of everything before destroying anything
   // (paint submission completion already awaited).
@@ -243,6 +249,10 @@ VulkanPresenter::~VulkanPresenter() {
   DestroyTemporalUpscalerContext();
 #endif
   nis_upscaler_.reset();
+  paint_context_.frame_generation = nullptr;
+  frame_generation_.reset();
+  paint_context_.dlss_frame_generation = nullptr;
+  dlss_frame_generation_.reset();
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
@@ -834,12 +844,23 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // awaiting completion of the usage of the swapchain and the surface on the
   // GPU.
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+    const bool old_frame_generation = paint_context_.swapchain_frame_generation;
     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
+    // A frame generation swapchain is replaced, not retired into the next.
+    if (old_frame_generation) {
+      paint_context_.DestroyRetiredSwapchain(old_swapchain, true);
+      old_swapchain = VK_NULL_HANDLE;
+    }
     bool surface_unusable;
+    bool frame_generation_created = false;
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable,
+        paint_context_.frame_generation, &frame_generation_created,
+        paint_context_.dlss_frame_generation != nullptr, &paint_context_.swapchain_surface_min_image_count,
+        &paint_context_.swapchain_image_usage);
+    paint_context_.swapchain_frame_generation = frame_generation_created;
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -940,10 +961,15 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
       return SurfacePaintConnectResult::kFailure;
     }
     bool surface_unusable;
+    bool frame_generation_created = false;
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable,
+        paint_context_.frame_generation, &frame_generation_created,
+        paint_context_.dlss_frame_generation != nullptr, &paint_context_.swapchain_surface_min_image_count,
+        &paint_context_.swapchain_image_usage);
+    paint_context_.swapchain_frame_generation = frame_generation_created;
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -1037,9 +1063,14 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   for (;;) {
     uint32_t swapchain_image_count = uint32_t(paint_context_.swapchain_images.size());
     bool swapchain_images_were_empty = !swapchain_image_count;
-    swapchain_images_get_result = dfn.vkGetSwapchainImagesKHR(
-        device, paint_context_.swapchain, &swapchain_image_count,
-        swapchain_images_were_empty ? nullptr : paint_context_.swapchain_images.data());
+    VkImage* const swapchain_images_out =
+        swapchain_images_were_empty ? nullptr : paint_context_.swapchain_images.data();
+    swapchain_images_get_result =
+        paint_context_.swapchain_frame_generation
+            ? frame_generation_->GetSwapchainImages(paint_context_.swapchain, &swapchain_image_count,
+                                                    swapchain_images_out)
+            : dfn.vkGetSwapchainImagesKHR(device, paint_context_.swapchain, &swapchain_image_count,
+                                          swapchain_images_out);
     // If the original swapchain image count was 0 (first call), SUCCESS is
     // returned, not INCOMPLETE.
     if (swapchain_images_get_result == VK_SUCCESS || swapchain_images_get_result == VK_INCOMPLETE) {
@@ -1128,6 +1159,30 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     paint_context_.swapchain_image_present_semaphores.push_back(present_semaphore);
   }
 
+  // DLSS frame generation on this (regular) swapchain, where it can generate.
+  paint_context_.swapchain_dlss_frame_generation = false;
+  if (paint_context_.dlss_frame_generation && !paint_context_.swapchain_frame_generation) {
+    std::string reason;
+    paint_context_.swapchain_dlss_frame_generation = paint_context_.dlss_frame_generation->AttachSwapchain(
+        paint_context_.swapchain, new_swapchain_format, paint_context_.swapchain_extent,
+        uint32_t(paint_context_.swapchain_images.size()), paint_context_.swapchain_surface_min_image_count,
+        paint_context_.swapchain_image_usage, paint_context_.swapchain_is_fifo,
+        paint_context_.present_queue_family, paint_context_.submissions.size(), reason);
+    if (!paint_context_.swapchain_dlss_frame_generation) {
+      REXLOG_WARN("VulkanPresenter: DLSS frame generation off for this swapchain, frames are shown as they are: {}",
+                  reason);
+      VulkanFrameGeneration::WriteStatus(*vulkan_device_, "NVIDIA DLSS Frame Generation unavailable: " + reason);
+    }
+  }
+  // Frame generation paints the frame without the HUD too: a swapchain-sized image.
+  const bool generating_swapchain =
+      paint_context_.swapchain_frame_generation || paint_context_.swapchain_dlss_frame_generation;
+  if (generating_swapchain && !CreateFrameGenerationHudless()) {
+    REXLOG_ERROR("VulkanPresenter: frame generation hudless image unavailable, frames are shown as they are");
+  }
+  SetFrameGenerationActive(generating_swapchain && paint_context_.fg_hudless_framebuffer[1] != VK_NULL_HANDLE);
+  paint_context_.fg_last_frame = 0;
+
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
   return SurfacePaintConnectResult::kSuccess;
 }
@@ -1162,12 +1217,66 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
     if (!new_image) {
       return false;
     }
+    // Frame generation inputs live with the image (painting holds it).
+    const bool frame_generation_images =
+        (frame_generation_ || dlss_frame_generation_) && new_image->CreateFrameGenerationImages();
     image_instance.SetToNewImage(std::move(new_image), guest_output_image_next_version_++);
+    if (frame_generation_images) {
+      image_instance.hudless_version = guest_output_image_next_version_++;
+    }
+  }
+
+  // Frame generation shows two frames per real one: the guest's frame rate is
+  // held a little below half the display's refresh rate (AMD's recommendation)
+  // here, on the thread producing the frames (painting may be the UI thread's).
+  // Every frame then reaches the presenter, without gaps that reset generation.
+  // Only while frames are generated: without the title's inputs (menus, a
+  // scene the producer doesn't describe) the game keeps its own frame rate.
+  if ((frame_generation_ || dlss_frame_generation_) && IsFrameGenerationActive() &&
+      frame_generation_generating_.load(std::memory_order_relaxed)) {
+    const double refresh = display_refresh_rate();
+    const auto now = std::chrono::steady_clock::now();
+    if (refresh >= 48.0) {
+      const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(2.0 * 1.03 / refresh));
+      const auto next = frame_generation_last_refresh_ + period;
+      if (now < next && next - now < std::chrono::milliseconds(100)) {
+        if (next - now > std::chrono::milliseconds(2)) {
+          std::this_thread::sleep_until(next - std::chrono::milliseconds(1));
+        }
+        while (std::chrono::steady_clock::now() < next) {
+          std::this_thread::yield();
+        }
+      }
+    }
+    frame_generation_last_refresh_ = std::chrono::steady_clock::now();
+  }
+
+  // Inputs for frame generation while it runs (the refresher fills them).
+  FrameGenerationTargets frame_generation_targets;
+  const GuestOutputImage& refreshed_image = *image_instance.image;
+  const bool frame_generation_wanted = IsFrameGenerationActive() &&
+                                       refreshed_image.frame_generation_hudless() &&
+                                       refreshed_image.frame_generation_depth() &&
+                                       refreshed_image.frame_generation_motion();
+  if (frame_generation_wanted) {
+    frame_generation_targets.hudless = refreshed_image.frame_generation_hudless()->image();
+    frame_generation_targets.hudless_view = refreshed_image.frame_generation_hudless()->view();
+    frame_generation_targets.hudless_version = image_instance.hudless_version;
+    frame_generation_targets.depth = refreshed_image.frame_generation_depth()->image();
+    frame_generation_targets.depth_view = refreshed_image.frame_generation_depth()->view();
+    frame_generation_targets.motion = refreshed_image.frame_generation_motion()->image();
+    frame_generation_targets.motion_view = refreshed_image.frame_generation_motion()->view();
+    frame_generation_targets.ever_written_previously = image_instance.ever_successfully_refreshed;
+    frame_generation_targets.debug = REXCVAR_GET(native_frame_generation_debug);
+    frame_generation_targets.inputs = &GuestOutputFrameGenerationInputs(mailbox_index);
   }
 
   VulkanGuestOutputRefreshContext context(is_8bpc_out_ref, image_instance.image->image(),
                                           image_instance.image->view(), image_instance.version,
-                                          image_instance.ever_successfully_refreshed);
+                                          image_instance.ever_successfully_refreshed,
+                                          frame_generation_wanted ? &frame_generation_targets
+                                                                  : nullptr);
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
@@ -1207,8 +1316,13 @@ void VulkanPresenter::GuestOutputRefreshSubmitted(uint32_t mailbox_index) {
 VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
-    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out) {
+    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out,
+    VulkanFrameGeneration* frame_generation, bool* frame_generation_out, bool dlss_frame_generation,
+    uint32_t* surface_min_image_count_out, VkImageUsageFlags* image_usage_out) {
   ui_surface_unusable_out = false;
+  if (frame_generation_out) {
+    *frame_generation_out = false;
+  }
 
   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
   const VkPhysicalDevice physical_device = vulkan_device->physical_device();
@@ -1436,6 +1550,13 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.surface = surface;
   swapchain_create_info.minImageCount =
       std::max(kSubmissionCount, surface_capabilities.minImageCount);
+  // DLSS frame generation holds the real image while it acquires the
+  // generated one (dlss_frame_generation.h).
+  if (dlss_frame_generation) {
+    swapchain_create_info.minImageCount =
+        std::max(swapchain_create_info.minImageCount,
+                 surface_capabilities.minImageCount + VulkanDlssFrameGeneration::kExtraSwapchainImages);
+  }
   if (surface_capabilities.maxImageCount) {
     swapchain_create_info.minImageCount =
         std::min(swapchain_create_info.minImageCount, surface_capabilities.maxImageCount);
@@ -1445,6 +1566,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.imageExtent = image_extent;
   swapchain_create_info.imageArrayLayers = 1;
   swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  // DLSS frame generation copies the real frame out and the generated one in.
+  if (dlss_frame_generation &&
+      (surface_capabilities.supportedUsageFlags & VulkanDlssFrameGeneration::kSwapchainUsage) ==
+          VulkanDlssFrameGeneration::kSwapchainUsage) {
+    swapchain_create_info.imageUsage |= VulkanDlssFrameGeneration::kSwapchainUsage;
+  }
   uint32_t swapchain_queue_family_indices[2];
   if (queue_family_index_graphics_compute != queue_family_index_present) {
     // Using concurrent sharing mode to avoid an explicit ownership transfer
@@ -1530,8 +1657,27 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   }
   swapchain_create_info.clipped = VK_TRUE;
   swapchain_create_info.oldSwapchain = old_swapchain;
-  VkSwapchainKHR swapchain;
-  if (dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain) != VK_SUCCESS) {
+  VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+  // AMD FSR frame generation: its proxy swapchain, which presents on a queue of
+  // its own; the presenter keeps submitting to the graphics queue. Else (or if
+  // it fails for this surface) the regular swapchain.
+  if (frame_generation && old_swapchain == VK_NULL_HANDLE) {
+    std::string reason;
+    if (frame_generation->CreateSwapchain(surface, swapchain_create_info, swapchain, reason)) {
+      queue_family_index_present = queue_family_index_graphics_compute;
+      if (frame_generation_out) {
+        *frame_generation_out = true;
+      }
+    } else {
+      swapchain = VK_NULL_HANDLE;
+      REXLOG_WARN("VulkanPresenter: frame generation swapchain unavailable, frames are shown as they are: {}",
+                  reason);
+      VulkanFrameGeneration::WriteStatus(*vulkan_device,
+                                         "AMD FSR frame generation unavailable: " + reason);
+    }
+  }
+  if (swapchain == VK_NULL_HANDLE &&
+      dfn.vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain) != VK_SUCCESS) {
     REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
     return VK_NULL_HANDLE;
   }
@@ -1543,6 +1689,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
       uint32_t(swapchain_create_info.presentMode));
 
   present_queue_family_out = queue_family_index_present;
+  if (surface_min_image_count_out) {
+    *surface_min_image_count_out = surface_capabilities.minImageCount;
+  }
+  if (image_usage_out) {
+    *image_usage_out = swapchain_create_info.imageUsage;
+  }
   image_format_out = swapchain_create_info.imageFormat;
   image_extent_out = swapchain_create_info.imageExtent;
   is_fifo_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
@@ -1552,8 +1704,22 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 }
 
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
+  // Frame generation presents (and generates) on threads of its own: done
+  // before the images it reads go.
+  if (swapchain != VK_NULL_HANDLE && swapchain_frame_generation && frame_generation) {
+    frame_generation->WaitForPresents();
+  }
+  // DLSS frame generation's held present first; its feature and images after
+  // the GPU work that used them.
+  if (swapchain != VK_NULL_HANDLE && swapchain_dlss_frame_generation && dlss_frame_generation) {
+    dlss_frame_generation->WaitForHeldPresent();
+  }
   if (swapchain != VK_NULL_HANDLE) {
     completion_timeline.AwaitAllSubmissions();
+    if (swapchain_dlss_frame_generation && dlss_frame_generation) {
+      dlss_frame_generation->DetachSwapchain();
+    }
+    swapchain_dlss_frame_generation = false;
     // Also wait for the presentation queue since vkQueuePresentKHR doesn't
     // signal a fence, and the present semaphores may still be in use.
     if (present_queue_family != UINT32_MAX) {
@@ -1573,6 +1739,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
     dfn.vkDestroySemaphore(device, present_semaphore, nullptr);
   }
   swapchain_image_present_semaphores.clear();
+  DestroyFrameGenerationHudless();
   swapchain_images.clear();
   swapchain_extent.width = 0;
   swapchain_extent.height = 0;
@@ -1582,12 +1749,44 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   return old_swapchain;
 }
 
-void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
-  VkSwapchainKHR old_swapchain = PrepareForSwapchainRetirement();
-  if (old_swapchain != VK_NULL_HANDLE) {
+void VulkanPresenter::PaintContext::DestroyRetiredSwapchain(VkSwapchainKHR old_swapchain,
+                                                            bool was_frame_generation) {
+  if (old_swapchain == VK_NULL_HANDLE) {
+    return;
+  }
+  if (was_frame_generation && frame_generation) {
+    frame_generation->DestroySwapchain(old_swapchain);
+  } else {
     vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
                                                      nullptr);
   }
+  if (was_frame_generation) {
+    swapchain_frame_generation = false;
+  }
+}
+
+void VulkanPresenter::PaintContext::DestroyFrameGenerationHudless() {
+  const VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  for (size_t i = 0; i < 2; ++i) {
+    util::DestroyAndNullHandle(dfn.vkDestroyFramebuffer, device, fg_hudless_framebuffer[i]);
+    util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, fg_hudless_view[i]);
+    util::DestroyAndNullHandle(dfn.vkDestroyImage, device, fg_hudless_image[i]);
+    util::DestroyAndNullHandle(dfn.vkFreeMemory, device, fg_hudless_memory[i]);
+  }
+  fg_neutral_depth[0].reset();
+  fg_neutral_depth[1].reset();
+  fg_neutral_motion.reset();
+  fg_neutral_ready = false;
+  fg_has_last_generated = false;
+  fg_gap_frames = 0;
+}
+
+void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
+  const bool was_frame_generation = swapchain_frame_generation;
+  VkSwapchainKHR old_swapchain = PrepareForSwapchainRetirement();
+  DestroyRetiredSwapchain(old_swapchain, was_frame_generation);
+  swapchain_frame_generation = false;
   present_queue_family = UINT32_MAX;
   if (vulkan_surface != VK_NULL_HANDLE) {
     const VulkanInstance* vulkan_instance = vulkan_device->vulkan_instance();
@@ -1617,7 +1816,7 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_create_info.pNext = nullptr;
   image_create_info.flags = 0;
   image_create_info.imageType = VK_IMAGE_TYPE_2D;
-  image_create_info.format = kGuestOutputFormat;
+  image_create_info.format = format_;
   image_create_info.extent.width = extent_.width;
   image_create_info.extent.height = extent_.height;
   image_create_info.extent.depth = 1;
@@ -1625,8 +1824,9 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_create_info.arrayLayers = 1;
   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_STORAGE_BIT;
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -1647,7 +1847,7 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_view_create_info.flags = 0;
   image_view_create_info.image = image_;
   image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  image_view_create_info.format = kGuestOutputFormat;
+  image_view_create_info.format = format_;
   image_view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
   image_view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
   image_view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
@@ -1662,6 +1862,130 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
     return false;
   }
 
+  return true;
+}
+
+bool VulkanPresenter::GuestOutputImage::CreateFrameGenerationImages() {
+  fg_hudless_ = Create(vulkan_device_, extent_.width, extent_.height, kGuestOutputFormat);
+  fg_depth_ = Create(vulkan_device_, extent_.width, extent_.height, kFrameGenerationDepthFormat);
+  fg_motion_ = Create(vulkan_device_, extent_.width, extent_.height, kFrameGenerationMotionFormat);
+  if (!fg_hudless_ || !fg_depth_ || !fg_motion_) {
+    fg_hudless_.reset();
+    fg_depth_.reset();
+    fg_motion_.reset();
+    REXLOG_ERROR("VulkanPresenter: Failed to create the frame generation input images");
+    return false;
+  }
+  return true;
+}
+
+bool VulkanPresenter::CreateFrameGenerationHudless() {
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  paint_context_.DestroyFrameGenerationHudless();
+  const VkFormat format = paint_context_.swapchain_render_pass_format;
+  if (paint_context_.fg_hudless_render_pass_format != format) {
+    util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
+                               paint_context_.fg_hudless_render_pass);
+  }
+  if (paint_context_.fg_hudless_render_pass == VK_NULL_HANDLE) {
+    // Compatible with the swapchain pass (same format): its pipelines draw here.
+    VkAttachmentDescription attachment = {};
+    attachment.format = format;
+    attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    attachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkAttachmentReference color_reference = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_reference;
+    // Frame generation reads it in compute work queued after this paint.
+    VkSubpassDependency dependencies[2] = {};
+    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[0].dstSubpass = 0;
+    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[0].srcAccessMask = 0;
+    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[1].srcSubpass = 0;
+    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    VkRenderPassCreateInfo render_pass_info = {};
+    render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    render_pass_info.attachmentCount = 1;
+    render_pass_info.pAttachments = &attachment;
+    render_pass_info.subpassCount = 1;
+    render_pass_info.pSubpasses = &subpass;
+    render_pass_info.dependencyCount = 2;
+    render_pass_info.pDependencies = dependencies;
+    if (dfn.vkCreateRenderPass(device, &render_pass_info, nullptr,
+                               &paint_context_.fg_hudless_render_pass) != VK_SUCCESS) {
+      paint_context_.fg_hudless_render_pass = VK_NULL_HANDLE;
+      return false;
+    }
+    paint_context_.fg_hudless_render_pass_format = format;
+  }
+  VkImageCreateInfo image_info = {};
+  image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_info.imageType = VK_IMAGE_TYPE_2D;
+  image_info.format = format;
+  image_info.extent = {paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height, 1};
+  image_info.mipLevels = 1;
+  image_info.arrayLayers = 1;
+  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  for (size_t i = 0; i < 2; ++i) {
+    if (!util::CreateDedicatedAllocationImage(vulkan_device_, image_info,
+                                              util::MemoryPurpose::kDeviceLocal,
+                                              paint_context_.fg_hudless_image[i],
+                                              paint_context_.fg_hudless_memory[i])) {
+      paint_context_.DestroyFrameGenerationHudless();
+      return false;
+    }
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = paint_context_.fg_hudless_image[i];
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.layerCount = 1;
+    if (dfn.vkCreateImageView(device, &view_info, nullptr, &paint_context_.fg_hudless_view[i]) !=
+        VK_SUCCESS) {
+      paint_context_.DestroyFrameGenerationHudless();
+      return false;
+    }
+    VkFramebufferCreateInfo framebuffer_info = {};
+    framebuffer_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebuffer_info.renderPass = paint_context_.fg_hudless_render_pass;
+    framebuffer_info.attachmentCount = 1;
+    framebuffer_info.pAttachments = &paint_context_.fg_hudless_view[i];
+    framebuffer_info.width = paint_context_.swapchain_extent.width;
+    framebuffer_info.height = paint_context_.swapchain_extent.height;
+    framebuffer_info.layers = 1;
+    if (dfn.vkCreateFramebuffer(device, &framebuffer_info, nullptr,
+                                &paint_context_.fg_hudless_framebuffer[i]) != VK_SUCCESS) {
+      paint_context_.DestroyFrameGenerationHudless();
+      return false;
+    }
+  }
+  for (auto& depth : paint_context_.fg_neutral_depth) {
+    depth = GuestOutputImage::Create(vulkan_device_, 8, 8, kFrameGenerationDepthFormat);
+  }
+  paint_context_.fg_neutral_motion =
+      GuestOutputImage::Create(vulkan_device_, 8, 8, kFrameGenerationMotionFormat);
   return true;
 }
 
@@ -1716,17 +2040,155 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     dfn.vkQueueWaitIdle(queue_acquisition.queue());
   }
 
+  // AMD FSR frame generation's proxy swapchain (frame_generation.h).
+  VulkanFrameGeneration* const frame_generation =
+      paint_context_.swapchain_frame_generation ? frame_generation_.get() : nullptr;
+  // DLSS frame generation on the regular swapchain (dlss_frame_generation.h):
+  // the previous real frame's held present goes first (present order, images).
+  VulkanDlssFrameGeneration* const dlss_generation =
+      paint_context_.swapchain_dlss_frame_generation ? paint_context_.dlss_frame_generation : nullptr;
+  if (dlss_generation) {
+    switch (dlss_generation->WaitForHeldPresent()) {
+      case VK_SUCCESS:
+      case VK_SUBOPTIMAL_KHR:
+        break;
+      case VK_ERROR_DEVICE_LOST:
+        vulkan_device_->SetLost();
+        REXLOG_ERROR("VulkanPresenter: Failed to present the held real frame as the device has been lost");
+        return PaintResult::kGpuLostResponsible;
+      default:
+        REXLOG_INFO("VulkanPresenter: The held real frame's present was dropped (outdated swapchain or surface)");
+        return PaintResult::kNotPresentedConnectionOutdated;
+    }
+  }
+  const bool any_generation = frame_generation || dlss_generation;
+  if (frame_generation && !paint_context_.fg_neutral_ready && paint_context_.fg_neutral_motion &&
+      paint_context_.fg_neutral_depth[0] && paint_context_.fg_neutral_depth[1]) {
+    const GuestOutputImage* neutral[3] = {paint_context_.fg_neutral_depth[0].get(),
+                                          paint_context_.fg_neutral_depth[1].get(),
+                                          paint_context_.fg_neutral_motion.get()};
+    VkImageMemoryBarrier barriers[3] = {};
+    for (size_t i = 0; i < 3; ++i) {
+      barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      barriers[i].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      barriers[i].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      barriers[i].srcQueueFamilyIndex = barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barriers[i].image = neutral[i]->image();
+      barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    }
+    dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 3, barriers);
+    // [0]: far of a forward depth (1), [1]: of an inverted one (0); still motion.
+    for (size_t i = 0; i < 3; ++i) {
+      VkClearColorValue value = {};
+      value.float32[0] = i == 0 ? 1.0f : 0.0f;
+      dfn.vkCmdClearColorImage(draw_command_buffer, neutral[i]->image(),
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1,
+                               &barriers[i].subresourceRange);
+    }
+    for (size_t i = 0; i < 3; ++i) {
+      barriers[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      barriers[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      barriers[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 3,
+                             barriers);
+    paint_context_.fg_neutral_ready = true;
+  }
+
+  GuestOutputProperties guest_output_properties;
+  GuestOutputPaintConfig guest_output_paint_config;
+  std::shared_ptr<GuestOutputImage> guest_output_image;
+  {
+    uint32_t guest_output_mailbox_index;
+    std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+        guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
+    if (guest_output_mailbox_index != UINT32_MAX) {
+      assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
+      guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
+    }
+    // Incremented the reference count of the guest output image - safe to leave
+    // the consumer critical section now as everything here either will be using
+    // the new reference or is exclusively owned by main target painting (and
+    // multiple threads can't paint the main target at the same time).
+  }
+
+  // Frame generation: this frame's inputs (the refresher's), and what to do
+  // with them. The UI (ImGui, drawn by the UI thread) is in the frame but not
+  // in the frame without the HUD: generation treats it as UI.
+  const FrameGenerationInputs& fg_inputs = guest_output_properties.frame_generation;
+  const int32_t fg_debug = any_generation ? REXCVAR_GET(native_frame_generation_debug) : 0;
+  const GuestOutputImage* fg_hudless_source =
+      guest_output_image ? guest_output_image->frame_generation_hudless() : nullptr;
+  const bool fg_inputs_ready =
+      any_generation && fg_inputs.valid && fg_hudless_source &&
+      guest_output_image->frame_generation_depth() && guest_output_image->frame_generation_motion() &&
+      paint_context_.fg_hudless_framebuffer[1] != VK_NULL_HANDLE;
+  // Diagnostics 3 and 4: the frame without the HUD (or the inputs drawn into it) instead.
+  const bool fg_show_hudless = fg_inputs_ready && fg_debug >= 3;
+  bool fg_generate = fg_inputs_ready && !fg_show_hudless && fg_inputs.generate &&
+                     fg_inputs.frame != paint_context_.fg_last_frame;
+  bool fg_generating = false, fg_began = false;
+  VulkanFrameGeneration::Frame fg_frame;
+  // DLSS: this frame's inputs, generated after the swapchain pass (the UI drawn).
+  bool dlss_pending = false;
+  VulkanDlssFrameGeneration::Frame dlss_frame;
+  // A frame presented without inputs (outside render passes). While
+  // generation is on, for up to a second of such frames (a frame the title
+  // didn't describe, a UI repaint), with neutral inputs and a reset rather
+  // than switching generation off and on: each switch makes the proxy wait
+  // for its presents and restart its present thread.
+  auto present_without_inputs = [&]() {
+    fg_began = true;
+    constexpr uint32_t kGapFrames = 60;
+    if (frame_generation->enabled() && !fg_show_hudless && paint_context_.fg_neutral_ready &&
+        paint_context_.fg_has_last_generated && paint_context_.fg_gap_frames < kGapFrames) {
+      VulkanFrameGeneration::Frame gap = paint_context_.fg_last_generated;
+      gap.reset = true;
+      gap.command_buffer = draw_command_buffer;
+      const GuestOutputImage& depth =
+          *paint_context_.fg_neutral_depth[gap.depth_inverted ? 1 : 0];
+      gap.depth = depth.image();
+      gap.depth_format = depth.format();
+      gap.motion = paint_context_.fg_neutral_motion->image();
+      gap.motion_format = paint_context_.fg_neutral_motion->format();
+      gap.render_width = depth.extent().width;
+      gap.render_height = depth.extent().height;
+      gap.hudless = VK_NULL_HANDLE;
+      if (frame_generation->BeginPresent(paint_context_.swapchain, gap)) {
+        ++paint_context_.fg_gap_frames;
+        return;
+      }
+    }
+    frame_generation->BeginPresent(paint_context_.swapchain, VulkanFrameGeneration::Frame());
+  };
+  // Every present is a real frame to generation: while it runs, a repaint
+  // without a new guest frame (UI ticks at the display's rate) is dropped,
+  // unless nothing was presented for a while (the UI keeps updating).
+  if (fg_inputs_ready && !fg_show_hudless && fg_inputs.frame == paint_context_.fg_last_frame &&
+      std::chrono::steady_clock::now() - paint_context_.fg_last_real_present <
+          std::chrono::milliseconds(50)) {
+    return PaintResult::kNotPresented;
+  }
+
   uint32_t swapchain_image_index;
   const auto acquire_start = std::chrono::steady_clock::now();
   VkResult acquire_result =
-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-                                VK_NULL_HANDLE, &swapchain_image_index);
+      frame_generation
+          ? frame_generation->AcquireNextImage(paint_context_.swapchain, UINT64_MAX,
+                                               acquire_semaphore, &swapchain_image_index)
+          : dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX,
+                                      acquire_semaphore, VK_NULL_HANDLE, &swapchain_image_index);
   LogBlockingPresentationCall("vkAcquireNextImageKHR", acquire_start, acquire_result);
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
       break;
     case VK_ERROR_DEVICE_LOST:
+      vulkan_device_->SetLost();
       REXLOG_ERROR(
           "VulkanPresenter: Failed to acquire the swapchain image as the "
           "device has been lost");
@@ -1775,25 +2237,17 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     swapchain_render_pass_begin_info.pClearValues = &swapchain_image_clear_attachment.clearValue;
     swapchain_image_clear_needed = false;
   }
+  // The frame without the HUD, painted the same way (cleared, letterbox black).
+  VkRenderPassBeginInfo hudless_render_pass_begin_info = swapchain_render_pass_begin_info;
+  hudless_render_pass_begin_info.renderPass = paint_context_.fg_hudless_render_pass;
+  // The image the last generated frame didn't use.
+  const uint32_t fg_hudless_index = paint_context_.fg_hudless_index ^ 1;
+  hudless_render_pass_begin_info.framebuffer = paint_context_.fg_hudless_framebuffer[fg_hudless_index];
+  hudless_render_pass_begin_info.clearValueCount = 1;
+  hudless_render_pass_begin_info.pClearValues = &swapchain_image_clear_attachment.clearValue;
 
   bool swapchain_image_pass_begun = false;
 
-  GuestOutputProperties guest_output_properties;
-  GuestOutputPaintConfig guest_output_paint_config;
-  std::shared_ptr<GuestOutputImage> guest_output_image;
-  {
-    uint32_t guest_output_mailbox_index;
-    std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
-        guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
-    if (guest_output_mailbox_index != UINT32_MAX) {
-      assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
-      guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
-    }
-    // Incremented the reference count of the guest output image - safe to leave
-    // the consumer critical section now as everything here either will be using
-    // the new reference or is exclusively owned by main target painting (and
-    // multiple threads can't paint the main target at the same time).
-  }
 
   if (guest_output_image) {
     VkExtent2D max_framebuffer_extent =
@@ -1845,27 +2299,40 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         // used, not dropped due to some error.
         paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_index] =
             std::make_pair(uint64_t(0), guest_output_image);
-        // Create the descriptors of the new image.
-        VkDescriptorImageInfo guest_output_image_descriptor_image_info;
-        guest_output_image_descriptor_image_info.sampler = VK_NULL_HANDLE;
-        guest_output_image_descriptor_image_info.imageView = guest_output_image->view();
-        guest_output_image_descriptor_image_info.imageLayout =
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkWriteDescriptorSet guest_output_image_descriptor_write;
-        guest_output_image_descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        guest_output_image_descriptor_write.pNext = nullptr;
-        guest_output_image_descriptor_write.dstSet =
-            paint_context_.guest_output_descriptor_sets
-                [PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
-                 guest_output_image_paint_ref_index];
-        guest_output_image_descriptor_write.dstBinding = 0;
-        guest_output_image_descriptor_write.dstArrayElement = 0;
-        guest_output_image_descriptor_write.descriptorCount = 1;
-        guest_output_image_descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        guest_output_image_descriptor_write.pImageInfo = &guest_output_image_descriptor_image_info;
-        guest_output_image_descriptor_write.pBufferInfo = nullptr;
-        guest_output_image_descriptor_write.pTexelBufferView = nullptr;
-        dfn.vkUpdateDescriptorSets(device, 1, &guest_output_image_descriptor_write, 0, nullptr);
+        // Create the descriptors of the new image (and of its frame
+        // generation hudless image, created with it).
+        VkDescriptorImageInfo guest_output_image_descriptor_image_infos[2] = {};
+        VkWriteDescriptorSet guest_output_image_descriptor_writes[2] = {};
+        uint32_t guest_output_image_descriptor_write_count = 0;
+        for (uint32_t j = 0; j < 2; ++j) {
+          const GuestOutputImage* descriptor_image =
+              j ? guest_output_image->frame_generation_hudless() : guest_output_image.get();
+          if (!descriptor_image) {
+            continue;
+          }
+          VkDescriptorImageInfo& image_info =
+              guest_output_image_descriptor_image_infos[guest_output_image_descriptor_write_count];
+          image_info.sampler = VK_NULL_HANDLE;
+          image_info.imageView = descriptor_image->view();
+          image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          VkWriteDescriptorSet& write =
+              guest_output_image_descriptor_writes[guest_output_image_descriptor_write_count++];
+          write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          write.pNext = nullptr;
+          write.dstSet = paint_context_.guest_output_descriptor_sets
+              [(j ? PaintContext::kGuestOutputDescriptorSetHudless0Sampled
+                  : PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled) +
+               guest_output_image_paint_ref_index];
+          write.dstBinding = 0;
+          write.dstArrayElement = 0;
+          write.descriptorCount = 1;
+          write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+          write.pImageInfo = &image_info;
+          write.pBufferInfo = nullptr;
+          write.pTexelBufferView = nullptr;
+        }
+        dfn.vkUpdateDescriptorSets(device, guest_output_image_descriptor_write_count,
+                                   guest_output_image_descriptor_writes, 0, nullptr);
       }
 
       // Make sure intermediate textures of the needed size are available, and
@@ -2005,14 +2472,6 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_index].first =
             current_paint_submission_index;
         paint_context_.guest_output_image_paint_last_submission = current_paint_submission_index;
-        VkViewport guest_output_viewport;
-        guest_output_viewport.x = 0.0f;
-        guest_output_viewport.y = 0.0f;
-        guest_output_viewport.minDepth = 0.0f;
-        guest_output_viewport.maxDepth = 1.0f;
-        VkRect2D guest_output_scissor;
-        guest_output_scissor.offset.x = 0;
-        guest_output_scissor.offset.y = 0;
         if (guest_output_flow.effect_count > 1) {
           paint_context_.guest_output_intermediate_image_last_submission =
               current_paint_submission_index;
@@ -2023,251 +2482,397 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
             guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
             guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
 #endif
-        for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
-          bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
-          GuestOutputPaintEffect effect = guest_output_flow.effects[i];
+        // The effect chain from `source_image` (`source_set` its descriptors)
+        // into the swapchain image (its pass stays open for the UI), or into
+        // the frame generation hudless image (the frame without the HUD,
+        // painted identically).
+        auto paint_guest_output = [&](const GuestOutputImage& source_image,
+                                      size_t source_set, bool to_hudless) {
+          VkViewport guest_output_viewport;
+          guest_output_viewport.x = 0.0f;
+          guest_output_viewport.y = 0.0f;
+          guest_output_viewport.minDepth = 0.0f;
+          guest_output_viewport.maxDepth = 1.0f;
+          VkRect2D guest_output_scissor;
+          guest_output_scissor.offset.x = 0;
+          guest_output_scissor.offset.y = 0;
+          for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
+            bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
+            GuestOutputPaintEffect effect = guest_output_flow.effects[i];
 
-          std::pair<uint32_t, uint32_t> effect_rect_size = guest_output_flow.effect_output_sizes[i];
-          if (is_final_effect && guest_output_flow.output_x == 0 &&
-              guest_output_flow.output_y == 0 &&
-              effect_rect_size.first < paint_context_.swapchain_extent.width &&
-              effect_rect_size.second < paint_context_.swapchain_extent.height) {
-            static std::atomic<bool> logged_swapchain_expand = false;
-            if (!logged_swapchain_expand.exchange(true)) {
-              REXLOG_WARN(
-                  "VulkanPresenter: expanding final guest output rect from "
-                  "{}x{} to swapchain {}x{} to avoid top-left-only output",
-                  effect_rect_size.first, effect_rect_size.second,
-                  paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
+            std::pair<uint32_t, uint32_t> effect_rect_size =
+                guest_output_flow.effect_output_sizes[i];
+            if (is_final_effect && guest_output_flow.output_x == 0 &&
+                guest_output_flow.output_y == 0 &&
+                effect_rect_size.first < paint_context_.swapchain_extent.width &&
+                effect_rect_size.second < paint_context_.swapchain_extent.height) {
+              static std::atomic<bool> logged_swapchain_expand = false;
+              if (!logged_swapchain_expand.exchange(true)) {
+                REXLOG_WARN(
+                    "VulkanPresenter: expanding final guest output rect from "
+                    "{}x{} to swapchain {}x{} to avoid top-left-only output",
+                    effect_rect_size.first, effect_rect_size.second,
+                    paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
+              }
+              effect_rect_size = std::make_pair(paint_context_.swapchain_extent.width,
+                                                paint_context_.swapchain_extent.height);
+              // Keep all final-pass data coherent - shader constants and
+              // letterbox clears are derived from guest_output_flow.
+              guest_output_flow.effect_output_sizes[i] = effect_rect_size;
+              guest_output_flow.output_x = 0;
+              guest_output_flow.output_y = 0;
+              guest_output_flow.letterbox_clear_rectangle_count = 0;
             }
-            effect_rect_size = std::make_pair(paint_context_.swapchain_extent.width,
-                                              paint_context_.swapchain_extent.height);
-            // Keep all final-pass data coherent - shader constants and
-            // letterbox clears are derived from guest_output_flow.
-            guest_output_flow.effect_output_sizes[i] = effect_rect_size;
-            guest_output_flow.output_x = 0;
-            guest_output_flow.output_y = 0;
-            guest_output_flow.letterbox_clear_rectangle_count = 0;
-          }
-          if (guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kNis &&
-              effect == GuestOutputPaintEffect::kFsrEasu && !is_final_effect) {
-            const GuestOutputImage& source =
-                i ? *paint_context_.guest_output_intermediate_images[i - 1] : *guest_output_image;
-            uint32_t effect_input_width = 0, effect_input_height = 0;
-            guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
-            if (DispatchNisUpscaler(draw_command_buffer, current_paint_submission_index, source,
-                                    effect_input_width, effect_input_height,
-                                    *paint_context_.guest_output_intermediate_images[i],
-                                    effect_rect_size.first, effect_rect_size.second,
-                                    guest_output_paint_config)) {
-              continue;
+            if (guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kNis &&
+                effect == GuestOutputPaintEffect::kFsrEasu && !is_final_effect) {
+              const GuestOutputImage& source =
+                  i ? *paint_context_.guest_output_intermediate_images[i - 1] : source_image;
+              uint32_t effect_input_width = 0, effect_input_height = 0;
+              guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
+              if (DispatchNisUpscaler(draw_command_buffer, current_paint_submission_index, source,
+                                      effect_input_width, effect_input_height,
+                                      *paint_context_.guest_output_intermediate_images[i],
+                                      effect_rect_size.first, effect_rect_size.second,
+                                      guest_output_paint_config)) {
+                continue;
+              }
             }
-          }
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-          bool use_temporal_upscaler =
-              temporal_effect_selected && effect == GuestOutputPaintEffect::kFsrEasu;
-          if (use_temporal_upscaler && !is_final_effect) {
-            VkImage source_image =
-                i ? paint_context_.guest_output_intermediate_images[i - 1]->image()
-                  : guest_output_image->image();
-            VkImage output_image = paint_context_.guest_output_intermediate_images[i]->image();
+            bool use_temporal_upscaler =
+                temporal_effect_selected && effect == GuestOutputPaintEffect::kFsrEasu;
+            if (use_temporal_upscaler && !is_final_effect) {
+              VkImage temporal_source_image =
+                  i ? paint_context_.guest_output_intermediate_images[i - 1]->image()
+                    : source_image.image();
+              VkImage output_image = paint_context_.guest_output_intermediate_images[i]->image();
 
-            VkImageMemoryBarrier barrier_to_uav = {};
-            barrier_to_uav.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier_to_uav.srcAccessMask = 0;
-            barrier_to_uav.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            barrier_to_uav.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier_to_uav.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barrier_to_uav.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier_to_uav.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier_to_uav.image = output_image;
-            barrier_to_uav.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barrier_to_uav.subresourceRange.baseMipLevel = 0;
-            barrier_to_uav.subresourceRange.levelCount = 1;
-            barrier_to_uav.subresourceRange.baseArrayLayer = 0;
-            barrier_to_uav.subresourceRange.layerCount = 1;
-            dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
-                                     nullptr, 1, &barrier_to_uav);
+              VkImageMemoryBarrier barrier_to_uav = {};
+              barrier_to_uav.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+              barrier_to_uav.srcAccessMask = 0;
+              barrier_to_uav.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+              barrier_to_uav.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+              barrier_to_uav.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+              barrier_to_uav.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier_to_uav.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier_to_uav.image = output_image;
+              barrier_to_uav.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              barrier_to_uav.subresourceRange.baseMipLevel = 0;
+              barrier_to_uav.subresourceRange.levelCount = 1;
+              barrier_to_uav.subresourceRange.baseArrayLayer = 0;
+              barrier_to_uav.subresourceRange.layerCount = 1;
+              dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0,
+                                       nullptr, 1, &barrier_to_uav);
 
-            uint32_t effect_input_width = 0, effect_input_height = 0;
-            guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
-            if (DispatchTemporalUpscaler(draw_command_buffer, source_image, effect_input_width,
-                                         effect_input_height, output_image, effect_rect_size.first,
-                                         effect_rect_size.second, guest_output_paint_config)) {
-              VkImageMemoryBarrier barrier_to_shader_read = {};
-              barrier_to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-              barrier_to_shader_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-              barrier_to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-              barrier_to_shader_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-              barrier_to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-              barrier_to_shader_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-              barrier_to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-              barrier_to_shader_read.image = output_image;
-              barrier_to_shader_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-              barrier_to_shader_read.subresourceRange.baseMipLevel = 0;
-              barrier_to_shader_read.subresourceRange.levelCount = 1;
-              barrier_to_shader_read.subresourceRange.baseArrayLayer = 0;
-              barrier_to_shader_read.subresourceRange.layerCount = 1;
-              dfn.vkCmdPipelineBarrier(
-                  draw_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                  0, nullptr, 0, nullptr, 1, &barrier_to_shader_read);
-              continue;
+              uint32_t effect_input_width = 0, effect_input_height = 0;
+              guest_output_flow.GetEffectInputSize(i, effect_input_width, effect_input_height);
+              if (DispatchTemporalUpscaler(draw_command_buffer, temporal_source_image,
+                                           effect_input_width, effect_input_height, output_image,
+                                           effect_rect_size.first, effect_rect_size.second,
+                                           guest_output_paint_config)) {
+                VkImageMemoryBarrier barrier_to_shader_read = {};
+                barrier_to_shader_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barrier_to_shader_read.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barrier_to_shader_read.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                barrier_to_shader_read.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                barrier_to_shader_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                barrier_to_shader_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_shader_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier_to_shader_read.image = output_image;
+                barrier_to_shader_read.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                barrier_to_shader_read.subresourceRange.baseMipLevel = 0;
+                barrier_to_shader_read.subresourceRange.levelCount = 1;
+                barrier_to_shader_read.subresourceRange.baseArrayLayer = 0;
+                barrier_to_shader_read.subresourceRange.layerCount = 1;
+                dfn.vkCmdPipelineBarrier(
+                    draw_command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0, 0, nullptr, 0, nullptr, 1, &barrier_to_shader_read);
+                continue;
+              }
             }
-          }
 #endif
 
-          int32_t effect_rect_x, effect_rect_y;
-          if (is_final_effect) {
-            effect_rect_x = guest_output_flow.output_x;
-            effect_rect_y = guest_output_flow.output_y;
-            dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
-                                     VK_SUBPASS_CONTENTS_INLINE);
-            swapchain_image_pass_begun = true;
-            guest_output_viewport.width = float(paint_context_.swapchain_extent.width);
-            guest_output_viewport.height = float(paint_context_.swapchain_extent.height);
-            guest_output_scissor.extent.width = paint_context_.swapchain_extent.width;
-            guest_output_scissor.extent.height = paint_context_.swapchain_extent.height;
-          } else {
-            effect_rect_x = 0;
-            effect_rect_y = 0;
-            VkRenderPassBeginInfo intermediate_render_pass_begin_info;
-            intermediate_render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            intermediate_render_pass_begin_info.pNext = nullptr;
-            intermediate_render_pass_begin_info.renderPass = guest_output_intermediate_render_pass_;
-            intermediate_render_pass_begin_info.framebuffer =
-                paint_context_.guest_output_intermediate_framebuffers[i];
-            intermediate_render_pass_begin_info.renderArea.offset.x = 0;
-            intermediate_render_pass_begin_info.renderArea.offset.y = 0;
-            intermediate_render_pass_begin_info.renderArea.extent.width = effect_rect_size.first;
-            intermediate_render_pass_begin_info.renderArea.extent.height = effect_rect_size.second;
-            intermediate_render_pass_begin_info.clearValueCount = 0;
-            intermediate_render_pass_begin_info.pClearValues = nullptr;
-            dfn.vkCmdBeginRenderPass(draw_command_buffer, &intermediate_render_pass_begin_info,
-                                     VK_SUBPASS_CONTENTS_INLINE);
-            guest_output_viewport.width = float(effect_rect_size.first);
-            guest_output_viewport.height = float(effect_rect_size.second);
-            guest_output_scissor.extent.width = effect_rect_size.first;
-            guest_output_scissor.extent.height = effect_rect_size.second;
-          }
-          dfn.vkCmdSetViewport(draw_command_buffer, 0, 1, &guest_output_viewport);
-          dfn.vkCmdSetScissor(draw_command_buffer, 0, 1, &guest_output_scissor);
-
-          const PaintContext::GuestOutputPaintPipeline& effect_pipeline =
-              paint_context_.guest_output_paint_pipelines[size_t(effect)];
-          VkPipeline effect_vulkan_pipeline = is_final_effect
-                                                  ? effect_pipeline.swapchain_pipeline
-                                                  : effect_pipeline.intermediate_pipeline;
-          assert_true(effect_vulkan_pipeline != VK_NULL_HANDLE);
-          dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                effect_vulkan_pipeline);
-
-          GuestOutputPaintPipelineLayoutIndex guest_output_paint_pipeline_layout_index =
-              GetGuestOutputPaintPipelineLayoutIndex(effect);
-          VkPipelineLayout guest_output_paint_pipeline_layout =
-              guest_output_paint_pipeline_layouts_[guest_output_paint_pipeline_layout_index];
-
-          PaintContext::GuestOutputDescriptorSet effect_src_descriptor_set;
-          if (i) {
-            effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
-                PaintContext::kGuestOutputDescriptorSetIntermediate0Sampled + (i - 1));
-          } else {
-            effect_src_descriptor_set = PaintContext::GuestOutputDescriptorSet(
-                PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
-                guest_output_image_paint_ref_index);
-          }
-          dfn.vkCmdBindDescriptorSets(
-              draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-              guest_output_paint_pipeline_layout, 0, 1,
-              &paint_context_.guest_output_descriptor_sets[effect_src_descriptor_set], 0, nullptr);
-
-          GuestOutputPaintRectangleConstants effect_rect_constants;
-          float effect_x_to_ndc = 2.0f / guest_output_viewport.width;
-          float effect_y_to_ndc = 2.0f / guest_output_viewport.height;
-          effect_rect_constants.x = -1.0f + float(effect_rect_x) * effect_x_to_ndc;
-          effect_rect_constants.y = -1.0f + float(effect_rect_y) * effect_y_to_ndc;
-          effect_rect_constants.width = float(effect_rect_size.first) * effect_x_to_ndc;
-          effect_rect_constants.height = float(effect_rect_size.second) * effect_y_to_ndc;
-          dfn.vkCmdPushConstants(draw_command_buffer, guest_output_paint_pipeline_layout,
-                                 VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(effect_rect_constants),
-                                 &effect_rect_constants);
-
-          uint32_t effect_constants_size = 0;
-          union {
-            BilinearConstants bilinear;
-            CasSharpenConstants cas_sharpen;
-            CasResampleConstants cas_resample;
-            FsrEasuConstants fsr_easu;
-            FsrRcasConstants fsr_rcas;
-          } effect_constants;
-          switch (guest_output_paint_pipeline_layout_index) {
-            case kGuestOutputPaintPipelineLayoutIndexBilinear: {
-              effect_constants_size = sizeof(effect_constants.bilinear);
-              effect_constants.bilinear.Initialize(guest_output_flow, i);
-            } break;
-            case kGuestOutputPaintPipelineLayoutIndexCasSharpen: {
-              effect_constants_size = sizeof(effect_constants.cas_sharpen);
-              effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
-                                                      guest_output_paint_config);
-            } break;
-            case kGuestOutputPaintPipelineLayoutIndexCasResample: {
-              effect_constants_size = sizeof(effect_constants.cas_resample);
-              effect_constants.cas_resample.Initialize(guest_output_flow, i,
-                                                       guest_output_paint_config);
-            } break;
-            case kGuestOutputPaintPipelineLayoutIndexFsrEasu: {
-              effect_constants_size = sizeof(effect_constants.fsr_easu);
-              effect_constants.fsr_easu.Initialize(guest_output_flow, i);
-            } break;
-            case kGuestOutputPaintPipelineLayoutIndexFsrRcas: {
-              effect_constants_size = sizeof(effect_constants.fsr_rcas);
-              effect_constants.fsr_rcas.Initialize(guest_output_flow, i, guest_output_paint_config);
-            } break;
-            default:
-              break;
-          }
-          if (effect_constants_size) {
-            dfn.vkCmdPushConstants(draw_command_buffer, guest_output_paint_pipeline_layout,
-                                   VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(effect_rect_constants),
-                                   effect_constants_size, &effect_constants);
-          }
-
-          dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
-
-          if (is_final_effect) {
-            // Clear the letterbox around the guest output if the guest output
-            // doesn't cover the entire swapchain image.
-            if (swapchain_image_clear_needed && guest_output_flow.letterbox_clear_rectangle_count) {
-              VkClearRect
-                  letterbox_clear_vulkan_rectangles[GuestOutputPaintFlow::kMaxClearRectangles];
-              for (size_t i = 0; i < guest_output_flow.letterbox_clear_rectangle_count; ++i) {
-                VkClearRect& letterbox_clear_vulkan_rectangle =
-                    letterbox_clear_vulkan_rectangles[i];
-                const GuestOutputPaintFlow::ClearRectangle& letterbox_clear_rectangle =
-                    guest_output_flow.letterbox_clear_rectangles[i];
-                letterbox_clear_vulkan_rectangle.rect.offset.x =
-                    int32_t(letterbox_clear_rectangle.x);
-                letterbox_clear_vulkan_rectangle.rect.offset.y =
-                    int32_t(letterbox_clear_rectangle.y);
-                letterbox_clear_vulkan_rectangle.rect.extent.width =
-                    letterbox_clear_rectangle.width;
-                letterbox_clear_vulkan_rectangle.rect.extent.height =
-                    letterbox_clear_rectangle.height;
-                letterbox_clear_vulkan_rectangle.baseArrayLayer = 0;
-                letterbox_clear_vulkan_rectangle.layerCount = 1;
+            int32_t effect_rect_x, effect_rect_y;
+            if (is_final_effect) {
+              effect_rect_x = guest_output_flow.output_x;
+              effect_rect_y = guest_output_flow.output_y;
+              if (to_hudless) {
+                dfn.vkCmdBeginRenderPass(draw_command_buffer, &hudless_render_pass_begin_info,
+                                         VK_SUBPASS_CONTENTS_INLINE);
+              } else {
+                dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
+                                         VK_SUBPASS_CONTENTS_INLINE);
+                swapchain_image_pass_begun = true;
               }
-              dfn.vkCmdClearAttachments(draw_command_buffer, 1, &swapchain_image_clear_attachment,
-                                        uint32_t(guest_output_flow.letterbox_clear_rectangle_count),
-                                        letterbox_clear_vulkan_rectangles);
+              guest_output_viewport.width = float(paint_context_.swapchain_extent.width);
+              guest_output_viewport.height = float(paint_context_.swapchain_extent.height);
+              guest_output_scissor.extent.width = paint_context_.swapchain_extent.width;
+              guest_output_scissor.extent.height = paint_context_.swapchain_extent.height;
+            } else {
+              effect_rect_x = 0;
+              effect_rect_y = 0;
+              VkRenderPassBeginInfo intermediate_render_pass_begin_info;
+              intermediate_render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+              intermediate_render_pass_begin_info.pNext = nullptr;
+              intermediate_render_pass_begin_info.renderPass =
+                  guest_output_intermediate_render_pass_;
+              intermediate_render_pass_begin_info.framebuffer =
+                  paint_context_.guest_output_intermediate_framebuffers[i];
+              intermediate_render_pass_begin_info.renderArea.offset.x = 0;
+              intermediate_render_pass_begin_info.renderArea.offset.y = 0;
+              intermediate_render_pass_begin_info.renderArea.extent.width = effect_rect_size.first;
+              intermediate_render_pass_begin_info.renderArea.extent.height =
+                  effect_rect_size.second;
+              intermediate_render_pass_begin_info.clearValueCount = 0;
+              intermediate_render_pass_begin_info.pClearValues = nullptr;
+              dfn.vkCmdBeginRenderPass(draw_command_buffer, &intermediate_render_pass_begin_info,
+                                       VK_SUBPASS_CONTENTS_INLINE);
+              guest_output_viewport.width = float(effect_rect_size.first);
+              guest_output_viewport.height = float(effect_rect_size.second);
+              guest_output_scissor.extent.width = effect_rect_size.first;
+              guest_output_scissor.extent.height = effect_rect_size.second;
             }
-            swapchain_image_clear_needed = false;
-          } else {
-            // Still need the swapchain pass to be open for UI drawing.
-            dfn.vkCmdEndRenderPass(draw_command_buffer);
+            dfn.vkCmdSetViewport(draw_command_buffer, 0, 1, &guest_output_viewport);
+            dfn.vkCmdSetScissor(draw_command_buffer, 0, 1, &guest_output_scissor);
+
+            const PaintContext::GuestOutputPaintPipeline& effect_pipeline =
+                paint_context_.guest_output_paint_pipelines[size_t(effect)];
+            // The hudless pass is compatible with the swapchain's (same format).
+            VkPipeline effect_vulkan_pipeline = is_final_effect
+                                                    ? effect_pipeline.swapchain_pipeline
+                                                    : effect_pipeline.intermediate_pipeline;
+            assert_true(effect_vulkan_pipeline != VK_NULL_HANDLE);
+            dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  effect_vulkan_pipeline);
+
+            GuestOutputPaintPipelineLayoutIndex guest_output_paint_pipeline_layout_index =
+                GetGuestOutputPaintPipelineLayoutIndex(effect);
+            VkPipelineLayout guest_output_paint_pipeline_layout =
+                guest_output_paint_pipeline_layouts_[guest_output_paint_pipeline_layout_index];
+
+            size_t effect_src_descriptor_set =
+                i ? PaintContext::kGuestOutputDescriptorSetIntermediate0Sampled + (i - 1)
+                  : source_set;
+            dfn.vkCmdBindDescriptorSets(
+                draw_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                guest_output_paint_pipeline_layout, 0, 1,
+                &paint_context_.guest_output_descriptor_sets[effect_src_descriptor_set], 0,
+                nullptr);
+
+            GuestOutputPaintRectangleConstants effect_rect_constants;
+            float effect_x_to_ndc = 2.0f / guest_output_viewport.width;
+            float effect_y_to_ndc = 2.0f / guest_output_viewport.height;
+            effect_rect_constants.x = -1.0f + float(effect_rect_x) * effect_x_to_ndc;
+            effect_rect_constants.y = -1.0f + float(effect_rect_y) * effect_y_to_ndc;
+            effect_rect_constants.width = float(effect_rect_size.first) * effect_x_to_ndc;
+            effect_rect_constants.height = float(effect_rect_size.second) * effect_y_to_ndc;
+            dfn.vkCmdPushConstants(draw_command_buffer, guest_output_paint_pipeline_layout,
+                                   VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(effect_rect_constants),
+                                   &effect_rect_constants);
+
+            uint32_t effect_constants_size = 0;
+            union {
+              BilinearConstants bilinear;
+              CasSharpenConstants cas_sharpen;
+              CasResampleConstants cas_resample;
+              FsrEasuConstants fsr_easu;
+              FsrRcasConstants fsr_rcas;
+            } effect_constants;
+            switch (guest_output_paint_pipeline_layout_index) {
+              case kGuestOutputPaintPipelineLayoutIndexBilinear: {
+                effect_constants_size = sizeof(effect_constants.bilinear);
+                effect_constants.bilinear.Initialize(guest_output_flow, i);
+              } break;
+              case kGuestOutputPaintPipelineLayoutIndexCasSharpen: {
+                effect_constants_size = sizeof(effect_constants.cas_sharpen);
+                effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
+                                                        guest_output_paint_config);
+              } break;
+              case kGuestOutputPaintPipelineLayoutIndexCasResample: {
+                effect_constants_size = sizeof(effect_constants.cas_resample);
+                effect_constants.cas_resample.Initialize(guest_output_flow, i,
+                                                         guest_output_paint_config);
+              } break;
+              case kGuestOutputPaintPipelineLayoutIndexFsrEasu: {
+                effect_constants_size = sizeof(effect_constants.fsr_easu);
+                effect_constants.fsr_easu.Initialize(guest_output_flow, i);
+              } break;
+              case kGuestOutputPaintPipelineLayoutIndexFsrRcas: {
+                effect_constants_size = sizeof(effect_constants.fsr_rcas);
+                effect_constants.fsr_rcas.Initialize(guest_output_flow, i,
+                                                     guest_output_paint_config);
+              } break;
+              default:
+                break;
+            }
+            if (effect_constants_size) {
+              dfn.vkCmdPushConstants(draw_command_buffer, guest_output_paint_pipeline_layout,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(effect_rect_constants),
+                                     effect_constants_size, &effect_constants);
+            }
+
+            dfn.vkCmdDraw(draw_command_buffer, 4, 1, 0, 0);
+
+            if (is_final_effect && to_hudless) {
+              // Cleared at the pass's load; left for frame generation to read.
+              dfn.vkCmdEndRenderPass(draw_command_buffer);
+            } else if (is_final_effect) {
+              // Clear the letterbox around the guest output if the guest output
+              // doesn't cover the entire swapchain image.
+              if (swapchain_image_clear_needed &&
+                  guest_output_flow.letterbox_clear_rectangle_count) {
+                VkClearRect
+                    letterbox_clear_vulkan_rectangles[GuestOutputPaintFlow::kMaxClearRectangles];
+                for (size_t j = 0; j < guest_output_flow.letterbox_clear_rectangle_count; ++j) {
+                  VkClearRect& letterbox_clear_vulkan_rectangle =
+                      letterbox_clear_vulkan_rectangles[j];
+                  const GuestOutputPaintFlow::ClearRectangle& letterbox_clear_rectangle =
+                      guest_output_flow.letterbox_clear_rectangles[j];
+                  letterbox_clear_vulkan_rectangle.rect.offset.x =
+                      int32_t(letterbox_clear_rectangle.x);
+                  letterbox_clear_vulkan_rectangle.rect.offset.y =
+                      int32_t(letterbox_clear_rectangle.y);
+                  letterbox_clear_vulkan_rectangle.rect.extent.width =
+                      letterbox_clear_rectangle.width;
+                  letterbox_clear_vulkan_rectangle.rect.extent.height =
+                      letterbox_clear_rectangle.height;
+                  letterbox_clear_vulkan_rectangle.baseArrayLayer = 0;
+                  letterbox_clear_vulkan_rectangle.layerCount = 1;
+                }
+                dfn.vkCmdClearAttachments(
+                    draw_command_buffer, 1, &swapchain_image_clear_attachment,
+                    uint32_t(guest_output_flow.letterbox_clear_rectangle_count),
+                    letterbox_clear_vulkan_rectangles);
+              }
+              swapchain_image_clear_needed = false;
+            } else {
+              // Still need the swapchain pass to be open for UI drawing.
+              dfn.vkCmdEndRenderPass(draw_command_buffer);
+            }
           }
+        };
+
+        const size_t guest_output_set =
+            PaintContext::kGuestOutputDescriptorSetGuestOutput0Sampled +
+            guest_output_image_paint_ref_index;
+        const size_t hudless_set = PaintContext::kGuestOutputDescriptorSetHudless0Sampled +
+                                   guest_output_image_paint_ref_index;
+        // Scalers that keep per-paint state (NIS, the FidelityFX source build's
+        // temporal pass) run once per paint: no second, hudless chain.
+        if (fg_generate && (temporal_effect_selected ||
+                            guest_output_paint_config.GetEffect() ==
+                                GuestOutputPaintConfig::Effect::kNis)) {
+          fg_generate = false;
+        }
+        if (fg_generate) {
+          // The frame without the HUD first, then Prepare (outside passes).
+          paint_guest_output(*fg_hudless_source, hudless_set, true);
+          const auto& final_size =
+              guest_output_flow.effect_output_sizes[guest_output_flow.effect_count - 1];
+          const GuestOutputImage& fg_depth = *guest_output_image->frame_generation_depth();
+          fg_frame.generate = true;
+          fg_frame.reset = fg_inputs.reset || paint_context_.fg_last_frame + 1 != fg_inputs.frame;
+          fg_frame.command_buffer = draw_command_buffer;
+          fg_frame.depth = fg_depth.image();
+          fg_frame.depth_format = fg_depth.format();
+          fg_frame.motion = guest_output_image->frame_generation_motion()->image();
+          fg_frame.motion_format = guest_output_image->frame_generation_motion()->format();
+          fg_frame.render_width = fg_depth.extent().width;
+          fg_frame.render_height = fg_depth.extent().height;
+          fg_frame.hudless = paint_context_.fg_hudless_image[fg_hudless_index];
+          fg_frame.backbuffer_format = paint_context_.swapchain_render_pass_format;
+          fg_frame.display_width = paint_context_.swapchain_extent.width;
+          fg_frame.display_height = paint_context_.swapchain_extent.height;
+          fg_frame.rect_x = guest_output_flow.output_x;
+          fg_frame.rect_y = guest_output_flow.output_y;
+          fg_frame.rect_width = final_size.first;
+          fg_frame.rect_height = final_size.second;
+          fg_frame.jitter_x = fg_inputs.jitter_x;
+          fg_frame.jitter_y = fg_inputs.jitter_y;
+          fg_frame.delta_ms = fg_inputs.delta_ms;
+          fg_frame.camera_near = fg_inputs.camera_near;
+          fg_frame.camera_far = fg_inputs.camera_far;
+          fg_frame.fov_y = fg_inputs.fov_y;
+          fg_frame.meters_per_unit = fg_inputs.meters_per_unit;
+          fg_frame.depth_inverted = fg_inputs.depth_inverted;
+          fg_frame.depth_infinite = fg_inputs.depth_infinite;
+          fg_frame.position = fg_inputs.position;
+          fg_frame.up = fg_inputs.up;
+          fg_frame.right = fg_inputs.right;
+          fg_frame.forward = fg_inputs.forward;
+          if (frame_generation) {
+            fg_generating = frame_generation->BeginPresent(paint_context_.swapchain, fg_frame);
+          } else {
+            // DLSS: generated after the swapchain pass (below), from the final
+            // frame: the guest output's rectangle in the backbuffer, with the
+            // depth and motion images covering it (a fixed size: letterbox
+            // bars moving in the scene don't re-create the feature).
+            dlss_frame.depth = fg_frame.depth;
+            dlss_frame.depth_view = fg_depth.view();
+            dlss_frame.depth_format = fg_frame.depth_format;
+            dlss_frame.motion = fg_frame.motion;
+            dlss_frame.motion_view = guest_output_image->frame_generation_motion()->view();
+            dlss_frame.motion_format = fg_frame.motion_format;
+            dlss_frame.render_width = fg_frame.render_width;
+            dlss_frame.render_height = fg_frame.render_height;
+            dlss_frame.hudless = fg_frame.hudless;
+            dlss_frame.hudless_view = paint_context_.fg_hudless_view[fg_hudless_index];
+            dlss_frame.rect_x = fg_frame.rect_x;
+            dlss_frame.rect_y = fg_frame.rect_y;
+            dlss_frame.rect_width = fg_frame.rect_width;
+            dlss_frame.rect_height = fg_frame.rect_height;
+            dlss_frame.jitter_x = fg_inputs.jitter_x;
+            dlss_frame.jitter_y = fg_inputs.jitter_y;
+            // History across frames without inputs: by the frame the motion
+            // refers to (dlss_frame_generation.h), not by consecutive frames.
+            dlss_frame.reset = fg_inputs.reset;
+            dlss_frame.frame = fg_inputs.frame;
+            dlss_frame.previous_frame = fg_inputs.previous_frame;
+            dlss_frame.depth_inverted = fg_inputs.depth_inverted;
+            dlss_frame.view_to_clip = fg_inputs.view_to_clip;
+            dlss_frame.clip_to_view = fg_inputs.clip_to_view;
+            dlss_frame.clip_to_previous_clip = fg_inputs.clip_to_previous_clip;
+            dlss_frame.previous_clip_to_clip = fg_inputs.previous_clip_to_clip;
+            dlss_frame.position = fg_inputs.position;
+            dlss_frame.up = fg_inputs.up;
+            dlss_frame.right = fg_inputs.right;
+            dlss_frame.forward = fg_inputs.forward;
+            dlss_frame.camera_near = fg_inputs.camera_near;
+            dlss_frame.camera_far = fg_inputs.camera_far;
+            // The frame's field of view, as its matrices (a letterboxed scene's is narrower).
+            const float projection_y = std::abs(fg_inputs.view_to_clip[5]);
+            dlss_frame.fov_y = projection_y > 1e-6f ? 2.f * std::atan(1.f / projection_y) : fg_inputs.fov_y;
+            dlss_frame.aspect = fg_inputs.aspect;
+            dlss_frame.meters_per_unit = fg_inputs.meters_per_unit;
+            dlss_pending = dlss_frame.rect_width && dlss_frame.rect_height;
+            paint_context_.fg_hudless_index = fg_hudless_index;
+          }
+          fg_began = true;
+          paint_context_.fg_last_frame = fg_inputs.frame;
+          if (fg_generating) {
+            paint_context_.fg_hudless_index = fg_hudless_index;
+            paint_context_.fg_last_generated = fg_frame;
+            paint_context_.fg_has_last_generated = true;
+            paint_context_.fg_gap_frames = 0;
+          }
+        } else if (frame_generation) {
+          present_without_inputs();
+        }
+        if (fg_show_hudless) {
+          paint_guest_output(*fg_hudless_source, hudless_set, false);
+        } else {
+          paint_guest_output(*guest_output_image, guest_output_set, false);
         }
       }
+    }
+  }
+  if (frame_generation && !fg_began) {
+    // No guest output painted: Prepare can still be recorded (no pass is open).
+    if (!swapchain_image_pass_begun) {
+      present_without_inputs();
+    } else {
+      frame_generation->BeginPresent(paint_context_.swapchain, VulkanFrameGeneration::Frame());
     }
   }
 
@@ -2318,7 +2923,115 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   dfn.vkCmdEndRenderPass(draw_command_buffer);
 
+  // DLSS frame generation: the final frame (the UI drawn) is the real one; a
+  // second image gets the generated frame, presented first.
+  uint32_t dlss_generated_index = UINT32_MAX;
+  VkSemaphore dlss_acquire_semaphore = VK_NULL_HANDLE;
+  if (dlss_generation) {
+    if (dlss_pending) {
+      // Other sizes: a new feature, after the GPU work using the old one.
+      if (!dlss_generation->FeatureMatches(dlss_frame)) {
+        paint_context_.completion_timeline.AwaitAllSubmissions();
+        dlss_generation->ReleaseFeature();
+      }
+      dlss_acquire_semaphore = dlss_generation->acquire_semaphore(size_t(current_paint_submission_index));
+      // The swapchain has images for both (kExtraSwapchainImages); a short
+      // wait at most, else this frame goes without.
+      const VkResult second_acquire = dfn.vkAcquireNextImageKHR(
+          device, paint_context_.swapchain, 50'000'000, dlss_acquire_semaphore, VK_NULL_HANDLE,
+          &dlss_generated_index);
+      if ((second_acquire == VK_SUCCESS || second_acquire == VK_SUBOPTIMAL_KHR) &&
+          dlss_generated_index != swapchain_image_index &&
+          dlss_generated_index < paint_context_.swapchain_images.size()) {
+        fg_generating = dlss_generation->Record(draw_command_buffer, dlss_frame,
+                                                paint_context_.swapchain_images[swapchain_image_index],
+                                                paint_context_.swapchain_images[dlss_generated_index]);
+      } else {
+        dlss_generated_index = UINT32_MAX;
+        dlss_acquire_semaphore = VK_NULL_HANDLE;
+        dlss_generation->NoteFrameWithoutGeneration();
+      }
+    } else {
+      dlss_generation->NoteFrameWithoutGeneration();
+    }
+  }
+
   dfn.vkEndCommandBuffer(draw_command_buffer);
+
+  // Generation on in the proxy: the refresher holds the real frame rate.
+  if (frame_generation) {
+    frame_generation_generating_.store(frame_generation->enabled(), std::memory_order_relaxed);
+  }
+  // DLSS: while frames were generated in the last second (a frame without
+  // inputs doesn't release the cap at once).
+  if (dlss_generation) {
+    const auto now = std::chrono::steady_clock::now();
+    frame_generation_generating_.store(
+        fg_generating || now - paint_context_.fg_last_real_present < std::chrono::seconds(1),
+        std::memory_order_relaxed);
+    if (fg_generating) {
+      paint_context_.fg_last_real_present = now;
+      ++paint_context_.fg_stats_generating;
+    }
+    ++paint_context_.fg_stats_real;
+    if (paint_context_.fg_stats_since == std::chrono::steady_clock::time_point{}) {
+      paint_context_.fg_stats_since = now;
+      paint_context_.fg_stats_presents_base = dlss_generation->generated_frames();
+      paint_context_.fg_stats_held_base = dlss_generation->held_presents();
+      paint_context_.fg_stats_resets_base = dlss_generation->resets();
+    } else if (now - paint_context_.fg_stats_since >= std::chrono::seconds(10)) {
+      const double seconds = std::chrono::duration<double>(now - paint_context_.fg_stats_since).count();
+      const uint64_t generated = dlss_generation->generated_frames();
+      const uint64_t held = dlss_generation->held_presents();
+      const uint64_t resets = dlss_generation->resets();
+      // Shown: every real frame, plus a second image per held real present.
+      const uint64_t shown = paint_context_.fg_stats_real + (held - paint_context_.fg_stats_held_base);
+      REXLOG_INFO(
+          "Frame generation (DLSS): {:.1f} real FPS, {:.1f} shown, {} of {} real frames generated ({} new "
+          "histories), display {:.0f} Hz, {}; histories in total: {} producer reset, {} after an error, {} "
+          "without a previous frame, {} after a frame without generation{}{}",
+          double(paint_context_.fg_stats_real) / seconds, double(shown) / seconds,
+          generated - paint_context_.fg_stats_presents_base, paint_context_.fg_stats_real,
+          resets - paint_context_.fg_stats_resets_base,
+          display_refresh_rate(), paint_context_.swapchain_is_fifo ? "FIFO" : "timed pacing",
+          dlss_generation->reset_reasons()[0], dlss_generation->reset_reasons()[1],
+          dlss_generation->reset_reasons()[2], dlss_generation->reset_reasons()[3],
+          dlss_generation->last_error().empty() ? "" : ", last issue: ", dlss_generation->last_error());
+      paint_context_.fg_stats_since = now;
+      paint_context_.fg_stats_presents_base = generated;
+      paint_context_.fg_stats_held_base = held;
+      paint_context_.fg_stats_resets_base = resets;
+      paint_context_.fg_stats_real = paint_context_.fg_stats_generating = 0;
+    }
+  }
+  // Frame generation statistics (the real frame rate is held by the refresher).
+  if (frame_generation) {
+    const auto now = std::chrono::steady_clock::now();
+    if (fg_generating) {
+      paint_context_.fg_last_real_present = now;
+      ++paint_context_.fg_stats_generating;
+    }
+    ++paint_context_.fg_stats_real;
+    if (paint_context_.fg_stats_since == std::chrono::steady_clock::time_point{}) {
+      paint_context_.fg_stats_since = now;
+      paint_context_.fg_stats_presents_base = frame_generation->PresentCount(paint_context_.swapchain);
+    } else if (now - paint_context_.fg_stats_since >= std::chrono::seconds(10)) {
+      const double seconds = std::chrono::duration<double>(now - paint_context_.fg_stats_since).count();
+      const uint64_t presents = frame_generation->PresentCount(paint_context_.swapchain);
+      REXLOG_INFO(
+          "Frame generation: {:.1f} real FPS, {:.1f} shown, {} of {} real frames with generation, "
+          "{} on/off switches in total, display {:.0f} Hz{}{}",
+          double(paint_context_.fg_stats_real) / seconds,
+          double(presents - paint_context_.fg_stats_presents_base) / seconds,
+          paint_context_.fg_stats_generating, paint_context_.fg_stats_real,
+          frame_generation->enable_switches(), display_refresh_rate(),
+          frame_generation->last_error().empty() ? "" : ", last issue: ",
+          frame_generation->last_error());
+      paint_context_.fg_stats_since = now;
+      paint_context_.fg_stats_presents_base = presents;
+      paint_context_.fg_stats_real = paint_context_.fg_stats_generating = 0;
+    }
+  }
 
   VkPipelineStageFlags acquire_semaphore_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   VkCommandBuffer command_buffers[2];
@@ -2341,16 +3054,24 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   command_buffers[command_buffer_count++] = draw_command_buffer;
   VkSemaphore present_semaphore =
       paint_context_.swapchain_image_present_semaphores[swapchain_image_index];
+  // DLSS: the generated image's acquisition (awaited by its copy) and present too.
+  const bool dlss_two_images = dlss_generated_index != UINT32_MAX;
+  const VkSemaphore wait_semaphores[2] = {acquire_semaphore, dlss_acquire_semaphore};
+  const VkPipelineStageFlags wait_stages[2] = {acquire_semaphore_wait_stage, VK_PIPELINE_STAGE_TRANSFER_BIT};
+  const VkSemaphore signal_semaphores[2] = {
+      present_semaphore, dlss_two_images
+                             ? paint_context_.swapchain_image_present_semaphores[dlss_generated_index]
+                             : VK_NULL_HANDLE};
   VkSubmitInfo submit_info;
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.pNext = nullptr;
-  submit_info.waitSemaphoreCount = 1;
-  submit_info.pWaitSemaphores = &acquire_semaphore;
-  submit_info.pWaitDstStageMask = &acquire_semaphore_wait_stage;
+  submit_info.waitSemaphoreCount = dlss_two_images ? 2 : 1;
+  submit_info.pWaitSemaphores = wait_semaphores;
+  submit_info.pWaitDstStageMask = wait_stages;
   submit_info.commandBufferCount = command_buffer_count;
   submit_info.pCommandBuffers = command_buffers;
-  submit_info.signalSemaphoreCount = 1;
-  submit_info.pSignalSemaphores = &present_semaphore;
+  submit_info.signalSemaphoreCount = dlss_two_images ? 2 : 1;
+  submit_info.pSignalSemaphores = signal_semaphores;
   const VkResult submit_result = paint_context_.completion_timeline.AcquireFenceAndSubmit(
       vulkan_device_->queue_family_graphics_compute(), 0, 1, &submit_info);
   if (submit_result != VK_SUCCESS) {
@@ -2389,7 +3110,26 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pImageIndices = &swapchain_image_index;
   present_info.pResults = nullptr;
   VkResult present_result;
-  {
+  if (frame_generation) {
+    // The proxy submits to the game queue through its lock itself, and presents
+    // on its own queue (frame_generation.h).
+    const auto present_start = std::chrono::steady_clock::now();
+    present_result = frame_generation->Present(present_info);
+    LogBlockingPresentationCall("vkQueuePresentKHR", present_start, present_result);
+  } else if (dlss_two_images) {
+    // The generated frame now; the real one held (dlss_frame_generation.h),
+    // also when this present fails (the image must leave the acquired state).
+    present_info.pWaitSemaphores = &signal_semaphores[1];
+    present_info.pImageIndices = &dlss_generated_index;
+    {
+      const VulkanDevice::Queue::Acquisition queue_acquisition =
+          vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+      const auto present_start = std::chrono::steady_clock::now();
+      present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+      LogBlockingPresentationCall("vkQueuePresentKHR", present_start, present_result);
+    }
+    dlss_generation->ScheduleRealPresent(swapchain_image_index, present_semaphore);
+  } else {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     const auto present_start = std::chrono::steady_clock::now();
@@ -2402,6 +3142,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     case VK_SUBOPTIMAL_KHR:
       return PaintResult::kPresentedSuboptimal;
     case VK_ERROR_DEVICE_LOST:
+      vulkan_device_->SetLost();
       REXLOG_ERROR(
           "VulkanPresenter: Failed to present the swapchain image as the "
           "device has been lost");
@@ -2715,6 +3456,34 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         "VulkanPresenter: Failed to allocate the guest output painting "
         "descriptor sets");
     return false;
+  }
+
+  // AMD FSR frame generation (native_frame_generation; needs the device's extra
+  // queues, so a restart to switch). Unavailable: the regular swapchain.
+  if (VulkanFrameGeneration::Requested()) {
+    std::string reason;
+    frame_generation_ = VulkanFrameGeneration::Create(*vulkan_device_, reason);
+    if (frame_generation_) {
+      paint_context_.frame_generation = frame_generation_.get();
+    } else {
+      REXLOG_WARN("VulkanPresenter: frame generation unavailable, frames are shown as they are: {}",
+                  reason);
+      VulkanFrameGeneration::WriteStatus(*vulkan_device_,
+                                         "AMD FSR frame generation unavailable: " + reason);
+    }
+  }
+  // NVIDIA DLSS frame generation (native_frame_generation = dlss): on the
+  // regular swapchain, the presenter presenting both frames.
+  if (VulkanDlssFrameGeneration::Requested()) {
+    std::string reason;
+    dlss_frame_generation_ = VulkanDlssFrameGeneration::Create(*vulkan_device_, reason);
+    if (dlss_frame_generation_) {
+      paint_context_.dlss_frame_generation = dlss_frame_generation_.get();
+    } else {
+      REXLOG_WARN("VulkanPresenter: DLSS frame generation unavailable, frames are shown as they are: {}", reason);
+      VulkanFrameGeneration::WriteStatus(*vulkan_device_,
+                                         "NVIDIA DLSS Frame Generation unavailable: " + reason);
+    }
   }
 
   return InitializeCommonSurfaceIndependent();

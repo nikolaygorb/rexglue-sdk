@@ -261,6 +261,7 @@ class XObject {
   // if we allocated it!
   uint32_t guest_object_ptr_ = 0;
   bool allocated_guest_object_ = false;
+  bool allocated_guest_workspace_ = false;
   // CreateNative allocated a placeholder X_OBJECT_TYPE (no kernel type).
   bool allocated_object_type_ = false;
   // Guest type recorded by ObOpenObjectByPointer.

@@ -30,9 +30,13 @@ bool D3D12GraphicsSystem::IsAvailable() {
 }
 
 std::string D3D12GraphicsSystem::name() const {
-  auto d3d12_command_processor = static_cast<D3D12CommandProcessor*>(command_processor());
-  if (d3d12_command_processor != nullptr) {
-    return d3d12_command_processor->GetWindowTitleText();
+  // Virtual: a subclass may make another command processor
+  // (CreateCommandProcessor), which this must not cast to D3D12CommandProcessor.
+  if (const CommandProcessor* processor = command_processor()) {
+    std::string title = processor->GetWindowTitleText();
+    if (!title.empty()) {
+      return title;
+    }
   }
   return "Direct3D 12";
 }

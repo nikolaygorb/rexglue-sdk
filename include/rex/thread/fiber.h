@@ -48,7 +48,8 @@ struct Fiber {
   void Destroy();
 
   /// Returns the fiber currently executing on this thread, or nullptr.
-  static Fiber* Current() { return tls_current_; }
+  /// Out of line: a thread_local static is not reachable across the DLL.
+  static Fiber* Current();
 
  private:
   static thread_local Fiber* tls_current_;

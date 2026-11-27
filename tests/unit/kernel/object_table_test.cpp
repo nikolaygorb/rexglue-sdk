@@ -36,6 +36,46 @@ class TestObject : public XObject {
 };
 
 int TestObject::destructor_count = 0;
+void InitTestLogging();
+
+TEST_CASE("Informational NT statuses succeed; warnings and errors fail", "[kernel][status]") {
+  CHECK(XSUCCEEDED(X_STATUS_SUCCESS));
+  CHECK(XSUCCEEDED(X_STATUS_OBJECT_NAME_EXISTS));
+  CHECK(XSUCCEEDED(X_STATUS_TIMER_RESUME_IGNORED));
+  CHECK(XFAILED(X_STATUS_BUFFER_OVERFLOW));
+  CHECK(XFAILED(X_STATUS_INVALID_HANDLE));
+}
+
+TEST_CASE("OBJ_OPENIF opens an independent slot and preserves collision semantics",
+          "[kernel][object_table]") {
+  InitTestLogging();
+  ObjectTable table;
+  auto object = object_ref<TestObject>(new TestObject());
+  object->set_name("NamedObject");
+  X_HANDLE first = 0, opened = 0;
+  REQUIRE(table.AddHandle(object.get(), &first) == X_STATUS_SUCCESS);
+  REQUIRE(table.AddNameMapping(object->name(), first) == X_STATUS_SUCCESS);
+  CHECK(table.OpenNamedHandle("namedobject", XObject::Type::Undefined, false, &opened) ==
+        X_STATUS_OBJECT_NAME_COLLISION);
+  CHECK(opened == 0);
+  CHECK(table.OpenNamedHandle("namedobject", XObject::Type::Event, true, &opened) ==
+        X_STATUS_OBJECT_TYPE_MISMATCH);
+  CHECK(opened == 0);
+  REQUIRE(table.OpenNamedHandle("NAMEDOBJECT", XObject::Type::Undefined, true, &opened) ==
+          X_STATUS_OBJECT_NAME_EXISTS);
+  REQUIRE(opened != first);
+  REQUIRE(table.ReleaseHandle(first) == X_STATUS_SUCCESS);
+  CHECK_FALSE(table.LookupObject<XObject>(first));
+  CHECK(table.LookupObject<XObject>(opened).get() == object.get());
+  X_HANDLE third = 0;
+  REQUIRE(table.OpenNamedHandle("NamedObject", XObject::Type::Undefined, true, &third) ==
+          X_STATUS_OBJECT_NAME_EXISTS);
+  CHECK(third != opened);
+  CHECK(table.ReleaseHandle(opened) == X_STATUS_SUCCESS);
+  CHECK(table.ReleaseHandle(third) == X_STATUS_SUCCESS);
+  CHECK(table.OpenNamedHandle("NamedObject", XObject::Type::Undefined, true, &opened) ==
+        X_STATUS_OBJECT_NAME_NOT_FOUND);
+}
 
 // Reset destructor count before each test
 struct DestructorCountReset {

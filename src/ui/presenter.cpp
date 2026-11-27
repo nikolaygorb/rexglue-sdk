@@ -13,6 +13,9 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <climits>
+#include <fstream>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -20,6 +23,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/ui/image_decode.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
@@ -87,14 +91,14 @@ REXCVAR_DEFINE_DOUBLE(present_nis_sharpness,
                       "UI/Presenter", "NVIDIA Image Scaling sharpness in [0, 1]")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kNisSharpnessMin,
            rex::ui::Presenter::GuestOutputPaintConfig::kNisSharpnessMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
                       "UI/Presenter", "Additional CAS sharpness in [0, 1]")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMin,
            rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(present_fsr_max_upsampling_passes,
                      rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax,
@@ -107,7 +111,7 @@ REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
                       "UI/Presenter", "FSR RCAS sharpness reduction in stops")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
            rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 REXCVAR_DEFINE_STRING(
@@ -119,11 +123,17 @@ REXCVAR_DEFINE_STRING(
 
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
                     "Enable output dithering in the final present pass")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(present_screenshot_request, 0, "UI/Presenter",
+                     "Debugging: each change of the value (while the game runs, from a config "
+                     "reload or the console) saves the guest's picture as "
+                     "screenshot_request_<value>.png in the working directory, for runs that "
+                     "compare settings without keyboard focus")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace {
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
@@ -322,6 +332,26 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 }
 
 }  // namespace
+
+REXCVAR_DEFINE_INT32(host_frame_limit, 0, "UI/Presenter",
+                     "Host presentation limit in FPS (0 = unlimited). Skips presents without "
+                     "waiting or changing guest speed.")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_device_lost_breadcrumbs, true, "GPU",
+                    "Record GPU work markers for device-loss diagnostics")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// ReIGlue 1100: a second marker before a draw that had work of its own
+// recorded first, so a device loss says whether the GPU hung in that work or in
+// the draw. Off: it costs GPU time on draws with such work, and only a player
+// whose GPU resets needs it.
+REXCVAR_DEFINE_BOOL(gpu_device_lost_setup_breadcrumbs, false, "GPU",
+                    "With gpu_device_lost_breadcrumbs on VK_AMD_buffer_marker, also mark the end "
+                    "of the work recorded before a draw (render passes, EDRAM transfers, texture "
+                    "loads, barriers), so that a device loss says whether the GPU hung in that "
+                    "work or in the draw (costs GPU time)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
 namespace ui {
@@ -536,6 +566,9 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // in a way so that the UI won't be stealing all the remaining GPU
       // resources if it's repainted continuously, and the window system itself
       // doesn't limit the frame rate.
+      // A host cap can skip the implicit-vsync present. Keep UI ticks active
+      // in that case, including when the limit is changed while a menu is open.
+      UpdateUITicksNeededFromUIThread();
       WaitForUITickFromUIThread();
 
       paint_result = PaintAndPresent(draw_ui);
@@ -601,10 +634,40 @@ void Presenter::PaintFromUIThread(bool force_paint) {
   }
 }
 
+// present_screenshot_request: a changed value saves the latest guest output
+// (the frame before the one being refreshed). The value the run starts with is
+// only taken as the one seen (gow2 sdk 0094's request, without a hotkey).
+void Presenter::SaveRequestedScreenshot() {
+  static std::atomic<int32_t> seen{INT32_MIN};
+  const int32_t request = REXCVAR_GET(present_screenshot_request);
+  const int32_t previous = seen.exchange(request, std::memory_order_relaxed);
+  if (previous == request || previous == INT32_MIN) {
+    return;
+  }
+  RawImage image;
+  if (!CaptureGuestOutput(image)) {
+    REXLOG_WARN("present_screenshot_request {}: no guest picture to save yet", request);
+    return;
+  }
+  const std::vector<uint8_t> rgba =
+      PackOpaqueRGBA(image.data.data(), image.width, image.height, image.stride);
+  const std::vector<uint8_t> png = EncodeImagePNG(rgba.data(), image.width, image.height);
+  const std::string path = "screenshot_request_" + std::to_string(request) + ".png";
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  file.write(reinterpret_cast<const char*>(png.data()), std::streamsize(png.size()));
+  if (png.empty() || !file) {
+    REXLOG_WARN("present_screenshot_request {}: can't write {}", request, path);
+    return;
+  }
+  REXLOG_INFO("present_screenshot_request {}: {}x{} saved to {}", request, image.width,
+              image.height, path);
+}
+
 bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+  SaveRequestedScreenshot();
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
@@ -612,6 +675,7 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
+  writable_properties.frame_generation = {};
   bool is_active = writable_properties.IsActive();
   const uint32_t mailbox_index = guest_output_mailbox_writable_;
   if (is_active) {
@@ -638,14 +702,22 @@ bool Presenter::RefreshGuestOutput(
   }
 
   if (guest_output_publish_deferrer_) {
-    guest_output_publish_deferrer_([this, is_active, mailbox_index]() {
+    const bool separate_paint = bool(guest_output_paint_deferrer_);
+    guest_output_publish_deferrer_([this, is_active, mailbox_index, separate_paint]() {
       if (is_active) {
         GuestOutputRefreshSubmitted(mailbox_index);
       }
       PublishGuestOutput();
+      if (!separate_paint) {
+        PaintGuestOutput();
+      }
     });
+    if (separate_paint) {
+      guest_output_paint_deferrer_([this]() { PaintGuestOutput(); });
+    }
   } else {
     PublishGuestOutput();
+    PaintGuestOutput();
   }
   return is_active;
 }
@@ -687,8 +759,11 @@ void Presenter::PublishGuestOutput() {
     // currently not accessible to the host presentation.
     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
   }
+}
 
-  // Trigger the presentation on the host.
+void Presenter::PaintGuestOutput() {
+  // Trigger the presentation on the host. Mailbox publication has completed;
+  // the producer may already be refreshing a different, exclusively owned slot.
   PaintResult paint_result = PaintResult::kNotPresented;
   {
     std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
@@ -882,6 +957,12 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
     // UI thread.
     std::unique_lock<std::mutex> config_lock(guest_output_paint_config_mutex_);
     *paint_config_out = guest_output_paint_config_;
+    // These only change shader constants; keep effect/resource selection in
+    // the existing configuration while applying the live controls each paint.
+    paint_config_out->SetCasAdditionalSharpness(float(REXCVAR_GET(present_cas_additional_sharpness)));
+    paint_config_out->SetFsrSharpnessReduction(float(REXCVAR_GET(present_fsr_sharpness_reduction)));
+    paint_config_out->SetNisSharpness(float(REXCVAR_GET(present_nis_sharpness)));
+    paint_config_out->SetDither(REXCVAR_GET(present_dither));
   }
 
   // Lock the mutex to make sure the image that will be acquired now is owned
@@ -1437,6 +1518,10 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
   if (repaint_needed_out) {
     *repaint_needed_out = false;
   }
+  // For pacing that depends on the display (frame generation).
+  if (window_) {
+    display_refresh_rate_.store(window_->GetDisplayRefreshRate(), std::memory_order_relaxed);
+  }
 
   // If the connection state is kUnconnectedSurfaceReportedUnusable, the
   // implementation has reported that the surface is not usable by the presenter
@@ -1582,7 +1667,17 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+  const int32_t limit = REXCVAR_GET(host_frame_limit);
+  if (!host_frame_limiter_.Allows(limit, PresentRateLimiter::Clock::now())) {
+    if (is_in_ui_thread_paint_ && !ui_drawers_.empty()) {
+      request_ui_paint_after_current_ui_thread_paint_ = true;
+    }
+    return PaintResult::kNotPresented;
+  }
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    host_frame_limiter_.NotePresent(limit, PresentRateLimiter::Clock::now());
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;

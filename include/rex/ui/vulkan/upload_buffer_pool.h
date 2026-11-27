@@ -19,8 +19,11 @@ namespace vulkan {
 
 class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
  public:
+  // prefer_device_local: in device-local memory the CPU can write when the
+  // device maps all of it (resizable BAR, ChooseHostMemoryType), for data the
+  // GPU reads in place; never read back by the CPU (uncached, slow to read).
   VulkanUploadBufferPool(const VulkanDevice* vulkan_device, VkBufferUsageFlags usage,
-                         size_t page_size = kDefaultPageSize);
+                         size_t page_size = kDefaultPageSize, bool prefer_device_local = false);
 
   uint8_t* Request(uint64_t submission_index, size_t size, size_t alignment, VkBuffer& buffer_out,
                    VkDeviceSize& offset_out);
@@ -53,6 +56,7 @@ class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
   uint32_t memory_type_ = UINT32_MAX;
 
   VkBufferUsageFlags usage_;
+  bool prefer_device_local_;
 };
 
 }  // namespace vulkan

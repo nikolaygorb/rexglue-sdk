@@ -332,6 +332,8 @@ bool build_ldbrx(BuilderContext& ctx);
 
 // Multiple word load
 bool build_lmw(BuilderContext& ctx);
+bool build_lswi(BuilderContext& ctx);
+bool build_lswx(BuilderContext& ctx);
 
 // Atomic load and reserve
 bool build_lwarx(BuilderContext& ctx);
@@ -367,6 +369,8 @@ bool build_stwux(BuilderContext& ctx);
 bool build_stwx(BuilderContext& ctx);
 bool build_stwbrx(BuilderContext& ctx);
 bool build_stmw(BuilderContext& ctx);
+bool build_stswi(BuilderContext& ctx);
+bool build_stswx(BuilderContext& ctx);
 
 // Atomic store conditional
 bool build_stwcx(BuilderContext& ctx);
@@ -418,6 +422,7 @@ bool build_lwsync(BuilderContext& ctx);
 bool build_eieio(BuilderContext& ctx);
 bool build_isync(BuilderContext& ctx);
 bool build_db16cyc(BuilderContext& ctx);
+bool build_db8cyc(BuilderContext& ctx);
 bool build_cctpl(BuilderContext& ctx);
 bool build_cctpm(BuilderContext& ctx);
 bool build_cctph(BuilderContext& ctx);

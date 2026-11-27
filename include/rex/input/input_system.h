@@ -74,7 +74,6 @@ class InputSystem : public system::IInputSystem {
   }
 
  private:
-  using JoystickValue = std::pair<uint16_t, uint16_t>;
   /// Re-enumerates every driver and notifies the assignment when the set
   /// changed.
   void RefreshDevices();
@@ -106,8 +105,6 @@ class InputSystem : public system::IInputSystem {
 
   std::bitset<kMaxGuestUsers> connected_users_;
   uint32_t last_used_user_ = 0;
-  // {left, right} stick maxima, scaling the deadzone percentages.
-  std::array<std::pair<JoystickValue, JoystickValue>, kMaxGuestUsers> user_max_joystick_value_ = {};
 
   std::atomic<int> ui_input_blockers_{0};
   // Masked out per user until the guest sees them released.

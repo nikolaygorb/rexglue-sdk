@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <utility>
 
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -119,6 +120,26 @@ u32 ConvertFiberToThread_impl(XThread* thread) {
   mem->SystemHeapFree(fiber_addr);
 
   return 1;  // TRUE
+}
+
+/// A created fiber that deleted itself, released by the thread's own fiber
+/// once it runs again (DeleteFiber_entry, SwitchToFiber_entry).
+thread_local uint32_t t_deleted_fiber = 0;
+
+/// Releases a fiber the calling thread is not running on: its guest stack,
+/// host fiber, registry entry and context block.
+void ReleaseFiber(KernelState* ks, memory::Memory* mem, uint32_t fiber_addr) {
+  auto* info = ks->LookupFiber(fiber_addr);
+  if (info) {
+    if (!info->is_thread_fiber && info->guest_stack_bottom) {
+      mem->LookupHeap(0x70000000)->Release(info->guest_stack_bottom);
+    }
+    if (info->host_fiber) {
+      info->host_fiber->Destroy();
+    }
+    ks->UnregisterFiber(fiber_addr);
+  }
+  mem->SystemHeapFree(fiber_addr);
 }
 
 }  // namespace
@@ -264,24 +285,26 @@ void DeleteFiber_entry(mapped_void lpFiber) {
   if (static_cast<uint32_t>(kthread->fiber_ptr) == fiber_addr) {
     REXKRNL_DEBUG("DeleteFiber: self-delete fiber={:#010x}", fiber_addr);
     PROFILE_FIBER_LEAVE;
+    // A created fiber cannot release its own host fiber: DeleteFiber on the
+    // running fiber ends the host thread at once, past XThread::Exit (no
+    // signal for waiters, no unlink, no stack release). Go back to the
+    // thread's own fiber, which releases this one and ends the thread
+    // (upstream rexglue 7a60e45c).
+    auto* self = ks->LookupFiber(fiber_addr);
+    auto* main_fiber = thread->main_fiber();
+    if (self && !self->is_thread_fiber && main_fiber && self->host_fiber != main_fiber) {
+      t_deleted_fiber = fiber_addr;
+      rex::thread::Fiber::SwitchTo(main_fiber);
+      // The thread's own fiber never switches back to a deleted fiber.
+      std::terminate();
+    }
     ConvertFiberToThread_impl(thread);
     thread->Exit(1);  // does not return
     return;
   }
 
   REXKRNL_DEBUG("DeleteFiber: fiber={:#010x}", fiber_addr);
-
-  auto* info = ks->LookupFiber(fiber_addr);
-  if (info) {
-    if (!info->is_thread_fiber && info->guest_stack_bottom) {
-      mem->LookupHeap(0x70000000)->Release(info->guest_stack_bottom);
-    }
-    if (info->host_fiber) {
-      info->host_fiber->Destroy();
-    }
-    ks->UnregisterFiber(fiber_addr);
-  }
-  mem->SystemHeapFree(fiber_addr);
+  ReleaseFiber(ks, mem, fiber_addr);
 }
 
 void SwitchToFiber_entry(mapped_void lpFiber) {
@@ -327,6 +350,14 @@ void SwitchToFiber_entry(mapped_void lpFiber) {
   // Host fiber switch -- suspends here, resumes when switched back
   rex::thread::Fiber::SwitchTo(target_info->host_fiber);
   // Resumed: non-volatile regs and stack state already restored by the fiber that switched back.
+
+  // Resumed by a created fiber that deleted itself (DeleteFiber_entry): this
+  // is the thread's own fiber, so release that one and end the thread here.
+  if (t_deleted_fiber) {
+    ReleaseFiber(ks, mem, std::exchange(t_deleted_fiber, 0u));
+    kthread->fiber_ptr = current_addr;
+    thread->Exit(1);  // does not return
+  }
 }
 
 }  // namespace rex::kernel::crt

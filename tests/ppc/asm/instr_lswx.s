@@ -1,0 +1,29 @@
+test_lswx_5:
+  #_ MEMORY_IN 10001000 11223344 55667788
+  #_ REGISTER_IN r3 0x10000FF8
+  #_ REGISTER_IN r4 0x00000008
+  #_ REGISTER_IN r6 0xFFFFFFFFFFFFFFFF
+  #_ REGISTER_IN r7 0x00000005
+  mtxer r7
+  lswx r5, r3, r4
+  blr
+  #_ REGISTER_OUT r5 0x11223344
+  #_ REGISTER_OUT r6 0x55000000
+
+test_lswx_count_zero_leaves_rd:
+  #_ MEMORY_IN 10001000 11223344
+  #_ REGISTER_IN r3 0x10001000
+  #_ REGISTER_IN r4 0x00000000
+  #_ REGISTER_IN r5 0x0000000012345678
+  #_ REGISTER_IN r7 0x00000000
+  mtxer r7
+  lswx r5, r3, r4
+  blr
+  #_ REGISTER_OUT r5 0x12345678
+
+test_mfxer_byte_count:
+  #_ REGISTER_IN r7 0x2000007F
+  mtxer r7
+  mfxer r8
+  blr
+  #_ REGISTER_OUT r8 0x2000007F

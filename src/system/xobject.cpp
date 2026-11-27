@@ -65,7 +65,10 @@ XObject::~XObject() {
       memory()->SystemHeapFree(header->object_type_ptr);
     }
 
-    memory()->SystemHeapFree(ptr);
+    if (allocated_guest_workspace_)
+      kernel_state_->FreeWorkspace(ptr);
+    else
+      memory()->SystemHeapFree(ptr);
   }
 }
 
@@ -243,6 +246,9 @@ bool ApcEndsWait() {
 
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                        uint64_t* opt_timeout) {
+  if (alertable && XThread::IsInThread() && XThread::GetCurrentThread()->HasPendingUserApc()) {
+    return X_STATUS_USER_APC;
+  }
   auto wait_handle = GetWaitHandle();
   if (!wait_handle) {
     // Object doesn't support waiting.
@@ -312,6 +318,11 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
 X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_type,
                                uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                                uint64_t* opt_timeout) {
+  if (!count)
+    return X_STATUS_SUCCESS;
+  if (alertable && XThread::IsInThread() && XThread::GetCurrentThread()->HasPendingUserApc()) {
+    return X_STATUS_USER_APC;
+  }
   std::vector<rex::thread::WaitHandle*> wait_handles(count);
   for (size_t i = 0; i < count; ++i) {
     wait_handles[i] = objects[i]->GetWaitHandle();
@@ -381,13 +392,16 @@ uint8_t* XObject::CreateNative(uint32_t size) {
 
   uint32_t total_size = size + sizeof(X_OBJECT_HEADER);
 
-  auto mem = memory()->SystemHeapAlloc(total_size);
+  const bool workspace = type_ == Type::Enumerator;
+  auto mem =
+      workspace ? kernel_state_->AllocWorkspace(total_size) : memory()->SystemHeapAlloc(total_size);
   if (!mem) {
     // Out of memory!
     return nullptr;
   }
 
   allocated_guest_object_ = true;
+  allocated_guest_workspace_ = workspace;
   memory()->Zero(mem, total_size);
   SetNativePointer(mem + sizeof(X_OBJECT_HEADER), true);
 

@@ -50,6 +50,36 @@ namespace {
 #if REX_PLATFORM_WIN32
 // From canary (src/xenia/base/main_win.cc).
 void RequestWin32HighResolutionTimer() {
+  // Windows 11 may ignore the resolution request while the window is occluded
+  // or minimized and fall back to the 15.625 ms tick, which halves the speed of
+  // titles paced by a 16 ms timer. Opt out of that throttling first
+  // (xenia-canary c5798e930).
+  if (HMODULE kernel32_module = GetModuleHandleW(L"kernel32.dll")) {
+    // clang-format off
+    BOOL (WINAPI* set_process_information)(
+        HANDLE process, PROCESS_INFORMATION_CLASS information_class,
+        LPVOID information, DWORD information_size) =
+        reinterpret_cast<decltype(set_process_information)>(
+            GetProcAddress(kernel32_module, "SetProcessInformation"));
+    // clang-format on
+    if (set_process_information) {
+      // PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, missing from older
+      // SDKs.
+      constexpr ULONG kIgnoreTimerResolution = 0x4;
+      PROCESS_POWER_THROTTLING_STATE throttling_state = {};
+      throttling_state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+      throttling_state.ControlMask = kIgnoreTimerResolution;
+      throttling_state.StateMask = 0;
+      if (!set_process_information(GetCurrentProcess(), ProcessPowerThrottling,
+                                   &throttling_state, sizeof(throttling_state))) {
+        REXLOG_WARN(
+            "Win32: could not opt out of timer resolution throttling (error {}); guest timers "
+            "may run slow while the window is not visible",
+            GetLastError());
+      }
+    }
+  }
+
   HMODULE ntdll_module = GetModuleHandleW(L"ntdll.dll");
   if (!ntdll_module) {
     return;

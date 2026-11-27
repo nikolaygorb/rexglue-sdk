@@ -62,21 +62,29 @@ namespace rex::codegen {
 // Vector Floating Point Arithmetic
 //=============================================================================
 
-bool build_vaddfp(BuilderContext& ctx) {
+// vD = vA op vB, with the NaN lanes of rex::ppc::vec_arith_result.
+static void emit_vec_fp_arith(BuilderContext& ctx, const char* simd_op) {
   ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("add");
+  const auto a = fmt::format("simde_mm_load_ps({}.f32)", ctx.v(ctx.insn.operands[1]));
+  const auto b = fmt::format("simde_mm_load_ps({}.f32)", ctx.v(ctx.insn.operands[2]));
+  ctx.println(
+      "\tsimde_mm_store_ps({0}.f32, rex::ppc::vec_arith_result(simde_mm_{1}_ps({2}, {3}), {2}, "
+      "{3}));",
+      ctx.v(ctx.insn.operands[0]), simd_op, a, b);
+}
+
+bool build_vaddfp(BuilderContext& ctx) {
+  emit_vec_fp_arith(ctx, "add");
   return true;
 }
 
 bool build_vsubfp(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("sub");
+  emit_vec_fp_arith(ctx, "sub");
   return true;
 }
 
 bool build_vmulfp128(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_binary("mul");
+  emit_vec_fp_arith(ctx, "mul");
   return true;
 }
 
@@ -122,68 +130,34 @@ bool build_vminfp(BuilderContext& ctx) {
   return true;
 }
 
+// vrefp, vrsqrtefp, vexptefp, vlogefp and their VMX128 forms: the console's
+// estimates, lane by lane (rex/ppc/estimates.h). Integer arithmetic on the
+// bits, so the result does not depend on the flush mode (a denormal input is
+// a zero, as with VSCR[NJ] set).
+static void emit_vec_estimate(BuilderContext& ctx, const char* estimate) {
+  ctx.println(
+      "\tsimde_mm_store_ps({}.f32, "
+      "rex::ppc::vec_estimate<rex::ppc::{}>(simde_mm_load_ps({}.f32)));",
+      ctx.v(ctx.insn.operands[0]), estimate, ctx.v(ctx.insn.operands[1]));
+}
+
 bool build_vrefp(BuilderContext& ctx) {
-  // TODO: see if we can use rcp safely
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_unary_expr("simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_load_ps({vA}.f32))");
+  emit_vec_estimate(ctx, "estimate_reciprocal");
   return true;
 }
 
 bool build_vrsqrtefp(BuilderContext& ctx) {
-  // TODO: see if we can use rsqrt safely
-  ctx.emit_set_flush_mode(true);
-  ctx.emit_vec_fp_unary_expr(
-      "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32)))");
+  emit_vec_estimate(ctx, "estimate_reciprocal_sqrt");
   return true;
 }
 
 bool build_vexptefp(BuilderContext& ctx) {
-  // SIMD exp2 estimate (~12-bit precision, matching PPC vexptefp spec)
-  // Algorithm: exp2(x) = 2^n * poly(f), where n = floor(x), f = x - n
-  auto vD = ctx.v(ctx.insn.operands[0]);
-  auto vA = ctx.v(ctx.insn.operands[1]);
-  ctx.emit_set_flush_mode(true);
-  ctx.println("\t{{");
-  ctx.println("\t\tsimde__m128 x = simde_mm_load_ps({}.f32);", vA);
-  // The exponent field only holds n in [-126, 127]: clamp x into that range
-  // (NaN passes through, max/min return the second operand) and fix up the
-  // out-of-range lanes after.
-  ctx.println(
-      "\t\tsimde__m128 xc = simde_mm_min_ps(simde_mm_set1_ps(127.99999f), "
-      "simde_mm_max_ps(simde_mm_set1_ps(-126.0f), x));");
-  ctx.println(
-      "\t\tsimde__m128 n = simde_mm_round_ps(xc, "
-      "SIMDE_MM_FROUND_TO_NEG_INF | SIMDE_MM_FROUND_NO_EXC);");
-  ctx.println("\t\tsimde__m128 f = simde_mm_sub_ps(xc, n);");
-  // 4th-order minimax polynomial for 2^f, f in [0,1), ~12-bit accuracy
-  ctx.println("\t\tsimde__m128 p = simde_mm_set1_ps(1.8775767e-3f);");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(8.9893397e-3f));");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(5.5826318e-2f));");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(2.4015361e-1f));");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(6.9315308e-1f));");
-  ctx.println("\t\tp = simde_mm_add_ps(simde_mm_mul_ps(p, f), simde_mm_set1_ps(1.0f));");
-  // Construct 2^n by adding n to the IEEE 754 exponent bias and shifting into place
-  ctx.println("\t\tsimde__m128i exp_bits = simde_mm_slli_epi32(");
-  ctx.println("\t\t\tsimde_mm_add_epi32(simde_mm_cvttps_epi32(n), simde_mm_set1_epi32(127)), 23);");
-  ctx.println("\t\tsimde__m128 r = simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits));");
-  // Below 2^-126 flush to 0 (non-Java mode), from 2^128 up +inf.
-  ctx.println(
-      "\t\tr = simde_mm_blendv_ps(r, simde_mm_setzero_ps(), "
-      "simde_mm_cmplt_ps(x, simde_mm_set1_ps(-126.0f)));");
-  ctx.println(
-      "\t\tr = simde_mm_blendv_ps(r, simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7F800000)), "
-      "simde_mm_cmpge_ps(x, simde_mm_set1_ps(128.0f)));");
-  ctx.println("\t\tsimde_mm_store_ps({}.f32, r);", vD);
-  ctx.println("\t}}");
+  emit_vec_estimate(ctx, "estimate_pow2");
   return true;
 }
 
 bool build_vlogefp(BuilderContext& ctx) {
-  // TODO: vectorize
-  ctx.emit_set_flush_mode(true);
-  for (size_t i = 0; i < 4; i++)
-    ctx.println("\t{}.f32[{}] = log2f({}.f32[{}]);", ctx.v(ctx.insn.operands[0]), i,
-                ctx.v(ctx.insn.operands[1]), i);
+  emit_vec_estimate(ctx, "estimate_log2");
   return true;
 }
 
@@ -191,13 +165,15 @@ bool build_vlogefp(BuilderContext& ctx) {
 // Vector Dot Products
 //=============================================================================
 
+// The console's fixed point sum by default; the float64 sum with
+// fast_dot_products (rex/ppc/intrinsics.h).
 bool build_vmsum3fp128(BuilderContext& ctx) {
-  emit_vec_fp_helper(ctx, "vec_msum3");
+  emit_vec_fp_helper(ctx, ctx.config().fastDotProducts ? "vec_msum3_fast" : "vec_msum3");
   return true;
 }
 
 bool build_vmsum4fp128(BuilderContext& ctx) {
-  emit_vec_fp_helper(ctx, "vec_msum4");
+  emit_vec_fp_helper(ctx, ctx.config().fastDotProducts ? "vec_msum4_fast" : "vec_msum4");
   return true;
 }
 
@@ -1167,18 +1143,16 @@ bool build_vpkd3d128(BuilderContext& ctx) {
       uint32_t mask = ctx.insn.operands[3];
       uint32_t shift = ctx.insn.operands[4];
 
-      // Pack the 4 floats to D3DCOLOR
+      // Pack the 4 floats to D3DCOLOR: 0 to 255 each (a NaN as 0), SAT for a
+      // lane outside.
       for (size_t i = 0; i < 4; i++) {
         constexpr size_t indices[] = {3, 0, 1, 2};
-        ctx.println("\t{}.u32[{}] = 0x404000FF;", ctx.v_temp(), i);
-        // Use !(x >= 3.0f) instead of (x < 3.0f) to properly clamp NaN to minimum
         ctx.println(
-            "\t{}.f32[{}] = !({}.f32[{}] >= 3.0f) ? 3.0f : ({}.f32[{}] > {}.f32[{}] ? {}.f32[{}] : "
-            "{}.f32[{}]);",
-            ctx.v_temp(), i, ctx.v(ctx.insn.operands[1]), i, ctx.v(ctx.insn.operands[1]), i,
-            ctx.v_temp(), i, ctx.v_temp(), i, ctx.v(ctx.insn.operands[1]), i);
-        ctx.println("\t{}.u32 {}= uint32_t({}.u8[{}]) << {};", ctx.temp(), i == 0 ? "" : "|",
-                    ctx.v_temp(), i * 4, indices[i] * 8);
+            "\t{}.u32[{}] = rex::ppc::pack_d3d_field({}.u32[{}], 0x40400000u, 0x404000FFu, "
+            "0x40400000u, ctx.vscr_sat);",
+            ctx.v_temp(), i, ctx.v(ctx.insn.operands[1]), i);
+        ctx.println("\t{}.u32 {}= ({}.u32[{}] & 0xFF) << {};", ctx.temp(), i == 0 ? "" : "|",
+                    ctx.v_temp(), i, indices[i] * 8);
       }
 
       // Handle mask operand:
@@ -1203,19 +1177,18 @@ bool build_vpkd3d128(BuilderContext& ctx) {
     {
       // Extract signed 16-bit values from floats and pack into one 32-bit word
       // floats are in form: 3.0f + X (stored as integer add to 3.0f representation 0x40400000)
-      // We need to saturate to signed 16-bit range [-32767, 32767] (NOT -32768, based on tests)
+      // We need to saturate to signed 16-bit range [-32767, 32767] (NOT -32768, based on tests);
+      // a NaN packs as 0x8000 and z and w have no field (no SAT from them).
       // NOTE: Guest element 0 is at array index 3, element 1 is at index 2 (reversed for host)
       // Element 0 (index 3) goes to HIGH word, element 1 (index 2) goes to LOW word
-      ctx.println("\t{}.s32 = {}.s32[3] - 0x40400000;", ctx.temp(), ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.s32 = {}.s32 > 32767 ? 32767 : ({}.s32 < -32767 ? -32767 : {}.s32);",
-                  ctx.temp(), ctx.temp(), ctx.temp(), ctx.temp());
-      ctx.println("\t{}.u32[0] = uint32_t(uint16_t({}.s32)) << 16;", ctx.v_temp(),
-                  ctx.temp());  // element 0 to high word
-      ctx.println("\t{}.s32 = {}.s32[2] - 0x40400000;", ctx.temp(), ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.s32 = {}.s32 > 32767 ? 32767 : ({}.s32 < -32767 ? -32767 : {}.s32);",
-                  ctx.temp(), ctx.temp(), ctx.temp(), ctx.temp());
-      ctx.println("\t{}.u32[0] |= uint16_t({}.s32);", ctx.v_temp(),
-                  ctx.temp());  // element 1 to low word
+      for (size_t i = 0; i < 2; i++) {
+        ctx.println(
+            "\t{}.u32[{}] = rex::ppc::pack_d3d_field({}.u32[{}], 0x403F8001u, 0x40407FFFu, "
+            "0x403F8000u, ctx.vscr_sat);",
+            ctx.v_temp(), i, ctx.v(ctx.insn.operands[1]), 3 - i);
+      }
+      ctx.println("\t{0}.u32[0] = (({0}.u32[0] & 0xFFFF) << 16) | ({0}.u32[1] & 0xFFFF);",
+                  ctx.v_temp());
       ctx.println("\t{}.u32[{}] = {}.u32[0];", ctx.v(ctx.insn.operands[0]), ctx.insn.operands[4],
                   ctx.v_temp());
       break;
@@ -1223,46 +1196,24 @@ bool build_vpkd3d128(BuilderContext& ctx) {
 
     case 2:  // NORMPACKED32 - pack 4 floats (in 3.0+X form) to 2:10:10:10 format (w:x:y:z)
     {
-      // Format: 2 bits for w (element 3), 10 bits each for x, y, z (elements 0, 1, 2)
-      // Input floats are in 3.0+X form where X is the integer to pack
-      // Algorithm: saturate float to range, then mask low bits to extract X
-      // Constants kPack2101010_* are defined in ppc/context.h
-      ctx.println("\t{}.u32[0] = 0;", ctx.v_temp());
-
-      // Pack x (10 bits, position 0-9) - Guest element 0 is at index 3
-      ctx.println(
-          "\t{}.f32 = {}.f32[3] < kPack2101010_Min10 ? kPack2101010_Min10 : ({}.f32[3] > "
-          "kPack2101010_Max10 ? kPack2101010_Max10 : {}.f32[3]);",
-          ctx.temp(), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[1]),
-          ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.u32[0] = {}.u32 & 0x3FF;", ctx.v_temp(), ctx.temp());
-
-      // Pack y (10 bits, position 10-19) - Guest element 1 is at index 2
-      ctx.println(
-          "\t{}.f32 = {}.f32[2] < kPack2101010_Min10 ? kPack2101010_Min10 : ({}.f32[2] > "
-          "kPack2101010_Max10 ? kPack2101010_Max10 : {}.f32[2]);",
-          ctx.temp(), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[1]),
-          ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.u32[0] |= ({}.u32 & 0x3FF) << 10;", ctx.v_temp(), ctx.temp());
-
-      // Pack z (10 bits, position 20-29) - Guest element 2 is at index 1
-      ctx.println(
-          "\t{}.f32 = {}.f32[1] < kPack2101010_Min10 ? kPack2101010_Min10 : ({}.f32[1] > "
-          "kPack2101010_Max10 ? kPack2101010_Max10 : {}.f32[1]);",
-          ctx.temp(), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[1]),
-          ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.u32[0] |= ({}.u32 & 0x3FF) << 20;", ctx.v_temp(), ctx.temp());
-
-      // Pack w (2 bits, position 30-31) - Guest element 3 is at index 0
-      ctx.println(
-          "\t{}.f32 = {}.f32[0] < kPack2101010_Min2 ? kPack2101010_Min2 : ({}.f32[0] > "
-          "kPack2101010_Max2 ? kPack2101010_Max2 : {}.f32[0]);",
-          ctx.temp(), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[1]),
-          ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.u32[0] |= ({}.u32 & 0x3) << 30;", ctx.v_temp(), ctx.temp());
-
-      ctx.println("\t{}.u32[{}] = {}.u32[0];", ctx.v(ctx.insn.operands[0]), ctx.insn.operands[4],
-                  ctx.v_temp());
+      // x, y, z: -511 to 511 (a NaN as 0x200), w: 0 to 3 (a NaN as 0); SAT for any lane
+      // outside. Guest element 0 (x) is at host index 3, element 3 (w) at index 0.
+      constexpr uint32_t kShift[] = {30, 20, 10, 0};
+      for (size_t i = 0; i < 4; i++) {
+        const bool w = i == 0;
+        ctx.println(
+            "\t{}.u32[{}] = rex::ppc::pack_d3d_field({}.u32[{}], 0x{:08X}u, 0x{:08X}u, "
+            "0x{:08X}u, ctx.vscr_sat);",
+            ctx.v_temp(), i, ctx.v(ctx.insn.operands[1]), i, w ? 0x40400000u : 0x403FFE01u,
+            w ? 0x40400003u : 0x404001FFu, w ? 0x40400000u : 0x403FFE00u);
+      }
+      ctx.println("\t{}.u32 = 0;", ctx.temp());
+      for (size_t i = 0; i < 4; i++) {
+        ctx.println("\t{}.u32 |= ({}.u32[{}] & 0x{:X}) << {};", ctx.temp(), ctx.v_temp(), i,
+                    i == 0 ? 0x3u : 0x3FFu, kShift[i]);
+      }
+      ctx.println("\t{}.u32[{}] = {}.u32;", ctx.v(ctx.insn.operands[0]), ctx.insn.operands[4],
+                  ctx.temp());
       break;
     }
 
@@ -1299,15 +1250,19 @@ bool build_vpkd3d128(BuilderContext& ctx) {
       // Pack 4 elements into 64 bits (2 words)
       // Guest element 0 goes to highest 16-bit position, element 3 to lowest
       // Output u16 index = (3-i) + 2*shift for element i
+      // -32767 to 32767 each (a NaN as 0x8000), SAT for any lane outside. All four
+      // fields are taken before the destination is written (it may be the source).
+      for (size_t i = 0; i < 4; i++) {
+        ctx.println(
+            "\t{}.u32[{}] = rex::ppc::pack_d3d_field({}.u32[{}], 0x403F8001u, 0x40407FFFu, "
+            "0x403F8000u, ctx.vscr_sat);",
+            ctx.v_temp(), i, ctx.v(ctx.insn.operands[1]), i);
+      }
       for (size_t i = 0; i < 4; i++) {
         size_t srcIdx = 3 - i;  // Guest element i is at host array index 3-i
         size_t dstIdx = (3 - i) + (2 * ctx.insn.operands[4]);  // Output also reversed
-        ctx.println("\t{}.s32 = {}.s32[{}] - 0x40400000;", ctx.temp(), ctx.v(ctx.insn.operands[1]),
-                    srcIdx);
-        ctx.println("\t{}.s32 = {}.s32 > 32767 ? 32767 : ({}.s32 < -32767 ? -32767 : {}.s32);",
-                    ctx.temp(), ctx.temp(), ctx.temp(), ctx.temp());
-        ctx.println("\t{}.u16[{}] = uint16_t({}.s32);", ctx.v(ctx.insn.operands[0]), dstIdx,
-                    ctx.temp());
+        ctx.println("\t{}.u16[{}] = uint16_t({}.u32[{}]);", ctx.v(ctx.insn.operands[0]), dstIdx,
+                    ctx.v_temp(), srcIdx);
       }
       break;
     }
@@ -1344,22 +1299,27 @@ bool build_vpkd3d128(BuilderContext& ctx) {
 
     case 6:  // NORMPACKED64 - pack 4 floats to 4:20:20:20 format
     {
-      // Format: 4 bits for w, 20 bits each for x, y, z (packed into 64 bits)
-      ctx.println("\t{}.u64[0] = 0;", ctx.v_temp());
-      // Pack x (20 bits, position 0-19)
-      ctx.println("\t{}.s32 = int32_t({}.f32[0]);", ctx.temp(), ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.u64[0] = uint64_t({}.s32 & 0xFFFFF);", ctx.v_temp(), ctx.temp());
-      // Pack y (20 bits, position 20-39)
-      ctx.println("\t{}.s32 = int32_t({}.f32[1]);", ctx.temp(), ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.u64[0] |= uint64_t({}.s32 & 0xFFFFF) << 20;", ctx.v_temp(), ctx.temp());
-      // Pack z (20 bits, position 40-59)
-      ctx.println("\t{}.s32 = int32_t({}.f32[2]);", ctx.temp(), ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.u64[0] |= uint64_t({}.s32 & 0xFFFFF) << 40;", ctx.v_temp(), ctx.temp());
-      // Pack w (4 bits, position 60-63)
-      ctx.println("\t{}.s32 = int32_t({}.f32[3]);", ctx.temp(), ctx.v(ctx.insn.operands[1]));
-      ctx.println("\t{}.u64[0] |= uint64_t({}.s32 & 0xF) << 60;", ctx.v_temp(), ctx.temp());
-      ctx.println("\t{}.u64[{}] = {}.u64[0];", ctx.v(ctx.insn.operands[0]),
-                  ctx.insn.operands[4] >> 1, ctx.v_temp());
+      // Format: 4 bits for w, 20 bits each for x, y, z (packed into 64 bits), the
+      // lanes in the 3.0 + X form like the other packs (the old code converted
+      // the float to an integer and took guest element 3 for x). x, y, z:
+      // -524287 to 524287 (a NaN as 0x80000), w: 0 to 15 (a NaN as 0); SAT for
+      // any lane outside. Guest element 0 (x) is at host index 3.
+      constexpr uint32_t kShift[] = {60, 40, 20, 0};
+      for (size_t i = 0; i < 4; i++) {
+        const bool w = i == 0;
+        ctx.println(
+            "\t{}.u32[{}] = rex::ppc::pack_d3d_field({}.u32[{}], 0x{:08X}u, 0x{:08X}u, "
+            "0x{:08X}u, ctx.vscr_sat);",
+            ctx.v_temp(), i, ctx.v(ctx.insn.operands[1]), i, w ? 0x40400000u : 0x40380001u,
+            w ? 0x4040000Fu : 0x4047FFFFu, w ? 0x40400000u : 0x40380000u);
+      }
+      ctx.println("\t{}.u64 = 0;", ctx.temp());
+      for (size_t i = 0; i < 4; i++) {
+        ctx.println("\t{}.u64 |= uint64_t({}.u32[{}] & 0x{:X}) << {};", ctx.temp(), ctx.v_temp(), i,
+                    i == 0 ? 0xFu : 0xFFFFFu, kShift[i]);
+      }
+      ctx.println("\t{}.u64[{}] = {}.u64;", ctx.v(ctx.insn.operands[0]), ctx.insn.operands[4] >> 1,
+                  ctx.temp());
       break;
     }
 
@@ -1391,6 +1351,9 @@ bool build_vupkd3d128(BuilderContext& ctx) {
       for (size_t i = 0; i < 2; i++) {
         ctx.println("\t{}.f32 = 3.0f;", ctx.temp());
         ctx.println("\t{}.s32 += {}.s16[{}];", ctx.temp(), ctx.v(ctx.insn.operands[1]), 1 - i);
+        // -32768 (3.0 - 2^-7, 0x403F8000) is the negative overflow, a quiet NaN on
+        // the console (xenia-canary's XMMUnpackSHORT_Overflow; test short2_3).
+        ctx.println("\tif ({}.u32 == 0x403F8000) {}.u32 = 0x7FC00000;", ctx.temp(), ctx.temp());
         ctx.println("\t{}.f32[{}] = {}.f32;", ctx.v_temp(), 3 - i, ctx.temp());
       }
       ctx.println("\t{}.f32[1] = 0.0f;", ctx.v_temp());
@@ -1459,6 +1422,8 @@ bool build_vupkd3d128(BuilderContext& ctx) {
         size_t dstIdx = 3 - i;  // Write to f32 indices 3, 2, 1, 0 (Guest elements 0, 1, 2, 3)
         ctx.println("\t{}.f32 = 3.0f;", ctx.temp());
         ctx.println("\t{}.s32 += {}.s16[{}];", ctx.temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
+        // -32768: a quiet NaN, as for NORMSHORT2.
+        ctx.println("\tif ({}.u32 == 0x403F8000) {}.u32 = 0x7FC00000;", ctx.temp(), ctx.temp());
         ctx.println("\t{}.f32[{}] = {}.f32;", ctx.v(ctx.insn.operands[0]), dstIdx, ctx.temp());
       }
       break;

@@ -26,11 +26,13 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/float_constants.h>
+#include <rex/graphics/util/register_writes.h>
 #include <rex/graphics/util/pipeline_wait.h>
 #include <rex/graphics/util/smaa_textures.h>
 #include <rex/graphics/xenos.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/ui/d3d12/dred.h>
 #include <rex/memory/utils.h>
 #include <rex/thread/mutex.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
@@ -38,6 +40,12 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(d3d12_max_frames_in_flight, 0, "GPU/D3D12",
+                     "How many frames the CPU may queue ahead of the GPU, 1 to 3; 0: 3 (canary). "
+                     "1 keeps the GPU at most one frame behind (Fable II flicker when the GPU "
+                     "falls behind), at some frame rate when the GPU is the limit")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
@@ -1727,6 +1735,12 @@ void D3D12CommandProcessor::ShutdownContext() {
 void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   // Only the shader constant blocks are handled here
   // (CommandProcessor::IsPlainRegister relies on that for the other registers).
+  // A constant written with the value it has changes nothing that depends on it
+  // (the constant buffers, the texture bindings, the vertex buffer residency).
+  if (elide_unchanged_registers_ && IsShaderConstantRegister(index) &&
+      register_file_->values[index] == value) {
+    return;
+  }
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -1791,12 +1805,25 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     return (usage_map[last_word] & last_mask) != 0;
   };
 
+  // With gpu_elide_unchanged_registers only the values that change are stored,
+  // and only the range between the first and the last changed one counts.
+  uint32_t first_changed = 0, last_changed = num_registers - 1;
+
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    if (elide_unchanged_registers_) {
+      if (!StoreChangedRegisters(register_file_->values + start_index, base, num_registers,
+                                 first_changed, last_changed)) {
+        return;
+      }
+    } else {
+      memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    }
     if (frame_open_) {
-      uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
-      uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      uint32_t first_float_constant =
+          (start_index + first_changed - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      uint32_t last_float_constant =
+          (start_index + last_changed - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
       if (first_float_constant < 256) {
         uint32_t last_vertex_constant = std::min(last_float_constant, 255u);
         if (range_has_any_constant_usage(current_float_constant_map_vertex_, first_float_constant,
@@ -1819,17 +1846,35 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    if (elide_unchanged_registers_) {
+      if (!StoreChangedRegisters(register_file_->values + start_index, base, num_registers,
+                                 first_changed, last_changed)) {
+        return;
+      }
+    } else {
+      memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    }
     cbuffer_binding_bool_loop_.up_to_date = false;
     return;
   }
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    // The fetch constant buffer, the texture bindings and the vertex buffer
+    // residency only depend on the values: with elision only the dwords that
+    // change invalidate them (the Vulkan command processor always compares).
+    if (elide_unchanged_registers_) {
+      if (!StoreChangedRegisters(register_file_->values + start_index, base, num_registers,
+                                 first_changed, last_changed)) {
+        return;
+      }
+    } else {
+      memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    }
     cbuffer_binding_fetch_.up_to_date = false;
-    uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t first_fetch_dword =
+        start_index + first_changed - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t last_fetch_dword = start_index + last_changed - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
@@ -2542,6 +2587,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+  // No sample passes and nothing is exported: no effect (not a VIZ survey,
+  // whose result is measured). Upstream rexglue 11539bc1.
+  if (is_rasterization_done && !memexport_used && !viz_survey &&
+      draw_util::IsDepthTestNeverPassing(regs)) {
+    return true;
+  }
 
   // A draw contributing to its VIZ ID without the kill bit counts
   // at hi-Z before the pixel shader can reject anything.
@@ -2673,13 +2724,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         return false;
       }
     }
-    // Waits only while the creation is pending, not for one that failed.
+    // Waits only while the creation is pending, not for one that failed. A draw
+    // that may never be redone (memexport, a surface at most 2 tiles wide)
+    // waits until the creation ends (xenia-canary f9431eb95).
     WaitForPipelineCreation(
         [&]() {
           return pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) != nullptr ||
                  !pipeline_cache_->IsD3D12PipelineCreationPendingByHandle(pipeline_handle);
         },
-        REXCVAR_GET(async_pipeline_wait_ms));
+        PipelineWaitBudgetMs(memexport_used || draw_util::IsAsyncPipelineWaitNeededForDraw(regs),
+                             REXCVAR_GET(async_pipeline_wait_ms)));
     if (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
       // Pipeline not ready (still being created asynchronously) - skip the
       // draw.
@@ -3781,35 +3835,8 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
   REXGPU_ERROR("D3D12 device removed: HRESULT 0x{:08X} - {}", static_cast<unsigned>(reason),
                reason_str);
 
-  Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred;
-  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
-    return;
-  }
+  ui::d3d12::LogDredDeviceLoss(device);
 
-  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs = {};
-  if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
-    for (const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode; node;
-         node = node->pNext) {
-      if (!node->pLastBreadcrumbValue || !node->pCommandHistory ||
-          *node->pLastBreadcrumbValue == 0) {
-        continue;
-      }
-      REXGPU_ERROR("DRED breadcrumb: completed {} of {} ops", *node->pLastBreadcrumbValue,
-                   node->BreadcrumbCount);
-      uint32_t last = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
-      uint32_t start = last > 3 ? last - 3 : 0;
-      uint32_t end = std::min(last + 1, node->BreadcrumbCount);
-      for (uint32_t i = start; i < end; i++) {
-        REXGPU_ERROR("  [{}] op type {}{}", i, static_cast<int>(node->pCommandHistory[i]),
-                     i == last ? " <-- FAULT" : "");
-      }
-    }
-  }
-
-  D3D12_DRED_PAGE_FAULT_OUTPUT page_fault = {};
-  if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&page_fault)) && page_fault.PageFaultVA != 0) {
-    REXGPU_ERROR("DRED page fault at VA 0x{:016X}", page_fault.PageFaultVA);
-  }
 }
 
 bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
@@ -3842,8 +3869,19 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionCompletion(
-      is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames] : 0);
+  // The frame ring keeps kQueueFrames slots; awaiting a more recent closed
+  // frame only limits how far the CPU runs ahead (d3d12_max_frames_in_flight,
+  // as vulkan_max_frames_in_flight; Fable 2 gpu_sync_at_frame_start is 1).
+  uint64_t await_submission = 0;
+  if (is_opening_frame) {
+    const int32_t configured_depth = REXCVAR_GET(d3d12_max_frames_in_flight);
+    const uint32_t queue_depth = configured_depth > 0
+                                     ? std::min(uint32_t(configured_depth), uint32_t(kQueueFrames))
+                                     : uint32_t(kQueueFrames);
+    await_submission =
+        closed_frame_submissions_[(frame_current_ + kQueueFrames - queue_depth) % kQueueFrames];
+  }
+  CheckSubmissionCompletion(await_submission);
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
   // open the frame.
@@ -3900,6 +3938,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
+    elide_unchanged_registers_ = REXCVAR_GET(gpu_elide_unchanged_registers);
 
     // Reset bindings that depend on the data stored in the pools.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));

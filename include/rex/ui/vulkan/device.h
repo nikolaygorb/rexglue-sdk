@@ -13,9 +13,11 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/gpu_breadcrumbs.h>
 
 namespace rex {
 namespace ui {
@@ -183,6 +185,10 @@ class VulkanDevice {
     bool customBorderColorWithoutFormat = false;
     uint32_t maxCustomBorderColorSamplers = 0;
 
+    // VK_KHR_push_descriptor (#81)
+
+    uint32_t maxPushDescriptors = 0;
+
     // VK_EXT_robustness2
 
     bool nullDescriptor = false;
@@ -213,6 +219,8 @@ class VulkanDevice {
   // the Vulkan API they were promoted to it supported (with the
   // `ext_major_minor_` prefix rather than `ext_`).
   struct Extensions {
+    bool ext_AMD_buffer_marker = false;
+    bool ext_NV_device_diagnostic_checkpoints = false;
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
@@ -227,6 +235,7 @@ class VulkanDevice {
     bool ext_1_2_EXT_host_query_reset = false;          // promoted to 1.2
     bool ext_EXT_conditional_rendering = false;         // #82
     bool ext_EXT_depth_bias_control = false;            // #284
+    bool ext_KHR_push_descriptor = false;               // #81
     // Has optional features not implied by this being true.
     bool ext_EXT_custom_border_color = false;
     // Has optional features not implied by this being true.
@@ -246,6 +255,9 @@ class VulkanDevice {
   VkDevice device() const { return device_; }
 
   struct Functions {
+    PFN_vkCmdWriteBufferMarkerAMD vkCmdWriteBufferMarkerAMD = nullptr;
+    PFN_vkCmdSetCheckpointNV vkCmdSetCheckpointNV = nullptr;
+    PFN_vkGetQueueCheckpointDataNV vkGetQueueCheckpointDataNV = nullptr;
 #define XE_UI_VULKAN_FUNCTION(name) PFN_##name name = nullptr;
 #define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
   PFN_##core_name core_name = nullptr;
@@ -266,6 +278,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_ext_conditional_rendering.inc>
     // VK_EXT_depth_bias_control (#284)
 #include <rex/ui/vulkan/functions/device_ext_depth_bias_control.inc>
+    // VK_KHR_push_descriptor (#81)
+#include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };
@@ -330,15 +344,46 @@ class VulkanDevice {
     uint32_t host_visible = 0b0;
     uint32_t host_coherent = 0b0;
     uint32_t host_cached = 0b0;
+    // Device-local and host-visible in a heap larger than 256 MiB: the whole
+    // video memory mapped for the CPU (resizable BAR / Smart Access Memory),
+    // or an integrated GPU's memory. The 256 MiB BAR window without it isn't.
+    uint32_t device_local_host_visible_large = 0b0;
   };
 
   const MemoryTypes& memory_types() const { return memory_types_; }
 
+  // Intel XeSS's device extensions and features are enabled (ui/vulkan/xess.h:
+  // GPU emulation devices, with libxess.dll next to the executable); else why not.
+  bool xess_ready() const { return xess_ready_; }
+  const std::string& xess_note() const { return xess_note_; }
+  // NVIDIA NGX's device extensions and features are enabled (ui/vulkan/ngx.h):
+  // DLSS on GPU emulation devices, DLSS Frame Generation on presentation
+  // devices, where NGX supports the GPU and driver; else why not.
+  bool ngx_sr_ready() const { return ngx_sr_ready_; }
+  const std::string& ngx_sr_note() const { return ngx_sr_note_; }
+  bool ngx_fg_ready() const { return ngx_fg_ready_; }
+  const std::string& ngx_fg_note() const { return ngx_fg_note_; }
+
   // Returns whether a device loss has been observed for the first time, so, for
   // instance, logging of the device loss can be limited only to the location
   // where it was first caught.
-  bool SetLost() noexcept { return !lost_.exchange(true, std::memory_order_acq_rel); }
+  bool SetLost() noexcept;
   bool IsLost() const noexcept { return lost_.load(std::memory_order_acquire); }
+
+  uint32_t RecordBreadcrumb(const ::rex::ui::GpuBreadcrumb& entry) const;
+  void EmitBreadcrumb(VkCommandBuffer command_buffer, uint32_t sequence) const;
+  // Whether breadcrumbs are recorded (a marker or checkpoint mechanism).
+  bool HasBreadcrumbs() const { return breadcrumb_mapping_ || breadcrumb_nv_; }
+  // Whether the second marker, written once a draw's work before it finished,
+  // is available (VK_AMD_buffer_marker only) and wanted
+  // (gpu_device_lost_setup_breadcrumbs).
+  bool CanMarkBreadcrumbSetup() const;
+  // The sequence number the next RecordBreadcrumb gives.
+  uint32_t NextBreadcrumb() const { return breadcrumb_trail_.Next(); }
+  // The second marker (ReIGlue 1100): `sequence` is the draw recorded next.
+  void EmitSetupBreadcrumb(VkCommandBuffer command_buffer, uint32_t sequence) const;
+  // NV checkpoint queries are legal only after an actual VK_ERROR_DEVICE_LOST.
+  void LogBreadcrumbs(bool query_lost_device = true) const;
 
   VkResult SubmitAndUpdateLost(const VkQueue queue, const uint32_t submit_count,
                                const VkSubmitInfo* const submits, const VkFence fence) {
@@ -351,6 +396,8 @@ class VulkanDevice {
 
  private:
   explicit VulkanDevice(const VulkanInstance* vulkan_instance, VkPhysicalDevice physical_device);
+  void InitializeBreadcrumbs();
+  void DestroyBreadcrumbs();
 
   const VulkanInstance* vulkan_instance_ = nullptr;
   VkPhysicalDevice physical_device_ = nullptr;
@@ -368,7 +415,17 @@ class VulkanDevice {
 
   MemoryTypes memory_types_;
 
+  bool xess_ready_ = false;
+  std::string xess_note_;
+  bool ngx_sr_ready_ = false, ngx_fg_ready_ = false;
+  std::string ngx_sr_note_, ngx_fg_note_;
+
   std::atomic<bool> lost_{false};
+  mutable ::rex::ui::GpuBreadcrumbTrail breadcrumb_trail_;
+  VkBuffer breadcrumb_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory breadcrumb_memory_ = VK_NULL_HANDLE;
+  void* breadcrumb_mapping_ = nullptr;
+  bool breadcrumb_nv_ = false;
 };
 
 }  // namespace vulkan

@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstring>
 #include <queue>
 
@@ -96,6 +97,14 @@ class XSocket : public XObject {
   uint64_t native_handle() const { return native_handle_; }
   uint16_t bound_port() const { return bound_port_; }
 
+  // The host port a bind to guest_port takes: 1-1023 need privileges on a
+  // POSIX host (and under Wine on one), so they move 10000 up; 0 (any free
+  // port) and 1024 up stay. xenia-canary XSocket::Bind, upstream rexglue PR
+  // #589.
+  static constexpr uint16_t HostPortForBind(uint16_t guest_port) {
+    return guest_port > 0 && guest_port < 1024 ? uint16_t(guest_port + 10000) : guest_port;
+  }
+
   X_STATUS Initialize(AddressFamily af, Type type, Protocol proto);
   X_STATUS Close();
 
@@ -140,6 +149,16 @@ class XSocket : public XObject {
 
   bool bound_ = false;  // Explicitly bound to an IP address?
   uint16_t bound_port_ = 0;
+  // The host socket was seen with a local port (bound, or bound implicitly by
+  // a send): UnboundDatagramReceive checks only until then.
+  std::atomic<bool> bound_seen_{false};
+
+  // A receive on a datagram socket that was never bound fails with WSAEINVAL
+  // on the console and on Windows; a POSIX host (and Wine over one) binds it
+  // on the fly and the receive waits for data that can't come. Sets the
+  // host's error and returns true for such a socket. Upstream rexglue PR
+  // #596.
+  bool UnboundDatagramReceive();
 
   bool broadcast_socket_ = false;
 

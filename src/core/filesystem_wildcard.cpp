@@ -62,50 +62,67 @@ bool WildcardRule::Check(const std::string_view lower, std::string::size_type* o
   return false;
 }
 
+// Matching model from rexglue/rexglue-sdk 32d2c0c8 (Tom Clay, BSD 3-Clause).
+// Copyright (c) 2026 Tom Clay. All rights reserved.
 void WildcardEngine::PreparePattern(const std::string_view pattern) {
-  rules_.clear();
-
-  WildcardFlags flags(WildcardFlags::FIRST);
-  size_t n = 0;
-  size_t last = 0;
-  while ((n = pattern.find_first_of("*?", last)) != pattern.npos) {
-    if (last != n) {
-      std::string str_str(pattern.substr(last, n - last));
-      rules_.push_back(WildcardRule(str_str, flags));
-    }
-    if (pattern[n] == '?') {
-      auto end = pattern.find_first_not_of('?', n + 1);
-      auto count = end == pattern.npos ? (pattern.size() - n) : (end - n);
-      rules_.push_back(WildcardRule(pattern.substr(n, count), WildcardFlags::ANY));
-      last = n + count;
-    } else if (pattern[n] == '*') {
-      last = n + 1;
-    } else {
-      assert_always();
-    }
-    flags = WildcardFlags();
-  }
-  if (last != pattern.size()) {
-    std::string str_str(pattern.substr(last));
-    rules_.push_back(
-        WildcardRule(str_str, last ? WildcardFlags::LAST : WildcardFlags::FIRST_AND_LAST));
-  }
+  pattern_ = rex::string::utf8_lower_ascii(pattern == "*.*" ? "*" : pattern);
 }
 
 void WildcardEngine::SetRule(const std::string_view pattern) {
   PreparePattern(pattern);
 }
 
-bool WildcardEngine::Match(const std::string_view str) const {
-  std::string str_lc = rex::string::utf8_lower_ascii(str);
-  std::string::size_type offset(0);
-  for (const auto& rule : rules_) {
-    if (!(rule.Check(str_lc, &offset))) {
-      return false;
-    }
+bool WildcardEngine::Match(const std::string_view name) const {
+  if (pattern_.empty()) {
+    return true;
   }
-
-  return true;
+  const std::string lower = rex::string::utf8_lower_ascii(name);
+  const size_t last_dot = lower.rfind('.');
+  const size_t count = pattern_.size();
+  std::vector<bool> active(count + 1);
+  std::vector<bool> next(count + 1);
+  active[0] = true;
+  for (size_t n = 0;; ++n) {
+    const bool at_end = n == lower.size();
+    const char c = at_end ? '\0' : lower[n];
+    for (size_t p = 0; p < count; ++p) {
+      const char token = pattern_[p];
+      if (active[p] && (token == '*' || token == '<' || (token == '>' && (at_end || c == '.')) ||
+                        (token == '"' && at_end))) {
+        active[p + 1] = true;
+      }
+    }
+    if (at_end) {
+      return active[count];
+    }
+    std::ranges::fill(next, false);
+    for (size_t p = 0; p < count; ++p) {
+      if (!active[p]) {
+        continue;
+      }
+      switch (pattern_[p]) {
+        case '*':
+          next[p] = true;
+          break;
+        case '<':
+          next[p] = next[p] || c != '.' || n != last_dot;
+          break;
+        case '?':
+          next[p + 1] = true;
+          break;
+        case '>':
+          next[p + 1] = next[p + 1] || c != '.';
+          break;
+        case '"':
+          next[p + 1] = next[p + 1] || c == '.';
+          break;
+        default:
+          next[p + 1] = next[p + 1] || pattern_[p] == c;
+          break;
+      }
+    }
+    std::swap(active, next);
+  }
 }
 
 }  // namespace rex::filesystem

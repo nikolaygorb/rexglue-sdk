@@ -284,8 +284,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // UINT32_MAX when the draw is outside an active ZPD segment, which is used
     // as a skip writing sentinel to the counter buffer.
     uint32_t zpd_counter_index;
+    // One bit per texture fetch constant: a stacked texture whose layer
+    // coordinate wraps instead of being clamped (stacked_texture_layer_wrap,
+    // texture_util::IsStackedLayerWrapped).
+    uint32_t textures_stacked_layer_wrap;
     // Align for std140.
-    uint32_t color_exp_bias_padding[3];
+    uint32_t color_exp_bias_padding[2];
 
     float color_exp_bias[4];
 
@@ -353,6 +357,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // 0 when it's in the viewport.
     float param_gen_window_offset[2];
     uint32_t param_gen_window_offset_padding[2];
+
+    // Object motion capture (SetMotionCapture): a mask other than 0 stores the
+    // host clip position of each vertex at motion_capture_base + (host vertex
+    // index & mask), 5 dwords (xyzw bits, then (index & 0xFFFFFF) | tag).
+    uint32_t motion_capture_base;
+    uint32_t motion_capture_mask;
+    uint32_t motion_capture_tag;
+    uint32_t motion_capture_padding;
   };
 
   enum ConstantBuffer : uint32_t {
@@ -462,7 +474,30 @@ class SpirvShaderTranslator : public ShaderTranslator {
         precise_interpolation_(REXCVAR_GET(precise_interpolation)),
         draw_resolution_scale_x_(draw_resolution_scale_x ? draw_resolution_scale_x : 1),
         draw_resolution_scale_y_(draw_resolution_scale_y ? draw_resolution_scale_y : 1),
+        draw_resolution_scale4_x_(draw_resolution_scale_x_ * 4),
+        draw_resolution_scale4_y_(draw_resolution_scale_y_ * 4),
         edram_tile_count_(edram_tile_count) {}
+
+  // A draw resolution scale in quarters (4 = 1x, 6 = 1.5x), for a renderer
+  // with host render targets that scales by fractions (the native renderer);
+  // call before translating. The pixel position (ps_param_gen), the memory
+  // export of one host pixel per guest pixel and the texel steps of
+  // resolution-scaled textures follow it. Not for fragment shader interlock,
+  // whose EDRAM layout takes the whole scale given at construction.
+  void SetDrawResolutionScale4(uint32_t scale4_x, uint32_t scale4_y) {
+    draw_resolution_scale4_x_ = scale4_x >= 4 ? scale4_x : 4;
+    draw_resolution_scale4_y_ = scale4_y >= 4 ? scale4_y : 4;
+  }
+  // Object motion (the native renderer's scene frames): host vertex shaders
+  // (HostVertexShaderType kVertex) store their final position into the
+  // storage buffer at kDescriptorSetSharedMemoryAndEdram binding
+  // kMotionCaptureBinding while the motion_capture_mask system constant is not
+  // 0. Needs vertexPipelineStoresAndAtomics; call before translating.
+  static constexpr uint32_t kMotionCaptureBinding = 3;
+  void SetMotionCapture(bool enabled) {
+    motion_capture_ = enabled && features_.vertex_pipeline_stores_and_atomics;
+  }
+  bool motion_capture() const { return motion_capture_; }
 
   uint64_t GetDefaultVertexShaderModification(
       uint32_t dynamic_addressable_register_count,
@@ -828,6 +863,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
                           spv::Id is_all_signed);
 
   spv::Id LoadMsaaSamplesFromFlags();
+  // Whether the stacked texture of the fetch constant wraps its layer
+  // coordinate (a bool from textures_stacked_layer_wrap).
+  spv::Id LoadStackedLayerWrap(uint32_t fetch_constant_index);
   // Whether it's possible and worth skipping running the translated shader for
   // 2x2 quads.
   bool FSI_IsDepthStencilEarly() const {
@@ -841,8 +879,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // present at all, must be a bool (if it's NoResult, 32bpp will be assumed).
   spv::Id FSI_AddSampleOffset(spv::Id sample_0_address, uint32_t sample_index,
                               spv::Id is_64bpp = spv::NoResult);
-  // Updates main_fsi_sample_mask_. Must be called outside non-uniform control
-  // flow because of taking derivatives of the fragment depth.
+  // Updates main_fsi_sample_mask_. Unless the shader writes oDepth, tests the
+  // depth and derivatives taken at the start of the shader.
   void FSI_DepthStencilTest(spv::Id msaa_samples, bool sample_mask_potentially_narrowed_previouly);
   // Adds the selected depth/stencil outcomes to the active ZPD counter slot.
   void FSI_AddMSAASamplesToZPD(bool count_passed, bool count_failed);
@@ -876,17 +914,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
   bool native_2x_msaa_with_attachments_;
   bool native_2x_msaa_no_attachments_;
 
-  // Scale of the draw being translated. All position-dependent paths use
-  // these. Only fetch offset scaling uses draw_resolution_scale_x_/y_ directly.
-  uint32_t GetCurrentDrawResolutionScaleX() const {
+  // Scale of the draw being translated, in quarters (SetDrawResolutionScale4).
+  // All position-dependent paths use these. Only fetch offset scaling uses
+  // draw_resolution_scale4_x_/y_ directly (it follows the textures' scale),
+  // and interlock's EDRAM layout the whole draw_resolution_scale_x_/y_.
+  uint32_t GetCurrentDrawResolutionScale4X() const {
     return is_pixel_shader() && GetSpirvShaderModification().pixel.resolution_scale_native
-               ? 1
-               : draw_resolution_scale_x_;
+               ? 4
+               : draw_resolution_scale4_x_;
   }
-  uint32_t GetCurrentDrawResolutionScaleY() const {
+  uint32_t GetCurrentDrawResolutionScale4Y() const {
     return is_pixel_shader() && GetSpirvShaderModification().pixel.resolution_scale_native
-               ? 1
-               : draw_resolution_scale_y_;
+               ? 4
+               : draw_resolution_scale4_y_;
   }
 
   // For safety with different drivers (even though fragment shader interlock in
@@ -903,8 +943,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // precise_interpolation - interpolate pixel shader inputs manually from
   // per-vertex values when fragment_shader_barycentric is supported.
   bool precise_interpolation_;
+  // SetMotionCapture.
+  bool motion_capture_ = false;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  // In quarters: draw_resolution_scale_x_ * 4 unless SetDrawResolutionScale4.
+  uint32_t draw_resolution_scale4_x_;
+  uint32_t draw_resolution_scale4_y_;
   uint32_t edram_tile_count_;
 
   // Is currently writing the empty depth-only pixel shader, such as for depth
@@ -1014,6 +1059,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdram32bppTilePitchDwordsScaled,
     kSystemConstantEdramDepthBaseDwordsScaled,
     kSystemConstantZpdCounterIndex,
+    kSystemConstantTexturesStackedLayerWrap,
     kSystemConstantColorExpBias,
     kSystemConstantEdramPolyOffsetFrontScale,
     kSystemConstantEdramPolyOffsetBackScale,
@@ -1031,6 +1077,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramBlendConstant,
     kSystemConstantTextureIntegerScaleBits,
     kSystemConstantParamGenWindowOffset,
+    kSystemConstantMotionCaptureBase,
+    kSystemConstantMotionCaptureMask,
+    kSystemConstantMotionCaptureTag,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
@@ -1040,6 +1089,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id buffers_shared_memory_;
   spv::Id buffer_edram_;
   spv::Id buffer_zpd_counter_;
+  spv::Id buffer_motion_capture_ = spv::NoResult;
 
   // Not using combined images and samplers because
   // maxPerStageDescriptorSamplers is often lower than
@@ -1107,7 +1157,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   std::array<spv::Id, xenos::kMaxColorRenderTargets> output_or_var_fragment_data_;
   // For host render targets and only when needed - float.
   spv::Id output_fragment_depth_;
-  // Raster depth and derivatives captured early for the host RT decal path.
+  // Raster depth and derivatives taken at the start of the shader for the host
+  // RT decal path and the FSI depth / stencil test.
   spv::Id main_fbo_depth_unbiased_;
   std::array<spv::Id, 2> main_fbo_depth_derivatives_;
   // For host render targets and only when needed - int[1].

@@ -16,9 +16,11 @@
 
 #if REX_HAS_D3D12
 #include <rex/graphics/d3d12/graphics_system.h>
+#include <rex/graphics/d3d12/null_graphics_system.h>
 #endif
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
+#include <rex/graphics/vulkan/null_graphics_system.h>
 #endif
 #if REX_HAS_D3D11
 #include <rex/graphics/d3d11/graphics_system.h>
@@ -41,6 +43,19 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
   }
 
   std::string_view backend = info->backend ? info->backend : "any";
+  // No GPU emulation (rex/graphics/null_command_processor.h), only by name,
+  // never for "any". "null" takes Vulkan when the plugin has it (the native
+  // renderer's API on every platform), else Direct3D 12.
+#if REX_HAS_VULKAN
+  if (backend == "null" || backend == "null-vulkan") {
+    return new rex::graphics::vulkan::VulkanNullGraphicsSystem();
+  }
+#endif
+#if REX_HAS_D3D12
+  if (backend == "null" || backend == "null-d3d12") {
+    return new rex::graphics::d3d12::D3D12NullGraphicsSystem();
+  }
+#endif
 #if REX_HAS_D3D11
   // Experimental: only when asked for by name, never for "any".
   if (backend == "d3d11") {

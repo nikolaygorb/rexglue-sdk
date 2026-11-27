@@ -25,7 +25,9 @@
 using namespace rex::graphics;
 
 // Found by shader_dxbc_fuzzer: the instruction range of an exec was read
-// without checking it against the microcode size.
+// without checking it against the microcode size. The instructions past the
+// end are skipped and the rest of the shader is used, as on a real title (FH1
+// has such a pixel shader): the translation stays valid.
 TEST_CASE("An exec past the end of the microcode is not read", "[graphics][shader]") {
   // One control flow pair, so one instruction slot: exece at slot 1, six ALU
   // instructions, then a nop.
@@ -41,8 +43,8 @@ TEST_CASE("An exec past the end of the microcode is not read", "[graphics][shade
   DxbcShaderTranslator translator(rex::ui::GraphicsProvider::GpuVendorID::kNvidia, false, false);
   Shader::Translation* translation = shader.GetOrCreateTranslation(
       translator.GetDefaultVertexShaderModification(shader.GetDynamicAddressableRegisterCount(0)));
-  CHECK_FALSE(translator.TranslateAnalyzedShader(*translation));
-  CHECK_FALSE(translation->is_valid());
+  CHECK(translator.TranslateAnalyzedShader(*translation));
+  CHECK(translation->is_valid());
 }
 
 namespace {

@@ -189,6 +189,12 @@ class SharedMemory {
 
   // Mark the memory range as updated and protect it.
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu);
+  // MakeRangeValid(start, length, false) before an upload's copy, except
+  // where every page of the range is valid already and not written by the GPU:
+  // FilterUnchangedUploads made those valid and protected for its comparison
+  // (the changed ones are then uploaded), and no write has invalidated one
+  // since, so they are protected still.
+  void MakeUploadRangeValid(uint32_t start, uint32_t length);
 
   // Hot pages (shared_memory_hot_pages): pages the CPU rewrites every frame,
   // such as dynamic vertex data, are not write-protected. Whenever they are

@@ -9,24 +9,34 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/vulkan/ngx.h>
 #include <rex/ui/vulkan/presenter.h>
+#include <rex/ui/vulkan/xess.h>
 
 #if REX_PLATFORM_MAC
 #include "vulkan_moltenvk.h"
 #endif
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
+REXCVAR_DEFINE_BOOL(vulkan_validation_sync, false, "UI/Vulkan",
+                    "With vulkan_validation_enabled: also the layer's synchronization validation "
+                    "(a read or write of an image or buffer without the barrier it needs after "
+                    "another one; on any GPU, very slow)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 namespace ui {
@@ -138,9 +148,18 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   // #395.
   requested_extensions.emplace("VK_KHR_portability_enumeration",
                                &vulkan_instance->extensions_.ext_KHR_portability_enumeration);
+  // #248, provided by the validation layer.
+  const bool validation_sync = try_enable_validation && REXCVAR_GET(vulkan_validation_sync);
+  if (validation_sync) {
+    requested_extensions.emplace("VK_EXT_validation_features",
+                                 &vulkan_instance->extensions_.ext_EXT_validation_features);
+  }
   if (with_surface) {
     // #1.
     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
+    // #120. Required by the device extension VK_EXT_full_screen_exclusive.
+    requested_extensions.emplace("VK_KHR_get_surface_capabilities2",
+                                 &vulkan_instance->extensions_.ext_KHR_get_surface_capabilities2);
 #ifdef VK_USE_PLATFORM_XCB_KHR
     // #6.
     requested_extensions.emplace("VK_KHR_xcb_surface",
@@ -166,6 +185,29 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     requested_extensions.emplace("VK_EXT_metal_surface",
                                  &vulkan_instance->extensions_.ext_EXT_metal_surface);
 #endif
+  }
+  // Intel XeSS (ui/vulkan/xess.h), when libxess.dll is next to the executable:
+  // its extensions, so a device of this instance can run it.
+  std::vector<const char*> xess_extensions;
+  uint32_t xess_api_version = 0;
+  const bool xess_wanted =
+      XessInstanceRequirements(xess_extensions, xess_api_version, vulkan_instance->xess_note_);
+  std::unique_ptr<bool[]> xess_extension_enabled(new bool[xess_extensions.size() + 1]());
+  for (size_t i = 0; i < xess_extensions.size(); ++i) {
+    // Already requested by the SDK: tracked by its own flag.
+    if (!requested_extensions.emplace(xess_extensions[i], &xess_extension_enabled[i]).second) {
+      xess_extension_enabled[i] = true;
+    }
+  }
+  // NVIDIA NGX (ui/vulkan/ngx.h: DLSS, DLSS Frame Generation), when its DLLs
+  // are next to the executable: its extensions likewise.
+  std::vector<const char*> ngx_extensions;
+  const bool ngx_wanted = ngx::InstanceRequirements(ngx_extensions, vulkan_instance->ngx_note_);
+  std::unique_ptr<bool[]> ngx_extension_enabled(new bool[ngx_extensions.size() + 1]());
+  for (size_t i = 0; i < ngx_extensions.size(); ++i) {
+    if (!requested_extensions.emplace(ngx_extensions[i], &ngx_extension_enabled[i]).second) {
+      ngx_extension_enabled[i] = true;
+    }
   }
 
   std::vector<const char*> enabled_extensions;
@@ -273,10 +315,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
         // retrieve different results if a pLayerName is available in one call
         // but not in another."
         while (true) {
+          // The layer's own count (the implementation's was asked before:
+          // then a layer with more extensions never got all of them).
           uint32_t supported_layer_extension_count = 0;
           const VkResult get_supported_layer_extension_count_result =
-              ifn.vkEnumerateInstanceExtensionProperties(nullptr, &supported_layer_extension_count,
-                                                         nullptr);
+              ifn.vkEnumerateInstanceExtensionProperties(
+                  available_layer.layerName, &supported_layer_extension_count, nullptr);
           if (get_supported_layer_extension_count_result != VK_SUCCESS &&
               get_supported_layer_extension_count_result != VK_INCOMPLETE) {
             got_layer_extensions = false;
@@ -361,6 +405,17 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   instance_create_info.ppEnabledLayerNames = enabled_layers.data();
   instance_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
   instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+  // vulkan_validation_sync: the layer's synchronization validation.
+  const VkValidationFeatureEnableEXT validation_feature_enables[] = {
+      VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT};
+  VkValidationFeaturesEXT validation_features = {};
+  validation_features.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+  validation_features.enabledValidationFeatureCount =
+      uint32_t(std::size(validation_feature_enables));
+  validation_features.pEnabledValidationFeatures = validation_feature_enables;
+  if (vulkan_instance->extensions_.ext_EXT_validation_features) {
+    instance_create_info.pNext = &validation_features;
+  }
   VkResult instance_create_result =
       ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
 
@@ -373,6 +428,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     for (const std::pair<std::string, bool*>& requested_layer : requested_layers) {
       *requested_layer.second = false;
     }
+    instance_create_info.pNext = nullptr;
     instance_create_info.enabledLayerCount = 0;
     instance_create_info.enabledExtensionCount = uint32_t(enabled_implementation_extension_count);
     instance_create_result =
@@ -383,6 +439,38 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     REXLOG_ERROR("Failed to create a Vulkan instance: {}",
                  vk::to_string(vk::Result(instance_create_result)));
     return nullptr;
+  }
+
+  if (xess_wanted) {
+    vulkan_instance->xess_ready_ = application_info.apiVersion >= xess_api_version;
+    if (!vulkan_instance->xess_ready_) {
+      vulkan_instance->xess_note_ = fmt::format("Vulkan {}.{} needed", VK_VERSION_MAJOR(xess_api_version),
+                                                VK_VERSION_MINOR(xess_api_version));
+    }
+    for (size_t i = 0; i < xess_extensions.size() && vulkan_instance->xess_ready_; ++i) {
+      if (!xess_extension_enabled[i]) {
+        vulkan_instance->xess_ready_ = false;
+        vulkan_instance->xess_note_ = fmt::format("instance extension {} unavailable", xess_extensions[i]);
+      }
+    }
+    REXLOG_INFO("Intel XeSS {}: instance requirements {}", XessVersion(),
+                vulkan_instance->xess_ready_ ? std::string("enabled") : vulkan_instance->xess_note_);
+  }
+  if (ngx_wanted) {
+    vulkan_instance->ngx_ready_ = true;
+    for (size_t i = 0; i < ngx_extensions.size(); ++i) {
+      if (!ngx_extension_enabled[i]) {
+        vulkan_instance->ngx_ready_ = false;
+        vulkan_instance->ngx_note_ = fmt::format("instance extension {} unavailable", ngx_extensions[i]);
+        break;
+      }
+    }
+    REXLOG_INFO("NVIDIA NGX (DLSS {}, frame generation {}): instance requirements {}",
+                ngx::RuntimeVersion(ngx::Feature::kSuperResolution).empty()
+                    ? std::string("absent") : ngx::RuntimeVersion(ngx::Feature::kSuperResolution),
+                ngx::RuntimeVersion(ngx::Feature::kFrameGeneration).empty()
+                    ? std::string("absent") : ngx::RuntimeVersion(ngx::Feature::kFrameGeneration),
+                vulkan_instance->ngx_ready_ ? std::string("enabled") : vulkan_instance->ngx_note_);
   }
 
   // Load instance functions.
@@ -476,6 +564,15 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
        enabled_extension_index < instance_create_info.enabledExtensionCount;
        ++enabled_extension_index) {
     REXLOG_INFO("* {}", instance_create_info.ppEnabledExtensionNames[enabled_extension_index]);
+  }
+  if (validation_sync) {
+    if (vulkan_instance->extensions_.ext_EXT_validation_features) {
+      REXLOG_INFO("Vulkan synchronization validation is on (vulkan_validation_sync)");
+    } else {
+      REXLOG_WARN(
+          "vulkan_validation_sync: the validation layer with VK_EXT_validation_features is not "
+          "available (the Vulkan SDK must be installed)");
+    }
   }
 
   // Create the debug messenger if requested and available.

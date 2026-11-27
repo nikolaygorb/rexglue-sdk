@@ -213,6 +213,13 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
   // Reads the pack's index the first time a texture cache is created (nullptr
   // if texture_replacement_path is empty or the index is unusable).
   replacement_index_ = texture_replacement::GetIndex();
+  if (replacement_index_) {
+    replacement_preloaded_.Load(*replacement_index_, texture_replacement::GetPreloadMemoryLimitBytes());
+    if (replacement_preloaded_.bytes()) {
+      REXGPU_INFO("Texture replacements: preloaded {} MB of CPU staging",
+                  replacement_preloaded_.bytes() >> 20);
+    }
+  }
 }
 
 TextureCache::~TextureCache() {
@@ -294,6 +301,23 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       REXCVAR_GET(texture_cache_memory_limit_hard) + limit_scaled_resolve_add_mb;
   uint32_t limit_soft_lifetime = REXCVAR_GET(texture_cache_memory_limit_soft_lifetime) * 1000;
   bool destroyed_any = false;
+  if (current_time - replacement_last_eviction_time_ >= 1000) {
+    replacement_last_eviction_time_ = current_time;
+    for (auto it = textures_.begin(); it != textures_.end();) {
+      const auto& texture = *it->second;
+      if (texture.is_replacement() &&
+          texture.last_usage_submission_index() <= completed_submission_index &&
+          current_time >= texture.last_usage_time() + 30000) {
+        if (!destroyed_any) {
+          ResetTextureBindings();
+          destroyed_any = true;
+        }
+        it = textures_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   // Retired textures (RetireTexture) that the GPU is
   // done with.
   for (auto it = retired_textures_.begin(); it != retired_textures_.end();) {
@@ -592,12 +616,24 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+  RequestTexturesWithDeferredLoads(used_texture_mask, 0);
+}
+
+void TextureCache::RequestTexturesWithDeferredLoads(uint32_t used_texture_mask,
+                                                   uint32_t deferred_load_mask) {
   const auto& regs = register_file();
 
   // Clear the aggregate flag, but invalidate only actually used outdated
   // bindings below to avoid resyncing all slots on unrelated texture updates.
-  texture_became_outdated_.exchange(false, std::memory_order_acquire);
-  InvalidateUsedOutdatedBindings(used_texture_mask);
+  // A plain load first: the exchange is a locked instruction, which waits for
+  // the store buffer (this draw's register, constant and command stores) to
+  // drain, on every draw, while only a memory watch callback sets the flag. A
+  // callback that sets it after the load is seen by the next draw, as it was
+  // when it came after the exchange (ReIGlue 0435).
+  if (texture_became_outdated_.load(std::memory_order_acquire)) {
+    texture_became_outdated_.exchange(false, std::memory_order_acquire);
+  }
+  InvalidateUsedOutdatedBindings(used_texture_mask & ~deferred_load_mask);
   if (replacement_index_) {
     // The texture replacement policy has changed (for example a multiplayer
     // match started): every binding is looked up again, so textures whose
@@ -747,10 +783,10 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
       binding.texture_signed = nullptr;
     }
-    if (load_unsigned_data) {
+    if (load_unsigned_data && !(deferred_load_mask & index_bit)) {
       queue_pending_texture_load(binding.texture);
     }
-    if (load_signed_data) {
+    if (load_signed_data && !(deferred_load_mask & index_bit)) {
       queue_pending_texture_load(binding.texture_signed);
     }
   }
@@ -992,7 +1028,13 @@ void TextureCache::Texture::RemoveFromUsageList() {
 }
 
 void TextureCache::Texture::WatchCallback(
-    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
+    bool invalidated_by_gpu) {
+  if (watch_stats_) {
+    auto& stats = *watch_stats_;
+    ++(is_mip ? (invalidated_by_gpu ? stats.mips_gpu : stats.mips_cpu)
+              : (invalidated_by_gpu ? stats.base_gpu : stats.base_cpu));
+  }
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
@@ -1006,11 +1048,16 @@ void TextureCache::Texture::WatchCallback(
   }
 }
 
+TextureCache::Texture::WatchStats TextureCache::Texture::GetWatchStats() const {
+  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  return watch_stats_ ? *watch_stats_ : WatchStats{};
+}
+
 void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
-  texture.WatchCallback(global_lock, argument != 0);
+  texture.WatchCallback(global_lock, argument != 0, invalidated_by_gpu);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
 }
 
@@ -1397,7 +1444,9 @@ std::unique_ptr<TextureCache::Texture> TextureCache::TryCreateReplacementTexture
   texture_replacement::Image image;
   std::string error;
   bool too_large = false;
-  if (!texture_replacement::LoadDds(file_path, key.format, width, height, key.mip_max_level + 1,
+  if (!replacement_preloaded_.Take(replacement_key, width, height, key.mip_max_level + 1,
+                                    GetMaxHostTextureWidthHeight(key.dimension), memory_left, image) &&
+      !texture_replacement::LoadDds(file_path, key.format, width, height, key.mip_max_level + 1,
                                     GetMaxHostTextureWidthHeight(key.dimension), memory_left,
                                     image, error, &too_large)) {
     if (too_large) {

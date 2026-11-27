@@ -37,6 +37,7 @@
 #include <rex/system/xam/app_manager.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xam/user_profile.h>
+#include <rex/system/xam/workspace_heap.h>
 #include <rex/platform/dynlib.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/xcontent.h>
@@ -309,9 +310,22 @@ class KernelState {
   util::NativeList* dpc_list() { return &dpc_list_; }
 
   // Runs |fn| on the file I/O worker without waiting (xenia-edge c6cc76167).
-  void PostIo(std::function<void()> fn);
+  // False when the worker has stopped (shutdown): |fn| is dropped.
+  bool PostIo(std::function<void()> fn);
+  // The file I/O worker has stopped; queued requests no longer run.
+  bool io_stopped() {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    return io_thread_stop_;
+  }
 
   void CompleteOverlapped(uint32_t overlapped_ptr, X_RESULT result);
+  uint32_t AllocWorkspace(uint32_t size, bool zero = true);
+  // Returns true for any address inside the workspace, including a stale block.
+  bool FreeWorkspace(uint32_t address);
+  // Posted completions run on the kernel's guest-capable dispatch thread.
+  // Uses only dispatch_mutex_, so timer-queue cancellation may wait safely
+  // while the global region is held.
+  bool PostDeferred(std::function<void()> fn);
   // The completion routine runs on the calling guest thread, if any.
   void CompleteOverlappedEx(uint32_t overlapped_ptr, X_RESULT result, uint32_t extended_error,
                             uint32_t length);
@@ -421,7 +435,9 @@ class KernelState {
   object_ref<XHostThread> dispatch_thread_;
   // Must be guarded by the global critical region.
   util::NativeList dpc_list_;
-  std::condition_variable_any dispatch_cond_;
+  std::mutex dispatch_mutex_;
+  std::unique_ptr<xam::WorkspaceHeap> workspace_;
+  std::condition_variable dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
 
   friend class XObject;

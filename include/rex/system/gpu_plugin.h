@@ -29,14 +29,16 @@
 namespace rex::system {
 
 // Bump on any change to GpuCreateInfo or to the IGraphicsSystem interface.
-inline constexpr uint32_t kGpuPluginAbiVersion = 1;
+inline constexpr uint32_t kGpuPluginAbiVersion = 2;
 
 inline constexpr const char* kGpuCreateSymbol = "rex_gpu_create";
 inline constexpr const char* kGpuAbiVersionSymbol = "rex_gpu_abi_version";
 
 struct GpuCreateInfo {
   uint32_t struct_size = 0;       // sizeof(GpuCreateInfo), set by the host
-  const char* backend = nullptr;  // "d3d12", "vulkan", "d3d11" (named only), or "any"
+  const char* backend = nullptr;  // "d3d12", "vulkan", "d3d11" (named only), "null" /
+                                  // "null-vulkan" / "null-d3d12" (named only: no GPU
+                                  // emulation), or "any"
 };
 
 // extern "C" exports every GPU plugin must provide:

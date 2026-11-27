@@ -52,7 +52,7 @@ bool XSemaphore::ReleaseSemaphore(int32_t release_count, int32_t* out_previous_c
   int32_t previous_count = 0;
   bool success;
   {
-    std::lock_guard<std::mutex> lock(count_lock_);
+    auto global_lock = global_critical_region_.Acquire();
     success = semaphore_->Release(release_count, &previous_count);
     if (success) {
       host_count_ += release_count;
@@ -72,7 +72,7 @@ void XSemaphore::WriteGuestCount() {
 }
 
 void XSemaphore::WaitCallback() {
-  std::lock_guard<std::mutex> lock(count_lock_);
+  auto global_lock = global_critical_region_.Acquire();
   host_count_ -= 1;
   WriteGuestCount();
 }
@@ -81,7 +81,7 @@ void XSemaphore::SyncFromGuest() {
   if (!guest_object()) {
     return;
   }
-  std::lock_guard<std::mutex> lock(count_lock_);
+  auto global_lock = global_critical_region_.Acquire();
   const int32_t guest_count =
       static_cast<int32_t>(guest_object<X_KSEMAPHORE>()->header.signal_state);
   if (guest_count == host_count_) {

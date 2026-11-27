@@ -12,6 +12,7 @@
 #include "ppc/disasm.h"
 #include "builders/builder_context.h"
 #include "builders.h"
+#include "reservation_sections.h"
 
 #include <algorithm>
 #include <cassert>
@@ -359,6 +360,41 @@ void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... arg
 
 }  // namespace
 
+namespace {
+
+// A bctr right after mtctr (nops between allowed): the switch pattern whose
+// jump table emission detects late.
+bool IsSwitchPatternBctr(const uint32_t* data) {
+  constexpr uint32_t MTCTR_MASK = 0xFC1FFFFF;
+  constexpr uint32_t MTCTR_OPCODE = 0x7C0003A6;
+  constexpr uint32_t NOP = 0x60000000;
+  for (int i = 1; i <= 3; i++) {
+    uint32_t prev_insn = load_and_swap<uint32_t>(data - i);
+    if ((prev_insn & MTCTR_MASK) == MTCTR_OPCODE) {
+      for (int j = 1; j < i; j++) {
+        if (load_and_swap<uint32_t>(data - j) != NOP)
+          return false;
+      }
+      return true;
+    }
+    if (prev_insn != NOP)
+      return false;
+  }
+  return false;
+}
+
+}  // namespace
+
+std::optional<JumpTable> DetectLateJumpTable(const BinaryView& binary, uint32_t bctrAddress,
+                                             const uint32_t* data) {
+  // A bctr right after mtctr (nops between allowed) that no table claims yet.
+  if (!IsSwitchPatternBctr(data))
+    return std::nullopt;
+
+  FunctionScanner scanner(binary);
+  return scanner.detect_jump_table(bctrAddress);
+}
+
 std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   if (authority() == FunctionAuthority::IMPORT) {
     return "";
@@ -495,6 +531,55 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
   emit_println(out, "\tREX_FUNC_PROLOGUE();");
 
+  // --- Lock-free reservation sections: found before emission, since a
+  // section's closing mtmsrd must know how it was opened ---
+  ReservationSections reservations;
+  if (!ctx.config.skipMsr && ctx.config.lockFreeReservations) {
+    ReservationCode code;
+    bool hasSection = false;
+    for (const auto& block : blocks()) {
+      auto* blockData = reinterpret_cast<const uint32_t*>(ctx.binary.translate(block.base));
+      if (!blockData)
+        continue;
+      for (uint32_t addr = block.base; addr < block.end(); addr += 4) {
+        const uint32_t* insnData = blockData + (addr - block.base) / 4;
+        const uint32_t word = load_and_swap<uint32_t>(insnData);
+        code.words.emplace(addr, word);
+        // mtmsrd r13
+        hasSection |= (word & 0xFFE007FE) == (0x7C000164 | 13u << 21);
+        if (ctx.config.midAsmHooks.contains(addr))
+          code.hookSites.insert(addr);
+        // bctr (not bctrl) with the switch pattern and no table yet: emission
+        // may still find one, whose targets are unknown here.
+        if (word == 0x4E800420 && !ctx.config.switchTables.contains(addr) &&
+            std::none_of(jumpTables().begin(), jumpTables().end(),
+                         [addr](const JumpTable& jt) { return jt.bctrAddress == addr; }) &&
+            IsSwitchPatternBctr(insnData)) {
+          code.unknownIndirectTargets = true;
+        }
+      }
+    }
+    if (hasSection) {
+      for (const auto& [site, table] : ctx.config.switchTables) {
+        if (containsAddress(site))
+          code.indirectTargets.insert(table.targets.begin(), table.targets.end());
+      }
+      for (const auto& jt : jumpTables())
+        code.indirectTargets.insert(jt.targets.begin(), jt.targets.end());
+      for (const auto& [site, hook] : ctx.config.midAsmHooks) {
+        for (uint32_t target :
+             {hook.jumpAddress, hook.jumpAddressOnTrue, hook.jumpAddressOnFalse}) {
+          if (target && containsAddress(target))
+            code.indirectTargets.insert(target);
+        }
+      }
+      reservations = FindReservationSections(code);
+      auto& totals = ReservationSectionCounts();
+      totals.sections += reservations.sections;
+      totals.lockFree += reservations.enters.size();
+    }
+  }
+
   // --- Second pass: emit instruction code ---
   const JumpTable* activeJt = nullptr;
   bool allRecompiled = true;
@@ -548,38 +633,15 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       } else {
         // Late jump table detection for bctr
         if (insn.opcode->id == PPC_INST_BCTR && !activeJt) {
-          bool is_switch_pattern = false;
-          constexpr uint32_t MTCTR_MASK = 0xFC1FFFFF;
-          constexpr uint32_t MTCTR_OPCODE = 0x7C0003A6;
-          constexpr uint32_t NOP = 0x60000000;
-
-          for (int i = 1; i <= 3 && !is_switch_pattern; i++) {
-            uint32_t prev_insn = load_and_swap<uint32_t>(data - i);
-            if ((prev_insn & MTCTR_MASK) == MTCTR_OPCODE) {
-              is_switch_pattern = true;
-              for (int j = 1; j < i; j++) {
-                if (load_and_swap<uint32_t>(data - j) != NOP) {
-                  is_switch_pattern = false;
-                  break;
-                }
-              }
-            } else if (prev_insn != NOP) {
-              break;
+          auto jt_opt = DetectLateJumpTable(ctx.binary, blockBase, data);
+          if (jt_opt.has_value()) {
+            lateJumpTables.emplace(blockBase, std::move(*jt_opt));
+            activeJt = &lateJumpTables.at(blockBase);
+            for (auto label : activeJt->targets) {
+              labels.emplace(label);
             }
-          }
-
-          if (is_switch_pattern) {
-            FunctionScanner scanner(ctx.binary);
-            auto jt_opt = scanner.detect_jump_table(blockBase);
-            if (jt_opt.has_value()) {
-              lateJumpTables.emplace(blockBase, std::move(*jt_opt));
-              activeJt = &lateJumpTables.at(blockBase);
-              for (auto label : activeJt->targets) {
-                labels.emplace(label);
-              }
-              REXCODEGEN_TRACE("Late-detected jump table at 0x{:08X} with {} entries", blockBase,
-                               activeJt->targets.size());
-            }
+            REXCODEGEN_TRACE("Late-detected jump table at 0x{:08X} with {} entries", blockBase,
+                             activeJt->targets.size());
           }
         }
 
@@ -593,8 +655,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
         // Dispatch instruction to builder
         int id = insn.opcode->id;
-        BuilderContext builderCtx{body,           ctx,      *this,   insn, blockBase, data,
-                                  localVariables, csrState, activeJt};
+        BuilderContext builderCtx{body,           ctx,      *this,    insn,         blockBase, data,
+                                  localVariables, csrState, activeJt, &reservations};
 
         if (hasHookBefore) {
           builderCtx.emit_mid_asm_hook();
@@ -1278,6 +1340,55 @@ size_t FunctionGraph::markFuncletRegisterSharing() {
     }
   }
 
+  return marked;
+}
+
+bool IsSaveRestoreHelperName(std::string_view name) {
+  for (std::string_view prefix :
+       {"__savegprlr_", "__restgprlr_", "__savefpr_", "__restfpr_", "__savevmx_", "__restvmx_"}) {
+    if (name.substr(0, prefix.size()) == prefix)
+      return true;
+  }
+  return false;
+}
+
+size_t FunctionGraph::markContextNonVolatiles(const std::function<bool(uint32_t)>& isSetJmp,
+                                              const std::function<bool(uint32_t)>& isLongJmp,
+                                              bool sehWrappers) {
+  // Calls into the guest's setjmp become ppc_setjmp: a longjmp back restores
+  // the whole ctx as it was at the setjmp, as the guest's longjmp restores the
+  // non-volatiles. C++ locals are not restored (their values are indeterminate
+  // after a host longjmp), so such a function keeps its non-volatiles in ctx.
+  // The save / restore helpers stay in ctx for the functions that keep theirs
+  // there; a localizing caller elides its calls to them. The bodies of setjmp
+  // and longjmp store and load every non-volatile of their caller (direct
+  // calls become ppc_setjmp / ppc_longjmp; a call through a pointer still
+  // reaches the body).
+  auto targets = [&](const std::vector<CallEdge>& edges) {
+    for (const auto& edge : edges) {
+      uint32_t address = 0;
+      if (const auto* target = edge.target.asFunction())
+        address = target->base();
+      else if (const auto* unresolved = std::get_if<CallTarget::Unresolved>(&edge.target.value))
+        address = unresolved->address;
+      if (isSetJmp(address))
+        return true;
+    }
+    return false;
+  };
+
+  size_t marked = 0;
+  for (const auto& [base, node] : functions_) {
+    const auto* seh = node->hasExceptionInfo() ? node->exceptionInfo()->asSeh() : nullptr;
+    bool keeps = IsSaveRestoreHelperName(node->name()) ||
+                 isSetJmp(base) || isLongJmp(base) || targets(node->calls()) ||
+                 targets(node->tailCalls()) ||
+                 (sehWrappers && seh && !seh->scopes.empty());
+    if (keeps && !node->keepsNonVolatilesInContext()) {
+      node->setKeepsNonVolatiles(true);
+      ++marked;
+    }
+  }
   return marked;
 }
 

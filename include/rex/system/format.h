@@ -13,6 +13,7 @@
 #pragma once
 
 #include <algorithm>
+#include <climits>
 #include <concepts>
 #include <cstdint>
 #include <cstring>
@@ -323,6 +324,7 @@ int32_t format_core(uint8_t* base, Data& data, Args& args, const bool wide) {
 
   char work8[512];
   char16_t work16[4];
+  std::string float_text;
 
   struct {
     const void* buffer;
@@ -467,8 +469,8 @@ int32_t format_core(uint8_t* base, Data& data, Args& args, const bool wide) {
           state = FS_Size;
           continue;
         } else if (c >= '0' && c <= '9') {
-          precision *= 10;
-          precision += c - '0';
+          precision =
+              precision > (INT32_MAX - (c - '0')) / 10 ? INT32_MAX : precision * 10 + c - '0';
           continue;
         }
         state = FS_Size;
@@ -479,7 +481,7 @@ int32_t format_core(uint8_t* base, Data& data, Args& args, const bool wide) {
         if (c == 'l') {
           if (data.peek(0) == 'l') {
             data.skip(1);
-            flags |= FF_IsLongLong;
+            // The console CRT consumes ll as its default integer width.
           } else {
             flags |= FF_IsLong;
           }
@@ -572,31 +574,31 @@ int32_t format_core(uint8_t* base, Data& data, Args& args, const bool wide) {
             }
 
             if (precision >= 0) {
-              precision = std::min(precision, (int32_t)std::size(work8));
+              precision = std::min(precision, int32_t(std::size(work8)));
             } else {
               precision = 1;
             }
 
+            uint64_t magnitude = static_cast<uint64_t>(value);
             if ((flags & FF_IsSigned) && value < 0) {
-              value = -value;
+              magnitude = uint64_t(0) - magnitude;
               flags |= FF_AddNegative;
             }
 
             if (!(flags & FF_IsLongLong)) {
-              value &= UINT32_MAX;
+              magnitude &= UINT32_MAX;
             }
 
-            if (value == 0) {
+            if (magnitude == 0) {
               prefix.length = 0;
             }
 
-            char* end = &work8[std::size(work8) - 1];
+            char* end = work8 + std::size(work8);
             char* start = end;
-            start[0] = '\0';
 
-            while (precision-- > 0 || value != 0) {
-              auto digit = (int32_t)(value % radix);
-              value /= radix;
+            while (precision-- > 0 || magnitude != 0) {
+              auto digit = (int32_t)(magnitude % radix);
+              magnitude /= radix;
               assert_true(digit < (int32_t)strlen(digits));
               *--start = digits[digit];
             }
@@ -658,18 +660,10 @@ int32_t format_core(uint8_t* base, Data& data, Args& args, const bool wide) {
               flags |= FF_AddNegative;
             }
 
-            auto s = format_double(value, precision, c, flags);
-            auto length = (int32_t)s.size();
-            assert_true(length < (int32_t)std::size(work8));
-
-            auto fstart = &work8[0];
-            auto fend = &fstart[length];
-
-            std::memcpy(fstart, s.c_str(), length);
-            fend[0] = '\0';
-
-            text.buffer = fstart;
-            text.length = (int32_t)(fend - fstart);
+            float_text =
+                format_double(value, std::min(precision, int32_t(std::size(work8))), c, flags);
+            text.buffer = float_text.c_str();
+            text.length = static_cast<int32_t>(float_text.size());
             text.is_wide = false;
             break;
           }
@@ -739,14 +733,29 @@ int32_t format_core(uint8_t* base, Data& data, Args& args, const bool wide) {
             break;
           }
 
-          // ANSI_STRING / UNICODE_STRING (not implemented)
           case 'Z': {
-            assert_always();
+            const uint32_t pointer = args.get32();
+            const uint32_t buffer =
+                pointer ? static_cast<uint32_t>(
+                              *rex::memory::GuestPtr<rex::be<uint32_t>*>(base, pointer + 4))
+                        : 0;
+            if (!buffer) {
+              text.buffer = "(null)";
+              text.length = 6;
+              text.is_wide = false;
+            } else {
+              const int32_t bytes = static_cast<int16_t>(
+                  static_cast<uint16_t>(*rex::memory::GuestPtr<rex::be<uint16_t>*>(base, pointer)));
+              text.is_wide = (flags & FF_IsWide) != 0;
+              text.length = std::max(text.is_wide ? bytes / 2 : bytes, 0);
+              text.buffer = rex::memory::GuestPtr<void*>(base, buffer);
+            }
             break;
           }
 
           default: {
-            assert_always();
+            state = FS_Unknown;
+            goto output;
           }
         }
       }

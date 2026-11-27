@@ -26,3 +26,11 @@ TEST_CASE("Mouse buttons are bindable by name", "[ui][keybinds]") {
   CHECK(ParseVirtualKey("MB5") == VirtualKey::kXButton2);
   CHECK(ParseVirtualKey("MB6") == VirtualKey::kNone);
 }
+
+TEST_CASE("The mouse wheel is bindable by name", "[ui][keybinds]") {
+  // Unassigned VK codes the mouse and keyboard driver presses per notch.
+  CHECK(ParseVirtualKey("WheelUp") == static_cast<VirtualKey>(0x0E));
+  CHECK(ParseVirtualKey("WheelDown") == static_cast<VirtualKey>(0x0F));
+  CHECK(rex::ui::VirtualKeyToString(static_cast<VirtualKey>(0x0E)) == "WheelUp");
+  CHECK(rex::ui::VirtualKeyToString(static_cast<VirtualKey>(0x0F)) == "WheelDown");
+}

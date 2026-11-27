@@ -116,7 +116,7 @@ bool D3D11SharedMemory::UploadRanges(
       uint32_t offset = upload_range_start << page_size_log2();
       uint32_t size = pages << page_size_log2();
       // Valid before copying, so an invalidation during the copy isn't lost.
-      MakeRangeValid(offset, size, false);
+      MakeUploadRangeValid(offset, size);
       D3D11_BOX box = {};
       box.left = offset;
       box.right = offset + size;

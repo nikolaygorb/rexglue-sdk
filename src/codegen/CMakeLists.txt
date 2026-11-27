@@ -11,7 +11,9 @@ set(CODEGEN_CORE_SOURCES
     output_partition.cpp
     output_stamp.cpp
     config.cpp
+    config_keys.cpp
     function_graph.cpp
+    caller_registers.cpp
     function_scanner.cpp
     sig_scanner.cpp
     vtable_scanner.cpp
@@ -28,6 +30,7 @@ set(CODEGEN_CORE_SOURCES
     template_registry.cpp
     manifest.cpp
     project_recompiler.cpp
+    reservation_sections.cpp
 )
 
 # PPC architecture sources (merged from rexarch)

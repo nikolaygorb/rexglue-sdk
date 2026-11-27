@@ -866,13 +866,16 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   if (!pipeline && pipeline_pending) {
     // Shaders still being created on the creation threads: wait up to
-    // async_pipeline_wait_ms, then skip the draw (pop-in), as D3D12.
+    // async_pipeline_wait_ms, then skip the draw (pop-in), as D3D12. A draw
+    // that may never be redone (memexport, a surface at most 2 tiles wide)
+    // waits until the creation ends (xenia-canary f9431eb95).
     WaitForPipelineCreation(
         [&]() {
           pipeline = configure_pipeline();
           return pipeline || !pipeline_pending;
         },
-        REXCVAR_GET(async_pipeline_wait_ms));
+        PipelineWaitBudgetMs(memexport_used || draw_util::IsAsyncPipelineWaitNeededForDraw(regs),
+                             REXCVAR_GET(async_pipeline_wait_ms)));
     if (!pipeline && pipeline_pending) {
       ++frame_stats_.draws_pending_pipeline;
       OnVIZSurveyDraw(false);

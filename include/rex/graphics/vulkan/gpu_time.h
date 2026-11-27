@@ -39,6 +39,17 @@ struct GpuSectionMark {
   GpuSection ended;
 };
 
+// A submission's timestamp queries in the ring: its range (reset before any is
+// written), the start and the end. recorded = false: the submission isn't
+// timed.
+struct GpuTimeRange {
+  bool recorded = false;
+  uint32_t first_query = 0;
+  uint32_t query_count = 0;
+  uint32_t start_query = 0;
+  uint32_t end_query = 0;
+};
+
 // Adds the ticks of one submission to ticks[section]: from its start stamp to
 // each mark, then from the last mark to its end stamp (which ends `last`).
 // valid_mask: the timestamp bits the queue writes (a counter that wraps).

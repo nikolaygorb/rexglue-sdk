@@ -111,6 +111,10 @@ XmaContext::~XmaContext() {
   if (av_frame_) {
     av_frame_free(&av_frame_);
   }
+  if (av_packet_) {
+    // Its buffer wraps xma_frame_ with a free callback that does nothing.
+    av_packet_free(&av_packet_);
+  }
 }
 
 int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
@@ -118,10 +122,15 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
   memory_ = memory;
   guest_ptr_ = guest_ptr;
 
-  // Allocate ffmpeg stuff:
+  // Allocate ffmpeg stuff. A packet's data is always xma_frame_ (PreparePacket),
+  // so its buffer reference wraps that array: FFmpeg uses the frame in place and
+  // the context owns no buffer of its own (it was an unused 128 KB allocation
+  // for each of the 320 contexts; ReIGlue 0428).
   av_packet_ = av_packet_alloc();
   assert_not_null(av_packet_);
-  av_packet_->buf = av_buffer_alloc(128 * 1024);
+  // The size is an int before libavutil 57, a size_t after.
+  av_packet_->buf = av_buffer_create(
+      xma_frame_.data(), static_cast<int>(xma_frame_.size()), [](void*, uint8_t*) {}, nullptr, 0);
 
   // find the XMA2 audio decoder
   av_codec_ = avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
@@ -130,15 +139,9 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
     return 1;
   }
 
-  av_context_ = avcodec_alloc_context3(av_codec_);
-  if (!av_context_) {
-    REXAPU_ERROR("XmaContext {}: Couldn't allocate context", id);
-    return 1;
-  }
-
-  // Initialize these to 0. They'll actually be set later.
-  av_context_->channels = 0;
-  av_context_->sample_rate = 0;
+  // The codec context, with the decoder's state (about 450 KB), is made by
+  // PrepareDecoder on the context's first decode. A reset flushes and reuses
+  // it; destruction releases it. Unused contexts still allocate no decoder.
 
   av_frame_ = av_frame_alloc();
   if (!av_frame_) {
@@ -220,6 +223,7 @@ bool XmaContext::Work() {
     const uint32_t pre_decode_offset = data.input_buffer_read_offset;
     const uint8_t pre_remaining_subframes = current_frame_remaining_subframes_;
     const int32_t pre_remaining_blocks = remaining_subframe_blocks_in_output_buffer_;
+    const uint32_t pre_buffer = data.current_buffer;
 
     Decode(&data);
     Consume(&output_rb, &data);
@@ -235,9 +239,13 @@ bool XmaContext::Work() {
     // Decode didn't advance the read offset and produced no new frame, so no
     // progress is possible until the next buffer. Only checked when no
     // subframes were pending: with subframes left, Decode() skips on purpose
-    // while Consume() drains the frame.
+    // while Consume() drains the frame. A loop jump back to the frame it came
+    // from leaves the offset where it was but wrote that frame: not a stall
+    // (breaking made the rest wait for the next kick; xenia-edge 3ff76c969).
     if (pre_remaining_subframes == 0 && data.input_buffer_read_offset == pre_decode_offset &&
-        current_frame_remaining_subframes_ == 0) {
+        current_frame_remaining_subframes_ == 0 &&
+        remaining_subframe_blocks_in_output_buffer_ == pre_remaining_blocks &&
+        data.current_buffer == pre_buffer) {
       REXAPU_NOISY_DEBUG("XmaContext {}: Decode stalled at offset {} (no progress)", id(),
                          pre_decode_offset);
       break;
@@ -315,13 +323,22 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
 void XmaContext::ResetDecoderState() {
   // A freed or re-initialized context is a new logical stream, so the previous
   // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
-  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
-  // flush callback, so the call never reaches the code clearing channel[].out.
-  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
-  // next decode, which does discard the history.
-  if (av_context_) {
-    av_context_->sample_rate = 0;
-    av_context_->channels = 0;
+  // Our FFmpeg registers wmapro_flush for xmaframes, clearing the overlap
+  // without rebuilding MDCT/VLC tables every time a voice is recycled.
+  // avcodec_flush_buffers only calls the codec's flush callback: an FFmpeg
+  // without it for xmaframes (the fork's pinned commit; the line is
+  // memory/thirdparty/0745-ffmpeg-xmaframes-flush.patch) keeps the old
+  // overlap and bit stream state. Then the decoder is freed, as before 0745,
+  // and PrepareDecoder makes a new one on the next decode.
+  if (av_context_ && avcodec_is_open(av_context_) && av_codec_ && av_codec_->flush) {
+    avcodec_flush_buffers(av_context_);
+  } else if (av_context_) {
+    static std::atomic<bool> logged_no_flush{false};
+    if (avcodec_is_open(av_context_) && !logged_no_flush.exchange(true)) {
+      REXAPU_INFO("XMA: FFmpeg's xmaframes decoder has no flush callback; a recycled "
+                  "context reopens its decoder");
+    }
+    avcodec_free_context(&av_context_);
   }
   raw_frame_.fill(0);
   decoded_frame_.fill(0);
@@ -368,9 +385,10 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
   }
 
   const uint32_t loop_start = std::max(kBitsPerPacketHeader, data->loop_start);
-  const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
 
-  if (data->input_buffer_read_offset != loop_end) {
+  // A loop_end of 0 is never a frame's offset: a context with a loop count but
+  // no loop plays through. Clamped to the header, it looped the first frame.
+  if (data->input_buffer_read_offset != data->loop_end) {
     return;
   }
 
@@ -525,7 +543,12 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
   kPacketInfo packet_info = {};
   packet_info.current_frame_offset_ = frame_offset;
 
-  const uint32_t first_frame_offset = xma::GetPacketFrameOffset(packet);
+  // With no frame start in the packet by its header, frames run from the read
+  // offset (one follows a frame that ended on the previous packet's last bit).
+  uint32_t first_frame_offset = xma::GetPacketFrameOffset(packet);
+  if (first_frame_offset >= kBitsPerPacket) {
+    first_frame_offset = frame_offset;
+  }
   BitStream stream(packet, kBitsPerPacket);
   stream.SetOffset(first_frame_offset);
 
@@ -669,12 +692,19 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
   sample_rate = GetSampleRate(sample_rate);
 
   uint32_t channels = is_two_channel ? 2 : 1;
-  if (av_context_->sample_rate != sample_rate ||
+  if (!av_context_ || av_context_->sample_rate != sample_rate ||
       av_context_->channels != static_cast<int>(channels)) {
     REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
-                       av_context_->sample_rate, sample_rate, av_context_->channels, channels);
-    avcodec_free_context(&av_context_);
+                       av_context_ ? av_context_->sample_rate : 0, sample_rate,
+                       av_context_ ? av_context_->channels : 0, channels);
+    if (av_context_) {
+      avcodec_free_context(&av_context_);
+    }
     av_context_ = avcodec_alloc_context3(av_codec_);
+    if (!av_context_) {
+      REXAPU_ERROR("XmaContext {}: Couldn't allocate context", id());
+      return -1;
+    }
 
     av_context_->sample_rate = sample_rate;
     av_context_->channels = channels;
@@ -682,6 +712,9 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
 
     if (avcodec_open2(av_context_, av_codec_, NULL) < 0) {
       REXAPU_ERROR("XmaContext: Failed to reopen FFmpeg context");
+      // Freed, so the next decode tries to open it again instead of using an
+      // unopened context whose format already matches.
+      avcodec_free_context(&av_context_);
       return -1;
     }
     return 1;
@@ -701,6 +734,9 @@ void XmaContext::PreparePacket(uint32_t frame_size, uint32_t frame_padding) {
 
 bool XmaContext::DecodePacket(AVCodecContext* av_context, const AVPacket* av_packet,
                               AVFrame* av_frame) {
+  if (!av_context) {
+    return false;  // PrepareDecoder could not make it.
+  }
   auto ret = avcodec_send_packet(av_context, av_packet);
   if (ret < 0) {
     char errbuf[AV_ERROR_MAX_STRING_SIZE];
@@ -789,8 +825,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   // jump to loop_start afterwards in the next-offset step.
   bool is_loop_end_frame = false;
   if (data->loop_count > 0) {
-    const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
-    is_loop_end_frame = (data->input_buffer_read_offset == loop_end);
+    is_loop_end_frame = (data->input_buffer_read_offset == data->loop_end);
   }
 
   if (data->input_buffer_read_offset < kBitsPerPacketHeader) {
@@ -825,7 +860,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   const uint32_t packet_first_frame_offset = xma::GetPacketFrameOffset(packet);
   uint32_t relative_offset = data->input_buffer_read_offset % kBitsPerPacket;
 
-  if (relative_offset < packet_first_frame_offset) {
+  // Before the packet's first frame is the tail of a frame from the previous
+  // packet. A header without a frame start in the packet doesn't mark one.
+  if (packet_first_frame_offset < kBitsPerPacket && relative_offset < packet_first_frame_offset) {
     data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + packet_first_frame_offset;
     relative_offset = packet_first_frame_offset;
   }
@@ -1007,6 +1044,23 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
         (data->input_buffer_read_offset + bits_to_copy) % kBitsPerPacket;
     data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + next_frame_offset;
     return;
+  }
+
+  // A frame that ended on its packet's last bit is followed right after the
+  // next packet's header, whatever that header says: EA's XMA1 headers say no
+  // frame starts there, and following them dropped the frame (xenia-edge
+  // 0ce969b9e).
+  if (packet_info.current_frame_size_ == kBitsPerPacket - relative_offset) {
+    const kPacketHandle next_handle =
+        GetPacketHandle(data, data->current_buffer, next_packet_index, current_input_packet_count);
+    if (next_handle.is_valid_) {
+      if (next_packet_index >= current_input_packet_count) {
+        SwapInputBuffer(data);
+      }
+      data->input_buffer_read_offset =
+          next_handle.packet_index_ * kBitsPerPacket + kBitsPerPacketHeader;
+      return;
+    }
   }
 
   // The next packet may sit in the next input buffer: continue there at the

@@ -3,10 +3,16 @@
 #
 # Runtime-loaded via rex::system::LoadGpuPlugin; consumers never link this
 # target. The Xenos format layer is compiled into rexcore.
+#
+# The plugin is plugin_main.cpp over rexgpu-core, a static library with
+# everything else: the graphics systems, the command processors (the PM4
+# executor in the base CommandProcessor), the shader front end and
+# translators, the caches and the backends. A title's own GPU plugin
+# (rexglue_add_gpu_plugin in cmake/rexglue_helpers.cmake) links the same
+# library, so a title renderer derives from the SDK's classes instead of
+# copying them.
 
 set(REXGPU_XENOS_SOURCES
-    plugin_main.cpp
-
     # Core GPU types
     flags.cpp
     register_file.cpp
@@ -18,6 +24,7 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
+    null_command_processor.cpp
     trace_player.cpp
     trace_reader.cpp
     trace_writer.cpp
@@ -49,8 +56,10 @@ set(REXGPU_XENOS_SPIRV_SOURCES
 # Vulkan backend
 set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/graphics_system.cpp
+    vulkan/null_graphics_system.cpp
     vulkan/deferred_command_buffer.cpp
     vulkan/device_memory.cpp
+    vulkan/glsl_compile.cpp
     vulkan/command_processor.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
@@ -58,6 +67,7 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/render_target_cache.cpp
     vulkan/shader.cpp
     vulkan/shared_memory.cpp
+    vulkan/tessellation_shaders.cpp
     vulkan/texture_cache.cpp
 )
 
@@ -81,6 +91,7 @@ if(REXGLUE_USE_D3D12)
     # D3D12 GPU backend
     set(REXGPU_XENOS_D3D12_SOURCES
         d3d12/graphics_system.cpp
+        d3d12/null_graphics_system.cpp
         d3d12/command_processor.cpp
         d3d12/primitive_processor.cpp
         d3d12/render_target_cache.cpp
@@ -128,24 +139,25 @@ if(REXGLUE_USE_D3D11)
     list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_D3D11_SOURCES})
 endif()
 
-add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
-add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+# Static, and only in a source-tree build (REXSDK_DIR): it is not installed.
+# Its objects are compiled with hidden visibility like the plugin's, and with
+# position-independent code because they end up in shared libraries.
+add_library(rexgpu-core STATIC ${REXGPU_XENOS_SOURCES})
+add_library(rex::gpu-core ALIAS rexgpu-core)
 
-set_target_properties(rexgpu-xenos PROPERTIES
-    EXPORT_NAME gpu-xenos
+set_target_properties(rexgpu-core PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
+    POSITION_INDEPENDENT_CODE ON
 )
-rexglue_add_version_resource(rexgpu-xenos DESCRIPTION "ReXGlue Xenos GPU emulation")
 
-target_include_directories(rexgpu-xenos PRIVATE
-    ${REXGLUE_ROOT}/thirdparty/renderdoc
+target_include_directories(rexgpu-core PRIVATE
     ${REXGLUE_ROOT}  # For thirdparty/dxbc/DXBCChecksum.h include
 )
 
-target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)
+target_compile_options(rexgpu-core PRIVATE -Wno-unused-variable)
 
-rex_target_pch(rexgpu-xenos
+rex_target_pch(rexgpu-core
     <mutex>
     <unordered_map>
     <rex/math.h>
@@ -163,29 +175,41 @@ if(REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES)
         PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
-# Everything PRIVATE: the plugin has no consumers. Never link the OBJECT
-# libraries (rexcore/rexui) here; rexruntime already contains those objects
-# and relinking them would duplicate global state.
-target_link_libraries(rexgpu-xenos PRIVATE
-    rexruntime
-    xxHash::xxhash
+# Never link the OBJECT libraries (rexcore/rexui) here; rexruntime already
+# contains those objects and relinking them would duplicate global state.
+# PUBLIC: what a plugin built on the core includes or calls itself (the SDK
+# headers through rexruntime, the graphics APIs); PRIVATE: libraries only the
+# core's own code uses (passed on to the plugin's link line only).
+target_link_libraries(rexgpu-core
+    PUBLIC
+        rexruntime
+        # renderdoc_app.h (header only): rex/ui/vulkan/instance.h includes it,
+        # so a plugin's own sources that include the Vulkan headers need it.
+        renderdoc
+    PRIVATE
+        xxHash::xxhash
 )
 
 if(REXGLUE_USE_VULKAN)
-    target_link_libraries(rexgpu-xenos PRIVATE
-        Vulkan::Headers
-        glslang::SPIRV
-        GPUOpen::VulkanMemoryAllocator
-        glslang
-        MachineIndependent
-        GenericCodeGen
-        OSDependent
-        OGLCompiler
+    target_link_libraries(rexgpu-core
+        PUBLIC
+            Vulkan::Headers
+            GPUOpen::VulkanMemoryAllocator
+            # SPIRV/SpvBuilder.h: the SPIR-V translator's headers
+            # (rex/graphics/pipeline/shader/spirv_builder.h) include it, so a
+            # plugin's own sources that use the translator need it.
+            glslang::SPIRV
+        PRIVATE
+            glslang
+            MachineIndependent
+            GenericCodeGen
+            OSDependent
+            OGLCompiler
     )
 endif()
 
 if(REXGLUE_USE_D3D12)
-    target_link_libraries(rexgpu-xenos PRIVATE
+    target_link_libraries(rexgpu-core PUBLIC
         d3d12
         dxgi
         dxguid
@@ -193,5 +217,89 @@ if(REXGLUE_USE_D3D12)
 endif()
 
 if(REXGLUE_USE_D3D11)
-    target_link_libraries(rexgpu-xenos PRIVATE d3d11)
+    target_link_libraries(rexgpu-core PUBLIC d3d11)
+endif()
+
+add_library(rexgpu-xenos SHARED plugin_main.cpp)
+add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
+
+set_target_properties(rexgpu-xenos PROPERTIES
+    EXPORT_NAME gpu-xenos
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+rexglue_add_version_resource(rexgpu-xenos DESCRIPTION "ReXGlue Xenos GPU emulation")
+
+# The whole archive: a static library hands the linker only the objects
+# something references, and objects reached only through static
+# initialisers (cvar definitions, registrations) would be dropped. Linked
+# whole, the plugin has exactly the objects it had as one SHARED target.
+# Everything PRIVATE: the plugin has no consumers.
+target_link_libraries(rexgpu-xenos PRIVATE
+    rexruntime
+    "$<LINK_LIBRARY:WHOLE_ARCHIVE,rexgpu-core>"
+)
+
+# rexgpu-native: the native renderer (docs/gpu-plugins.md), Vulkan only, one
+# plugin for every title, chosen with gpu_plugin = "native". Built on the whole
+# of rexgpu-core like rexgpu-xenos; not installed (rexgpu-core is not).
+if(REXGLUE_USE_VULKAN)
+    set(REXGPU_NATIVE_SOURCES
+        native/plugin_main.cpp
+        native/graphics_system.cpp
+        native/bindings.cpp
+        native/command_processor.cpp
+        native/scene_probe.cpp
+        native/scene_frames.cpp
+        native/object_motion.cpp
+        native/composite.cpp
+        native/dlss_upscaler.cpp
+        native/draw_state.cpp
+        native/edram_ownership.cpp
+        native/edram_transfer.cpp
+        native/edram_tiles.cpp
+        native/memexport.cpp
+        native/pipeline_storage.cpp
+        native/pipelines.cpp
+        native/present.cpp
+        native/primitive_processor.cpp
+        native/render_targets.cpp
+        native/resolve.cpp
+        native/resolve_memory.cpp
+        native/resolve_pass.cpp
+        native/resolve_placement.cpp
+        native/resolve_readback.cpp
+        native/resolve_rect.cpp
+        native/shaders.cpp
+        native/shared_memory.cpp
+        native/submission.cpp
+        native/system_constants.cpp
+        native/temporal_upscaler.cpp
+        native/texture_cache.cpp
+        native/xess_upscaler.cpp
+    )
+    add_library(rexgpu-native SHARED ${REXGPU_NATIVE_SOURCES})
+    add_library(rex::gpu-native ALIAS rexgpu-native)
+    set_target_properties(rexgpu-native PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+    rexglue_add_version_resource(rexgpu-native DESCRIPTION "ReXGlue native renderer")
+    target_link_libraries(rexgpu-native PRIVATE
+        rexruntime
+        "$<LINK_LIBRARY:WHOLE_ARCHIVE,rexgpu-core>"
+    )
+    # AMD FSR (cmake/rexglue_fsr_sdk.cmake): ffx-api headers only; the signed
+    # DLLs are loaded at run time, so a build without them still runs.
+    if(REXGLUE_FSR_SDK_DIR)
+        target_include_directories(rexgpu-native PRIVATE "${REXGLUE_FSR_SDK_DIR}/Kits/FidelityFX")
+        target_compile_definitions(rexgpu-native PRIVATE REX_HAS_FSR_SDK=1)
+    endif()
+    # Intel XeSS (cmake/rexglue_xess_sdk.cmake): SR headers for
+    # native/xess_upscaler.cpp only; libxess.dll loads at run time.
+    if(REXGLUE_XESS_SDK_DIR)
+        set_source_files_properties(native/xess_upscaler.cpp PROPERTIES
+            INCLUDE_DIRECTORIES "${REXGLUE_XESS_SDK_DIR}/inc"
+            COMPILE_DEFINITIONS REX_HAS_XESS_SDK=1)
+    endif()
 endif()

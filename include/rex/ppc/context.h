@@ -21,6 +21,7 @@
 
 #include <rex/platform/fpscr.h>
 #include <rex/ppc/func.h>
+#include <rex/ppc/reservation.h>
 #include <rex/types.h>
 
 #include <simde/x86/avx.h>
@@ -63,6 +64,8 @@ struct XERRegister {
   uint8_t so;
   uint8_t ov;
   uint8_t ca;
+  // XER[57:63]: the byte count of lswx / stswx (mtxer, mfxer).
+  uint8_t byte_count;
 };
 
 //=============================================================================
@@ -157,13 +160,20 @@ struct FPSCRRegister {
   // Bits the guest owns; the rest is host policy seeded by InitHost.
   static constexpr uint32_t GuestMask = uint32_t(RoundMaskVal) | uint32_t(FlushMask);
 
-  // Exception bits (ReXGlue fork). They live in the host's sticky exception
-  // status flags, which the guest's arithmetic sets as the Xenon FPU would set
-  // these: OX, UX, ZX, XX, and VX for an invalid operation (reported as
-  // VXSOFT, the host doesn't say which kind). FX is reported while any is set;
-  // FEX stays 0 (the guest's exception enables are kept masked). Host code
-  // running on the thread (the kernel, the runtime) sets them too.
+  // Exception bits (ReXGlue fork). OX, UX, ZX, XX and VX live in the host's
+  // sticky exception status flags, which the guest's arithmetic sets as the
+  // Xenon FPU would set these. Host code running on the thread (the kernel, the
+  // runtime) sets them too. The rest is kept here (syncExceptions):
+  // - the VX causes by name: a guest write keeps them, an invalid operation of
+  //   the arithmetic is reported as VXSOFT (the host doesn't say which kind);
+  //   VX is set while any is, and the host's invalid flag with it;
+  // - FX, sticky: set when an exception bit goes from 0 to 1, a host flag
+  //   between two reads of the FPSCR included, cleared only by the guest;
+  // - the enables VE, OE, UE, ZE, XE, kept as written (host exceptions stay
+  //   masked), and FEX, set while an exception bit and its enable are.
+  // mffs reads the upper word as 0xFFF80000, as the console does.
   static constexpr uint32_t kFX = 0x80000000;
+  static constexpr uint32_t kFEX = 0x40000000;
   static constexpr uint32_t kVX = 0x20000000;
   static constexpr uint32_t kOX = 0x10000000;
   static constexpr uint32_t kUX = 0x08000000;
@@ -172,14 +182,26 @@ struct FPSCRRegister {
   static constexpr uint32_t kVXSOFT = 0x00000400;
   // VXSNAN, VXISI, VXIDI, VXZDZ, VXIMZ, VXVC, VXSOFT, VXSQRT, VXCVI.
   static constexpr uint32_t kVXCauses = 0x01F80000 | 0x00000700;
-  // What a guest write can change.
+  // The exception bits a guest write can change, besides FX (FEX and VX are
+  // summaries).
   static constexpr uint32_t kExceptionBits = kOX | kUX | kZX | kXX | kVXCauses;
+  // VE, OE, UE, ZE, XE.
+  static constexpr uint32_t kVE = 0x00000080;
+  static constexpr uint32_t kEnables = 0x000000F8;
+  uint32_t vx_causes = 0;
+  uint32_t enables = 0;
+  bool fx = false;
+  // The host flags (kHostExceptions of them) at the last syncExceptions.
+  uint32_t status_seen = 0;
+  static constexpr uint32_t kHostExceptions =
+      Platform::StatusInvalid | Platform::StatusOverflow | Platform::StatusUnderflow |
+      Platform::StatusDivideByZero | Platform::StatusInexact;
 
-  // NI, non-IEEE mode (ReXGlue fork): while set, scalar arithmetic flushes
-  // denormals as on Xenon, by staying in the host's flush mode (the one VMX
-  // code runs in). Read and written with RN.
+  // NI, non-IEEE mode. Xenon does not implement it: a write is dropped, it
+  // reads back as 0, and scalar code keeps denormals whatever was written
+  // (only RN reaches the FPU's control; xenia-edge c5ae0a002, the console's
+  // captures of mffs and mtfsfi). Named for the masks of field 7.
   static constexpr uint32_t kNI = 0x00000004;
-  uint32_t ni = 0;
 
   // FR, FI and FPRF (C and FPCC) (ReXGlue fork). Kept as the guest wrote
   // them; with the codegen option fpscr_result_bits the arithmetic sets them
@@ -313,45 +335,70 @@ struct FPSCRRegister {
                   (uint32_t(eq) << 13) | (uint32_t(un) << 12);
   }
 
-  inline uint32_t loadExceptionsFromHost() const noexcept {
+  // Folds the host flags raised since the last call into FX and the VX causes;
+  // returns FX, OX, UX, ZX, XX and the VX causes. The host's invalid flag is
+  // VX: cleared (a reset of the flags), it takes the causes with it.
+  inline uint32_t syncExceptions() noexcept {
     fenceGuestState();
-    const uint32_t status = Platform::getstatus();
-    uint32_t bits = 0;
-    if (status & Platform::StatusInvalid) bits |= kVX | kVXSOFT;
+    const uint32_t status = Platform::getstatus() & kHostExceptions;
+    if (status & ~status_seen) {
+      fx = true;
+    }
+    status_seen = status;
+    if (!(status & Platform::StatusInvalid)) {
+      vx_causes = 0;
+    } else if (!vx_causes) {
+      vx_causes = kVXSOFT;
+    }
+    uint32_t bits = (fx ? kFX : 0) | vx_causes;
     if (status & Platform::StatusOverflow) bits |= kOX;
     if (status & Platform::StatusUnderflow) bits |= kUX;
     if (status & Platform::StatusDivideByZero) bits |= kZX;
     if (status & Platform::StatusInexact) bits |= kXX;
-    return bits ? bits | kFX : 0;
+    return bits;
   }
 
-  // Writes the exception bits of `value` that `mask` selects. FX, FEX and VX
-  // are derived, not written. An invalid operation is cleared when the write
-  // covers VXSOFT (how it's reported) or every VX cause.
+  // Every exception bit, FEX and VX with them.
+  inline uint32_t loadExceptionsFromHost() noexcept {
+    uint32_t bits = syncExceptions();
+    if (bits & kVXCauses) {
+      bits |= kVX;
+    }
+    // OX, UX, ZX, XX against OE, UE, ZE, XE; VX against VE.
+    if (((bits >> 25) & (enables >> 3) & 0xF) || ((bits & kVX) && (enables & kVE))) {
+      bits |= kFEX;
+    }
+    return bits;
+  }
+
+  // Writes the exception bits of `value` that `mask` selects. FEX and VX are
+  // summaries, not written. A write that covers FX (field 0 of mtfsf or
+  // mtfsfi, mtfsb, mcrfs) sets it as written; otherwise an exception bit going
+  // from 0 to 1 sets FX.
   inline void storeExceptionsFromGuest(uint32_t value, uint32_t mask) noexcept {
-    mask &= kExceptionBits;
+    mask &= kFX | kExceptionBits;
     if (!mask) {
       return;
     }
-    fenceGuestState();
-    uint32_t status = Platform::getstatus();
-    auto apply = [&](uint32_t bits, uint32_t flag) {
-      if (!(mask & bits)) {
-        return;
-      }
-      if (value & mask & bits) {
-        status |= flag;
-      } else if (bits != kVXCauses || (mask & kVXSOFT) || (mask & kVXCauses) == kVXCauses) {
-        status &= ~flag;
-      }
-    };
-    apply(kVXCauses, Platform::StatusInvalid);
-    apply(kOX, Platform::StatusOverflow);
-    apply(kUX, Platform::StatusUnderflow);
-    apply(kZX, Platform::StatusDivideByZero);
-    apply(kXX, Platform::StatusInexact);
+    const uint32_t old = syncExceptions();
+    const uint32_t bits = (old & ~mask) | (value & mask);
+    fx = (mask & kFX) ? (bits & kFX) != 0 : (fx || (bits & ~old & kExceptionBits) != 0);
+    vx_causes = bits & kVXCauses;
+    uint32_t status = Platform::getstatus() & ~kHostExceptions;
+    if (vx_causes) status |= Platform::StatusInvalid;
+    if (bits & kOX) status |= Platform::StatusOverflow;
+    if (bits & kUX) status |= Platform::StatusUnderflow;
+    if (bits & kZX) status |= Platform::StatusDivideByZero;
+    if (bits & kXX) status |= Platform::StatusInexact;
     Platform::setstatus(status);
+    status_seen = status & kHostExceptions;
     fenceGuestState();
+  }
+
+  // VE, OE, UE, ZE, XE (fields 6 and 7).
+  inline void storeEnablesFromGuest(uint32_t value, uint32_t mask) noexcept {
+    mask &= kEnables;
+    enables = (enables & ~mask) | (value & mask);
   }
 
   inline uint32_t getcsr() noexcept { return Platform::getcsr(); }
@@ -381,54 +428,43 @@ struct FPSCRRegister {
     setcsr(csr);
   }
 
-  // RN, NI and the result bits.
+  // RN, the enables and the result bits. NI reads 0.
   inline uint32_t loadFromHost() noexcept {
     csr = getcsr();
-    return Platform::HostToGuest[(csr & RoundMaskVal) >> RoundShift] | (ni ? kNI : 0) |
-           result_bits;
+    return Platform::HostToGuest[(csr & RoundMaskVal) >> RoundShift] | enables | result_bits;
   }
 
-  // Field 7: RN and NI. The flush mode for NI is applied by the next
-  // enableFlushMode or disableFlushMode (the codegen forgets its mode after a
-  // write of NI).
+  // Field 7: RN. NI is dropped (see kNI); the flush mode is unchanged.
   inline void storeFromGuest(uint32_t value) noexcept {
-    ni = (value & kNI) ? 1 : 0;
     csr &= ~RoundMaskVal;
     csr |= Platform::GuestToHost[value & kRoundMask];
     setcsr(csr);
   }
 
-  inline void enableFlushModeUnconditional() noexcept {
-    csr |= FlushMask;
+  // VSCR[NJ] clear (ReXGlue fork, mtvscr): vector code keeps denormals, its
+  // mode (enableFlushMode) does not flush. The console starts with NJ set.
+  uint8_t vector_ieee = 0;
+
+  inline void setFlushModeUnconditional(bool flush) noexcept {
+    csr = flush ? (csr | uint32_t(FlushMask)) : (csr & ~uint32_t(FlushMask));
     setcsr(csr);
   }
 
-  inline void disableFlushModeUnconditional() noexcept {
-    if (ni) [[unlikely]] {
-      enableFlushModeUnconditional();
-      return;
-    }
-    csr &= ~FlushMask;
-    setcsr(csr);
-  }
-
-  inline void enableFlushMode() noexcept {
-    if ((csr & FlushMask) != FlushMask) [[unlikely]] {
-      csr |= FlushMask;
+  inline void setFlushMode(bool flush) noexcept {
+    const uint32_t want = flush ? uint32_t(FlushMask) : 0;
+    if ((csr & uint32_t(FlushMask)) != want) [[unlikely]] {
+      csr = (csr & ~uint32_t(FlushMask)) | want;
       setcsr(csr);
     }
   }
 
-  inline void disableFlushMode() noexcept {
-    if (ni) [[unlikely]] {
-      enableFlushMode();
-      return;
-    }
-    if ((csr & FlushMask) != 0) [[unlikely]] {
-      csr &= ~FlushMask;
-      setcsr(csr);
-    }
-  }
+  // The vector code's mode: flush, unless VSCR[NJ] is clear.
+  inline void enableFlushModeUnconditional() noexcept { setFlushModeUnconditional(!vector_ieee); }
+  inline void enableFlushMode() noexcept { setFlushMode(!vector_ieee); }
+
+  // The scalar code's mode: no flush (FPSCR[NI] has no effect on Xenon).
+  inline void disableFlushModeUnconditional() noexcept { setFlushModeUnconditional(false); }
+  inline void disableFlushMode() noexcept { setFlushMode(false); }
 
   inline void InitHost() noexcept {
     csr = getcsr();
@@ -483,7 +519,13 @@ struct alignas(0x40) PPCContext {
   PPCRegister r30;
   PPCRegister r31;
 
-  uint64_t lr;
+  // LR. Guest code addresses are 32-bit, so it is kept as 32 bits: the return
+  // address a bl stores is one 32-bit immediate store (a 64-bit field takes
+  // movabs and mov for an address above 0x80000000; -2.3 % instructions in
+  // integer code). mflr zero-extends it, mtlr drops the register's upper
+  // half. The slot stays 8 bytes, so the fields after it keep their offsets.
+  uint32_t lr;
+  uint32_t lr_upper_unused = 0;
   PPCRegister ctr;
   PPCXERRegister xer;
   PPCRegister reserved;
@@ -670,8 +712,11 @@ struct alignas(0x40) PPCContext {
   PPCVRegister v127;
 
   // VRSAVE (SPR 256): a software-only mask of the vector registers in use.
-  // Kept last so that adding it moved no other field.
+  // Added after vector registers so that it moved no existing register field.
   uint32_t vrsave = 0;
+  // Appended to preserve every existing register offset. All titles must be
+  // regenerated/rebuilt with the runtime that provides reservation helpers.
+  rex::ppc::ReservationState reservation;
 
   //--- Non-volatile register save/restore --------
   // Layout: r14-r31 (144) | f14-f31 (144) | v14-v31 (288) | v64-v127 (1024)
@@ -707,7 +752,6 @@ struct alignas(0x40) PPCContext {
     src += 3 * sizeof(PPCCRRegister);
     PPCFPSCRRegister saved_fpscr;
     std::memcpy(&saved_fpscr, src, sizeof(PPCFPSCRRegister));
-    fpscr.ni = saved_fpscr.ni;
     fpscr.result_bits = saved_fpscr.result_bits;
     fpscr.restoreGuestBits(saved_fpscr.csr);
   }

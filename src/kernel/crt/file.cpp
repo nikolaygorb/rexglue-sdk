@@ -246,21 +246,28 @@ u32 CloseHandle_entry(u32 hObject) {
   return 1;
 }
 
+// A guest FILETIME is the high word, then the low word: the 360 SDK declares it
+// that way for big-endian PowerPC, so it reads as one 64-bit value. These shims
+// stored and read the low word first (upstream rexglue 993bfb43).
+static void StoreFileTime(be<uint32_t>* out, uint64_t time) {
+  out[0] = static_cast<uint32_t>(time >> 32);
+  out[1] = static_cast<uint32_t>(time & 0xFFFFFFFF);
+}
+
+static uint64_t LoadFileTime(const be<uint32_t>* in) {
+  return (static_cast<uint64_t>(static_cast<uint32_t>(in[0])) << 32) |
+         static_cast<uint32_t>(in[1]);
+}
+
 static void FillFindData(mapped_void lpFindFileData, rex::filesystem::Entry* entry) {
   auto* buf = static_cast<uint8_t*>(static_cast<void*>(lpFindFileData));
   std::memset(buf, 0, 0x140);
 
   auto* fields = reinterpret_cast<be<uint32_t>*>(buf);
   fields[0] = entry->attributes();  // 0x00 dwFileAttributes
-  fields[1] =
-      static_cast<uint32_t>(entry->create_timestamp() & 0xFFFFFFFF);   // 0x04 ftCreationTime.Low
-  fields[2] = static_cast<uint32_t>(entry->create_timestamp() >> 32);  // 0x08 ftCreationTime.High
-  fields[3] =
-      static_cast<uint32_t>(entry->access_timestamp() & 0xFFFFFFFF);   // 0x0C ftLastAccessTime.Low
-  fields[4] = static_cast<uint32_t>(entry->access_timestamp() >> 32);  // 0x10 ftLastAccessTime.High
-  fields[5] =
-      static_cast<uint32_t>(entry->write_timestamp() & 0xFFFFFFFF);   // 0x14 ftLastWriteTime.Low
-  fields[6] = static_cast<uint32_t>(entry->write_timestamp() >> 32);  // 0x18 ftLastWriteTime.High
+  StoreFileTime(&fields[1], entry->create_timestamp());  // 0x04 ftCreationTime
+  StoreFileTime(&fields[3], entry->access_timestamp());  // 0x0C ftLastAccessTime
+  StoreFileTime(&fields[5], entry->write_timestamp());   // 0x14 ftLastWriteTime
   fields[7] = static_cast<uint32_t>(entry->size() >> 32);             // 0x1C nFileSizeHigh
   fields[8] = static_cast<uint32_t>(entry->size() & 0xFFFFFFFF);      // 0x20 nFileSizeLow
   // 0x24 dwReserved0, 0x28 dwReserved1 already zero
@@ -383,12 +390,9 @@ u32 GetFileAttributesExA_entry(u32 fInfoLevelId, mapped_string lpFileName,
   auto* buf =
       reinterpret_cast<be<uint32_t>*>(static_cast<uint8_t*>(static_cast<void*>(lpFileInformation)));
   buf[0] = entry->attributes();                                            // dwFileAttributes
-  buf[1] = static_cast<uint32_t>(entry->create_timestamp() & 0xFFFFFFFF);  // ftCreationTime.Low
-  buf[2] = static_cast<uint32_t>(entry->create_timestamp() >> 32);         // ftCreationTime.High
-  buf[3] = static_cast<uint32_t>(entry->access_timestamp() & 0xFFFFFFFF);  // ftLastAccessTime.Low
-  buf[4] = static_cast<uint32_t>(entry->access_timestamp() >> 32);         // ftLastAccessTime.High
-  buf[5] = static_cast<uint32_t>(entry->write_timestamp() & 0xFFFFFFFF);   // ftLastWriteTime.Low
-  buf[6] = static_cast<uint32_t>(entry->write_timestamp() >> 32);          // ftLastWriteTime.High
+  StoreFileTime(&buf[1], entry->create_timestamp());  // ftCreationTime
+  StoreFileTime(&buf[3], entry->access_timestamp());  // ftLastAccessTime
+  StoreFileTime(&buf[5], entry->write_timestamp());   // ftLastWriteTime
   buf[7] = static_cast<uint32_t>(entry->size() >> 32);                     // nFileSizeHigh
   buf[8] = static_cast<uint32_t>(entry->size() & 0xFFFFFFFF);              // nFileSizeLow
   return 1;
@@ -445,11 +449,9 @@ u32 CompareFileTime_entry(mapped_void lpFileTime1, mapped_void lpFileTime2) {
       reinterpret_cast<be<uint32_t>*>(static_cast<uint8_t*>(static_cast<void*>(lpFileTime1)));
   auto* ft2 =
       reinterpret_cast<be<uint32_t>*>(static_cast<uint8_t*>(static_cast<void*>(lpFileTime2)));
-  // FILETIME: { dwLowDateTime, dwHighDateTime }
-  uint64_t t1 =
-      (static_cast<uint64_t>(static_cast<uint32_t>(ft1[1])) << 32) | static_cast<uint32_t>(ft1[0]);
-  uint64_t t2 =
-      (static_cast<uint64_t>(static_cast<uint32_t>(ft2[1])) << 32) | static_cast<uint32_t>(ft2[0]);
+  // FILETIME: { dwHighDateTime, dwLowDateTime } on the guest.
+  uint64_t t1 = LoadFileTime(ft1);
+  uint64_t t2 = LoadFileTime(ft2);
   if (t1 < t2)
     return static_cast<uint32_t>(-1);
   if (t1 > t2)

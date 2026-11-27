@@ -21,4 +21,8 @@ void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr)
 X_STATUS xeRtlInitializeCriticalSectionAndSpinCount(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr,
                                                     uint32_t spin_count);
 
+// Adds delta to a critical section's LockCount, which guest memory holds
+// big-endian, atomically; returns the new value.
+int32_t CriticalSectionAddLockCount(volatile int32_t* lock_count, int32_t delta);
+
 }  // namespace rex::kernel::xboxkrnl

@@ -349,9 +349,22 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
                                    uint32_t& unique_texture_bindings,
                                    string::StringBuffer& ucode_disasm_buffer) {
   instr.Disassemble(&ucode_disasm_buffer);
-  // Malformed microcode may point an exec past the end of the program.
+  // Malformed microcode may point an exec past the end of the program: the
+  // instructions there are skipped, in the analysis and in translation (on the
+  // console they read whatever follows; ReIGlue 0510, FH1 #808: an FM4 track
+  // pixel shader of 105 dwords whose control flow points at instruction 3720).
   uint32_t instr_end = std::min(instr.instruction_address + instr.instruction_count,
                                 uint32_t(ucode_data_.size() / 3));
+  if (instr.instruction_address + instr.instruction_count > instr_end &&
+      !ucode_past_end_logged_) {
+    ucode_past_end_logged_ = true;
+    REXGPU_WARN(
+        "Shader {:016X} ({} shader, {} dwords): an exec runs instructions {} to {}, past the end "
+        "of the microcode; skipped",
+        ucode_data_hash_, type() == xenos::ShaderType::kVertex ? "vertex" : "pixel",
+        ucode_data_.size(), instr.instruction_address,
+        instr.instruction_address + instr.instruction_count - 1);
+  }
   uint32_t sequence = instr.sequence;
   for (uint32_t instr_offset = instr.instruction_address; instr_offset < instr_end;
        ++instr_offset, sequence >>= 2) {
@@ -1190,7 +1203,8 @@ void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& in
   const uint32_t* ucode_dwords = ucode_data.data();
   uint32_t instr_end = instr.instruction_address + instr.instruction_count;
   if (instr_end > ucode_data.size() / 3) {
-    EmitTranslationError("Exec refers to instructions past the end of the microcode");
+    // Skipped, the rest of the shader translated (Shader::GatherExecInformation
+    // warns). A fatal error here dropped every draw with the shader.
     instr_end = uint32_t(ucode_data.size() / 3);
   }
   uint32_t sequence = instr.sequence;

@@ -143,6 +143,10 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     {"MMB", VirtualKey::kMButton},
     {"MB4", VirtualKey::kXButton1},
     {"MB5", VirtualKey::kXButton2},
+    // The mouse wheel, as keys pressed for a moment per notch (the mouse and
+    // keyboard driver; VK codes 0x0E / 0x0F are unassigned in Windows).
+    {"WheelUp", static_cast<VirtualKey>(0x0E)},
+    {"WheelDown", static_cast<VirtualKey>(0x0F)},
 };
 
 VirtualKey ParseVirtualKey(std::string_view name) {

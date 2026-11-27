@@ -28,6 +28,7 @@
 #include <rex/kernel/xboxkrnl/error.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
+#include <rex/net/xnaddr.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
@@ -500,9 +501,21 @@ u32 NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string strin
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
 // subsequent socket calls (like a handle to a XNet address)
+// The online address, else the LAN one (upstream rexglue ab7ed503, PR #570):
+// System Link titles connect to what this writes.
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
-  return 1;
+  if (!xn_addr || !in_addr) {
+    return 1;
+  }
+  // Raw IN_ADDR words: both sides stay in network byte order.
+  uint32_t ina = 0;
+  uint32_t ina_online = 0;
+  std::memcpy(&ina, &xn_addr->ina, sizeof(ina));
+  std::memcpy(&ina_online, &xn_addr->inaOnline, sizeof(ina_online));
+  const uint32_t addr = rex::net::XnAddrInAddr(ina, ina_online);
+  std::memcpy(in_addr.host_address(), &addr, sizeof(addr));
+  return addr ? 0 : 1;
 }
 
 // Does the reverse of the above.
@@ -781,13 +794,24 @@ struct x_fd_set {
   rex::be<uint32_t> fd_array[64];
 };
 
+// A POSIX fd_set is a bitmap of FD_SETSIZE descriptors; a Win32 one is a
+// list that takes any socket handle.
+inline bool FitsHostFdSet(uint64_t handle) {
+#if REX_PLATFORM_WIN32
+  (void)handle;
+  return true;
+#else
+  return handle < static_cast<uint64_t>(FD_SETSIZE);
+#endif
+}
+
 struct host_set {
   uint32_t count;
   object_ref<XSocket> sockets[64];
 
   void Load(const x_fd_set* guest_set) {
-    assert_true(guest_set->fd_count < 64);
-    this->count = guest_set->fd_count;
+    // A guest count past 64 overran sockets[] (xenia-edge 38428daa0).
+    this->count = std::min<uint32_t>(guest_set->fd_count, 64);
     for (uint32_t i = 0; i < this->count; ++i) {
       auto socket_handle = static_cast<X_HANDLE>(guest_set->fd_array[i]);
       if (socket_handle == -1) {
@@ -812,10 +836,17 @@ struct host_set {
     }
   }
 
-  void Store(fd_set* native_set) {
+  // Raises max_handle to the highest host handle it sets.
+  void Store(fd_set* native_set, int& max_handle) {
     FD_ZERO(native_set);
     for (uint32_t i = 0; i < this->count; ++i) {
-      FD_SET(this->sockets[i]->native_handle(), native_set);
+      const uint64_t handle = this->sockets[i]->native_handle();
+      if (!FitsHostFdSet(handle)) {
+        REXKRNL_ERROR("NetDll_select: host socket {} is past FD_SETSIZE", handle);
+        continue;
+      }
+      FD_SET(handle, native_set);
+      max_handle = std::max(max_handle, static_cast<int>(handle));
     }
   }
 
@@ -823,7 +854,8 @@ struct host_set {
     uint32_t new_count = 0;
     for (uint32_t i = 0; i < this->count; ++i) {
       auto socket = this->sockets[i];
-      if (FD_ISSET(socket->native_handle(), native_set)) {
+      const uint64_t handle = socket->native_handle();
+      if (FitsHostFdSet(handle) && FD_ISSET(handle, native_set)) {
         this->sockets[new_count++] = socket;
       }
     }
@@ -834,24 +866,29 @@ struct host_set {
 i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                         ppc_ptr_t<x_fd_set> writefds, ppc_ptr_t<x_fd_set> exceptfds,
                         mapped_void timeout_ptr) {
+  // The guest's nfds means nothing to Winsock and a title can pass anything;
+  // a POSIX host looks only at the descriptors below the one it is given, so it
+  // gets the highest host handle plus one (xenia-edge 1d728cd9d).
+  int max_handle = -1;
   host_set host_readfds = {};
   fd_set native_readfds = {};
   if (readfds) {
     host_readfds.Load(readfds);
-    host_readfds.Store(&native_readfds);
+    host_readfds.Store(&native_readfds, max_handle);
   }
   host_set host_writefds = {};
   fd_set native_writefds = {};
   if (writefds) {
     host_writefds.Load(writefds);
-    host_writefds.Store(&native_writefds);
+    host_writefds.Store(&native_writefds, max_handle);
   }
   host_set host_exceptfds = {};
   fd_set native_exceptfds = {};
   if (exceptfds) {
     host_exceptfds.Load(exceptfds);
-    host_exceptfds.Store(&native_exceptfds);
+    host_exceptfds.Store(&native_exceptfds, max_handle);
   }
+  const int native_nfds = max_handle + 1;
   timeval* timeout_in = nullptr;
   timeval timeout;
   if (timeout_ptr) {
@@ -861,7 +898,8 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                              reinterpret_cast<int32_t*>(&timeout.tv_usec));
     timeout_in = &timeout;
   }
-  int ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
+  int ret = select(native_nfds, readfds ? &native_readfds : nullptr,
+                   writefds ? &native_writefds : nullptr,
                    exceptfds ? &native_exceptfds : nullptr, timeout_in);
   if (readfds) {
     host_readfds.UpdateFrom(&native_readfds);

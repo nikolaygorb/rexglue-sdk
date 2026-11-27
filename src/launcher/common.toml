@@ -1,0 +1,405 @@
+# ReXGlue launcher: the settings every title has.
+#
+# Staged next to each title's launcher as launcher/common.toml. The title's
+# launcher/launcher.toml adds its own rows, replaces one of these by giving a
+# row with the same key, and drops the ones it doesn't use with
+#   [common]
+#   hide = ["key", ...]
+# Row format and theme: docs/launcher.md. Values are written to the title's
+# settings/<file>.toml in place: only the changed lines differ.
+#
+# A user-facing cvar added to or renamed in the SDK gets its row here in the
+# same patch (next to docs/graphics-options.md).
+
+pages = ["Display", "Graphics", "Controls", "Game", "Advanced"]
+
+# Safe mode: a one-off start with these flags; the settings files stay as they are.
+safe_mode = [
+  "--gpu_plugin=xenos",
+  "--graphics_backend=vulkan",
+  "--resolution_scale=1",
+  "--present_effect=bilinear",
+  "--swap_post_effect=none",
+]
+
+#------------------------------------------------------------------------------
+# Display
+#------------------------------------------------------------------------------
+
+[[row]]
+page = "Display"
+key = "fullscreen"
+kind = "choice"
+label = "Screen mode"
+choices = [[true, "Fullscreen"], [false, "Windowed"]]
+default = true
+help = "Fullscreen covers the whole monitor. Windowed opens a window of the resolution below."
+
+[[row]]
+page = "Display"
+key = "monitor"
+kind = "select"
+label = "Monitor"
+source = "displays"  # the system's monitors, numbered as the game counts them
+default = 0
+help = "The monitor the game opens on. Default is the main one."
+
+[[row]]
+page = "Display"
+key = "resolution"
+kind = "select"
+label = "Resolution"
+source = "display_modes"  # the chosen monitor's full-screen sizes
+help = "The window's size, and the video mode the game is told about. The list is the chosen monitor's sizes; Default follows the game."
+
+[[row]]
+page = "Display"
+key = "vsync"
+kind = "toggle"
+label = "VSync"
+default = true
+help = "Waits for the monitor's refresh, so the picture never tears. Off answers a little sooner but can tear."
+
+#------------------------------------------------------------------------------
+# Graphics
+#------------------------------------------------------------------------------
+
+[[row]]
+page = "Graphics"
+key = "gpu_plugin"
+kind = "choice"
+label = "Renderer"
+choices = [
+  ["native", "Native", "file:rexgpu-native"],
+  ["xenos", "Emulated", "file:rexgpu-xenos"],
+]
+restart = true
+help = "Native draws the game's commands straight with Vulkan and is faster on the GPU. Emulated runs the Xbox 360 GPU emulation (Xenos): the most compatible path, and the one that can also use D3D12 or D3D11."
+
+[[row]]
+page = "Graphics"
+key = "graphics_backend"
+kind = "choice"
+label = "Graphics API"
+choices = [
+  ["any", "Auto"],
+  ["vulkan", "Vulkan"],
+  ["d3d12", "D3D12", "windows"],
+  ["d3d11", "D3D11", "windows"],
+]
+lock_if = { key = "gpu_plugin", value = "native", shows = "vulkan" }
+restart = true
+help = "Used by Emulated. Auto tries D3D12, then Vulkan. Native always renders with Vulkan; the choice here is kept for when you switch back. D3D11 is experimental."
+
+[[row]]
+page = "Graphics"
+key = "vulkan_device"
+kind = "select"
+label = "Rendering GPU (Vulkan)"
+source = "vulkan_devices"
+backend = "vulkan"
+default = -1
+restart = true
+help = "The graphics card the game renders on with Vulkan, including Native. Auto lets the game choose. This does not change the monitor or the GPU drawing this launcher."
+
+[[row]]
+page = "Graphics"
+key = "d3d12_adapter"
+kind = "select"
+label = "Rendering GPU (D3D12)"
+source = "dxgi_devices"
+backend = "d3d12"
+default = -1
+restart = true
+help = "The graphics card the game renders on with D3D12. Auto lets the game choose. With Graphics API set to Auto, Vulkan's device selection is used if the game falls back to Vulkan."
+
+[[row]]
+page = "Graphics"
+key = "d3d11_adapter"
+kind = "select"
+label = "Rendering GPU (D3D11)"
+source = "dxgi_devices"
+backend = "d3d11"
+default = -1
+restart = true
+help = "The graphics card the game renders on with D3D11. Auto lets the game choose. Software (WARP) renders on the CPU and is mainly for diagnostics."
+
+[[row]]
+page = "Graphics"
+key = "resolution_scale"
+kind = "slider"
+label = "Resolution scale"
+min = 1
+max = 4
+step = 1
+integer = true
+suffix = "×"
+default = 2
+restart = true
+hide_if = { key = "gpu_plugin", value = "native" }
+help = "Draws the game at a multiple of its own 1280 × 720. 2 or 3 is typical; each step costs much more GPU time and memory."
+
+[[row]]
+page = "Graphics"
+key = "native_resolution_scale"
+kind = "slider"
+label = "Resolution scale"
+min = 1
+max = 4
+step = 0.25
+decimals = 2
+suffix = "×"
+default = 0.0
+restart = true
+visible_if = { key = "gpu_plugin", value = "native" }
+help = "Native supports 1× to 4× in quarter steps, such as 1.25× or 1.5×. 1.5× draws a 1280 × 720 game at 1920 × 1080. Until you adjust it, the scale follows the game's whole-number setting; Reset restores that automatic choice."
+
+# Temporal upscaler (AMD FSR, Intel XeSS or NVIDIA DLSS): needs the title's
+# scene data (docs/native-scene-contract.md), so disabled here; a title with it
+# lists the keys in [common] enable. Its rows show only with AMD's, Intel's or
+# NVIDIA's DLLs next to the game (Windows builds).
+[[row]]
+page = "Graphics"
+key = "native_temporal_upscaler"
+kind = "choice"
+label = "Upscaler"
+# Short labels: the row stays segments (it turns into a list once they no longer fit).
+choices = [["off", "Off"], ["fsr3", "FSR 3"], ["fsr4", "FSR 4", "fsr4:upscaler"], ["xess", "XeSS", "xess:upscaler"], ["dlss", "DLSS", "dlss:upscaler"]]
+default = "off"
+disabled = true
+status = "upscaler.log"
+only = "file:amd_fidelityfx_upscaler_vk|file:libxess|file:nvngx_dlss"
+visible_if = { key = "gpu_plugin", value = "native" }
+help = "Anti-aliasing and upscaling on the 3D scene, with its depth and motion; the HUD stays sharp. AMD FSR 3 runs on most GPUs; FSR 4 (machine learning, a sharper and steadier picture) is offered only where the chosen GPU supports it (Radeon RX 6000 and newer); should it not start, the game uses FSR 3. Intel XeSS (machine learning) is offered where the chosen GPU runs it: fastest on Intel Arc, slower elsewhere; its first start on a GPU prepares its shaders for a while (the plain picture meanwhile). NVIDIA DLSS (machine learning; DLAA in Native AA mode) is offered on GeForce RTX GPUs. Last run says what ran. Needs the game's support: greyed out in games without it. Can be switched while the game runs."
+
+[[row]]
+page = "Graphics"
+key = "native_scene_upscale"
+kind = "choice"
+label = "Upscaler mode"
+choices = [[false, "Native AA"], [true, "Upscale"]]
+default = false
+disabled = true
+only = "file:amd_fidelityfx_upscaler_vk|file:libxess|file:nvngx_dlss"
+visible_if = { key = "gpu_plugin", value = "native" }
+enable_if = [
+  { key = "native_temporal_upscaler", value = "fsr3" },
+  { key = "native_temporal_upscaler", value = "fsr4" },
+  { key = "native_temporal_upscaler", value = "xess" },
+  { key = "native_temporal_upscaler", value = "dlss" },
+]
+help = "Native AA: the scene is drawn at the resolution scale and the upscaler only smooths it, the best picture. Upscale: the scene is drawn at the game's own resolution and the upscaler rebuilds it at the resolution scale, much faster (about 30% at 2× with FSR). At 1× both are the same. XeSS and DLSS upscale up to 3×; above that they run as Native AA."
+
+[[row]]
+page = "Graphics"
+key = "native_fsr_sharpness"
+kind = "slider"
+label = "FSR sharpness"
+min = 0.0
+max = 1.0
+step = 0.05
+decimals = 2
+default = 0.5
+disabled = true
+only = "file:amd_fidelityfx_upscaler_vk"
+visible_if = { key = "gpu_plugin", value = "native" }
+enable_if = [
+  { key = "native_temporal_upscaler", value = "fsr3" },
+  { key = "native_temporal_upscaler", value = "fsr4" },
+]
+help = "AMD FSR's sharpening: 0 off, 1 the sharpest (XeSS has none). Can be changed while the game runs."
+
+# Frame generation (AMD FSR, NVIDIA DLSS): needs the title's scene data too
+# (disabled here, a title with a scene producer lists the keys in [common] enable).
+[[row]]
+page = "Graphics"
+key = "native_frame_generation"
+kind = "choice"
+label = "Frame generation"
+choices = [["off", "Off"], ["fsr3", "FSR 3"], ["fsr4", "FSR 4", "fsr4:frame_generation"], ["dlss", "DLSS", "dlss:frame_generation"]]
+default = "off"
+disabled = true
+restart = true
+status = "frame_generation.log"
+only = "file:amd_fidelityfx_framegeneration_vk|file:nvngx_dlssg"
+visible_if = { key = "gpu_plugin", value = "native" }
+help = "AMD FSR frame generation shows a generated frame between two real ones, so a 144 Hz display shows about 140 frames while the game draws about 70 (it is held near half the display's refresh rate). Best with VSync off or a variable refresh rate display, and a game running at 60 FPS or more. Adds a little input latency. Works with or without the upscaler above (FSR or XeSS). FSR 3 runs on most GPUs; FSR 4 (machine learning, fewer artifacts in generated frames) is offered only where the chosen GPU supports it (Radeon RX 9000 and newer); should it not start, the game uses FSR 3. NVIDIA DLSS frame generation is offered on GeForce RTX 40 and newer. Needs the game's support: greyed out in games without it. Takes effect at the next start."
+
+[[row]]
+page = "Graphics"
+key = "present_effect"
+kind = "choice"
+label = "Simple upscaler"
+choices = [["bilinear", "Off"], ["fsr", "FSR 1"], ["cas", "CAS"]]
+default = "bilinear"
+help = "Scales the finished picture, HUD included, to the window, one frame at a time. FSR 1 keeps edges sharp while scaling up, then sharpens; CAS only sharpens. Not the upscaler above: when the resolution scale is above the window's size, Off is right."
+
+[[row]]
+page = "Graphics"
+key = "present_fsr_sharpness_reduction"
+kind = "slider"
+label = "FSR 1 softening"
+min = 0.0
+max = 2.0
+step = 0.1
+decimals = 1
+default = 0.2
+enable_if = { key = "present_effect", value = "fsr" }
+help = "How much FSR 1 holds its sharpening back: 0 is the sharpest picture, 2 the softest."
+
+[[row]]
+page = "Graphics"
+key = "present_cas_additional_sharpness"
+kind = "slider"
+label = "CAS sharpness"
+min = 0.0
+max = 1.0
+step = 0.05
+decimals = 2
+default = 0.0
+enable_if = { key = "present_effect", value = "cas" }
+help = "Extra sharpening on top of CAS's own."
+
+[[row]]
+page = "Graphics"
+key = "swap_post_effect"
+kind = "choice"
+label = "Anti-aliasing"
+choices = [["none", "Off"], ["fxaa", "FXAA"], ["smaa", "SMAA"]]
+default = "smaa"
+restart = true
+# The temporal upscaler anti-aliases itself (the renderer skips this while it runs).
+enable_if = [
+  { key = "native_temporal_upscaler", value = "off" },
+  { key = "gpu_plugin", value = "xenos" },
+]
+help = "Smooths jagged edges after the frame is drawn. SMAA is sharper and better on thin lines; FXAA is lighter but slightly blurry. Only while the upscaler is off: it smooths the picture itself."
+
+[[row]]
+page = "Graphics"
+key = "anisotropic_override"
+kind = "choice"
+label = "Texture filtering"
+choices = [[-1, "Game"], [2, "2×"], [3, "4×"], [4, "8×"], [5, "16×"]]
+default = 5
+help = "Keeps textures sharp on surfaces seen at a steep angle. Game leaves it to the title."
+
+#------------------------------------------------------------------------------
+# Controls
+#------------------------------------------------------------------------------
+
+[[row]]
+page = "Controls"
+key = "input_backend"
+file = "mapping"
+kind = "choice"
+label = "Gamepad driver"
+choices = [["sdl", "SDL"], ["xinput", "XInput", "windows"]]
+default = "sdl"
+restart = true
+help = "SDL works with Xbox, PlayStation, Switch and most other gamepads, all mapped to the Xbox layout. XInput sees Xbox gamepads only."
+
+[[row]]
+page = "Controls"
+key = "mnk_mode"
+file = "mapping"
+kind = "toggle"
+label = "Keyboard and mouse"
+default = true
+help = "Play with keyboard and mouse. A connected gamepad keeps working at the same time."
+
+[[row]]
+page = "Controls"
+key = "mnk_mouse"
+file = "mapping"
+kind = "toggle"
+label = "Mouse as right stick"
+default = true
+enable_if = { key = "mnk_mode", value = true }
+help = "Mouse movement drives the right stick where the game has no mouse look of its own (menus, vehicles)."
+
+[[row]]
+page = "Controls"
+kind = "button"
+label = "Key bindings"
+button = "Edit bindings…"
+action = "bindings"
+help = "Keyboard and mouse keys for every gamepad button (the keybind_* lines of settings/mapping.toml), on a picture of the pad, and the title's own PC actions."
+
+[[row]]
+page = "Controls"
+key = "max_local_users"
+kind = "choice"
+label = "Players"
+choices = [[1, "1"], [2, "2"], [3, "3"], [4, "4"]]
+default = 1
+restart = true
+help = "Local split-screen players. Players after the first sign in when their gamepad is assigned."
+
+#------------------------------------------------------------------------------
+# Advanced
+#------------------------------------------------------------------------------
+
+[[row]]
+page = "Advanced"
+key = "user_language"
+kind = "select"
+label = "Language"
+choices = [
+  [1, "English"],
+  [2, "Japanese"],
+  [3, "German"],
+  [4, "French"],
+  [5, "Spanish"],
+  [6, "Italian"],
+  [7, "Korean"],
+  [8, "Chinese (Traditional)"],
+  [9, "Portuguese"],
+  [10, "Chinese (Simplified)"],
+  [11, "Polish"],
+  [12, "Russian"],
+]
+default = 1
+restart = true
+help = "The console language the game sees. A language the game doesn't have falls back to English."
+
+[[row]]
+page = "Advanced"
+key = "async_shader_compilation"
+kind = "toggle"
+label = "Background shader compilation"
+default = true
+help = "Prepares shaders on other threads: fewer stutters, sometimes a missing effect for a moment."
+
+[[row]]
+page = "Advanced"
+key = "log_level"
+kind = "select"
+label = "Log detail"
+choices = [["error", "Errors only"], ["warn", "Warnings"], ["info", "Info"], ["debug", "Debug"], ["trace", "Trace"]]
+default = "info"
+help = "How much the game writes to its log. Info is the default; Debug or Trace adds detail for investigating a problem."
+
+[[row]]
+page = "Advanced"
+kind = "button"
+label = "Settings files"
+button = "Open settings folder"
+action = "open_settings"
+help = "Opens the settings folder: hardware.toml and mapping.toml, with a comment on every line."
+
+[[row]]
+page = "Advanced"
+kind = "button"
+label = "Logs"
+button = "Open logs folder"
+action = "open_logs"
+help = "Opens the folder with the game's logs, for a bug report."
+
+[[row]]
+page = "Advanced"
+kind = "button"
+label = "Defaults"
+button = "Reset all settings"
+action = "reset_all"
+help = "Puts every setting back to its recommended value. Nothing is written until Save or Play."

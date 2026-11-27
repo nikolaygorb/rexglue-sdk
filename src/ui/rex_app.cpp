@@ -15,7 +15,10 @@
 #include <functional>
 #include <string>
 
+#include <SDL3/SDL_messagebox.h>
+
 #include <rex/assert.h>
+#include <rex/host_isa.h>
 #include <rex/cvar.h>
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
@@ -62,6 +65,18 @@ REXCVAR_DEFINE_BOOL(xex_image_check, true, "Runtime",
                     "Show a warning at startup when default.xex is not the build the game "
                     "was recompiled from (the log gets it either way)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+// REXGLUE_RECOMP_PGO=generate (set on the host target by rexglue_setup_target):
+// the instrumented build writes its profile here, since the app leaves through
+// std::_Exit, which skips the profile runtime's atexit writer.
+#if defined(REXGLUE_RECOMP_PGO_GENERATE)
+extern "C" int __llvm_profile_write_file(void);
+static void WriteRecompProfile() {
+  __llvm_profile_write_file();
+}
+#else
+static void WriteRecompProfile() {}
+#endif
 
 namespace {
 
@@ -147,6 +162,16 @@ system::AchievementManager& ReXApp::achievements() const {
 }
 
 bool ReXApp::OnInitialize() {
+  // Generated code built for a wider instruction set (REXGLUE_RECOMP_ISA)
+  // would stop at its first such instruction on an older CPU: say why instead.
+  if (!rex::host_isa::HostRunsRequired()) {
+    const std::string message = std::string("This build of ") + std::string(GetName()) +
+                                " needs a CPU with " + rex::host_isa::RequiredName() +
+                                ", which this one lacks. Use the build for other CPUs.";
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, std::string(GetName()).c_str(),
+                             message.c_str(), nullptr);
+    return false;
+  }
   if (!SetupEnvironment())
     return false;
   if (!SetupPresentation())
@@ -174,17 +199,20 @@ bool ReXApp::SetupEnvironment() {
   if (std::filesystem::exists(default_config_path))
     rex::cvar::LoadConfig(default_config_path);
 
+  // The cvars are UTF-8: a std::string assigned to a path is read in the ANSI
+  // code page on Windows, so a folder with characters outside it was not found
+  // (hells-gate-recomp 4058ada, the part our patch 0669 left).
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
   if (!game_data_cvar.empty()) {
-    game_dir = game_data_cvar;
+    game_dir = rex::to_path(game_data_cvar);
   }
 
   // User data: cvar override, or platform user directory
   std::filesystem::path user_dir;
   std::string user_data_cvar = REXCVAR_GET(user_data_root);
   if (!user_data_cvar.empty()) {
-    user_dir = user_data_cvar;
+    user_dir = rex::to_path(user_data_cvar);
   } else {
     user_dir = rex::filesystem::GetUserFolder() / GetName();
   }
@@ -193,14 +221,14 @@ bool ReXApp::SetupEnvironment() {
   std::filesystem::path update_dir;
   std::string update_data_cvar = REXCVAR_GET(update_data_root);
   if (!update_data_cvar.empty()) {
-    update_dir = update_data_cvar;
+    update_dir = rex::to_path(update_data_cvar);
   }
 
   // Cache: cvar override, or user_dir/cache
   std::filesystem::path cache_dir;
   std::string cache_root_cvar = REXCVAR_GET(cache_root);
   if (!cache_root_cvar.empty()) {
-    cache_dir = cache_root_cvar;
+    cache_dir = rex::to_path(cache_root_cvar);
   } else {
     cache_dir = user_dir / "cache";
   }
@@ -208,7 +236,7 @@ bool ReXApp::SetupEnvironment() {
   std::filesystem::path metadata_dir;
   std::string metadata_root_cvar = REXCVAR_GET(metadata_root);
   if (!metadata_root_cvar.empty()) {
-    metadata_dir = metadata_root_cvar;
+    metadata_dir = rex::to_path(metadata_root_cvar);
   }
 
   PathConfig path_config{game_dir,  user_dir,     update_dir,
@@ -244,6 +272,24 @@ bool ReXApp::SetupEnvironment() {
   rex::AddSink(log_sink_);
 
   OnPostInitLogging();
+
+  // Problems the config loads ran into before the log was open.
+  for (const auto& report : rex::cvar::GetConfigLoadReports()) {
+    const std::string config_name = rex::path_to_utf8(report.path);
+    if (report.kind == rex::cvar::ConfigLoadReport::Kind::kDuplicates) {
+      std::string keys;
+      for (const auto& key : report.duplicate_keys) {
+        keys += keys.empty() ? key : ", " + key;
+      }
+      REXLOG_WARN("Config {}: set more than once, the last value used: {}", config_name, keys);
+    } else if (report.kind == rex::cvar::ConfigLoadReport::Kind::kUnreadable) {
+      REXLOG_ERROR("Config {} can't be read (line {}: {}); defaults are used. {}", config_name,
+                   report.line, report.error,
+                   report.bad_copy.empty()
+                       ? std::string("The copy to .bad failed: the next save replaces the file.")
+                       : "A copy is kept as " + rex::path_to_utf8(report.bad_copy) + ".");
+    }
+  }
 
   if (std::filesystem::exists(config_path_))
     REXLOG_DEBUG("Loaded config: {}", rex::path_to_utf8(config_path_.filename()));
@@ -558,6 +604,7 @@ void ReXApp::LaunchModule() {
         auto* graphics_system = runtime_->graphics_system();
         const int exit_code = graphics_system ? rex::ui::RunGpuTraceReplay(*graphics_system) : 2;
         // As OnClosing: no subsystem teardown.
+        WriteRecompProfile();
         rex::FlushLogging();
         std::_Exit(exit_code);
       });
@@ -638,6 +685,7 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   (void)e;
   REXLOG_INFO("Window closing, shutting down...");
   shutting_down_.store(true, std::memory_order_release);
+  OnPreTerminateTitle();
   if (runtime_ && runtime_->kernel_state()) {
     runtime_->kernel_state()->TerminateTitle();
   }
@@ -646,6 +694,7 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   // ShutdownLogging, which frees loggers a straggler may still use); the OS
   // reclaims the rest.
   REXLOG_INFO("Title terminated; hard-exiting process.");
+  WriteRecompProfile();
   rex::FlushLogging();
   std::_Exit(0);
 }

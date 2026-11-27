@@ -28,8 +28,8 @@ class VulkanGraphicsSystem : public GraphicsSystem {
 
  protected:
   void CreateProvider(bool with_presentation) override;
-
- private:
+  // Protected, as in D3D12GraphicsSystem: a subclass (the null backend, a
+  // native renderer) makes another command processor on the same provider.
   std::unique_ptr<CommandProcessor> CreateCommandProcessor() override;
 };
 

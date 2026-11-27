@@ -18,6 +18,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/memory.h>
@@ -48,7 +49,7 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
   const uint32_t target = ctx.last_indirect_target;
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   if (const std::string path = REXCVAR_GET(unregistered_function_log); !path.empty()) {
-    std::ofstream(path, std::ios::app) << fmt::format(
+    std::ofstream(rex::to_path(path), std::ios::app) << fmt::format(
         "0x{:08X} = {{}}  # called with LR 0x{:08X}\n", target, lr);
   }
   REX_FATAL(
@@ -94,7 +95,7 @@ bool FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address) {
   // Pad out stack a bit, as some games seem to overwrite the caller by about 16 to 32b.
   ctx->r1.u64 -= 64 + 112;
 
-  uint64_t previous_lr = ctx->lr;
+  uint32_t previous_lr = ctx->lr;
   ctx->lr = 0xBCBCBCBC;
 
   fn(*ctx, memory_->virtual_membase());

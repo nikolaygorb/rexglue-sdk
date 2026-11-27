@@ -7,11 +7,28 @@ add_executable(unit_tests
     memory/read_watch_test.cpp
     memory/range_access_test.cpp
     kernel/object_table_test.cpp
+    kernel/speaker_config_test.cpp
+    kernel/workspace_test.cpp
+    ppc/reservation_test.cpp
+    graphics/gpu_breadcrumbs_test.cpp
+    ui/present_rate_limiter_test.cpp
+    core/async_sink_test.cpp
+    core/guest_spinlock_test.cpp
+    kernel/xecrypt_sha2_test.cpp
+    kernel/page_flags_test.cpp
+    kernel/encrypted_memory_test.cpp
+    kernel/dispatcher_test.cpp
+    kernel/thread_layout_test.cpp
     kernel/native_memory_test.cpp
+    kernel/format_test.cpp
+    kernel/crt_secure_test.cpp
     kernel/bignum_rsa_test.cpp
     kernel/xecrypt_md5_test.cpp
     kernel/ob_name_test.cpp
     kernel/xnet_startup_params_test.cpp
+    kernel/xnaddr_test.cpp
+    kernel/socket_bind_port_test.cpp
+    kernel/critical_section_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/filesystem_test.cpp
@@ -22,6 +39,8 @@ add_executable(unit_tests
     core/vfs_mount_path_test.cpp
     core/vfs_open_status_test.cpp
     core/vfs_entry_update_test.cpp
+    core/vfs_basic_info_test.cpp
+    core/host_isa_test.cpp
     core/vfs_delete_on_close_test.cpp
     core/vfs_host_errors_test.cpp
     core/vfs_overlay_test.cpp
@@ -36,13 +55,20 @@ add_executable(unit_tests
     core/utf8_case_test.cpp
     core/dynlib_attach_test.cpp
     core/bit_scan_test.cpp
+    core/bit_range_test.cpp
+    core/endian_atomic_test.cpp
     core/sleep_duration_test.cpp
+    core/guest_tick_accumulator_test.cpp
     core/event_pulse_test.cpp
     core/logging_file_sink_test.cpp
     ppc/import_function_test.cpp
+    ppc/hook_stub_test.cpp
     ppc/stack_test.cpp
     ppc/fpscr_test.cpp
+    ppc/vector_store_test.cpp
     ppc/fp_fma_test.cpp
+    ppc/upstream_hardware_cases_test.cpp
+    ppc/upstream_multiply_add_test.cpp
     system/guest_path_test.cpp
     system/xsocket_accept_test.cpp
     system/achievement_manager_test.cpp
@@ -59,14 +85,21 @@ add_executable(unit_tests
     input/input_assignment_test.cpp
     input/mnk_stick_test.cpp
     input/split_screen_test.cpp
+    input/deadzone_test.cpp
     codegen/analysis_test.cpp
+    codegen/millicode_copies_test.cpp
+    codegen/fp_options_test.cpp
+    codegen/delay_hint_test.cpp
+    codegen/config_keys_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
+    codegen/reservation_sections_test.cpp
     graphics/alu_parse_test.cpp
     graphics/fetch_parse_test.cpp
     graphics/register_file_test.cpp
     graphics/register_reset_test.cpp
+    graphics/async_pipeline_wait_test.cpp
     graphics/float_precision_test.cpp
     graphics/scalar_estimate_test.cpp
     graphics/shader_replacements_test.cpp
@@ -83,6 +116,8 @@ add_executable(unit_tests
     graphics/zpd_report_test.cpp
     graphics/gpu_completion_timeline_test.cpp
     graphics/float_constant_runs_test.cpp
+    graphics/register_writes_test.cpp
+    graphics/register_groups_test.cpp
     graphics/memexport_write_back_test.cpp
     graphics/texture_replacement_test.cpp
     graphics/scaled_resolve_coverage_test.cpp
@@ -97,8 +132,17 @@ add_executable(unit_tests
     graphics/d3d11_shader_bytecode_test.cpp
     graphics/d3d11_geometry_shader_test.cpp
     graphics/trace_format_test.cpp
+    graphics/scene_contract_test.cpp
+    graphics/upscaler_policy_test.cpp
+    graphics/pm4_event_write_test.cpp
     graphics/frame_stats_test.cpp
     graphics/storage_seed_test.cpp
+    graphics/native_scale_test.cpp
+    graphics/native_edram_tiles_test.cpp
+    graphics/native_edram_ownership_test.cpp
+    graphics/native_transfer_filter_test.cpp
+    graphics/native_resolve_rect_test.cpp
+    graphics/native_resolve_placement_test.cpp
     ui/presenter_paint_config_test.cpp
     ui/keybind_names_test.cpp
     ui/image_decode_test.cpp
@@ -119,6 +163,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/shader.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/translator_disasm.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/packet_disassembler.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/replacement.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/primitive_processor.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
@@ -127,6 +172,11 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/trace_reader.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/trace_writer.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
+    # The native renderer's API-free bookkeeping (rexgpu-native).
+    ${PROJECT_SOURCE_DIR}/src/graphics/native/edram_ownership.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/native/edram_tiles.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/native/resolve_rect.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/native/resolve_placement.cpp
     # FloatToD3D11Fixed16p8 for draw.cpp (rexui, which unit_tests doesn't link).
     ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
     # PNG encoding and image comparison of GPU trace replay (rexui).
@@ -135,6 +185,15 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/d3d11/shader_bytecode.cpp
     ${PROJECT_SOURCE_DIR}/thirdparty/dxbc/DXBCChecksum.cpp
 )
+
+if(REXGLUE_USE_VULKAN)
+    # The native renderer's draw state (Vulkan state values, no device).
+    target_sources(unit_tests PRIVATE
+        graphics/native_draw_state_test.cpp
+        graphics/render_area_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/graphics/native/draw_state.cpp
+    )
+endif()
 
 target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include

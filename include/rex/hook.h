@@ -61,11 +61,13 @@
     REXKRNL_WARN("{} STUB - {}", #subroutine, msg); \
   }
 
-#define REX_STUB_RETURN(subroutine, value)                                                \
-  extern "C" REX_FUNC(subroutine) {                                                       \
-    (void)base;                                                                           \
-    REXKRNL_WARN("{} STUB - returning {:#x}", #subroutine, static_cast<uint32_t>(value)); \
-    ctx.r3.u64 = (value);                                                                 \
+#define REX_STUB_RETURN(subroutine, value)                 \
+  extern "C" REX_FUNC(subroutine) {                        \
+    (void)base;                                            \
+    const auto rex_stub_result = (value);                  \
+    REXKRNL_WARN("{} STUB - returning {:#x}", #subroutine, \
+                 static_cast<uint32_t>(rex_stub_result));  \
+    ctx.r3.u64 = rex_stub_result;                          \
   }
 
 // Export: hook + register in global registry for kernel ordinal lookup.

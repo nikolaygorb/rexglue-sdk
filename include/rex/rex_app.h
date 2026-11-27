@@ -175,6 +175,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Use for cleanup that depends on runtime resources.
   virtual void OnGuestThreadExit(system::XThread* thread) { (void)thread; }
 
+  /// Called on the UI thread before the close path terminates guest threads
+  /// and hard-exits. OnShutdown is not reached on that path. Flush bounded
+  /// diagnostics here; do not wait for guest execution or tear down Runtime.
+  virtual void OnPreTerminateTitle() {}
+
   /// Detached overlay mode ("bring your own renderer"). Called once from
   /// SetupPresentation when the SDK has no graphics backend
   /// (config.graphics == nullptr, typically cleared in OnPreSetup) and the app

@@ -24,6 +24,12 @@ namespace chrono {
 
 using hundrednanoseconds = std::chrono::duration<int64_t, hundrednano>;
 
+// Day 0 of NT file times (FILETIME, guest system time). Counting from here
+// directly works where std::chrono::system_clock counts nanoseconds (Linux,
+// range 1677-2262), which can't hold dates near 1601 (xenia-canary 5d1784c57).
+inline constexpr std::chrono::sys_days filetime_epoch{std::chrono::year{1601} /
+                                                      std::chrono::January / 1};
+
 // TODO(JoelLinn) define xstead_clock xsystem_clock etc.
 
 namespace detail {

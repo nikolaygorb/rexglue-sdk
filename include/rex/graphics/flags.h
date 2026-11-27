@@ -48,6 +48,7 @@ REXCVAR_DECLARE(bool, occlusion_query_viz);
 // GPU Depth / Render Target Behavior
 REXCVAR_DECLARE(bool, depth_float24_round);
 REXCVAR_DECLARE(bool, depth_float24_convert_in_pixel_shader);
+REXCVAR_DECLARE(bool, vulkan_reverse_depth_range);
 REXCVAR_DECLARE(bool, depth_transfer_not_equal_test);
 REXCVAR_DECLARE(bool, native_stencil_value_output);
 REXCVAR_DECLARE(bool, native_stencil_value_output_d3d12_intel);
@@ -85,6 +86,9 @@ REXCVAR_DECLARE(bool, gpu_debug_markers);
 REXCVAR_DECLARE(bool, force_depth_clamp);
 REXCVAR_DECLARE(bool, xenos_sample_positions);
 REXCVAR_DECLARE(bool, texture_point_snap);
+REXCVAR_DECLARE(int32_t, stacked_texture_layer_wrap);
+REXCVAR_DECLARE(bool, clamp_relative_float_constants);
+REXCVAR_DECLARE(bool, gpu_elide_unchanged_registers);
 bool IsGpuDebugMarkersEnabled();
 
 // GPU Alpha Test

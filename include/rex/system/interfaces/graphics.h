@@ -53,6 +53,15 @@ class IGraphicsSystem {
 
   // --- Optional capabilities, default no-op -------------------------------
 
+  // Title scene markers (rex/graphics/title_scene.h): 0 when unsupported.
+  // Optional, so custom GPU plugins need not expose their CommandProcessor
+  // across the DLL boundary. Stats: consumed, completed, failed (count >= 3),
+  // then views accepted and the last accepted view's source_hash (count >= 5).
+  virtual uint32_t GetTitleSceneProtocolVersion() const { return 0; }
+  virtual bool QueryTitleSceneStats(uint64_t* values, uint32_t count) const {
+    (void)values; (void)count; return false;
+  }
+
   // Host presentation objects for ReXApp's overlay wiring; custom systems may
   // leave these null.
   virtual ui::GraphicsProvider* provider() const { return nullptr; }

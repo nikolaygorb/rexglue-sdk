@@ -5,6 +5,7 @@
  */
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <string_view>
@@ -12,9 +13,49 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/filesystem.h>
+#include <rex/filesystem/wildcard.h>
 
 using rex::filesystem::FileAccess;
 using rex::filesystem::FileHandle;
+
+TEST_CASE("NT wildcard matching backtracks and handles DOS tokens", "[filesystem][wildcard]") {
+  const auto matches = [](std::string_view pattern, std::string_view name) {
+    rex::filesystem::WildcardEngine engine;
+    engine.SetRule(pattern);
+    return engine.Match(name);
+  };
+  CHECK(matches("*.*", "README"));
+  CHECK(matches("a*ab", "aaab"));
+  CHECK(matches("a?c", "ABC"));
+  CHECK_FALSE(matches("a?c", "ABCD"));
+  CHECK(matches("<.txt", "archive.part.txt"));
+  CHECK(matches("file>\"*", "file.txt"));
+  CHECK(matches("file\"", "file"));
+  CHECK_FALSE(matches("file\"", "file.txt"));
+}
+
+TEST_CASE("Exclusive host creation preserves an existing file", "[filesystem][file]") {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("rexglue_exclusive_" +
+                     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  struct Cleanup {
+    std::filesystem::path path;
+    ~Cleanup() {
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+    }
+  } cleanup{path};
+  REQUIRE(rex::filesystem::CreateNewFile(path));
+  auto file = FileHandle::OpenExisting(path, rex::filesystem::FileAccess::kGenericWrite);
+  REQUIRE(file);
+  const char value[] = "keep";
+  size_t written = 0;
+  REQUIRE(file->Write(0, value, 4, &written));
+  CHECK(file->Flush());
+  file.reset();
+  CHECK_FALSE(rex::filesystem::CreateNewFile(path));
+  CHECK(std::filesystem::file_size(path) == 4);
+}
 
 namespace {
 

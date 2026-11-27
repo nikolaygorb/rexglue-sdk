@@ -12,7 +12,11 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
 #include <cstring>
+#include <optional>
+#include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/kernel/xboxkrnl/private.h>
@@ -21,6 +25,8 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/flags.h>
+#include <rex/thread/mutex.h>
 #include <rex/system/xtypes.h>
 
 namespace rex::kernel::xboxkrnl {
@@ -31,7 +37,7 @@ uint32_t ToXdkProtectFlags(uint32_t protect) {
   if (!(protect & memory::kMemoryProtectRead) && !(protect & memory::kMemoryProtectWrite)) {
     result = X_PAGE_NOACCESS;
   } else if ((protect & memory::kMemoryProtectRead) && !(protect & memory::kMemoryProtectWrite)) {
-    result = X_PAGE_READONLY;
+    result = X_PAGE_READONLY | X_PAGE_USER_READONLY;
   } else {
     result = X_PAGE_READWRITE;
   }
@@ -60,6 +66,88 @@ uint32_t FromXdkProtectFlags(uint32_t protect) {
   return result;
 }
 
+namespace {
+
+// The runs of a range that hold no committed pages.
+std::vector<std::pair<uint32_t, uint32_t>> UncommittedRuns(memory::BaseHeap* heap,
+                                                           uint32_t address, uint32_t size) {
+  std::vector<std::pair<uint32_t, uint32_t>> runs;
+  const uint32_t end = address + size;
+  while (address < end) {
+    memory::HeapAllocationInfo info = {};
+    uint32_t length = end - address;
+    if (heap->QueryRegionInfo(address, &info, length) && info.region_size) {
+      length = std::min(length, info.region_size);
+    }
+    if (!(info.state & memory::kMemoryAllocationCommit)) {
+      runs.emplace_back(address, length);
+    }
+    address += length;
+  }
+  return runs;
+}
+
+// The title's address spaces as the kernel bounds them, [low, high).
+struct TitleSpace {
+  uint32_t page_size;
+  uint32_t low;
+  uint32_t high;
+};
+constexpr TitleSpace kTitleSpaces[] = {{0x1000, 0x00010000, 0x2FFF0000},
+                                       {0x10000, 0x40000000, 0x6FFF0000}};
+
+const TitleSpace& TitleSpaceFor(uint32_t page_size) {
+  return kTitleSpaces[page_size == kTitleSpaces[0].page_size ? 0 : 1];
+}
+
+const TitleSpace* TitleSpaceOf(uint32_t address) {
+  for (const auto& space : kTitleSpaces) {
+    if (address >= space.low && address < space.high) {
+      return &space;
+    }
+  }
+  return nullptr;
+}
+
+// The base of the reservation holding an address, if one does.
+std::optional<uint32_t> ReservationOf(memory::BaseHeap* heap, uint32_t address) {
+  memory::HeapAllocationInfo info;
+  // One page is enough; the scan would otherwise walk the whole reservation.
+  if (address - heap->heap_base() >= heap->heap_size() ||
+      !heap->QueryRegionInfo(address, &info, 1) || !info.state) {
+    return std::nullopt;
+  }
+  return info.allocation_base;
+}
+
+bool IsWritableProtect(uint32_t protect) {
+  return (protect & memory::kMemoryProtectWrite) != 0;
+}
+
+// Zeroes the runs, or fills them (MEM_NOZERO).
+void InitializeRuns(memory::BaseHeap* heap,
+                    const std::vector<std::pair<uint32_t, uint32_t>>& runs, uint32_t protect,
+                    bool nozero) {
+  for (const auto& [start, length] : runs) {
+    if (!IsWritableProtect(protect)) {
+      heap->Protect(start, length, memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+    }
+    if (!nozero) {
+      REX_KERNEL_MEMORY()->Zero(start, length);
+    } else if (!REXCVAR_GET(scribble_heap) || !IsWritableProtect(protect)) {
+      // The console leaves stale data in these pages and titles can read it.
+      // scribble_heap has already filled the writable ones.
+      auto fill = REX_KERNEL_MEMORY()->TranslateVirtual<be<uint16_t>*>(start);
+      std::fill_n(fill, length / 2, be<uint16_t>(uint16_t(0x7175)));
+    }
+    if (!IsWritableProtect(protect)) {
+      heap->Protect(start, length, protect);
+    }
+  }
+}
+
+}  // namespace
+
 u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_ptr,
                                   u32 alloc_type, u32 protect_bits, u32 debug_memory) {
   uint32_t input_base = base_addr_ptr ? static_cast<uint32_t>(*base_addr_ptr) : 0;
@@ -78,17 +166,11 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   assert_not_null(base_addr_ptr);
   assert_not_null(region_size_ptr);
 
-  // Set to TRUE when allocation is from devkit memory area.
-  // assert_true(debug_memory == 0);
-  // just warn tf am i gunna do about it
+  // Set to TRUE when allocation is from devkit memory area. There is no
+  // separate devkit region, so the flag is ignored.
   if ((uint32_t)debug_memory != 0)
     REXKRNL_WARN("attmpted allocation to devkit memory area (debug_memory={})",
                  (uint32_t)debug_memory);
-
-  // This allocates memory from the kernel heap, which is initialized on startup
-  // and shared by both the kernel implementation and user code.
-  // The xe_memory_ref object is used to actually get the memory, and although
-  // it's simple today we could extend it to do better things in the future.
 
   // Must request a size.
   if (!base_addr_ptr || !region_size_ptr || !*region_size_ptr) {
@@ -108,10 +190,12 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
     REXKRNL_WARN("Game setting EXECUTE bit on allocation");
   }
 
+  const uint32_t base = input_base;
+  memory::BaseHeap* heap = nullptr;
   uint32_t page_size;
-  if (*base_addr_ptr != 0) {
+  if (base) {
     // ignore specified page size when base address is specified.
-    auto heap = REX_KERNEL_MEMORY()->LookupHeap(*base_addr_ptr);
+    heap = REX_KERNEL_MEMORY()->LookupHeap(base);
     if (!heap || heap->heap_type() != memory::HeapType::kGuestVirtual) {
       return X_STATUS_INVALID_PARAMETER;
     }
@@ -124,73 +208,135 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
     }
   }
 
-  // Round the base address down to the nearest page boundary.
-  uint32_t adjusted_base = *base_addr_ptr - (*base_addr_ptr % page_size);
-  // For some reason, some games pass in negative sizes.
-  uint32_t adjusted_size =
-      int32_t(*region_size_ptr) < 0 ? -int32_t(region_size_ptr.value()) : region_size_ptr.value();
-  // Use 64KB allocation granularity when no base address is specified,
-  // matching Xbox 360 behavior. With a base address, use the heap's page size.
-  adjusted_size = rex::round_up(adjusted_size, adjusted_base ? page_size : 64 * 1024);
-
-  // Allocate.
-  uint32_t allocation_type = 0;
-  if (alloc_type & X_MEM_RESERVE) {
-    allocation_type |= memory::kMemoryAllocationReserve;
-  }
-  if (alloc_type & X_MEM_COMMIT) {
-    allocation_type |= memory::kMemoryAllocationCommit;
-  }
-  if (alloc_type & X_MEM_RESET) {
-    REXKRNL_ERROR("X_MEM_RESET not implemented");
-    assert_always();
-  }
-  uint32_t protect = FromXdkProtectFlags(protect_bits);
+  const uint32_t size = input_size;
+  const bool nozero = !!(alloc_type & X_MEM_NOZERO);
+  const uint32_t protect = FromXdkProtectFlags(protect_bits);
+  uint32_t adjusted_size;
   uint32_t address = 0;
-  memory::BaseHeap* heap;
-  memory::HeapAllocationInfo prev_alloc_info = {};
-  bool was_commited = false;
-
-  if (adjusted_base != 0) {
-    heap = REX_KERNEL_MEMORY()->LookupHeap(adjusted_base);
-    if (!heap) {
-      return X_STATUS_INVALID_PARAMETER;
+  // What this call initializes: every page it commits when it zeroes them,
+  // only the pages no commit has initialized before when it fills them.
+  std::vector<std::pair<uint32_t, uint32_t>> init_runs;
+  {
+    // Held from the checks through the fill so no other call commits or frees
+    // these pages in between (two threads committing the same page wiped each
+    // other's data).
+    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+    uint32_t adjusted_base = 0;
+    if (base) {
+      // The range must fit in the address space its base is in. A negative
+      // size is too large for any.
+      const TitleSpace* space = TitleSpaceOf(base);
+      if (!space || size > space->high - base) {
+        REXKRNL_WARN(
+            "NtAllocateVirtualMemory: range {:08X} size {:08X} is outside the title's address "
+            "space",
+            base, size);
+        return X_STATUS_INVALID_PARAMETER;
+      }
+      const uint32_t end = rex::round_up(base + size, page_size, false);
+      if (alloc_type & X_MEM_RESERVE) {
+        // A reservation starts on the 64 KB boundary below the base, on pages
+        // no other reservation holds.
+        adjusted_base = base & ~uint32_t(0xFFFF);
+        if (!heap->IsRangeUnallocated(adjusted_base, end - adjusted_base)) {
+          REXKRNL_WARN(
+              "NtAllocateVirtualMemory: reservation {:08X}-{:08X} overlaps another one",
+              adjusted_base, end - 1);
+          return X_STATUS_CONFLICTING_ADDRESSES;
+        }
+      } else {
+        // A commit takes the pages that start inside the range so a range
+        // starting mid-page leaves that page alone and one inside a single page
+        // commits nothing. One reservation must hold the range, or for an empty
+        // one the page holding the base and the next.
+        adjusted_base = rex::round_up(base, page_size, false);
+        const auto reservation = ReservationOf(heap, adjusted_base);
+        if (!reservation || ReservationOf(heap, end - 1) != reservation) {
+          REXKRNL_WARN(
+              "NtAllocateVirtualMemory: commit {:08X} size {:08X} is not inside one reservation",
+              base, size);
+          return X_STATUS_CONFLICTING_ADDRESSES;
+        }
+        // A reset changes neither the pages nor the base and size.
+        if (alloc_type & X_MEM_RESET) {
+          return X_STATUS_SUCCESS;
+        }
+      }
+      adjusted_size = std::max(end, adjusted_base) - adjusted_base;
+      if (!adjusted_size) {
+        *base_addr_ptr = adjusted_base;
+        *region_size_ptr = 0;
+        return X_STATUS_SUCCESS;
+      }
+    } else {
+      // The range must fit in the address space for its page size.
+      const TitleSpace& space = TitleSpaceFor(page_size);
+      if (size > space.high - space.low) {
+        REXKRNL_WARN("NtAllocateVirtualMemory: size {:08X} does not fit the address space", size);
+        return X_STATUS_INVALID_PARAMETER;
+      }
+      // Sized to the page size; placed on a 64 KB boundary below.
+      adjusted_size = rex::round_up(size, page_size);
     }
-    if (heap->page_size() != page_size) {
-      // Specified the wrong page size for the wrong heap.
-      return X_STATUS_ACCESS_DENIED;
-    }
-    was_commited = heap->QueryRegionInfo(adjusted_base, &prev_alloc_info) &&
-                   (prev_alloc_info.state & memory::kMemoryAllocationCommit) != 0;
 
-    if (heap->AllocFixed(adjusted_base, adjusted_size, page_size, allocation_type, protect)) {
-      address = adjusted_base;
+    // Allocate.
+    uint32_t allocation_type = 0;
+    if (alloc_type & X_MEM_RESERVE) {
+      allocation_type |= memory::kMemoryAllocationReserve;
     }
-  } else {
-    bool top_down = !!(alloc_type & X_MEM_TOP_DOWN);
-    heap = REX_KERNEL_MEMORY()->LookupHeapByType(false, page_size);
-    heap->Alloc(adjusted_size, page_size, allocation_type, protect, top_down, &address);
-  }
-  if (!address) {
-    // Failed - assume no memory available.
-    return X_STATUS_NO_MEMORY;
-  }
-
-  // Zero memory, if needed.
-  if (address && !(alloc_type & X_MEM_NOZERO)) {
     if (alloc_type & X_MEM_COMMIT) {
-      if (!(protect & memory::kMemoryProtectWrite)) {
-        heap->Protect(address, adjusted_size,
-                      memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+      allocation_type |= memory::kMemoryAllocationCommit;
+    }
+    if (alloc_type & X_MEM_RESET) {
+      REXKRNL_ERROR("X_MEM_RESET not implemented");
+      assert_always();
+    }
+    const bool commit = !!(alloc_type & X_MEM_COMMIT);
+    // Only the pages this call commits are initialized.
+    std::vector<std::pair<uint32_t, uint32_t>> commit_runs;
+
+    if (base) {
+      if (commit) {
+        commit_runs = UncommittedRuns(heap, adjusted_base, adjusted_size);
       }
-      if (!was_commited) {
-        REX_KERNEL_MEMORY()->Zero(address, adjusted_size);
+      if (heap->AllocFixed(adjusted_base, adjusted_size, page_size, allocation_type, protect)) {
+        address = adjusted_base;
       }
-      if (!(protect & memory::kMemoryProtectWrite)) {
-        heap->Protect(address, adjusted_size, protect);
+    } else {
+      bool top_down = !!(alloc_type & X_MEM_TOP_DOWN);
+      heap = REX_KERNEL_MEMORY()->LookupHeapByType(false, page_size);
+      // A region starts on a 64 KB boundary whatever its page size, inside the
+      // address space for its page size.
+      const TitleSpace& space = TitleSpaceFor(page_size);
+      heap->AllocRange(space.low, space.high - 1, adjusted_size, 64 * 1024, allocation_type,
+                       protect, top_down, &address);
+      if (address && commit) {
+        commit_runs.emplace_back(address, adjusted_size);
       }
     }
+    if (!address) {
+      // Failed - assume no memory available.
+      return X_STATUS_NO_MEMORY;
+    }
+
+    for (const auto& [start, length] : commit_runs) {
+      auto uninitialized = heap->TakeUninitializedRuns(start, length);
+      if (!nozero) {
+        init_runs.emplace_back(start, length);
+      } else {
+        init_runs.insert(init_runs.end(), uninitialized.begin(), uninitialized.end());
+      }
+    }
+    // A region this call placed is new to every other call, so only a range at
+    // a base has to be initialized before the lock is released.
+    if (base) {
+      InitializeRuns(heap, init_runs, protect, nozero);
+    }
   }
+  if (!base) {
+    InitializeRuns(heap, init_runs, protect, nozero);
+  }
+
   // Stash back.
   // Maybe set X_STATUS_ALREADY_COMMITTED if MEM_COMMIT?
   *base_addr_ptr = address;
@@ -239,7 +385,7 @@ u32 NtProtectVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_siz
   *region_size_ptr = adjusted_size;
 
   if (old_protect) {
-    *old_protect = tmp_old_protect;
+    *old_protect = ToXdkProtectFlags(tmp_old_protect);
   }
 
   return X_STATUS_SUCCESS;
@@ -267,8 +413,16 @@ u32 NtFreeVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_p
                  base_addr_value, region_size_value);
   }
 
-  if (!base_addr_value) {
-    return X_STATUS_MEMORY_NOT_ALLOCATED;
+  if (free_type != X_MEM_DECOMMIT && free_type != X_MEM_RELEASE) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  // The range must fit in the address space its base is in.
+  const TitleSpace* space = TitleSpaceOf(base_addr_value);
+  if (!space || region_size_value > space->high - base_addr_value) {
+    REXKRNL_WARN("NtFreeVirtualMemory: range {:08X} size {:08X} is outside the title's address "
+                 "space",
+                 base_addr_value, region_size_value);
+    return X_STATUS_INVALID_PARAMETER;
   }
 
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_addr_value);
@@ -276,23 +430,39 @@ u32 NtFreeVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_size_p
     REXKRNL_WARN("NtFreeVirtualMemory: {:08X} is not in a guest virtual heap", base_addr_value);
     return X_STATUS_INVALID_PARAMETER;
   }
-  bool result = false;
-  if (free_type == X_MEM_DECOMMIT) {
-    if (!region_size_value) {
-      // NT decommits the whole region containing the base when the size is
-      // zero. Not implemented; refuse instead of dropping the call silently.
-      REXKRNL_WARN("NtFreeVirtualMemory: MEM_DECOMMIT with size 0 (base: {:08X}) not implemented",
-                   base_addr_value);
-      return X_STATUS_INVALID_PARAMETER;
-    }
-
-    region_size_value = rex::round_up(region_size_value, heap->page_size());
-    result = heap->Decommit(base_addr_value, region_size_value);
-  } else {
-    result = heap->Release(base_addr_value, &region_size_value);
+  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
+  // Both take the pages that start inside the range so size 0 decommits
+  // nothing. A reservation must hold the first page and the range.
+  const uint32_t page_size = heap->page_size();
+  const uint32_t end = rex::round_up(base_addr_value + region_size_value, page_size, false);
+  const uint32_t start = rex::round_up(base_addr_value, page_size, false);
+  const uint32_t length = std::max(end, start) - start;
+  const auto reservation = ReservationOf(heap, start);
+  if (!reservation) {
+    return X_STATUS_MEMORY_NOT_ALLOCATED;
   }
-  if (!result) {
-    return X_STATUS_UNSUCCESSFUL;
+  if (length && ReservationOf(heap, end - 1) != reservation) {
+    REXKRNL_WARN("NtFreeVirtualMemory: {:08X} size {:08X} is not inside one reservation",
+                 base_addr_value, region_size_value);
+    return X_STATUS_UNABLE_TO_FREE_VM;
+  }
+  if (free_type == X_MEM_RELEASE && !region_size_value) {
+    // Size 0 releases the whole reservation, from its base.
+    if (base_addr_value >> 12 != *reservation >> 12) {
+      return X_STATUS_FREE_VM_NOT_AT_BASE;
+    }
+    if (!heap->Release(*reservation, &region_size_value)) {
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    base_addr_value = *reservation;
+  } else {
+    // A release of part of a reservation leaves the rest reserved.
+    if (length && !(free_type == X_MEM_DECOMMIT ? heap->Decommit(start, length)
+                                                : heap->ReleaseRange(start, length))) {
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    base_addr_value = start;
+    region_size_value = length;
   }
 
   *base_addr_ptr = base_addr_value;
@@ -329,7 +499,8 @@ u32 NtQueryVirtualMemory_entry(u32 base_address,
     return X_STATUS_INVALID_PARAMETER;
   }
 
-  memory_basic_information_ptr->base_address = alloc_info.base_address;
+  // The queried address is rounded down to its page (xenia-canary a078f5499).
+  memory_basic_information_ptr->base_address = alloc_info.base_address & ~(heap->page_size() - 1);
   memory_basic_information_ptr->allocation_base = alloc_info.allocation_base;
   memory_basic_information_ptr->allocation_protect =
       ToXdkProtectFlags(alloc_info.allocation_protect);
@@ -348,7 +519,9 @@ u32 NtQueryVirtualMemory_entry(u32 base_address,
     x_state = X_MEM_FREE;
   }
   memory_basic_information_ptr->state = x_state;
-  memory_basic_information_ptr->protect = ToXdkProtectFlags(alloc_info.protect);
+  // Only committed pages have a protection.
+  memory_basic_information_ptr->protect =
+      x_state == X_MEM_COMMIT ? ToXdkProtectFlags(alloc_info.protect) : 0;
   memory_basic_information_ptr->type = X_MEM_PRIVATE;
 
   return X_STATUS_SUCCESS;
@@ -361,10 +534,18 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
                        (uint32_t)flags, (uint32_t)region_size, (uint32_t)protect_bits,
                        (uint32_t)min_addr_range, (uint32_t)max_addr_range, (uint32_t)alignment);
 
-  // Check protection bits.
-  if (!(protect_bits & (X_PAGE_READONLY | X_PAGE_READWRITE))) {
-    REXKRNL_ERROR("MmAllocatePhysicalMemoryEx: bad protection bits");
-    return 0;
+  // Check protection bits. 54540817 passes X_MEM_LARGE_PAGES |
+  // X_PAGE_WRITECOMBINE with no access bits for its front buffer; refusing it
+  // left VdSwap with a null front buffer (audio, no video), so a missing access
+  // mode is taken as read/write (xenia-canary 838850fed).
+  constexpr uint32_t kAccessProtectBits =
+      X_PAGE_READONLY | X_PAGE_READWRITE | X_PAGE_EXECUTE_READ | X_PAGE_EXECUTE_READWRITE;
+  if (!(protect_bits & kAccessProtectBits)) {
+    REXKRNL_WARN(
+        "MmAllocatePhysicalMemoryEx: no access mode in protection bits {:08X} (flags {:08X}, "
+        "size {:08X}), assuming read/write",
+        (uint32_t)protect_bits, (uint32_t)flags, (uint32_t)region_size);
+    protect_bits |= X_PAGE_READWRITE;
   }
 
   // Either may be OR'ed into protect_bits:
@@ -433,8 +614,13 @@ void MmFreePhysicalMemory_entry(u32 type, u32 base_address) {
 
 u32 MmQueryAddressProtect_entry(u32 base_address) {
   auto heap = REX_KERNEL_MEMORY()->LookupHeap(base_address);
-  uint32_t access;
-  if (!heap->QueryProtect(base_address, &access)) {
+  uint32_t access = 0;
+  uint32_t state = 0;
+  if (!heap || !heap->QueryProtect(base_address, &access, &state)) {
+    access = 0;
+  }
+  // Only committed pages have a protection (xenia-canary a078f5499).
+  if (!(state & memory::kMemoryAllocationCommit)) {
     access = 0;
   }
   access = !access ? 0 : ToXdkProtectFlags(access);
@@ -652,25 +838,26 @@ u32 KeLockL2_entry() {
 
 void KeUnlockL2_entry() {}
 
-u32 MmCreateKernelStack_entry(u32 stack_size, u32 r4) {
-  assert_zero(r4);  // Unknown argument.
-
-  auto stack_size_aligned = (stack_size + 0xFFF) & 0xFFFFF000;
-  uint32_t stack_alignment = (stack_size & 0xF000) ? 0x1000 : 0x10000;
-
-  uint32_t stack_address;
-  REX_KERNEL_STATE()
-      ->memory()
-      ->LookupHeap(0x70000000)
-      ->AllocRange(0x70000000, 0x7F000000, stack_size_aligned, stack_alignment,
+u32 MmCreateKernelStack_entry(u32 stack_size, u32 type) {
+  if (type > 2 || !stack_size || stack_size > 0x0F000000) {
+    return 0;
+  }
+  const uint32_t stack_size_aligned = rex::round_up(stack_size, 0x1000u);
+  auto* heap = REX_KERNEL_MEMORY()->LookupHeap(0x70000000);
+  uint32_t stack_address = 0;
+  if (!heap || !heap->AllocRange(
+                   0x70000000, 0x7F000000, stack_size_aligned, heap->page_size(),
                    memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
-                   memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false, &stack_address);
-  return stack_address + stack_size;
+                   memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false, &stack_address)) {
+    return 0;
+  }
+  return stack_address + stack_size_aligned;
 }
 
 u32 MmDeleteKernelStack_entry(mapped_void stack_base, mapped_void stack_end) {
   // Release the stack (where stack_end is the low address)
-  if (REX_KERNEL_STATE()->memory()->LookupHeap(0x70000000)->Release(stack_end.guest_address())) {
+  auto* heap = REX_KERNEL_MEMORY()->LookupHeap(stack_end.guest_address());
+  if (heap && heap->Release(stack_end.guest_address())) {
     return X_STATUS_SUCCESS;
   }
 
@@ -689,25 +876,56 @@ u32 MmIsAddressValid_entry(u32 address) {
   return heap->QueryRangeAccess(address, address) != rex::memory::PageAccess::kNoAccess;
 }
 
-u32 NtAllocateEncryptedMemory_entry(u32 unk, u32 region_size, mapped_u32 base_addr_ptr) {
-  if (!region_size) {
+u32 KeGetCurrentProcessType_entry();  // xboxkrnl_threading.cpp
+
+namespace {
+
+// A region of the encrypted 64 KB XEX pages that NtAllocateEncryptedMemory
+// allocates from (canary e8f4be2c8).
+struct EncryptedMemoryRegion {
+  uint32_t base;
+  uint32_t size;
+
+  bool Contains(uint32_t address) const { return address - base < size; }
+};
+
+constexpr EncryptedMemoryRegion kSystemEncryptedMemoryRegion = {0x8C000000, 0x01000000};
+constexpr EncryptedMemoryRegion kTitleEncryptedMemoryRegion = {0x8D000000, 0x03000000};
+
+// The region of a region type: 1 the title's, 2 the system's, 0 the current
+// process's. nullptr for any other type.
+const EncryptedMemoryRegion* EncryptedRegionFor(uint32_t region_type) {
+  if (region_type > X_PROCTYPE_SYSTEM) {
+    return nullptr;
+  }
+  const uint32_t type = region_type ? region_type : KeGetCurrentProcessType_entry();
+  return type == X_PROCTYPE_USER ? &kTitleEncryptedMemoryRegion : &kSystemEncryptedMemoryRegion;
+}
+
+}  // namespace
+
+u32 NtAllocateEncryptedMemory_entry(u32 region_type, u32 region_size, mapped_u32 base_addr_ptr) {
+  if (region_type > X_PROCTYPE_SYSTEM || !region_size) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  const EncryptedMemoryRegion& region = *EncryptedRegionFor(region_type);
 
-  const uint32_t region_size_adjusted = rex::round_up(uint32_t(region_size), 64 * 1024);
-  if (region_size_adjusted > 16 * 1024 * 1024) {
+  auto heap = REX_KERNEL_MEMORY()->LookupHeap(region.base);
+  if (!heap) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  const uint32_t region_size_adjusted =
+      rex::round_up(uint32_t(region_size), heap->page_size(), false);
+  if (!region_size_adjusted || region_size_adjusted > region.size) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
   uint32_t out_address = 0;
-  auto heap = REX_KERNEL_MEMORY()->LookupHeap(0x8C000000);
-  if (!heap) {
-    return X_STATUS_UNSUCCESSFUL;
-  }
-  if (!heap->AllocRange(
-          0x8C000000, 0x8FFFFFFF, region_size_adjusted, 64 * 1024, memory::kMemoryAllocationCommit,
-          memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false, &out_address)) {
-    return X_STATUS_UNSUCCESSFUL;
+  if (!heap->AllocRange(region.base, region.base + region.size - 1, region_size_adjusted,
+                        heap->page_size(), memory::kMemoryAllocationCommit,
+                        memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false,
+                        &out_address)) {
+    return X_STATUS_NO_MEMORY;
   }
 
   REXKRNL_IMPORT_RESULT("NtAllocateEncryptedMemory", "addr={:#x}", out_address);
@@ -715,23 +933,34 @@ u32 NtAllocateEncryptedMemory_entry(u32 unk, u32 region_size, mapped_u32 base_ad
   return X_STATUS_SUCCESS;
 }
 
-u32 NtFreeEncryptedMemory_entry(u32 region_type, mapped_u32 base_address_ptr) {
-  if (!base_address_ptr) {
+// The base is passed by value; reading it as a pointer crashed on the first
+// free (canary e8f4be2c8).
+u32 NtFreeEncryptedMemory_entry(u32 region_type, u32 base_address) {
+  if (region_type > X_PROCTYPE_SYSTEM) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  const EncryptedMemoryRegion& region = *EncryptedRegionFor(region_type);
+  if (!region.Contains(base_address)) {
     return X_STATUS_INVALID_PARAMETER;
   }
 
-  auto heap = REX_KERNEL_MEMORY()->LookupHeap(0x80000000);
+  auto heap = REX_KERNEL_MEMORY()->LookupHeap(region.base);
   if (!heap) {
     return X_STATUS_INVALID_PARAMETER;
   }
-  const uint32_t encrypt_address = heap->heap_base() + heap->page_size() * (*base_address_ptr);
 
-  auto encrypt_heap = REX_KERNEL_MEMORY()->LookupHeap(encrypt_address);
-  if (!encrypt_heap || encrypt_heap->heap_type() != memory::HeapType::kGuestXex) {
+  // The page the address rounds up to has to start an allocation.
+  const uint32_t page_address = rex::round_up(base_address, heap->page_size(), false);
+  memory::HeapAllocationInfo info;
+  if (!region.Contains(page_address) || !heap->QueryRegionInfo(page_address, &info) ||
+      !info.state || info.allocation_base != page_address) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  if (base_address != page_address) {
+    return X_STATUS_FREE_VM_NOT_AT_BASE;
+  }
 
-  REX_KERNEL_MEMORY()->SystemHeapFree(encrypt_address);
+  heap->Release(page_address);
   return X_STATUS_SUCCESS;
 }
 

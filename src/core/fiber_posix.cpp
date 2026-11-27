@@ -27,6 +27,8 @@ namespace rex::thread {
 
 thread_local Fiber* Fiber::tls_current_ = nullptr;
 
+Fiber* Fiber::Current() { return tls_current_; }
+
 Fiber* Fiber::ConvertCurrentThread() {
   auto* f = new Fiber();
   if (getcontext(&f->context_) == -1) {
@@ -69,9 +71,12 @@ void Fiber::SwitchTo(Fiber* target) {
 }
 
 void Fiber::Destroy() {
-  // Thread fibers are destroyed from the owning thread itself.
   if (is_thread_fiber_) {
-    tls_current_ = nullptr;
+    // Only the owning thread's current fiber is cleared: destroying another
+    // thread's fiber must not touch the caller's (upstream rexglue 6937495b).
+    if (tls_current_ == this) {
+      tls_current_ = nullptr;
+    }
   } else {
     assert(this != tls_current_ && "Destroy called on the currently running fiber");
   }

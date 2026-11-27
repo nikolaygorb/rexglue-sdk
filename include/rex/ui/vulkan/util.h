@@ -49,9 +49,18 @@ enum class MemoryPurpose {
 };
 
 inline uint32_t ChooseHostMemoryType(const VulkanDevice::MemoryTypes& memory_types,
-                                     uint32_t supported_types, const bool is_readback) {
+                                     uint32_t supported_types, const bool is_readback,
+                                     const bool prefer_device_local = false) {
   supported_types &= memory_types.host_visible;
   uint32_t memory_type;
+  // Uploads the GPU reads in place (constants, indices) from video memory the
+  // CPU can write through the resizable BAR, uncached, when there is such.
+  if (prefer_device_local && !is_readback &&
+      rex::bit_scan_forward(supported_types & memory_types.device_local_host_visible_large &
+                                ~memory_types.host_cached,
+                            &memory_type)) {
+    return memory_type;
+  }
   // For upload, uncached is preferred so writes do not pollute the CPU cache.
   // For readback, cached is preferred so multiple CPU reads are fast.
   // If the preferred caching behavior is not available, pick any host-visible.

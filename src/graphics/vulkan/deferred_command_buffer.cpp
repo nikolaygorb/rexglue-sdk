@@ -20,7 +20,19 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/render_area.h>
 #include <rex/math.h>
+
+// Read at the start of each replay (Execute, ExecuteStreams).
+REXCVAR_DEFINE_BOOL(vulkan_tight_render_area, false, "GPU/Vulkan",
+                    "Begin each render pass (xenos and native) with a render area that covers only "
+                    "what its draws and clears can write (the scissors in effect at its draws and "
+                    "its clear rectangles) instead of the whole render target, so tile-based GPUs "
+                    "(phones, some integrated GPUs) load and store less memory. A pass that clears "
+                    "its attachments when it begins, or has a draw with no known scissor, keeps "
+                    "the whole area. Costs a second walk over each pass's commands on the "
+                    "replaying thread; no gain expected on desktop GPUs")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_merge_adjacent_barriers, false, "GPU/Vulkan",
                     "Pipeline barriers recorded one after another, with only binds, push "
@@ -33,14 +45,29 @@ namespace rex::graphics::vulkan {
 
 DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                                              size_t initial_size)
-    : command_processor_(command_processor) {
+    : command_processor_(&command_processor) {
   command_stream_.reserve(initial_size / sizeof(uintmax_t));
+}
+
+DeferredCommandBuffer::DeferredCommandBuffer(const ui::vulkan::VulkanDevice* vulkan_device,
+                                             size_t initial_size)
+    : vulkan_device_(vulkan_device) {
+  command_stream_.reserve(initial_size / sizeof(uintmax_t));
+  // The device's breadcrumbs exist from its creation (the command processor's
+  // buffer is told in its SetupContext).
+  count_breadcrumb_work_ = vulkan_device && vulkan_device->HasBreadcrumbs();
+}
+
+const ui::vulkan::VulkanDevice::Functions& DeferredCommandBuffer::functions() const {
+  return vulkan_device_ ? vulkan_device_->functions()
+                        : command_processor_->GetVulkanDevice()->functions();
 }
 
 void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
   hoisted_stream_.clear();
   write_stream_ = &command_stream_;
+  breadcrumb_work_ = ui::GpuBreadcrumbWork();
 }
 
 size_t DeferredCommandBuffer::CmdHoistPoint() {
@@ -65,6 +92,8 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
   merge_barriers_ = REXCVAR_GET(vulkan_merge_adjacent_barriers);
+  tight_render_area_ = REXCVAR_GET(vulkan_tight_render_area);
+  tight_has_scissor_ = false;
   ExecuteStream(command_buffer, command_stream_.data(), command_stream_.size(),
                 hoisted_stream_.data());
 }
@@ -74,6 +103,8 @@ void DeferredCommandBuffer::ExecuteStreams(VkCommandBuffer command_buffer,
   // Read here too: with vulkan_threaded_submission this is the only entry, on
   // the replay thread, which alone uses the merge scratch.
   merge_barriers_ = REXCVAR_GET(vulkan_merge_adjacent_barriers);
+  tight_render_area_ = REXCVAR_GET(vulkan_tight_render_area);
+  tight_has_scissor_ = false;
   ExecuteStream(command_buffer, streams.main.data(), streams.main.size(), streams.hoisted.data());
 }
 
@@ -215,8 +246,7 @@ bool DeferredCommandBuffer::MergeBarriersAt(VkCommandBuffer command_buffer,
                                     arrays.image + barrier->image_memory_barrier_count);
     }
   }
-  const ui::vulkan::VulkanDevice::Functions& dfn =
-      command_processor_.GetVulkanDevice()->functions();
+  const ui::vulkan::VulkanDevice::Functions& dfn = functions();
   dfn.vkCmdPipelineBarrier(
       command_buffer, src_stage_mask, dst_stage_mask, 0, uint32_t(merged_memory_barriers_.size()),
       merged_memory_barriers_.data(), uint32_t(merged_buffer_barriers_.size()),
@@ -235,11 +265,60 @@ bool DeferredCommandBuffer::MergeBarriersAt(VkCommandBuffer command_buffer,
   return true;
 }
 
+// gears-of-war-2-pc-port 0089: walks a render pass's commands (from after its
+// begin) and returns the render area its draws and clears can write. The
+// scissor in effect at the begin is the one the replay last executed.
+VkRect2D DeferredCommandBuffer::PassRenderArea(const uintmax_t* stream, size_t stream_remaining,
+                                               const VkRect2D& full, VkRect2D scissor,
+                                               bool has_scissor) {
+  render_area::PassArea area;
+  while (stream_remaining) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+    stream += kCommandHeaderSizeElements;
+    stream_remaining -= kCommandHeaderSizeElements;
+    switch (header.command) {
+      case Command::kVkEndRenderPass:
+      case Command::kVkEndRendering:
+        return render_area::TightRenderArea(area, full);
+      case Command::kVkSetScissor: {
+        auto& args = *reinterpret_cast<const ArgsVkSetScissor*>(stream);
+        if (args.first_scissor == 0 && args.scissor_count >= 1) {
+          scissor = *reinterpret_cast<const VkRect2D*>(
+              reinterpret_cast<const uint8_t*>(stream) +
+              rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D)));
+          has_scissor = true;
+        }
+      } break;
+      case Command::kVkDraw:
+      case Command::kVkDrawIndexed:
+        render_area::AddDraw(area, has_scissor ? &scissor : nullptr);
+        break;
+      case Command::kVkClearAttachments: {
+        auto& args = *reinterpret_cast<const ArgsVkClearAttachments*>(stream);
+        size_t offset_bytes =
+            rex::align(sizeof(ArgsVkClearAttachments), alignof(VkClearAttachment));
+        offset_bytes = rex::align(offset_bytes + sizeof(VkClearAttachment) * args.attachment_count,
+                                  alignof(VkClearRect));
+        const VkClearRect* rects = reinterpret_cast<const VkClearRect*>(
+            reinterpret_cast<const uint8_t*>(stream) + offset_bytes);
+        for (uint32_t i = 0; i < args.rect_count; ++i) {
+          render_area::AddClearRect(area, rects[i].rect);
+        }
+      } break;
+      default:
+        break;
+    }
+    stream += header.arguments_size_elements;
+    stream_remaining -= header.arguments_size_elements;
+  }
+  // The pass doesn't end in this stream: whatever follows may write anywhere.
+  return full;
+}
+
 void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const uintmax_t* stream,
                                           size_t stream_remaining,
                                           const uintmax_t* hoisted_stream) const {
-  const ui::vulkan::VulkanDevice::Functions& dfn =
-      command_processor_.GetVulkanDevice()->functions();
+  const ui::vulkan::VulkanDevice::Functions& dfn = functions();
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -254,7 +333,14 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
         render_pass_begin_info.pNext = nullptr;
         render_pass_begin_info.renderPass = args.render_pass;
         render_pass_begin_info.framebuffer = args.framebuffer;
-        render_pass_begin_info.renderArea = args.render_area;
+        // A pass with clear values clears its attachments' render area when it
+        // begins: that one keeps the whole area.
+        render_pass_begin_info.renderArea =
+            tight_render_area_ && !args.clear_value_count
+                ? PassRenderArea(stream + header.arguments_size_elements,
+                                 stream_remaining - header.arguments_size_elements,
+                                 args.render_area, tight_scissor_, tight_has_scissor_)
+                : args.render_area;
         render_pass_begin_info.clearValueCount = args.clear_value_count;
         if (render_pass_begin_info.clearValueCount) {
           offset_bytes = rex::align(offset_bytes, alignof(VkClearValue));
@@ -413,6 +499,14 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
                           args.group_count_z);
       } break;
 
+      case Command::kBreadcrumb: {
+        const auto* device = vulkan_device_ ? vulkan_device_ : command_processor_->GetVulkanDevice();
+        device->EmitBreadcrumb(command_buffer, *reinterpret_cast<const uint32_t*>(stream));
+      } break;
+      case Command::kSetupBreadcrumb: {
+        const auto* device = vulkan_device_ ? vulkan_device_ : command_processor_->GetVulkanDevice();
+        device->EmitSetupBreadcrumb(command_buffer, *reinterpret_cast<const uint32_t*>(stream));
+      } break;
       case Command::kVkDraw: {
         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
@@ -460,6 +554,28 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
         rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
         rendering_info.flags = args.flags;
         rendering_info.renderArea = args.render_area;
+        if (tight_render_area_) {
+          // Attachments cleared when it begins or resolved when it ends keep
+          // the whole area.
+          bool whole = false;
+          auto check = [&whole](const VkRenderingAttachmentInfo* attachment) {
+            if (attachment && (attachment->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+                               attachment->resolveMode != VK_RESOLVE_MODE_NONE)) {
+              whole = true;
+            }
+          };
+          for (uint32_t i = 0; i < args.color_attachment_count; ++i) {
+            check(color_attachments + i);
+          }
+          check(depth_attachment);
+          check(stencil_attachment);
+          if (!whole) {
+            rendering_info.renderArea = PassRenderArea(
+                stream + header.arguments_size_elements,
+                stream_remaining - header.arguments_size_elements, args.render_area,
+                tight_scissor_, tight_has_scissor_);
+          }
+        }
         rendering_info.layerCount = args.layer_count;
         rendering_info.viewMask = args.view_mask;
         rendering_info.colorAttachmentCount = args.color_attachment_count;
@@ -577,10 +693,14 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
 
       case Command::kVkSetScissor: {
         auto& args = *reinterpret_cast<const ArgsVkSetScissor*>(stream);
-        dfn.vkCmdSetScissor(command_buffer, args.first_scissor, args.scissor_count,
-                            reinterpret_cast<const VkRect2D*>(
-                                reinterpret_cast<const uint8_t*>(stream) +
-                                rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D))));
+        const VkRect2D* rects = reinterpret_cast<const VkRect2D*>(
+            reinterpret_cast<const uint8_t*>(stream) +
+            rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D)));
+        dfn.vkCmdSetScissor(command_buffer, args.first_scissor, args.scissor_count, rects);
+        if (args.first_scissor == 0 && args.scissor_count >= 1) {
+          tight_scissor_ = rects[0];
+          tight_has_scissor_ = true;
+        }
       } break;
 
       case Command::kVkSetStencilCompareMask: {
@@ -609,6 +729,85 @@ void DeferredCommandBuffer::ExecuteStream(VkCommandBuffer command_buffer, const 
       case Command::kVkWriteTimestamp: {
         auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
         dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage, args.query_pool, args.query);
+      } break;
+
+      case Command::kVkClearDepthStencilImage: {
+        auto& args = *reinterpret_cast<const ArgsVkClearDepthStencilImage*>(stream);
+        dfn.vkCmdClearDepthStencilImage(
+            command_buffer, args.image, args.image_layout, &args.depth_stencil, args.range_count,
+            reinterpret_cast<const VkImageSubresourceRange*>(
+                reinterpret_cast<const uint8_t*>(stream) +
+                rex::align(sizeof(ArgsVkClearDepthStencilImage),
+                           alignof(VkImageSubresourceRange))));
+      } break;
+
+      case Command::kVkResolveImage: {
+        auto& args = *reinterpret_cast<const ArgsVkResolveImage*>(stream);
+        dfn.vkCmdResolveImage(command_buffer, args.src_image, args.src_image_layout,
+                              args.dst_image, args.dst_image_layout, args.region_count,
+                              reinterpret_cast<const VkImageResolve*>(
+                                  reinterpret_cast<const uint8_t*>(stream) +
+                                  rex::align(sizeof(ArgsVkResolveImage), alignof(VkImageResolve))));
+      } break;
+
+      case Command::kVkBlitImage: {
+        auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
+        dfn.vkCmdBlitImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                           args.dst_image_layout, args.region_count,
+                           reinterpret_cast<const VkImageBlit*>(
+                               reinterpret_cast<const uint8_t*>(stream) +
+                               rex::align(sizeof(ArgsVkBlitImage), alignof(VkImageBlit))),
+                           args.filter);
+      } break;
+
+      case Command::kVkUpdateBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkUpdateBuffer*>(stream);
+        dfn.vkCmdUpdateBuffer(command_buffer, args.dst_buffer, args.dst_offset, args.data_size,
+                              reinterpret_cast<const uint8_t*>(stream) +
+                                  sizeof(ArgsVkUpdateBuffer));
+      } break;
+
+      case Command::kVkPushDescriptorSetKHR: {
+        auto& args = *reinterpret_cast<const ArgsVkPushDescriptorSetKHR*>(stream);
+        const uint8_t* args_bytes = reinterpret_cast<const uint8_t*>(stream);
+        size_t offset_bytes = sizeof(ArgsVkPushDescriptorSetKHR);
+        push_descriptor_writes_.resize(args.descriptor_write_count);
+        for (uint32_t i = 0; i < args.descriptor_write_count; ++i) {
+          offset_bytes = rex::align(offset_bytes, alignof(ArgsPushDescriptorWrite));
+          const auto& write_args =
+              *reinterpret_cast<const ArgsPushDescriptorWrite*>(args_bytes + offset_bytes);
+          offset_bytes += sizeof(ArgsPushDescriptorWrite);
+          offset_bytes = rex::align(offset_bytes, alignof(uintmax_t));
+          VkWriteDescriptorSet& write = push_descriptor_writes_[i];
+          write = {};
+          write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          write.dstBinding = write_args.dst_binding;
+          write.dstArrayElement = write_args.dst_array_element;
+          write.descriptorCount = write_args.descriptor_count;
+          write.descriptorType = write_args.descriptor_type;
+          const void* infos = args_bytes + offset_bytes;
+          switch (write_args.info) {
+            case PushDescriptorInfo::kImage:
+              write.pImageInfo = static_cast<const VkDescriptorImageInfo*>(infos);
+              break;
+            case PushDescriptorInfo::kBuffer:
+              write.pBufferInfo = static_cast<const VkDescriptorBufferInfo*>(infos);
+              break;
+            case PushDescriptorInfo::kTexelBufferView:
+              write.pTexelBufferView = static_cast<const VkBufferView*>(infos);
+              break;
+          }
+          offset_bytes += GetPushDescriptorInfoSize(write_args.info) * write_args.descriptor_count;
+        }
+        dfn.vkCmdPushDescriptorSetKHR(command_buffer, args.pipeline_bind_point, args.layout,
+                                      args.set, args.descriptor_write_count,
+                                      push_descriptor_writes_.data());
+      } break;
+
+      case Command::kExternal: {
+        auto& args = *reinterpret_cast<const ArgsExternal*>(stream);
+        args.callback(command_buffer, reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsExternal),
+                      args.user);
       } break;
 
       case Command::kHoistedCommands: {
@@ -713,6 +912,88 @@ void DeferredCommandBuffer::CmdVkPipelineBarrier(
   }
 }
 
+DeferredCommandBuffer::PushDescriptorInfo DeferredCommandBuffer::GetPushDescriptorInfo(
+    VkDescriptorType type) {
+  switch (type) {
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+      return PushDescriptorInfo::kTexelBufferView;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+      return PushDescriptorInfo::kBuffer;
+    default:
+      // Samplers, images, combined image samplers, input attachments.
+      return PushDescriptorInfo::kImage;
+  }
+}
+
+size_t DeferredCommandBuffer::GetPushDescriptorInfoSize(PushDescriptorInfo info) {
+  switch (info) {
+    case PushDescriptorInfo::kBuffer:
+      return sizeof(VkDescriptorBufferInfo);
+    case PushDescriptorInfo::kTexelBufferView:
+      return sizeof(VkBufferView);
+    default:
+      return sizeof(VkDescriptorImageInfo);
+  }
+}
+
+void DeferredCommandBuffer::CmdVkPushDescriptorSetKHR(
+    VkPipelineBindPoint pipeline_bind_point, VkPipelineLayout layout, uint32_t set,
+    uint32_t descriptor_write_count, const VkWriteDescriptorSet* descriptor_writes) {
+  size_t arguments_size = sizeof(ArgsVkPushDescriptorSetKHR);
+  for (uint32_t i = 0; i < descriptor_write_count; ++i) {
+    const VkWriteDescriptorSet& write = descriptor_writes[i];
+    assert_null(write.pNext);
+    arguments_size = rex::align(arguments_size, alignof(ArgsPushDescriptorWrite));
+    arguments_size += sizeof(ArgsPushDescriptorWrite);
+    arguments_size = rex::align(arguments_size, alignof(uintmax_t));
+    arguments_size +=
+        GetPushDescriptorInfoSize(GetPushDescriptorInfo(write.descriptorType)) *
+        write.descriptorCount;
+  }
+  uint8_t* args_ptr =
+      reinterpret_cast<uint8_t*>(WriteCommand(Command::kVkPushDescriptorSetKHR, arguments_size));
+  auto& args = *reinterpret_cast<ArgsVkPushDescriptorSetKHR*>(args_ptr);
+  args.pipeline_bind_point = pipeline_bind_point;
+  args.layout = layout;
+  args.set = set;
+  args.descriptor_write_count = descriptor_write_count;
+  size_t offset_bytes = sizeof(ArgsVkPushDescriptorSetKHR);
+  for (uint32_t i = 0; i < descriptor_write_count; ++i) {
+    const VkWriteDescriptorSet& write = descriptor_writes[i];
+    offset_bytes = rex::align(offset_bytes, alignof(ArgsPushDescriptorWrite));
+    auto& write_args = *reinterpret_cast<ArgsPushDescriptorWrite*>(args_ptr + offset_bytes);
+    write_args.dst_binding = write.dstBinding;
+    write_args.dst_array_element = write.dstArrayElement;
+    write_args.descriptor_count = write.descriptorCount;
+    write_args.descriptor_type = write.descriptorType;
+    write_args.info = GetPushDescriptorInfo(write.descriptorType);
+    offset_bytes += sizeof(ArgsPushDescriptorWrite);
+    offset_bytes = rex::align(offset_bytes, alignof(uintmax_t));
+    const size_t infos_size =
+        GetPushDescriptorInfoSize(write_args.info) * write.descriptorCount;
+    const void* infos = nullptr;
+    switch (write_args.info) {
+      case PushDescriptorInfo::kImage:
+        infos = write.pImageInfo;
+        break;
+      case PushDescriptorInfo::kBuffer:
+        infos = write.pBufferInfo;
+        break;
+      case PushDescriptorInfo::kTexelBufferView:
+        infos = write.pTexelBufferView;
+        break;
+    }
+    if (infos_size) {
+      std::memcpy(args_ptr + offset_bytes, infos, infos_size);
+    }
+    offset_bytes += infos_size;
+  }
+}
+
 void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering_info) {
   assert_null(rendering_info->pNext);
 
@@ -754,7 +1035,58 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
   }
 }
 
+void DeferredCommandBuffer::CountBreadcrumbWork(Command command) {
+  uint16_t* counter = nullptr;
+  switch (command) {
+    case Command::kVkBeginRenderPass:
+    case Command::kVkBeginRendering:
+      counter = &breadcrumb_work_.render_passes;
+      break;
+    case Command::kVkDraw:
+    case Command::kVkDrawIndexed:
+      counter = &breadcrumb_work_.draws;
+      break;
+    case Command::kVkDispatch:
+    case Command::kExternal:
+      counter = &breadcrumb_work_.dispatches;
+      break;
+    case Command::kVkPipelineBarrier:
+      counter = &breadcrumb_work_.barriers;
+      break;
+    case Command::kVkCopyBuffer:
+    case Command::kVkCopyBufferToImage:
+    case Command::kVkCopyImage:
+    case Command::kVkCopyImageToBuffer:
+    case Command::kVkCopyQueryPoolResults:
+    case Command::kVkBlitImage:
+    case Command::kVkResolveImage:
+    case Command::kVkClearColorImage:
+    case Command::kVkClearDepthStencilImage:
+    case Command::kVkFillBuffer:
+    case Command::kVkUpdateBuffer:
+      counter = &breadcrumb_work_.copies;
+      break;
+    case Command::kVkClearAttachments:
+      counter = &breadcrumb_work_.clears;
+      break;
+    case Command::kVkBeginQuery:
+      counter = &breadcrumb_work_.queries;
+      break;
+    case Command::kVkBeginConditionalRenderingEXT:
+      counter = &breadcrumb_work_.conditional;
+      break;
+    default:
+      return;
+  }
+  if (*counter != UINT16_MAX) {
+    ++*counter;
+  }
+}
+
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
+  if (count_breadcrumb_work_ && write_stream_ == &command_stream_) {
+    CountBreadcrumbWork(command);
+  }
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
   std::vector<uintmax_t>& stream = *write_stream_;

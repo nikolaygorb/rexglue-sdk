@@ -333,6 +333,17 @@ constexpr bool IsSignedViewBound(uint8_t packed_signs, bool is_signed) {
   return is_signed || !IsAnySignNotSigned(packed_signs);
 }
 
+// stacked_texture_layer_wrap: a stacked texture (2D array) of at least
+// min_layers layers (and 2) whose fetch constant repeats on the layer axis
+// (clamp_z kRepeat) has its layer coordinate wrapped by the shaders instead of
+// clamped (looping animations stored as layers). Never with min_layers 0.
+inline bool IsStackedLayerWrapped(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                  uint32_t min_layers) {
+  return min_layers && fetch.dimension == xenos::DataDimension::k2DOrStacked &&
+         fetch.clamp_z == xenos::ClampMode::kRepeat &&
+         uint32_t(fetch.size_2d.stack_depth) + 1 >= std::max(min_layers, uint32_t(2));
+}
+
 // Returns normalized clamp modes specified in the fetch constant based on the
 // texture data dimension in it.
 void GetClampModesForDimension(const xenos::xe_gpu_texture_fetch_t& fetch,

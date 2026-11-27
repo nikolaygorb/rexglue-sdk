@@ -116,6 +116,7 @@ class XFile : public XObject {
                  uint32_t* out_bytes_written, uint32_t apc_context, bool* out_pending = nullptr);
 
   X_STATUS SetLength(size_t length);
+  X_STATUS Flush();
   X_STATUS Rename(const std::filesystem::path& file_path, bool replace_existing);
 
   void RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);
@@ -130,6 +131,7 @@ class XFile : public XObject {
   void SetFindPattern(const std::string_view pattern) {
     find_engine_.SetRule(pattern);
     find_index_ = 0;
+    find_started_ = true;
   }
 
   rex::filesystem::Entry* FindNext() {
@@ -163,6 +165,7 @@ class XFile : public XObject {
 
   rex::filesystem::WildcardEngine find_engine_;
   size_t find_index_ = 0;
+  bool find_started_ = false;
 
   bool is_synchronous_ = false;
   bool allow_buffering_ = false;

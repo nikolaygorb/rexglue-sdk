@@ -253,5 +253,27 @@ TEST_CASE("Texture replacement dump is a pack", "[graphics][texture]") {
                           image, error, &too_large));
   CHECK(too_large);
 
+  std::ofstream(folder / "pack.toml") << "preload = true\n";
+  tr::Index preload_index;
+  REQUIRE(preload_index.Load(folder, false, error));
+  REQUIRE(preload_index.PreloadList().size() == 1);
+  tr::PreloadCache preload;
+  preload.Load(preload_index, 8);
+  CHECK(preload.bytes() == 0);
+  preload.Load(preload_index, 16);
+  CHECK(preload.bytes() == 16);
+  std::filesystem::remove(preload_index.FilePath(*preload_index.Find(key)));
+  REQUIRE(preload.Take(key, 8, 4, 1, 16384, 16, image));
+  CHECK(image.data == level);
+  CHECK(preload.bytes() == 0);
+  CHECK_FALSE(preload.Take(key, 8, 4, 1, 16384, 16, image));
+
   std::filesystem::remove_all(folder);
+}
+
+TEST_CASE("Texture pack preload uses top-level TOML booleans", "[graphics][texture]") {
+  CHECK(tr::ManifestPreload("preload = true # startup\n[other]\npreload=false\n"));
+  CHECK_FALSE(tr::ManifestPreload("preload = 'true'"));
+  CHECK_FALSE(tr::ManifestPreload("[other]\npreload = true"));
+  CHECK_FALSE(tr::ManifestPreload("preload = invalid"));
 }

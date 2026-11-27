@@ -228,6 +228,24 @@ endif()
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fidelityfx.cmake)
 
 #=============================================================================
+# AMD FSR SDK 2.4 (signed Vulkan DLLs + ffx-api headers) for the native
+# temporal upscaler; downloaded on demand, Windows only.
+#=============================================================================
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fsr_sdk.cmake)
+
+#=============================================================================
+# Intel XeSS SDK 3.0.2 (libxess.dll + SR headers) for the native temporal
+# upscaler; downloaded on demand, Windows only.
+#=============================================================================
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_xess_sdk.cmake)
+
+#=============================================================================
+# NVIDIA DLSS SDK 310.9.16 (NGX headers, static library, DLSS SR and frame
+# generation DLLs); downloaded on demand, Windows x64 only.
+#=============================================================================
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_dlss_sdk.cmake)
+
+#=============================================================================
 # imgui - Immediate mode GUI (no CMakeLists.txt, manual target)
 #=============================================================================
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/imgui")

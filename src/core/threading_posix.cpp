@@ -1109,8 +1109,11 @@ class PosixCondition<Thread> : public PosixConditionBase, public AlertSource {
 #endif
   }
 
-  void QueueUserCallback(std::function<void()> callback) {
+  bool QueueUserCallback(std::function<void()> callback) {
     WaitStarted();
+    std::unique_lock state_lock(state_mutex_);
+    if (state_ == State::kFinished)
+      return false;
     {
       std::unique_lock<std::mutex> lock(callback_mutex_);
       user_callbacks_.push_back(std::move(callback));
@@ -1123,10 +1126,11 @@ class PosixCondition<Thread> : public PosixConditionBase, public AlertSource {
     // If the callback is queued on the current thread, don't self-signal.
     // Alertable waits drain this queue in normal thread context.
     if (pthread_equal(thread_, pthread_self())) {
+      state_lock.unlock();
       if (alertable_state_) {
         DispatchQueuedUserCallbacks();
       }
-      return;
+      return true;
     }
 
 #if defined(__APPLE__)
@@ -1146,6 +1150,7 @@ class PosixCondition<Thread> : public PosixConditionBase, public AlertSource {
     if (result != 0) {
       REXSYS_WARN("QueueUserCallback: signal delivery failed ({})", result);
     }
+    return result == 0;
   }
 
   void SetAlertWaiter(Waiter* waiter) override {
@@ -1512,6 +1517,8 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
 std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wait_handle_count,
                                            bool wait_all, bool is_alertable,
                                            std::chrono::milliseconds timeout) {
+  if (!wait_handle_count)
+    return {WaitResult::kSuccess, 0};
   std::vector<PosixConditionBase*> conditions;
   conditions.reserve(wait_handle_count);
   for (size_t i = 0u; i < wait_handle_count; ++i) {
@@ -1658,8 +1665,8 @@ class PosixThread : public PosixConditionHandle<Thread> {
   int priority() override { return handle_.priority(); }
   void set_priority(int new_priority) override { handle_.set_priority(new_priority); }
 
-  void QueueUserCallback(std::function<void()> callback) override {
-    handle_.QueueUserCallback(std::move(callback));
+  bool QueueUserCallback(std::function<void()> callback) override {
+    return handle_.QueueUserCallback(std::move(callback));
   }
 
   bool Resume(uint32_t* out_previous_suspend_count) override {

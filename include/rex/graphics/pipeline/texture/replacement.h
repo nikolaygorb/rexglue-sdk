@@ -85,6 +85,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <rex/graphics/xenos.h>
@@ -134,6 +135,7 @@ bool ComputeKey(const GuestBaseLevel& level, std::vector<uint8_t>& scratch, uint
 
 // Parses 1 to 16 hex digits (either case) into a key.
 bool ParseKey(std::string_view text, uint64_t& key_out);
+bool ManifestPreload(std::string_view text);
 
 // Whether an index line's `file` may be used: a relative path inside the pack
 // folder, with `/` between components (no backslashes), no empty, `.` or `..`
@@ -187,10 +189,12 @@ class Index {
   size_t skipped_lines() const { return skipped_lines_; }
   // The first skipped line (1-based) of the last pack read, 0 if none.
   size_t first_skipped_line() const { return first_skipped_line_; }
+  std::vector<std::pair<uint64_t, IndexEntry>> PreloadList() const;
 
  private:
   std::vector<std::filesystem::path> folders_;
   std::vector<bool> strict_alpha_;
+  std::vector<bool> preload_;
   std::unordered_map<uint64_t, IndexEntry> entries_;
   size_t skipped_lines_ = 0;
   size_t first_skipped_line_ = 0;
@@ -256,6 +260,20 @@ struct Image {
 
   const uint8_t* level_data(size_t level) const { return data.data() + levels[level].offset; }
 };
+
+// CPU staging only: uploads remain synchronous with first use, as before.
+// Consume preloaded bytes once so GPU-resident replacements don't keep a CPU copy.
+class PreloadCache {
+ public:
+  void Load(const Index& index, uint64_t budget_bytes);
+  bool Take(uint64_t key, uint32_t guest_width, uint32_t guest_height,
+            uint32_t guest_levels, uint32_t max_side, uint64_t max_bytes, Image& out);
+  uint64_t bytes() const { return bytes_; }
+ private:
+  uint64_t bytes_ = 0;
+  std::unordered_map<uint64_t, Image> images_;
+};
+uint64_t GetPreloadMemoryLimitBytes();
 
 // Whether a width x height image may stand for a guest texture of
 // guest_width x guest_height: any size with the guest's aspect ratio, to

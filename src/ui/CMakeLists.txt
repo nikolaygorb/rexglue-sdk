@@ -2,6 +2,7 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    displays.cpp
     graphics_upload_buffer_pool.cpp
     gpu_trace_replay.cpp
     graphics_util.cpp
@@ -41,14 +42,18 @@ set(REXUI_VULKAN_SOURCES
     vulkan/spirv_tools_context.cpp
     vulkan/ui_samplers.cpp
     vulkan/vulkan_device.cpp
+    vulkan/vulkan_dlss_frame_generation.cpp
+    vulkan/vulkan_frame_generation.cpp
     vulkan/vulkan_gpu_completion_timeline.cpp
     vulkan/vulkan_immediate_drawer.cpp
     vulkan/vulkan_instance.cpp
     vulkan/vulkan_mem_alloc.cpp
+    vulkan/vulkan_ngx.cpp
     vulkan/vulkan_presenter.cpp
     vulkan/vulkan_provider.cpp
     vulkan/vulkan_upload_buffer_pool.cpp
     vulkan/vulkan_util.cpp
+    vulkan/vulkan_xess.cpp
 )
 
 # D3D12 UI backend
@@ -150,6 +155,35 @@ if(TARGET amd_fidelityfx_dx12)
 endif()
 if(REXUI_HAS_FIDELITYFX_RUNTIME)
     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_RUNTIME=1)
+endif()
+
+# AMD FSR frame generation (cmake/rexglue_fsr_sdk.cmake): ffx-api headers for
+# vulkan/vulkan_frame_generation.cpp only; the signed DLLs load at run time.
+if(REXGLUE_USE_VULKAN AND REXGLUE_FSR_SDK_DIR)
+    set_source_files_properties(vulkan/vulkan_frame_generation.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${REXGLUE_FSR_SDK_DIR}/Kits/FidelityFX"
+        COMPILE_DEFINITIONS REX_HAS_FSR_SDK=1
+        SKIP_PRECOMPILE_HEADERS ON)
+endif()
+
+# Intel XeSS (cmake/rexglue_xess_sdk.cmake): SR headers for vulkan/vulkan_xess.cpp
+# only; libxess.dll loads at run time.
+if(REXGLUE_USE_VULKAN AND REXGLUE_XESS_SDK_DIR)
+    set_source_files_properties(vulkan/vulkan_xess.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${REXGLUE_XESS_SDK_DIR}/inc"
+        COMPILE_DEFINITIONS REX_HAS_XESS_SDK=1
+        SKIP_PRECOMPILE_HEADERS ON)
+endif()
+
+# NVIDIA DLSS (cmake/rexglue_dlss_sdk.cmake): NGX headers for
+# vulkan/vulkan_ngx.cpp only (the one NGX user); the NGX static library is
+# linked into rexruntime (src/kernel/CMakeLists.txt), the feature DLLs load at
+# run time.
+if(REXGLUE_USE_VULKAN AND REXGLUE_DLSS_SDK_DIR)
+    set_source_files_properties(vulkan/vulkan_ngx.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${REXGLUE_DLSS_SDK_DIR}/include"
+        COMPILE_DEFINITIONS REX_HAS_DLSS_SDK=1
+        SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
 if(REXGLUE_USE_VULKAN)

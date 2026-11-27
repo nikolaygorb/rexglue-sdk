@@ -158,6 +158,7 @@ void SpirvShaderTranslator::Reset() {
   builder_.reset();
 
   uniform_float_constants_ = spv::NoResult;
+  buffer_motion_capture_ = spv::NoResult;
 
   input_vertex_index_ = spv::NoResult;
   input_primitive_id_ = spv::NoResult;
@@ -442,6 +443,8 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_depth_base_dwords_scaled", offsetof(SystemConstants, edram_depth_base_dwords_scaled),
        type_uint_},
       {"zpd_counter_index", offsetof(SystemConstants, zpd_counter_index), type_uint_},
+      {"textures_stacked_layer_wrap", offsetof(SystemConstants, textures_stacked_layer_wrap),
+       type_uint_},
       {"color_exp_bias", offsetof(SystemConstants, color_exp_bias), type_float4_},
       {"edram_poly_offset_front_scale", offsetof(SystemConstants, edram_poly_offset_front_scale),
        type_float_},
@@ -464,6 +467,9 @@ void SpirvShaderTranslator::StartTranslation() {
       {"texture_integer_scale_bits", offsetof(SystemConstants, texture_integer_scale_bits),
        type_uint4_array_8},
       {"param_gen_window_offset", offsetof(SystemConstants, param_gen_window_offset), type_float2_},
+      {"motion_capture_base", offsetof(SystemConstants, motion_capture_base), type_uint_},
+      {"motion_capture_mask", offsetof(SystemConstants, motion_capture_mask), type_uint_},
+      {"motion_capture_tag", offsetof(SystemConstants, motion_capture_tag), type_uint_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
@@ -1860,6 +1866,33 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
                                                    type_int_, "gl_VertexIndex");
     builder_->addDecoration(input_vertex_index_, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
     main_interface_.push_back(input_vertex_index_);
+    // Object motion capture buffer uint[] (SetMotionCapture).
+    if (motion_capture_ && GetSpirvShaderModification().vertex.host_vertex_shader_type ==
+                               Shader::HostVertexShaderType::kVertex) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeRuntimeArray(type_uint_));
+      builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
+                              sizeof(uint32_t));
+      spv::Id type_motion_capture = builder_->makeStructType(id_vector_temp_, "XeMotionCapture");
+      builder_->addMemberName(type_motion_capture, 0, "motion_capture");
+      builder_->addMemberDecoration(type_motion_capture, 0, spv::DecorationRestrict);
+      builder_->addMemberDecoration(type_motion_capture, 0, spv::DecorationOffset, 0);
+      builder_->addDecoration(type_motion_capture, features_.spirv_version >= spv::Spv_1_3
+                                                       ? spv::DecorationBlock
+                                                       : spv::DecorationBufferBlock);
+      buffer_motion_capture_ = builder_->createVariable(
+          spv::NoPrecision,
+          features_.spirv_version >= spv::Spv_1_3 ? spv::StorageClassStorageBuffer
+                                                  : spv::StorageClassUniform,
+          type_motion_capture, "xe_motion_capture");
+      builder_->addDecoration(buffer_motion_capture_, spv::DecorationDescriptorSet,
+                              int(kDescriptorSetSharedMemoryAndEdram));
+      builder_->addDecoration(buffer_motion_capture_, spv::DecorationBinding,
+                              int(kMotionCaptureBinding));
+      if (features_.spirv_version >= spv::Spv_1_4) {
+        main_interface_.push_back(buffer_motion_capture_);
+      }
+    }
   }
 
   uint32_t output_location = 0;
@@ -3010,6 +3043,63 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
       position = composite_construct_op->getResultId();
       builder_->getBuildPoint()->addInstruction(std::move(composite_construct_op));
     }
+    // Object motion: the final host position at motion_capture_base +
+    // (index & mask), 5 dwords per vertex: xyzw, (index & 0xFFFFFF) | tag.
+    if (buffer_motion_capture_ != spv::NoResult) {
+      auto system_uint = [&](int member) {
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(member));
+        return builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                                uniform_system_constants_,
+                                                                id_vector_temp_),
+                                    spv::NoPrecision);
+      };
+      spv::Id capture_mask = system_uint(kSystemConstantMotionCaptureMask);
+      SpirvBuilder::IfBuilder capture_if(
+          builder_->createBinOp(spv::OpINotEqual, type_bool_, capture_mask, const_uint_0_),
+          spv::SelectionControlDontFlattenMask, *builder_);
+      {
+        // The guest's index: Vulkan reads guest indices in their byte order
+        // (vertex_index_endian), contiguous only once swapped.
+        spv::Id vertex_index = EndianSwap32Uint(
+            builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                    builder_->createLoad(input_vertex_index_, spv::NoPrecision)),
+            system_uint(kSystemConstantVertexIndexEndian));
+        spv::Id entry = builder_->createBinOp(
+            spv::OpIMul, type_uint_,
+            builder_->createBinOp(
+                spv::OpIAdd, type_uint_, system_uint(kSystemConstantMotionCaptureBase),
+                builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, vertex_index, capture_mask)),
+            builder_->makeUintConstant(5));
+        spv::StorageClass capture_storage_class = features_.spirv_version >= spv::Spv_1_3
+                                                      ? spv::StorageClassStorageBuffer
+                                                      : spv::StorageClassUniform;
+        auto store_word = [&](uint32_t word, spv::Id value) {
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(const_int_0_);
+          id_vector_temp_.push_back(builder_->createUnaryOp(
+              spv::OpBitcast, type_int_,
+              word ? builder_->createBinOp(spv::OpIAdd, type_uint_, entry,
+                                           builder_->makeUintConstant(word))
+                   : entry));
+          builder_->createStore(value,
+                                builder_->createAccessChain(capture_storage_class,
+                                                            buffer_motion_capture_,
+                                                            id_vector_temp_));
+        };
+        for (uint32_t i = 0; i < 4; ++i) {
+          store_word(i, builder_->createUnaryOp(
+                            spv::OpBitcast, type_uint_,
+                            builder_->createCompositeExtract(position, type_float_, i)));
+        }
+        store_word(4, builder_->createBinOp(
+                          spv::OpBitwiseOr, type_uint_,
+                          builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, vertex_index,
+                                                builder_->makeUintConstant(0xFFFFFFu)),
+                          system_uint(kSystemConstantMotionCaptureTag)));
+      }
+      capture_if.makeEndIf();
+    }
     builder_->createStore(position, position_ptr);
   }
 }
@@ -3110,7 +3200,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
         input_interpolators_per_vertex_[interpolator_index] = interpolator_per_vertex;
         builder_->addDecoration(interpolator_per_vertex, spv::DecorationLocation,
                                 int(input_location));
-        // Centroid doesn't apply to per-vertex values interpolated manually.
+        // Centroid can't be decorated on per-vertex values; centroid
+        // interpolators clamp the barycentric weights to the triangle in main.
         builder_->addDecoration(interpolator_per_vertex, spv::DecorationPerVertexNV);
         main_interface_.push_back(interpolator_per_vertex);
         ++input_location;
@@ -3161,7 +3252,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // (per-sample if supported).
   bool memexport_resolution_scaled =
       current_shader().memexport_eM_written() &&
-      (GetCurrentDrawResolutionScaleX() > 1 || GetCurrentDrawResolutionScaleY() > 1);
+      (GetCurrentDrawResolutionScale4X() > 4 || GetCurrentDrawResolutionScale4Y() > 4);
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
       float24_depth_from_fragment_coordinates || polygon_offset_in_shader ||
       alpha_to_coverage_possible) {
@@ -3292,9 +3383,13 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     // to the execution mask GPUs naturally have.
   }
 
-  if (IsApplyingPolygonOffset()) {
+  if (IsApplyingPolygonOffset() ||
+      (edram_fragment_shader_interlock_ && !current_shader().writes_depth())) {
     // The decal path needs the original triangle depth slope, not the slope of
-    // whichever lanes survive guest control flow or kill.
+    // whichever lanes survive guest control flow or kill. The late FSI depth /
+    // stencil test may run in the branch on main_fsi_sample_mask_ != 0, where
+    // the lanes outside the coverage are inactive, so take it here for FSI too
+    // (xenia-edge 8f189544e).
     assert_true(input_fragment_coordinates_ != spv::NoResult);
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeIntConstant(2));
@@ -3403,8 +3498,8 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
 
   if (current_shader().memexport_eM_written()) {
     // Make sure memexport is done only once for a guest pixel.
-    uint32_t resolution_scaled_axes = uint32_t(GetCurrentDrawResolutionScaleX() > 1) |
-                                      (uint32_t(GetCurrentDrawResolutionScaleY() > 1) << 1);
+    uint32_t resolution_scaled_axes = uint32_t(GetCurrentDrawResolutionScale4X() > 4) |
+                                      (uint32_t(GetCurrentDrawResolutionScale4Y() > 4) << 1);
     if (resolution_scaled_axes) {
       assert_true(input_fragment_coordinates_ != spv::NoResult);
       spv::Id memexport_allowed = spv::NoResult;
@@ -3418,15 +3513,48 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision);
-        spv::Id position_mod =
-            builder_->createBinOp(spv::OpUMod, type_uint_,
-                                  builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position),
-                                  builder_->makeUintConstant(i ? GetCurrentDrawResolutionScaleY()
-                                                               : GetCurrentDrawResolutionScaleX()));
-        spv::Id position_is_center = builder_->createBinOp(
-            spv::OpIEqual, type_bool_, position_mod,
-            builder_->makeUintConstant(i ? (GetCurrentDrawResolutionScaleY() >> 1)
-                                         : (GetCurrentDrawResolutionScaleX() >> 1)));
+        spv::Id position_uint = builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position);
+        uint32_t axis_scale4 =
+            i ? GetCurrentDrawResolutionScale4Y() : GetCurrentDrawResolutionScale4X();
+        spv::Id position_is_center;
+        if (!(axis_scale4 & 3)) {
+          spv::Id position_mod =
+              builder_->createBinOp(spv::OpUMod, type_uint_, position_uint,
+                                    builder_->makeUintConstant(axis_scale4 >> 2));
+          position_is_center =
+              builder_->createBinOp(spv::OpIEqual, type_bool_, position_mod,
+                                    builder_->makeUintConstant(axis_scale4 >> 3));
+        } else {
+          // A fractional scale: guest pixels are not all as many host pixels
+          // wide. The host pixel is in the guest pixel its centre is in,
+          // (4 * x + 2) / scale4, and that guest pixel's centre is in host
+          // pixel ((2 * guest + 1) * scale4 - 1) >> 3.
+          spv::Id const_scale4 = builder_->makeUintConstant(axis_scale4);
+          spv::Id guest = builder_->createBinOp(
+              spv::OpUDiv, type_uint_,
+              builder_->createBinOp(
+                  spv::OpIAdd, type_uint_,
+                  builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, position_uint,
+                                        builder_->makeUintConstant(2)),
+                  builder_->makeUintConstant(2)),
+              const_scale4);
+          spv::Id center = builder_->createBinOp(
+              spv::OpShiftRightLogical, type_uint_,
+              builder_->createBinOp(
+                  spv::OpISub, type_uint_,
+                  builder_->createBinOp(
+                      spv::OpIMul, type_uint_,
+                      builder_->createBinOp(
+                          spv::OpIAdd, type_uint_,
+                          builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, guest,
+                                                builder_->makeUintConstant(1)),
+                          builder_->makeUintConstant(1)),
+                      const_scale4),
+                  builder_->makeUintConstant(1)),
+              builder_->makeUintConstant(3));
+          position_is_center =
+              builder_->createBinOp(spv::OpIEqual, type_bool_, position_uint, center);
+        }
         memexport_allowed = memexport_allowed != spv::NoResult
                                 ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
                                                         memexport_allowed, position_is_center)
@@ -3479,6 +3607,11 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
   bool use_precise_interpolation = UsePreciseInterpolation();
   spv::Id bary_y_vec4 = spv::NoResult;
   spv::Id bary_z_vec4 = spv::NoResult;
+  // Weights for centroid interpolators (xenia-edge 4fb8372d2).
+  spv::Id bary_centroid_y_vec4 = spv::NoResult;
+  spv::Id bary_centroid_z_vec4 = spv::NoResult;
+  const uint32_t interpolators_centroid =
+      GetSpirvShaderModification().pixel.interpolators_centroid & interpolator_mask;
   if (use_precise_interpolation && interpolator_mask) {
     spv::Id barycentric_coords = builder_->createLoad(input_barycentric_coord_, spv::NoPrecision);
     bary_y_vec4 = builder_->smearScalar(
@@ -3487,6 +3620,45 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     bary_z_vec4 = builder_->smearScalar(
         spv::NoPrecision, builder_->createCompositeExtract(barycentric_coords, type_float_, 2),
         type_float4_);
+    // The barycentric input is at the pixel centre (a shader has one), which on
+    // an MSAA edge pixel can lie outside the triangle: there a centroid
+    // interpolator would extrapolate past the triangle's edges. Clamp the
+    // weights to the triangle instead (each at least 0, renormalized to a sum
+    // of 1); inside it they are used as they are, so values equal at every
+    // vertex stay exact.
+    if (interpolators_centroid) {
+      std::array<spv::Id, 3> bary;
+      std::array<spv::Id, 3> bary_clamped;
+      spv::Id bary_outside = spv::NoResult;
+      for (uint32_t i = 0; i < 3; ++i) {
+        bary[i] = builder_->createCompositeExtract(barycentric_coords, type_float_, i);
+        bary_clamped[i] = builder_->createBinBuiltinCall(
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450FMax, bary[i], const_float_0_);
+        spv::Id bary_negative =
+            builder_->createBinOp(spv::OpFOrdLessThan, type_bool_, bary[i], const_float_0_);
+        bary_outside = bary_outside != spv::NoResult
+                           ? builder_->createBinOp(spv::OpLogicalOr, type_bool_, bary_outside,
+                                                   bary_negative)
+                           : bary_negative;
+      }
+      // At least one weight is positive (they sum to 1), so the sum is > 0.
+      spv::Id bary_clamped_sum = builder_->createBinOp(
+          spv::OpFAdd, type_float_,
+          builder_->createBinOp(spv::OpFAdd, type_float_, bary_clamped[0], bary_clamped[1]),
+          bary_clamped[2]);
+      std::array<spv::Id, 2> bary_centroid_vec4;
+      for (uint32_t i = 0; i < 2; ++i) {
+        bary_centroid_vec4[i] = builder_->smearScalar(
+            spv::NoPrecision,
+            builder_->createTriOp(spv::OpSelect, type_float_, bary_outside,
+                                  builder_->createBinOp(spv::OpFDiv, type_float_,
+                                                        bary_clamped[1 + i], bary_clamped_sum),
+                                  bary[1 + i]),
+            type_float4_);
+      }
+      bary_centroid_y_vec4 = bary_centroid_vec4[0];
+      bary_centroid_z_vec4 = bary_centroid_vec4[1];
+    }
   }
   for (uint32_t i = 0; i < register_count(); ++i) {
     if (i == param_gen_interpolator) {
@@ -3512,8 +3684,11 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
         }
         spv::Id d1 = builder_->createBinOp(spv::OpFSub, type_float4_, v[1], v[0]);
         spv::Id d2 = builder_->createBinOp(spv::OpFSub, type_float4_, v[2], v[0]);
-        spv::Id term1 = builder_->createBinOp(spv::OpFMul, type_float4_, d1, bary_y_vec4);
-        spv::Id term2 = builder_->createBinOp(spv::OpFMul, type_float4_, d2, bary_z_vec4);
+        const bool centroid = (interpolators_centroid & (UINT32_C(1) << i)) != 0;
+        spv::Id term1 = builder_->createBinOp(spv::OpFMul, type_float4_, d1,
+                                              centroid ? bary_centroid_y_vec4 : bary_y_vec4);
+        spv::Id term2 = builder_->createBinOp(spv::OpFMul, type_float4_, d2,
+                                              centroid ? bary_centroid_z_vec4 : bary_z_vec4);
         interpolated_value = builder_->createBinOp(
             spv::OpFAdd, type_float4_, v[0],
             builder_->createBinOp(spv::OpFAdd, type_float4_, term1, term2));
@@ -3565,10 +3740,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (GetCurrentDrawResolutionScaleX() > 1) {
+    if (GetCurrentDrawResolutionScale4X() > 4) {
       param_gen_x = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_x,
-          builder_->makeFloatConstant(1.0f / float(GetCurrentDrawResolutionScaleX())));
+          builder_->makeFloatConstant(4.0f / float(GetCurrentDrawResolutionScale4X())));
     }
     param_gen_x = builder_->createBinOp(
         spv::OpFAdd, type_float_, param_gen_x,
@@ -3604,10 +3779,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (GetCurrentDrawResolutionScaleY() > 1) {
+    if (GetCurrentDrawResolutionScale4Y() > 4) {
       param_gen_y = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_y,
-          builder_->makeFloatConstant(1.0f / float(GetCurrentDrawResolutionScaleY())));
+          builder_->makeFloatConstant(4.0f / float(GetCurrentDrawResolutionScale4Y())));
     }
     param_gen_y = builder_->createBinOp(
         spv::OpFAdd, type_float_, param_gen_y,
@@ -3853,6 +4028,14 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
   if (storage_index) {
     index = builder_->createBinOp(spv::OpIAdd, type_int_, index,
                                   builder_->makeIntConstant(int(storage_index)));
+  }
+  if (is_float_constant && REXCVAR_GET(clamp_relative_float_constants)) {
+    // Within the 256 float constants (a0 itself only in [-256, 255]), as in
+    // the DXBC translator: out of the uniform buffer's range the read depends
+    // on the driver's robustness.
+    index = builder_->createTriBuiltinCall(type_int_, ext_inst_glsl_std_450_, GLSLstd450SClamp,
+                                           index, builder_->makeIntConstant(0),
+                                           builder_->makeIntConstant(255));
   }
   return index;
 }

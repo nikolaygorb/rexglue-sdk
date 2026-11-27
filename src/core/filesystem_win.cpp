@@ -73,6 +73,16 @@ std::filesystem::path GetUserFolder() {
   return result;
 }
 
+bool CreateNewFile(const std::filesystem::path& path) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE)
+    return false;
+  CloseHandle(file);
+  return true;
+}
+
 bool CreateEmptyFile(const std::filesystem::path& path) {
   auto handle =
       CreateFileW(path.c_str(), 0, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -177,7 +187,7 @@ class Win32FileHandle : public FileHandle {
     }
     return true;
   }
-  void Flush() override { FlushFileBuffers(handle_); }
+  bool Flush() override { return FlushFileBuffers(handle_) != FALSE; }
 
  private:
   HANDLE handle_ = nullptr;

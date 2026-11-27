@@ -421,3 +421,10 @@ FodyWeavers.xsd
 CMakeUserPresets.json
 
 /memory/*
+
+# AMD FSR SDK files downloaded by cmake/rexglue_fsr_sdk.cmake
+thirdparty/fsr-sdk-*/
+# Intel XeSS SDK files downloaded by cmake/rexglue_xess_sdk.cmake
+thirdparty/xess-sdk-*/
+# NVIDIA DLSS SDK files downloaded by cmake/rexglue_dlss_sdk.cmake
+thirdparty/dlss-sdk-*/

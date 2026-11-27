@@ -10,7 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <mutex>
+#include <rex/thread/mutex.h>
 
 #include <rex/system/xobject.h>
 #include <rex/system/xtypes.h>
@@ -50,7 +50,7 @@ class XEvent : public XObject {
   void SyncFromGuest() override;
 
  private:
-  // Writes the guest header's signal state (under state_lock_).
+  // Writes the guest header's signal state (under global_critical_region_).
   void SetGuestSignalState(uint32_t signal_state);
 
   bool manual_reset_ = false;
@@ -58,7 +58,10 @@ class XEvent : public XObject {
 
   // The guest header's signal state follows the host event, so a title that
   // reads or writes it directly sees the same (canary dcf2994ea).
-  std::mutex state_lock_;
+  // A header access may fault into the memory watch handler, which takes this
+  // region. Use the same recursive region as SyncFromGuest's callers to avoid
+  // acquiring it while holding a private mutex in the opposite order.
+  rex::thread::global_critical_region global_critical_region_;
   bool host_signaled_ = false;
 };
 

@@ -93,6 +93,10 @@ inline std::string RunCase(const Case& c, const Op* ops, const uint8_t* pool) {
   // A case starts from the reset FPSCR (round to nearest, no flush), not from
   // whatever rounding mode or flush the previous case left on the host.
   ctx.fpscr.setcsr(0x1F80);
+  // setcsr keeps the host's exception flags (FPSCR FX, VX, OX, UX, ZX, XX
+  // live there); the hardware captures start from a clear FPSCR, so they are
+  // cleared too, or one case's invalid operation shows in the next's CR1.
+  ctx.fpscr.restoreStatus(0);
   ctx.fpscr.loadFromHost();
   auto* raw = reinterpret_cast<uint8_t*>(&ctx);
   const Op* begin = ops + c.first_op;

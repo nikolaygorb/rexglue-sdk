@@ -9,4 +9,4 @@ test_mtfsb_rn:
   mffs f2
   mtfsfi 7, 0
   blr
-  #_ REGISTER_OUT f2 0x0000000000000002
+  #_ REGISTER_OUT f2 0xFFF8000000000002

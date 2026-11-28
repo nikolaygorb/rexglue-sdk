@@ -34,6 +34,8 @@ struct RecompilerLocalVariables {
   bool r[32]{};
   bool f[32]{};
   bool v[128]{};
+  /// vmx_leaf_as_local applies to this function: every v register is a local.
+  bool vmx_leaf{};
   bool env{};
   bool temp{};
   bool v_temp{};

@@ -111,6 +111,11 @@ struct RecompilerConfig {
   /// r0, r2, r11 and r12 only (f0 and v32-v63, which non_argument_as_local
   /// localizes too, stay in ctx for the same reason).
   bool nonArgumentGprsAsLocalVariables = false;
+  /// Every VMX register as a local in a function with no calls, no scalar
+  /// floating point and no mtvscr: copied from ctx at entry (after setting
+  /// the vector flush mode, which nothing in the function changes), back to
+  /// ctx at every return, so ctx ends as without it (`vmx_leaf_as_local`).
+  bool vmxLeafAsLocal = false;
   /// With registers as locals: every function reading one its caller set
   /// (before any path of its own sets it) becomes share_registers by itself.
   bool autoShareRegisters = true;

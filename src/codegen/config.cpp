@@ -124,6 +124,8 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("non_volatile_gpr_as_local"), "non_volatile_gpr_as_local");
   MergeBool(cfg.nonArgumentGprsAsLocalVariables, toml["non_argument_gpr_as_local"].value_or(false),
             hasBool("non_argument_gpr_as_local"), "non_argument_gpr_as_local");
+  MergeBool(cfg.vmxLeafAsLocal, toml["vmx_leaf_as_local"].value_or(false),
+            hasBool("vmx_leaf_as_local"), "vmx_leaf_as_local");
   MergeBool(cfg.autoShareRegisters, toml["auto_share_registers"].value_or(true),
             hasBool("auto_share_registers"), "auto_share_registers");
   MergeBool(cfg.fpuFlushDenormals, toml["fpu_flush_denormals"].value_or(false),

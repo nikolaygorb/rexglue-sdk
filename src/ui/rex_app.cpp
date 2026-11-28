@@ -25,6 +25,8 @@
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
+#include <rex/perf/thread_sampler.h>
+#include <rex/ppc/intrinsics.h>
 #include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
@@ -65,6 +67,11 @@ REXCVAR_DEFINE_BOOL(xex_image_check, true, "Runtime",
                     "Show a warning at startup when default.xex is not the build the game "
                     "was recompiled from (the log gets it either way)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(vec_estimate_host, false, "Runtime",
+                    "vrefp and vrsqrtefp as the host's exact 1/x and 1/sqrt(x): faster, not "
+                    "the console's estimates (a title comparing them may behave differently)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // REXGLUE_RECOMP_PGO=generate (set on the host target by rexglue_setup_target):
 // the instrumented build writes its profile here, since the app leaves through
@@ -426,6 +433,15 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
       return false;
     }
   }
+
+  // The generated code's copy of the flag lives in this executable.
+  rex::ppc::vec_estimate_host.store(REXCVAR_GET(vec_estimate_host), std::memory_order_relaxed);
+  rex::cvar::RegisterChangeCallback(
+      "vec_estimate_host", [](std::string_view, std::string_view value) {
+        rex::ppc::vec_estimate_host.store(rex::string::from_string<bool>(value, false),
+                                          std::memory_order_relaxed);
+      });
+  rex::perf::StartThreadSampler();
 
   OnPostSetup();
 

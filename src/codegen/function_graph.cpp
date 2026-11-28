@@ -586,6 +586,85 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   CSRState csrState = CSRState::Unknown;
   RecompilerLocalVariables localVariables;
 
+  // vmx_leaf_as_local: no call or branch out (ctx would have to be in sync),
+  // no trap or sc (the runtime may read ctx), no scalar floating point and no
+  // mtvscr (a flush mode change the locals are not fenced against).
+  auto vmxLeafEligible = [&]() {
+    if (!ctx.config.vmxLeafAsLocal || keepsNonVolatilesInContext() ||
+        (sehInfo && !sehInfo->scopes.empty()))
+      return false;
+    for (const auto& block : blocks()) {
+      auto* blockData = reinterpret_cast<const uint8_t*>(ctx.binary.translate(block.base));
+      if (!blockData)
+        return false;
+      for (uint32_t addr = block.base; addr < block.end(); addr += 4) {
+        if (ctx.config.midAsmHooks.contains(addr))
+          return false;
+        const uint32_t w = load_and_swap<uint32_t>(blockData + (addr - block.base));
+        const uint32_t xo = PPC_XOP(w);
+        switch (PPC_OP(w)) {
+          case PPC_OP_B:
+            if ((w & 3) != 0 || !containsAddress(addr + PPC_BI(w)))
+              return false;
+            break;
+          case PPC_OP_BC:
+            if ((w & 3) != 0 || !containsAddress(addr + PPC_BD(w)))
+              return false;
+            break;
+          case 19:
+            if (xo == 16) {  // bclr
+              if (w & 1)
+                return false;
+            } else if (xo == 528) {  // bcctr: a known jump table only
+              if ((w & 1) || !(ctx.config.switchTables.contains(addr) ||
+                               std::any_of(jumpTables().begin(), jumpTables().end(),
+                                           [addr](const JumpTable& jt) {
+                                             return jt.bctrAddress == addr;
+                                           })))
+                return false;
+            } else if (xo == 50 || xo == 18) {  // rfi, rfid
+              return false;
+            }
+            break;
+          case 2:   // tdi
+          case 3:   // twi
+          case 17:  // sc
+          case 59:
+          case 63:
+            return false;
+          case 31:
+            switch (xo) {
+              case 4:    // tw
+              case 68:   // td
+              case 535:  // lfsx
+              case 567:  // lfsux
+              case 599:  // lfdx
+              case 631:  // lfdux
+              case 663:  // stfsx
+              case 695:  // stfsux
+              case 727:  // stfdx
+              case 759:  // stfdux
+              case 983:  // stfiwx
+                return false;
+              default:
+                break;
+            }
+            break;
+          case 4:
+            if ((w & 0xFC0007FF) == 0x10000644)  // mtvscr
+              return false;
+            break;
+          default:
+            if (PPC_OP(w) >= 48 && PPC_OP(w) <= 55)  // lfs ... stfdu
+              return false;
+            break;
+        }
+      }
+    }
+    return true;
+  };
+  localVariables.vmx_leaf = vmxLeafEligible();
+
   // Local map for late-detected jump tables (can't mutate const config)
   std::unordered_map<uint32_t, JumpTable> lateJumpTables;
 
@@ -709,6 +788,27 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     emit_println(body, "\t\t}} SEH_END");
     emit_println(body, "\t}}\n");
   } else {
+    // vmx_leaf_as_local: the locals go back to ctx at every return, and at
+    // the end, should the code fall off it.
+    std::string sync;
+    for (size_t i = 0; localVariables.vmx_leaf && i < 128; i++) {
+      if (localVariables.v[i])
+        sync += fmt::format("ctx.v{0} = v{0}; ", i);
+    }
+    if (!sync.empty()) {
+      std::string synced;
+      synced.reserve(body.size() + body.size() / 8);
+      const std::string_view kReturn = "return;";
+      size_t from = 0;
+      for (size_t at; (at = body.find(kReturn, from)) != std::string::npos;
+           from = at + kReturn.size()) {
+        synced.append(body, from, at - from);
+        synced += "{ " + sync + "return; }";
+      }
+      synced.append(body, from);
+      body = std::move(synced);
+      emit_println(body, "\t{}", sync);
+    }
     emit_println(body, "}}\n");
   }
 
@@ -735,8 +835,18 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       emit_println(out, "\tPPCRegister f{}{{}};", i);
   }
 
+  bool vmxLeafUsed = false;
+  for (size_t i = 0; localVariables.vmx_leaf && i < 128; i++)
+    vmxLeafUsed |= localVariables.v[i];
+  if (vmxLeafUsed) {
+    // Before the copies: the mode's fence orders them after it, and so the
+    // arithmetic on them.
+    emit_println(out, "\tctx.fpscr.enableFlushMode();");
+  }
   for (size_t i = 0; i < 128; i++) {
-    if (localVariables.v[i])
+    if (localVariables.v[i] && vmxLeafUsed)
+      emit_println(out, "\tPPCVRegister v{0} = ctx.v{0};", i);
+    else if (localVariables.v[i])
       emit_println(out, "\tPPCVRegister v{}{{}};", i);
   }
 

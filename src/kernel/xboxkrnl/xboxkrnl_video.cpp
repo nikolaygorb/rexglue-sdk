@@ -26,6 +26,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
+#include <rex/perf/thread_sampler.h>
 #include <rex/types.h>
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
@@ -458,6 +459,8 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   assert(texture_format_ptr);
   assert(width);
   assert(height);
+
+  rex::perf::NoteGuestSwap();
 
   namespace xenos = rex::graphics::xenos;
 

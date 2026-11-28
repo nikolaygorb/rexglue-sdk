@@ -53,3 +53,45 @@ A profile goes stale as the generated code changes: regenerate it after codegen 
 ## Unaligned vector stores (stvlx / stvrx)
 
 `stvlx` and `stvrx` (and their `l` / `128` forms) write their part of the register with at most two overlapping stores (`rex::ppc::StoreVectorLeft` / `StoreVectorRight`), not a loop of up to 16 volatile byte stores. Like `stvx`, the stores are plain (not volatile). Always on; titles regenerate to get it. From upstream ReXGlue `55dd9b0b` (the store pair it also fuses into one 16-byte store is not taken: two plain stores each are close).
+
+## Vector estimates (vrsqrtefp / vrefp / vlogefp / vexptefp)
+
+`vrsqrtefp` and `vrefp` return the console's 12-bit table estimates (`rex/ppc/estimates.h`). When all four lanes are normal (positive for `vrsqrtefp`, biased exponent 1..252 for `vrefp`), `vec_estimate` computes them in SSE4.1 for the whole vector (one table read per lane, `pmaddwd` interpolation); any other lane takes the scalar per-lane path. Bit-exact: checked against the scalar code for all 2^32 inputs. Always on, header only (titles rebuild, no regeneration). Under `__AVX2__` the table reads use a gather; `REX_PPC_NO_GATHER` turns that off.
+
+`vlogefp` (all lanes positive normals) and `vexptefp` (all lanes below 128 in magnitude with a result of at least 2^-126) take the same kind of whole-vector path: table reads per lane, the exponent and the fixed-point input in integer SSE (a variable shift as a multiply's high half), no host floating-point flag raised. Also checked for all 2^32 inputs, on x86-64-v2 and v3.
+
+In Fuse, whose hottest vector job kernel runs four `vrsqrtefp` and four `vrefp` per record (~330,000 records a frame), the scalar estimates were ~44 ms of CPU a frame; with this path gameplay went from ~27 to ~40-45 FPS (x86-64-v2).
+
+| Setting | Default | Effect |
+|---|---|---|
+| `vec_estimate_host` | `false` | `vrsqrtefp` = `1 / sqrt(x)`, `vrefp` = `1 / x` with SSE `sqrtps` / `divps`. Applies while running. **Not bit-exact**: a title that compares or accumulates estimates can diverge (xenia-canary saw spawning and collision differences in Red Dead Redemption). Fuse: another +15-20 % in its heaviest scenes. |
+
+## Vector integer instructions without a lane loop
+
+`vsubsws`, `vpkuhus` / `vpkuhus128`, `vpkuwus` / `vpkuwus128`, `vrlw` / `vrlw128`, `vsrw` / `vsrw128` and `vsraw` / `vsraw128` used to be generated as one statement per lane (4 to 16). They are now one SSE helper each (`rex::ppc::simde_mm_subs_epi32`, `simde_mm_packus_epu16` / `_epu32`, `simde_mm_rolv_epi32`, simde's `srlv` / `srav`, native only under AVX2, as `vslw` already was), with the same results (unit tests against scalar references, PPC asm tests). Titles regenerate to get it. As before, none of them sets VSCR[SAT].
+
+## Vector registers as locals in leaf functions
+
+`vmx_leaf_as_local` (manifest, default `false`; see [codegen-registers.md](codegen-registers.md)): a function with no call or branch out, no trap or `sc`, no scalar floating point and no `mtvscr` keeps the vector registers it uses in C++ locals, copied from `ctx` at entry and back at every return. In Fuse 820 functions qualified and the title ran correctly, but the hot vector kernel was not faster (~95 ns per record either way): its cost is in the exact per-operation helpers, not in the register file in memory. Kept as an option to measure on other titles.
+
+## Finding the hot code: thread sampler
+
+A wall-clock sampler of the title's threads, built into the runtime (Windows x64). Every `thread_sampler_interval_us` it suspends each selected thread, walks its host stack and resumes it; waiting threads are sampled too, so a report shows where a thread's frame time goes, not just its CPU use. At the end it names the frames from the PDBs next to the executable (inlined frames expanded). Build with symbols (`RelWithDebInfo`).
+
+| Setting | Default | Effect |
+|---|---|---|
+| `thread_sampler_delay` | `0` | Capture once this many seconds after start (0: only on request). |
+| `thread_sampler_request` | `0` | Change to a new nonzero number while running to capture now. |
+| `thread_sampler_seconds` | `20` | Length of a capture. |
+| `thread_sampler_interval_us` | `1000` | Time between sampling rounds. |
+| `thread_sampler_threads` | empty | Threads whose name contains this. Empty: guest threads (`"<name> (XXXXXXXX)"`) and the thread calling `VdSwap`; `*`: every thread. |
+| `thread_sampler_dir` | empty | Report folder; empty: `logs/profile` next to the executable. |
+
+Example: `title.exe --frame_stats_interval=5 --thread_sampler_delay=90`.
+
+Each capture writes `sampler-<UTC time>/`:
+
+- `report.txt`: per thread its CPU % and the % of samples blocked in a syscall (`Nt*` / `Zw*` on top); for the `VdSwap` thread and the 6 busiest threads three tables in % and ms per guest frame (frames counted at `VdSwap`), with the blocked part: *Guest self* (innermost `sub_XXXXXXXX` on the stack), *Guest inclusive* (any `sub_` on the stack), *Leaf* (any function on top).
+- `stacks.folded`: folded stacks of all sampled threads, for speedscope or `flamegraph.pl`.
+
+The sampler costs some FPS while it captures (each thread is stopped about once per interval). A title whose renderer does not call `VdSwap` calls `rex::perf::NoteGuestSwap()` from its own present hook to get per-frame numbers.

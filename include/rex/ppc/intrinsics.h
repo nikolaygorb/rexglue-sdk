@@ -14,6 +14,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <climits>
 #include <cmath>
@@ -176,6 +177,57 @@ inline void StoreVectorRight(uint8_t* host_quadword, uint32_t ea, const uint8_t*
 inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b) {
   return simde_mm_add_epi32(
       a, simde_mm_min_epu32(simde_mm_xor_si128(a, simde_mm_cmpeq_epi32(a, a)), b));
+}
+
+// Signed 32-bit saturating subtract (vsubsws)
+inline simde__m128i simde_mm_subs_epi32(simde__m128i a, simde__m128i b) {
+  const simde__m128i diff = simde_mm_sub_epi32(a, b);
+  // Overflow: a and b differ in sign and the difference's sign is not a's.
+  const simde__m128i overflow =
+      simde_mm_and_si128(simde_mm_xor_si128(a, b), simde_mm_xor_si128(a, diff));
+  const simde__m128i saturated =
+      simde_mm_xor_si128(simde_mm_srai_epi32(a, 31), simde_mm_set1_epi32(0x7FFFFFFF));
+  return simde_mm_castps_si128(simde_mm_blendv_ps(simde_mm_castsi128_ps(diff),
+                                                  simde_mm_castsi128_ps(saturated),
+                                                  simde_mm_castsi128_ps(overflow)));
+}
+
+// Unsigned halfwords to bytes, saturated (vpkuhus); packus alone reads them as signed
+inline simde__m128i simde_mm_packus_epu16(simde__m128i lo, simde__m128i hi) {
+  const simde__m128i max = simde_mm_set1_epi16(0xFF);
+  return simde_mm_packus_epi16(simde_mm_min_epu16(lo, max), simde_mm_min_epu16(hi, max));
+}
+
+// Unsigned words to halfwords, saturated (vpkuwus)
+inline simde__m128i simde_mm_packus_epu32(simde__m128i lo, simde__m128i hi) {
+  const simde__m128i max = simde_mm_set1_epi32(0xFFFF);
+  return simde_mm_packus_epi32(simde_mm_min_epu32(lo, max), simde_mm_min_epu32(hi, max));
+}
+
+// Each word rotated left by the low 5 bits of its count (vrlw)
+inline simde__m128i simde_mm_rolv_epi32(simde__m128i a, simde__m128i count) {
+  count = simde_mm_and_si128(count, simde_mm_set1_epi32(31));
+#if defined(__AVX2__) || !(defined(__x86_64__) || defined(_M_X64))
+  return simde_mm_or_si128(
+      simde_mm_sllv_epi32(a, count),
+      simde_mm_srlv_epi32(a, simde_mm_sub_epi32(simde_mm_set1_epi32(32), count)));
+#else
+  // 16 swaps the halves; the rest is a multiply by 2^n (exact conversion, no
+  // FP flag), whose 64-bit product has the rotation as high half | low half.
+  const simde__m128i swap = simde_mm_cmpgt_epi32(simde_mm_and_si128(count, simde_mm_set1_epi32(16)),
+                                                 simde_mm_setzero_si128());
+  a = simde_mm_blendv_epi8(
+      a, simde_mm_or_si128(simde_mm_slli_epi32(a, 16), simde_mm_srli_epi32(a, 16)), swap);
+  const simde__m128i factor = simde_mm_cvttps_epi32(simde_mm_castsi128_ps(
+      simde_mm_slli_epi32(simde_mm_add_epi32(simde_mm_and_si128(count, simde_mm_set1_epi32(15)),
+                                             simde_mm_set1_epi32(127)),
+                          23)));
+  const simde__m128i even = simde_mm_mul_epu32(a, factor);
+  const simde__m128i odd =
+      simde_mm_mul_epu32(simde_mm_srli_epi64(a, 32), simde_mm_srli_epi64(factor, 32));
+  return simde_mm_blend_epi16(simde_mm_or_si128(even, simde_mm_srli_epi64(even, 32)),
+                              simde_mm_or_si128(odd, simde_mm_slli_epi64(odd, 32)), 0xCC);
+#endif
 }
 
 // Signed 8-bit average (rounds towards zero)
@@ -690,9 +742,221 @@ inline double fp_frsqrte(double b) {
   return r;
 }
 
+// vrefp and vrsqrtefp as the host's exact 1/x and 1/sqrt(x) instead of the
+// console's estimates: faster, not bit-exact (see estimates.h for the risk).
+// Per module (the title's code lives in the executable, which sets it).
+inline std::atomic<bool> vec_estimate_host{false};
+
+// The lane-parallel estimates' tables, one 32-bit entry per segment for a
+// single read per lane: two int16 for pmaddwd, which interpolates in one step.
+// vrsqrtefp: the slope in the high half; the base's 16 bits less 0x8000 in the
+// low half (signed), the 0x8000 * 1024 added back after.
+inline constexpr std::array<uint32_t, 32> kVecEstimateRsqrtTable = [] {
+  std::array<uint32_t, 32> table{};
+  for (size_t i = 0; i < table.size(); ++i) {
+    const uint32_t entry = kEstimateReciprocalSqrtTable[i];
+    table[i] = (entry & 0xFFFF0000u) | ((entry - 0x8000u) & 0xFFFFu);
+  }
+  return table;
+}();
+// vrefp: the slope in the high half, the base / 512 (all are multiples) in the low.
+inline constexpr std::array<uint32_t, 32> kVecEstimateRecipTable = [] {
+  std::array<uint32_t, 32> table{};
+  for (size_t i = 0; i < table.size(); ++i) {
+    table[i] = (uint32_t(kEstimateReciprocalSlope[i]) << 16) | (kEstimateReciprocalBase[i] >> 9);
+  }
+  return table;
+}();
+
+inline simde__m128i vec_table_lookup(const std::array<uint32_t, 32>& table, simde__m128i index) {
+#if defined(__AVX2__) && !defined(REX_PPC_NO_GATHER)
+  return simde_mm_i32gather_epi32(reinterpret_cast<const int32_t*>(table.data()), index, 4);
+#else
+  return simde_mm_setr_epi32(int32_t(table[uint32_t(simde_mm_cvtsi128_si32(index))]),
+                             int32_t(table[uint32_t(simde_mm_extract_epi32(index, 1))]),
+                             int32_t(table[uint32_t(simde_mm_extract_epi32(index, 2))]),
+                             int32_t(table[uint32_t(simde_mm_extract_epi32(index, 3))]));
+#endif
+}
+
+// pmaddwd's second operand: `low` in the low half, -step in the high.
+inline simde__m128i vec_estimate_weights(simde__m128i step, int32_t low) {
+  return simde_mm_or_si128(simde_mm_slli_epi32(simde_mm_sub_epi32(simde_mm_setzero_si128(), step), 16),
+                           simde_mm_set1_epi32(low));
+}
+
+// estimate_reciprocal_sqrt in all lanes when each is a positive normal; false
+// otherwise (the scalar handles zeros, denormals, negatives, infinities, NaNs).
+// Checked against it for every input (each positive normal takes this path).
+inline bool vec_estimate_rsqrt_normal(simde__m128 x, simde__m128& out) {
+  const simde__m128i bits = simde_mm_castps_si128(x);
+  const simde__m128i normal =
+      simde_mm_andnot_si128(simde_mm_cmpgt_epi32(simde_mm_set1_epi32(0x00800000), bits),
+                            simde_mm_cmpgt_epi32(simde_mm_set1_epi32(0x7F800000), bits));
+  if (simde_mm_movemask_ps(simde_mm_castsi128_ps(normal)) != 0xF) [[unlikely]] {
+    return false;
+  }
+  // The exponent's parity and the top 4 mantissa bits pick the entry.
+  const simde__m128i index =
+      simde_mm_and_si128(simde_mm_srli_epi32(bits, 19), simde_mm_set1_epi32(31));
+  const simde__m128i interp =
+      simde_mm_and_si128(simde_mm_srli_epi32(bits, 9), simde_mm_set1_epi32(1023));
+  simde__m128i raw = simde_mm_add_epi32(
+      simde_mm_madd_epi16(vec_table_lookup(kVecEstimateRsqrtTable, index),
+                          vec_estimate_weights(interp, 1024)),
+      simde_mm_set1_epi32(0x2000000));
+  // An odd exponent's half of the table lacks bit 25, never bit 24: one shift
+  // normalizes it, (380 - exponent) / 2 is the result's exponent either way.
+  const simde__m128i odd = simde_mm_srai_epi32(simde_mm_slli_epi32(bits, 8), 31);
+  raw = simde_mm_add_epi32(raw, simde_mm_and_si128(raw, odd));
+  // Two bits dropped, to nearest even.
+  raw = simde_mm_add_epi32(
+      simde_mm_add_epi32(raw, simde_mm_set1_epi32(1)),
+      simde_mm_and_si128(simde_mm_srli_epi32(raw, 2), simde_mm_set1_epi32(1)));
+  const simde__m128i exponent = simde_mm_slli_epi32(
+      simde_mm_srli_epi32(simde_mm_sub_epi32(simde_mm_set1_epi32(380), simde_mm_srli_epi32(bits, 23)),
+                          1),
+      23);
+  out = simde_mm_castsi128_ps(simde_mm_or_si128(
+      exponent, simde_mm_and_si128(simde_mm_srli_epi32(raw, 2), simde_mm_set1_epi32(0x007FFFFF))));
+  return true;
+}
+
+// estimate_reciprocal in all lanes when each has a biased exponent 1..252
+// (the result normal); false otherwise.
+inline bool vec_estimate_recip_normal(simde__m128 x, simde__m128& out) {
+  const simde__m128i bits = simde_mm_castps_si128(x);
+  const simde__m128i magnitude = simde_mm_and_si128(bits, simde_mm_set1_epi32(0x7FFFFFFF));
+  const simde__m128i normal =
+      simde_mm_andnot_si128(simde_mm_cmpgt_epi32(simde_mm_set1_epi32(0x00800000), magnitude),
+                            simde_mm_cmpgt_epi32(simde_mm_set1_epi32(0x7E800000), magnitude));
+  if (simde_mm_movemask_ps(simde_mm_castsi128_ps(normal)) != 0xF) [[unlikely]] {
+    return false;
+  }
+  const simde__m128i segment =
+      simde_mm_and_si128(simde_mm_srli_epi32(bits, 18), simde_mm_set1_epi32(31));
+  const simde__m128i step =
+      simde_mm_and_si128(simde_mm_srli_epi32(bits, 9), simde_mm_set1_epi32(0x1FF));
+  const simde__m128i result = simde_mm_madd_epi16(vec_table_lookup(kVecEstimateRecipTable, segment),
+                                                  vec_estimate_weights(step, 512));
+  // (253 - exponent) << 23, the sign kept.
+  const simde__m128i exponent = simde_mm_sub_epi32(
+      simde_mm_set1_epi32(253 << 23), simde_mm_and_si128(bits, simde_mm_set1_epi32(0x7F800000)));
+  out = simde_mm_castsi128_ps(simde_mm_or_si128(
+      simde_mm_or_si128(simde_mm_andnot_si128(magnitude, bits), exponent),
+      simde_mm_and_si128(result, simde_mm_set1_epi32(0x007FFFFF))));
+  return true;
+}
+
+inline simde__m128i vec_table_lookup16(const uint16_t* table, simde__m128i index) {
+  return simde_mm_setr_epi32(table[uint32_t(simde_mm_cvtsi128_si32(index))],
+                             table[uint32_t(simde_mm_extract_epi32(index, 1))],
+                             table[uint32_t(simde_mm_extract_epi32(index, 2))],
+                             table[uint32_t(simde_mm_extract_epi32(index, 3))]);
+}
+
+// The high 32 bits of each lane's 32 x 32-bit unsigned product.
+inline simde__m128i vec_mulhi_epu32(simde__m128i a, simde__m128i b) {
+  const simde__m128i even = simde_mm_srli_epi64(simde_mm_mul_epu32(a, b), 32);
+  const simde__m128i odd =
+      simde_mm_mul_epu32(simde_mm_srli_epi64(a, 32), simde_mm_srli_epi64(b, 32));
+  return simde_mm_blend_epi16(even, odd, 0xCC);
+}
+
+// 2^e as an integer for e in 0..30. Exact conversions raise no host FP flag.
+inline simde__m128i vec_pow2_epi32(simde__m128i e) {
+  return simde_mm_cvttps_epi32(simde_mm_castsi128_ps(
+      simde_mm_slli_epi32(simde_mm_add_epi32(e, simde_mm_set1_epi32(127)), 23)));
+}
+
+// estimate_log2 in all lanes when each is a positive normal; false otherwise.
+// The sum is exact, as in the scalar code.
+inline bool vec_estimate_log2_normal(simde__m128 x, simde__m128& out) {
+  const simde__m128i bits = simde_mm_castps_si128(x);
+  const simde__m128i normal =
+      simde_mm_andnot_si128(simde_mm_cmpgt_epi32(simde_mm_set1_epi32(0x00800000), bits),
+                            simde_mm_cmpgt_epi32(simde_mm_set1_epi32(0x7F800000), bits));
+  if (simde_mm_movemask_ps(simde_mm_castsi128_ps(normal)) != 0xF) [[unlikely]] {
+    return false;
+  }
+  const simde__m128i exponent =
+      simde_mm_sub_epi32(simde_mm_srli_epi32(bits, 23), simde_mm_set1_epi32(127));
+  const simde__m128i fraction = vec_table_lookup16(
+      kEstimateLog2Table,
+      simde_mm_and_si128(simde_mm_srli_epi32(bits, 12), simde_mm_set1_epi32(0x7FF)));
+  out = simde_mm_add_ps(
+      simde_mm_cvtepi32_ps(exponent),
+      simde_mm_mul_ps(simde_mm_cvtepi32_ps(fraction), simde_mm_set1_ps(1.0f / 2048.0f)));
+  return true;
+}
+
+// estimate_pow2 in all lanes when each is below 128 in magnitude (no NaN or
+// infinity) and the result is normal or one; false otherwise.
+inline bool vec_estimate_pow2_normal(simde__m128 x, simde__m128& out) {
+  const simde__m128i bits = simde_mm_castps_si128(x);
+  const simde__m128i exponent =
+      simde_mm_and_si128(simde_mm_srli_epi32(bits, 23), simde_mm_set1_epi32(0xFF));
+  if (simde_mm_movemask_ps(simde_mm_castsi128_ps(
+          simde_mm_cmpgt_epi32(simde_mm_set1_epi32(134), exponent))) != 0xF) [[unlikely]] {
+    return false;
+  }
+  // The magnitude in fixed point with 15 fraction bits, truncated: the
+  // mantissa shifted right by 135 - exponent, as a multiply's high half by
+  // 2^(32 - shift). Shifts above 32 (denormals and zeros included) give 0.
+  const simde__m128i mantissa = simde_mm_or_si128(
+      simde_mm_and_si128(bits, simde_mm_set1_epi32(0x7FFFFF)), simde_mm_set1_epi32(0x800000));
+  const simde__m128i shift = simde_mm_sub_epi32(simde_mm_set1_epi32(135), exponent);
+  const simde__m128i in_range = simde_mm_cmpgt_epi32(simde_mm_set1_epi32(33), shift);
+  const simde__m128i factor = simde_mm_and_si128(
+      vec_pow2_epi32(simde_mm_max_epi32(simde_mm_sub_epi32(simde_mm_set1_epi32(32), shift),
+                                        simde_mm_setzero_si128())),
+      in_range);
+  const simde__m128i sign = simde_mm_srai_epi32(bits, 31);
+  const simde__m128i units = simde_mm_srai_epi32(
+      simde_mm_sub_epi32(simde_mm_xor_si128(vec_mulhi_epu32(mantissa, factor), sign), sign), 4);
+  const simde__m128i integer = simde_mm_srai_epi32(units, 11);
+  if (simde_mm_movemask_ps(simde_mm_castsi128_ps(
+          simde_mm_cmpgt_epi32(integer, simde_mm_set1_epi32(-127)))) != 0xF) [[unlikely]] {
+    return false;
+  }
+  const simde__m128i fraction =
+      vec_table_lookup16(kEstimatePow2Table, simde_mm_and_si128(units, simde_mm_set1_epi32(0x7FF)));
+  out = simde_mm_castsi128_ps(simde_mm_add_epi32(
+      simde_mm_slli_epi32(simde_mm_add_epi32(integer, simde_mm_set1_epi32(126)), 23),
+      simde_mm_slli_epi32(fraction, 12)));
+  return true;
+}
+
 // vrefp, vrsqrtefp, vlogefp, vexptefp: the console's estimate in each lane.
 template <uint32_t (*Estimate)(uint32_t)>
 inline simde__m128 vec_estimate(simde__m128 x) {
+  if constexpr (Estimate == &estimate_reciprocal_sqrt) {
+    if (vec_estimate_host.load(std::memory_order_relaxed)) [[unlikely]] {
+      return simde_mm_div_ps(simde_mm_set1_ps(1.0f), simde_mm_sqrt_ps(x));
+    }
+    simde__m128 r;
+    if (vec_estimate_rsqrt_normal(x, r)) [[likely]] {
+      return r;
+    }
+  } else if constexpr (Estimate == &estimate_reciprocal) {
+    if (vec_estimate_host.load(std::memory_order_relaxed)) [[unlikely]] {
+      return simde_mm_div_ps(simde_mm_set1_ps(1.0f), x);
+    }
+    simde__m128 r;
+    if (vec_estimate_recip_normal(x, r)) [[likely]] {
+      return r;
+    }
+  } else if constexpr (Estimate == &estimate_log2) {
+    simde__m128 r;
+    if (vec_estimate_log2_normal(x, r)) [[likely]] {
+      return r;
+    }
+  } else if constexpr (Estimate == &estimate_pow2) {
+    simde__m128 r;
+    if (vec_estimate_pow2_normal(x, r)) [[likely]] {
+      return r;
+    }
+  }
   alignas(16) uint32_t lanes[4];
   simde_mm_store_ps(reinterpret_cast<float*>(lanes), x);
   for (uint32_t& lane : lanes) {

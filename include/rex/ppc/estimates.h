@@ -395,16 +395,17 @@ inline uint32_t estimate_pow2(uint32_t value) {
          (static_cast<uint32_t>(kEstimatePow2Table[units & 0x7FF]) << 12);
 }
 
-// vrsqrtefp: a 32-entry table of base and slope, interpolated by the next 10
-// mantissa bits.
+// vrsqrtefp: a 32-entry table of slope (high half) and base (low half),
+// interpolated by the next 10 mantissa bits.
+inline constexpr uint32_t kEstimateReciprocalSqrtTable[32] = {
+    0x0568B4FD, 0x04F3AF97, 0x048DAAA5, 0x0435A618, 0x03E7A1E4, 0x03A29DFE, 0x03659A5C,
+    0x032E96F8, 0x02FC93CA, 0x02D090CE, 0x02A88DFE, 0x02838B57, 0x026188D4, 0x02438673,
+    0x02268431, 0x020B820B, 0x03D27FFA, 0x03807C29, 0x033878AA, 0x02F97572, 0x02C27279,
+    0x02926FB7, 0x02666D26, 0x023F6AC0, 0x021D6881, 0x01FD6665, 0x01E16468, 0x01C76287,
+    0x01AF60C1, 0x01995F12, 0x01855D79, 0x01735BF4,
+};
+
 inline uint32_t estimate_reciprocal_sqrt(uint32_t bits) {
-  static constexpr uint32_t kTable[32] = {
-      0x0568B4FD, 0x04F3AF97, 0x048DAAA5, 0x0435A618, 0x03E7A1E4, 0x03A29DFE, 0x03659A5C,
-      0x032E96F8, 0x02FC93CA, 0x02D090CE, 0x02A88DFE, 0x02838B57, 0x026188D4, 0x02438673,
-      0x02268431, 0x020B820B, 0x03D27FFA, 0x03807C29, 0x033878AA, 0x02F97572, 0x02C27279,
-      0x02926FB7, 0x02666D26, 0x023F6AC0, 0x021D6881, 0x01FD6665, 0x01E16468, 0x01C76287,
-      0x01AF60C1, 0x01995F12, 0x01855D79, 0x01735BF4,
-  };
   const uint32_t sign = bits >> 31;
   const uint32_t biased_exp = (bits >> 23) & 0xFF;
   const uint32_t mantissa = bits & 0x007FFFFF;
@@ -428,7 +429,7 @@ inline uint32_t estimate_reciprocal_sqrt(uint32_t bits) {
   const uint32_t index = (exp_parity | (mantissa >> 19)) ^ 16;
   const uint32_t interp = (mantissa >> 9) & 1023;
   int32_t result_exp = (127 - static_cast<int32_t>(biased_exp)) >> 1;
-  const uint32_t entry = kTable[index];
+  const uint32_t entry = kEstimateReciprocalSqrtTable[index];
   const uint32_t slope = entry >> 16;
   const uint32_t base = (entry << 10) & 0x3FFFC00u;
   int32_t raw = static_cast<int32_t>(base) - static_cast<int32_t>(interp * slope);

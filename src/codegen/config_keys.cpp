@@ -40,6 +40,7 @@ constexpr std::array kBinaryKeys = {
     KeySpec{"fast_dot_products", Kind::kBoolean},
     KeySpec{"non_volatile_gpr_as_local", Kind::kBoolean},
     KeySpec{"non_argument_gpr_as_local", Kind::kBoolean},
+    KeySpec{"vmx_leaf_as_local", Kind::kBoolean},
     KeySpec{"auto_share_registers", Kind::kBoolean},
     KeySpec{"fpu_flush_denormals", Kind::kBoolean},
     KeySpec{"fpscr_result_bits", Kind::kBoolean},

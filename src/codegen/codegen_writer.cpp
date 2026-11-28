@@ -94,6 +94,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
        cfg.nonVolatileRegistersAsLocalVariables || cfg.nonVolatileGprsAsLocalVariables},
       {"non_argument_gpr_as_local",
        cfg.nonArgumentRegistersAsLocalVariables || cfg.nonArgumentGprsAsLocalVariables},
+      {"vmx_leaf_as_local", cfg.vmxLeafAsLocal},
   };
 
   // The XEX this code comes from, checked by ReXApp at startup

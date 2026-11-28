@@ -67,6 +67,8 @@ add_executable(unit_tests
     ppc/fpscr_test.cpp
     ppc/vector_store_test.cpp
     ppc/fp_fma_test.cpp
+    ppc/vec_estimate_test.cpp
+    ppc/vector_integer_test.cpp
     ppc/upstream_hardware_cases_test.cpp
     ppc/upstream_multiply_add_test.cpp
     system/guest_path_test.cpp

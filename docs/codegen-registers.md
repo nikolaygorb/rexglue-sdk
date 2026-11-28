@@ -10,6 +10,7 @@ Generated code keeps the guest registers in the `PPCContext` (`ctx.r3`, `ctx.f1`
 | `non_argument_gpr_as_local` | r0, r2, r11, r12 | Recommended with the above. f0 and v32-v63 stay in ctx. |
 | `non_volatile_as_local` | r14-r31, f14-f31, v14-v31, v64-v127 | Older and wider form of `non_volatile_gpr_as_local`. |
 | `non_argument_as_local` | r0, r2, r11, r12, f0, v32-v63 | Older and wider form of `non_argument_gpr_as_local`. |
+| `vmx_leaf_as_local` | v0-v127 | Only in functions with no call or branch out of them, no trap or `sc`, no scalar floating point and no `mtvscr`. The registers it uses are copied from `ctx` at entry, after the vector flush mode is set (nothing in the function changes it, so the arithmetic on the locals cannot cross a mode change), and back at every return: `ctx` ends as without it. |
 | `auto_share_registers` | none | Default `true`. Finds the functions that need `share_registers` (below). Set it to `false` only to compare against a manual list. |
 
 The projects created by `rexglue init` build Windows targets with `-fno-ms-volatile` (clang) or `/volatile:iso` (MSVC). Guest memory is accessed through volatile pointers, and Microsoft's volatile semantics make each access a barrier that forces every register back into `ctx`. The locals pay off only with ISO semantics.
